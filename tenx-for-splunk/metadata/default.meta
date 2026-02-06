@@ -1,0 +1,83 @@
+
+# Application-level permissions
+#
+# Because we want the resources provided by the 10x app (macros, transforms, etc...) to be
+# usable by other apps as well, we basically export all with full read access.
+#
+# This can allow other apps to utilize them if needed.
+#
+
+[]
+access = read : [ * ], write : [ admin, power ]
+
+### EVENT TYPES
+
+[eventtypes]
+export = system
+
+
+### COMMANDS
+
+[commands]
+export = system
+
+
+### TRANSFORMS
+
+[transforms]
+export = system
+
+
+### LOOKUPS
+
+[lookups]
+export = system
+
+
+### VIEWSTATES: even normal users should be able to create shared viewstates
+
+[viewstates]
+access = read : [ * ], write : [ * ]
+export = system
+
+[macros/tenx-inflate]
+access = read : [ * ], write : [ admin, power ]
+export = system
+
+[macros/tenx-inflate-debug]
+access = read : [ * ], write : [ admin, power ]
+export = system
+
+[macros/tenx-message%281%29]
+access = read : [ * ], write : [ admin, power ]
+export = system
+
+[collections/tenx_dml]
+access = read : [ * ], write : [ * ]
+export = system
+
+[transforms/tenx-dml-lookup]
+access = read : [ * ], write : [ * ]
+export = system
+
+[props]
+access = read : [ * ], write : [ * ]
+export = system
+
+
+### Alerts needed config
+
+[alert_actions]
+export = system
+
+[alerts]
+export = system
+
+[restmap]
+export = system
+
+
+### SEARCH BNF
+
+[searchbnf]
+export = system

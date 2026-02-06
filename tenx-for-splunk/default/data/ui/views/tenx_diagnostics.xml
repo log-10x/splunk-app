@@ -1,0 +1,301 @@
+<!--
+  10x Diagnostics Dashboard
+  =========================
+
+  Use this dashboard to troubleshoot issues with 10x log optimization.
+
+  Common Issues:
+  - Dashboard panels showing "No results found"
+  - Templates not appearing in KV store
+  - Inflation returning original encoded events
+  - Time range or index permission issues
+
+  See README.md "Troubleshooting" section for detailed explanations.
+-->
+<dashboard version="1.1" theme="light">
+  <label>10x Diagnostics</label>
+  <description>Troubleshoot 10x configuration, data flow, and search issues</description>
+
+  <!-- Row 1: Index and Data Discovery -->
+  <row>
+    <panel>
+      <title>1. Index Event Counts</title>
+      <table>
+        <search>
+          <query>| eventcount summarize=false index=*
+| search index IN (tenx_encoded, tenx_dml, main)
+| sort -count</query>
+          <earliest>1</earliest>
+          <latest></latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="count">10</option>
+      </table>
+    </panel>
+    <panel>
+      <title>2. tstats Event Count</title>
+      <single>
+        <search>
+          <query>| tstats count where index=tenx_encoded</query>
+          <earliest>1</earliest>
+          <latest></latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="unit">events (tstats)</option>
+      </single>
+    </panel>
+    <panel>
+      <title>3. search Event Count</title>
+      <single>
+        <search>
+          <query>index=tenx_encoded | stats count</query>
+          <earliest>1</earliest>
+          <latest></latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="unit">events (search)</option>
+      </single>
+    </panel>
+  </row>
+
+  <!-- Row 2: Data Time Range -->
+  <row>
+    <panel>
+      <title>4. Data Time Range</title>
+      <table>
+        <search>
+          <query>index=tenx_encoded
+| stats min(_time) as earliest_epoch, max(_time) as latest_epoch, count
+| eval earliest=strftime(earliest_epoch, "%Y-%m-%d %H:%M:%S")
+| eval latest=strftime(latest_epoch, "%Y-%m-%d %H:%M:%S")
+| eval days_span=round((latest_epoch-earliest_epoch)/86400, 1)
+| table earliest, latest, days_span, count
+| rename earliest as "Earliest Event", latest as "Latest Event", days_span as "Days Span", count as "Total Events"</query>
+          <earliest>1</earliest>
+          <latest></latest>
+        </search>
+        <option name="drilldown">none</option>
+      </table>
+    </panel>
+    <panel>
+      <title>5. Sourcetype Breakdown</title>
+      <table>
+        <search>
+          <query>| tstats count where index=tenx_encoded by sourcetype
+| sort -count</query>
+          <earliest>1</earliest>
+          <latest></latest>
+        </search>
+        <option name="drilldown">none</option>
+      </table>
+    </panel>
+  </row>
+
+  <!-- Row 3: KV Store Status -->
+  <row>
+    <panel>
+      <title>6. KV Store Template Count</title>
+      <single>
+        <search>
+          <query>| inputlookup tenx-dml-lookup | stats count</query>
+          <earliest>1</earliest>
+          <latest></latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="unit">templates in KV store</option>
+      </single>
+    </panel>
+    <panel>
+      <title>7. Consume KV Last Run</title>
+      <single>
+        <search>
+          <query>index=_internal sourcetype=scheduler savedsearch_name="Consume KV" status=success
+| head 1
+| eval last_run=strftime(_time, "%Y-%m-%d %H:%M:%S")
+| table last_run</query>
+          <earliest>1</earliest>
+          <latest></latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="field">last_run</option>
+      </single>
+    </panel>
+    <panel>
+      <title>8. Recent Consume KV Runs</title>
+      <table>
+        <search>
+          <query>index=_internal sourcetype=scheduler savedsearch_name="Consume KV"
+| head 10
+| eval run_time=strftime(_time, "%H:%M:%S")
+| table run_time, status, run_time_seconds</query>
+          <earliest>-1h</earliest>
+          <latest></latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="count">5</option>
+      </table>
+    </panel>
+  </row>
+
+  <!-- Row 4: Field Extraction Test -->
+  <row>
+    <panel>
+      <title>9. Field Extraction Test</title>
+      <table>
+        <search>
+          <query>index=tenx_encoded
+| head 5
+| table _raw, tenx_hash, tenx_var_0, tenx_vars</query>
+          <earliest>1</earliest>
+          <latest></latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="wrap">true</option>
+      </table>
+    </panel>
+  </row>
+
+  <!-- Row 5: Inflation Test -->
+  <row>
+    <panel>
+      <title>10. Inflation Test (Before)</title>
+      <table>
+        <search>
+          <query>index=tenx_encoded
+| head 3
+| table _raw</query>
+          <earliest>1</earliest>
+          <latest></latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="wrap">true</option>
+      </table>
+    </panel>
+    <panel>
+      <title>11. Inflation Test (After)</title>
+      <table>
+        <search>
+          <query>index=tenx_encoded
+| head 3
+| `tenx-inflate`
+| table _raw</query>
+          <earliest>1</earliest>
+          <latest></latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="wrap">true</option>
+      </table>
+    </panel>
+  </row>
+
+  <!-- Row 6: Inflation Debug -->
+  <row>
+    <panel>
+      <title>12. Inflation Debug (Intermediate Fields)</title>
+      <table>
+        <search>
+          <query>index=tenx_encoded
+| head 3
+| `tenx-inflate-debug`
+| table tenx_hash, tenx_var_0, tenx_ts_sec, tenx_ts_f, tenx_log_term</query>
+          <earliest>1</earliest>
+          <latest></latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="wrap">true</option>
+      </table>
+    </panel>
+  </row>
+
+  <!-- Row 7: Template Lookup Test -->
+  <row>
+    <panel>
+      <title>13. Sample Templates from KV Store</title>
+      <table>
+        <search>
+          <query>| inputlookup tenx-dml-lookup
+| head 5
+| table _key, pattern, timestamp_format</query>
+          <earliest>1</earliest>
+          <latest></latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="wrap">true</option>
+      </table>
+    </panel>
+    <panel>
+      <title>14. Template Lookup Match Test</title>
+      <table>
+        <search>
+          <query>index=tenx_encoded
+| head 5
+| lookup tenx-dml-lookup _key as tenx_hash OUTPUT pattern
+| eval has_template=if(isnull(pattern), "NO", "YES")
+| table tenx_hash, has_template, pattern</query>
+          <earliest>1</earliest>
+          <latest></latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="wrap">true</option>
+      </table>
+    </panel>
+  </row>
+
+  <!-- Row 8: Template Pipeline Status -->
+  <row>
+    <panel>
+      <title>15. Raw DML Templates (Recent)</title>
+      <table>
+        <search>
+          <query>index=tenx_dml sourcetype=tenx_dml_raw_json
+| head 5
+| spath
+| table templateHash, template</query>
+          <earliest>-1h</earliest>
+          <latest></latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="wrap">true</option>
+      </table>
+    </panel>
+    <panel>
+      <title>16. Python Script Logs</title>
+      <table>
+        <search>
+          <query>index=_internal source=*tenx_dml_to_kv.log
+| head 20
+| table _time, _raw</query>
+          <earliest>-1h</earliest>
+          <latest></latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="wrap">true</option>
+      </table>
+    </panel>
+  </row>
+
+  <!-- Row 9: Compression Analysis -->
+  <row>
+    <panel>
+      <title>17. Compression Ratio Test</title>
+      <table>
+        <search>
+          <query>index=tenx_encoded
+| head 100
+| eval encoded_size=len(_raw)
+| `tenx-inflate`
+| eval inflated_size=len(_raw)
+| stats avg(encoded_size) as avg_enc, avg(inflated_size) as avg_inf, count
+| eval ratio=round(avg_inf/avg_enc, 2)
+| eval savings_pct=round((1-(avg_enc/avg_inf))*100, 1)
+| table count, avg_enc, avg_inf, ratio, savings_pct
+| rename count as "Sample Size", avg_enc as "Avg Encoded (bytes)", avg_inf as "Avg Inflated (bytes)", ratio as "Compression Ratio", savings_pct as "Savings %"</query>
+          <earliest>1</earliest>
+          <latest></latest>
+        </search>
+        <option name="drilldown">none</option>
+      </table>
+    </panel>
+  </row>
+
+</dashboard>

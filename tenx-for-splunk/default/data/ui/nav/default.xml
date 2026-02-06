@@ -1,0 +1,7 @@
+<nav>
+  <view name="tenx_dashboard" default='true' label="10x Analytics" />
+  <view name="tenx_diagnostics" label="10x Diagnostics" />
+  <view name="search" default_search='true' />
+  <view name="alerts" />
+  <view name="dashboards" />
+</nav>

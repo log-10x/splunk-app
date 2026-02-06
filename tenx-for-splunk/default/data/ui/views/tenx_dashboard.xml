@@ -1,0 +1,359 @@
+<!--
+  10x Analytics Dashboard
+  =======================
+
+  Monitor log optimization performance, storage savings, and ROI metrics.
+
+  IMPORTANT: Dashboard Search Gotchas
+  ===================================
+
+  1. TIME RANGE: Always use <earliest>1</earliest> (epoch second 1), NOT <earliest>0</earliest>
+     - Dashboard interprets earliest=0 differently than REST API
+     - Leave <latest></latest> empty (not "now") for all-time searches
+
+  2. INDEX SPECIFICATION: Always use explicit index names
+     - CORRECT:     index=tenx_encoded
+     - PROBLEMATIC: index=* sourcetype=tenx_encoded
+     - Dashboard search context may not have access to all indexes with wildcards
+
+  3. SUBSEARCHES: Avoid appendpipe/tstats subsearch patterns
+     - appendpipe [| tstats ...] fails silently in dashboard context
+     - Use simpler query patterns with untable for pivoting
+
+  4. TSTATS VS SEARCH:
+     - tstats: searches tsidx metadata, fast, always works
+     - search: searches raw events, needs correct index/time permissions
+     - If tstats works but search doesn't, check index specification and time range
+
+  See README.md "Dashboard Troubleshooting" section for detailed diagnostics.
+-->
+<dashboard version="1.1" theme="light">
+  <label>10x Analytics Dashboard</label>
+  <description>Monitor log optimization performance, storage savings, and ROI metrics</description>
+
+  <!--
+    Row 1: Key Metrics
+    Note: Uses tstats for Total Encoded Events (fast metadata query)
+    Other panels use search command with explicit index names
+  -->
+  <row>
+    <panel>
+      <title>Total Encoded Events</title>
+      <single>
+        <search>
+          <query>| tstats count where index=tenx_encoded | eval count=tostring(count, "commas")</query>
+          <earliest>1</earliest>
+          <latest></latest>
+        </search>
+        <option name="colorMode">block</option>
+        <option name="drilldown">none</option>
+        <option name="numberPrecision">0</option>
+        <option name="rangeColors">["0x53a051","0x53a051"]</option>
+        <option name="rangeValues">[0]</option>
+        <option name="useColors">1</option>
+        <option name="unit">events</option>
+      </single>
+    </panel>
+    <panel>
+      <title>Active Templates</title>
+      <single>
+        <search>
+          <query>| inputlookup tenx-dml-lookup | stats count</query>
+          <earliest>1</earliest>
+          <latest></latest>
+        </search>
+        <option name="colorMode">block</option>
+        <option name="drilldown">none</option>
+        <option name="numberPrecision">0</option>
+        <option name="rangeColors">["0x006d9c","0x006d9c"]</option>
+        <option name="rangeValues">[0]</option>
+        <option name="useColors">1</option>
+        <option name="unit">templates</option>
+      </single>
+    </panel>
+    <panel>
+      <title>Compression Ratio</title>
+      <single>
+        <search>
+          <query>index=tenx_encoded
+| head 5000
+| eval encoded_size=len(_raw)
+| `tenx-inflate`
+| eval inflated_size=len(_raw)
+| stats avg(encoded_size) as avg_encoded, avg(inflated_size) as avg_inflated
+| eval ratio=round(avg_inflated/avg_encoded, 2)
+| eval ratio=ratio."x"</query>
+          <earliest>1</earliest>
+          <latest></latest>
+        </search>
+        <option name="colorMode">block</option>
+        <option name="drilldown">none</option>
+        <option name="rangeColors">["0xf8be34","0x53a051"]</option>
+        <option name="rangeValues">[1.5]</option>
+        <option name="useColors">1</option>
+        <option name="field">ratio</option>
+      </single>
+    </panel>
+    <panel>
+      <title>Estimated Storage Savings</title>
+      <single>
+        <search>
+          <query>index=tenx_encoded
+| head 10000
+| eval encoded_size=len(_raw)
+| `tenx-inflate`
+| eval inflated_size=len(_raw)
+| stats sum(encoded_size) as enc_bytes, sum(inflated_size) as inf_bytes
+| eval savings_mb=round((inf_bytes-enc_bytes)/1048576, 1)
+| eval savings_pct=round((1-(enc_bytes/inf_bytes))*100, 1)
+| eval display=savings_mb." MB (".savings_pct."%)"
+| table display</query>
+          <earliest>1</earliest>
+          <latest></latest>
+        </search>
+        <option name="colorMode">block</option>
+        <option name="drilldown">none</option>
+        <option name="rangeColors">["0x53a051","0x53a051"]</option>
+        <option name="rangeValues">[0]</option>
+        <option name="useColors">1</option>
+        <option name="field">display</option>
+      </single>
+    </panel>
+  </row>
+
+  <!--
+    Row 2: Storage Analysis
+    Note: Storage Comparison uses untable for pivoting (NOT appendpipe which fails in dashboards)
+  -->
+  <row>
+    <panel>
+      <title>Storage Comparison</title>
+      <chart>
+        <search>
+          <query>index=tenx_encoded
+| head 10000
+| eval encoded_size=len(_raw)
+| `tenx-inflate`
+| eval inflated_size=len(_raw)
+| stats sum(encoded_size) as enc_bytes, sum(inflated_size) as inf_bytes
+| eval Encoded=round(enc_bytes/1048576, 2), Original=round(inf_bytes/1048576, 2)
+| eval Savings=Original-Encoded
+| fields Encoded, Original, Savings
+| untable _row metric MB</query>
+          <earliest>1</earliest>
+          <latest></latest>
+        </search>
+        <option name="charting.chart">bar</option>
+        <option name="charting.chart.showDataLabels">all</option>
+        <option name="charting.drilldown">none</option>
+        <option name="charting.legend.placement">none</option>
+        <option name="charting.chart.stackMode">default</option>
+      </chart>
+    </panel>
+    <panel>
+      <title>Event Volume Over Time</title>
+      <chart>
+        <search>
+          <query>index=tenx_encoded
+| timechart span=1h count as "Encoded Events"</query>
+          <earliest>1</earliest>
+          <latest></latest>
+        </search>
+        <option name="charting.chart">area</option>
+        <option name="charting.chart.nullValueMode">zero</option>
+        <option name="charting.drilldown">none</option>
+        <option name="charting.legend.placement">bottom</option>
+        <option name="charting.axisTitleX.text">Time</option>
+        <option name="charting.axisTitleY.text">Events</option>
+      </chart>
+    </panel>
+  </row>
+
+  <!-- Row 3: Template Analysis -->
+  <row>
+    <panel>
+      <title>Top 10 Templates by Usage</title>
+      <chart>
+        <search>
+          <query>index=tenx_encoded
+| rex field=_raw "^~?(?&lt;hash&gt;[^,]+)"
+| stats count by hash
+| sort -count
+| head 10
+| lookup tenx-dml-lookup _key as hash OUTPUT pattern
+| eval template=substr(pattern, 1, 50)."..."
+| table template, count</query>
+          <earliest>1</earliest>
+          <latest></latest>
+        </search>
+        <option name="charting.chart">bar</option>
+        <option name="charting.chart.showDataLabels">all</option>
+        <option name="charting.drilldown">none</option>
+        <option name="charting.legend.placement">none</option>
+        <option name="charting.axisTitleX.text">Events</option>
+        <option name="charting.axisTitleY.text">Template</option>
+      </chart>
+    </panel>
+    <panel>
+      <title>Template Usage Distribution</title>
+      <chart>
+        <search>
+          <query>index=tenx_encoded
+| rex field=_raw "^~?(?&lt;hash&gt;[^,]+)"
+| stats count by hash
+| eval usage_bucket=case(
+    count&lt;10, "1-9 events",
+    count&lt;100, "10-99 events",
+    count&lt;1000, "100-999 events",
+    count&lt;10000, "1K-10K events",
+    true(), "10K+ events"
+)
+| stats count as templates by usage_bucket
+| sort usage_bucket</query>
+          <earliest>1</earliest>
+          <latest></latest>
+        </search>
+        <option name="charting.chart">pie</option>
+        <option name="charting.drilldown">none</option>
+      </chart>
+    </panel>
+  </row>
+
+  <!-- Row 4: Health Status -->
+  <row>
+    <panel>
+      <title>Inflation Success Rate (Sample)</title>
+      <single>
+        <search>
+          <query>index=tenx_encoded
+| head 1000
+| rex field=_raw "^~?(?&lt;hash&gt;[^,]+)"
+| `tenx-inflate`
+| eval success=if(match(_raw, "^~"), 0, 1)
+| stats sum(success) as successful, count as total
+| eval rate=round((successful/total)*100, 2)."%"
+| table rate</query>
+          <earliest>1</earliest>
+          <latest></latest>
+        </search>
+        <option name="colorMode">block</option>
+        <option name="drilldown">none</option>
+        <option name="rangeColors">["0xdc4e41","0xf8be34","0x53a051"]</option>
+        <option name="rangeValues">[90,99]</option>
+        <option name="useColors">1</option>
+        <option name="field">rate</option>
+      </single>
+    </panel>
+    <panel>
+      <title>Template Pipeline Status</title>
+      <single>
+        <search>
+          <query>index=tenx_dml sourcetype=tenx_dml_raw_json
+| stats count as recent_templates
+| eval status=if(recent_templates>0, "Active", "Idle")
+| table status</query>
+          <earliest>1</earliest>
+          <latest></latest>
+        </search>
+        <option name="colorMode">block</option>
+        <option name="drilldown">none</option>
+        <option name="colorBy">value</option>
+        <option name="field">status</option>
+      </single>
+    </panel>
+    <panel>
+      <title>KV Store Last Updated</title>
+      <single>
+        <search>
+          <query>index=_internal sourcetype=scheduler savedsearch_name="Consume KV" status=success
+| head 1
+| eval last_run=strftime(_time, "%Y-%m-%d %H:%M:%S")
+| table last_run</query>
+          <earliest>1</earliest>
+          <latest></latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="field">last_run</option>
+      </single>
+    </panel>
+    <panel>
+      <title>Avg Event Size Reduction</title>
+      <single>
+        <search>
+          <query>index=tenx_encoded
+| head 5000
+| eval encoded_size=len(_raw)
+| `tenx-inflate`
+| eval inflated_size=len(_raw)
+| stats avg(encoded_size) as avg_enc, avg(inflated_size) as avg_inf
+| eval reduction=round(avg_inf-avg_enc, 0)." bytes"
+| table reduction</query>
+          <earliest>1</earliest>
+          <latest></latest>
+        </search>
+        <option name="colorMode">block</option>
+        <option name="drilldown">none</option>
+        <option name="rangeColors">["0x53a051","0x53a051"]</option>
+        <option name="rangeValues">[0]</option>
+        <option name="useColors">1</option>
+        <option name="field">reduction</option>
+      </single>
+    </panel>
+  </row>
+
+  <!-- Row 5: Detailed Tables -->
+  <row>
+    <panel>
+      <title>Template Details (Top 20 by Usage)</title>
+      <table>
+        <search>
+          <query>index=tenx_encoded
+| rex field=_raw "^~?(?&lt;hash&gt;[^,]+)"
+| stats count as "Event Count" by hash
+| sort -"Event Count"
+| head 20
+| lookup tenx-dml-lookup _key as hash OUTPUT pattern, timestamp_format
+| eval "Has Timestamp"=if(len(timestamp_format)>0, "Yes", "No")
+| eval "Pattern Preview"=substr(pattern, 1, 80)
+| rename hash as "Template Hash"
+| table "Template Hash", "Event Count", "Has Timestamp", "Pattern Preview"</query>
+          <earliest>1</earliest>
+          <latest></latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="count">10</option>
+        <option name="wrap">true</option>
+      </table>
+    </panel>
+  </row>
+
+  <!-- Row 6: ROI Calculator -->
+  <row>
+    <panel>
+      <title>ROI Summary</title>
+      <table>
+        <search>
+          <query>index=tenx_encoded
+| head 10000
+| eval encoded_size=len(_raw)
+| `tenx-inflate`
+| eval inflated_size=len(_raw)
+| stats sum(encoded_size) as enc_bytes, sum(inflated_size) as inf_bytes, count as sample_count
+| eval enc_mb=round(enc_bytes/1048576, 2)
+| eval inf_mb=round(inf_bytes/1048576, 2)
+| eval savings_mb=round(inf_mb-enc_mb, 2)
+| eval ratio=round(inf_bytes/enc_bytes, 2)
+| eval savings_pct=round((1-(enc_bytes/inf_bytes))*100, 1)
+| eval monthly_savings=round((savings_mb/1024)*15, 2)
+| rename sample_count as "Sample Events", inf_mb as "Original Size (MB)", enc_mb as "Encoded Size (MB)", savings_mb as "Storage Saved (MB)", ratio as "Compression Ratio", savings_pct as "Savings %", monthly_savings as "Monthly Savings ($)"
+| fields "Sample Events", "Original Size (MB)", "Encoded Size (MB)", "Storage Saved (MB)", "Compression Ratio", "Savings %", "Monthly Savings ($)"</query>
+          <earliest>1</earliest>
+          <latest></latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="count">10</option>
+      </table>
+    </panel>
+  </row>
+
+</dashboard>

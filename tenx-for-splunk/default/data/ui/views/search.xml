@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<view template="tenx-for-splunk:/static/pages/tenx_template_slim.html" type="html" isDashboard="False">
+	<label>10x Search</label>
+</view>
