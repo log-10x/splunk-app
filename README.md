@@ -2,17 +2,17 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-Search and visualize [10x-encoded](https://doc.log10x.com/run/transform/#encoding) events in Splunk with zero data loss. This open-source app transparently decodes encoded events at search time, maintaining full querying, dashboard, and alerting capabilities while reducing ingestion costs by over 50%.
+Search and visualize [compact](https://doc.log10x.com/run/transform/#compact) events in Splunk with zero data loss. This open-source app transparently expands compact events at search time, maintaining full querying, dashboard, and alerting capabilities while reducing ingestion costs by over 50%.
 
 Use the [Cloud Reporter](https://doc.log10x.com/apps/cloud/reporter/) to identify optimization opportunities in your existing Splunk data.
 
 ## How It Works
 
-The app intercepts search requests and automatically inflates [encoded events](https://doc.log10x.com/run/transform/#encoding) before displaying results. Users interact with Splunk exactly as before - searching, building dashboards, and configuring alerts on the original full-fidelity data.
+The app intercepts search requests and automatically expands [compact events](https://doc.log10x.com/run/transform/#compact) before displaying results. Users interact with Splunk exactly as before - searching, building dashboards, and configuring alerts on the original full-fidelity data.
 
 ### Ingestion Flow
 
-Events are [encoded](https://doc.log10x.com/run/transform/#encoding) at the edge by the [Receiver](https://doc.log10x.com/apps/receiver/) running in [Compact mode](https://doc.log10x.com/apps/receiver/compact/) and ingested into Splunk with reduced payload size:
+Events are [compacted](https://doc.log10x.com/run/transform/#compact) at the edge by the [Receiver](https://doc.log10x.com/apps/receiver/) running in [Compact mode](https://doc.log10x.com/apps/receiver/compact/) and ingested into Splunk with reduced payload size:
 
 ```
 Receiver  -->  Ingest (UF/HEC)  -->  KV Store (Templates)
@@ -21,7 +21,7 @@ Receiver  -->  Ingest (UF/HEC)  -->  KV Store (Templates)
 
 ### Search Flow
 
-Searches are transparently transformed to [inflate](https://doc.log10x.com/run/transform/#decoding) encoded events:
+Searches are transparently transformed to [expand](https://doc.log10x.com/run/transform/#expand) compact events:
 
 ```
 User Search  -->  Hook Intercept  -->  Transform (Add Macro)  -->  Inflate (Decode)  -->  Full Results
@@ -48,7 +48,7 @@ $SPLUNK_HOME/bin/splunk restart
 
 ### Step 2: Create HEC Tokens
 
-Create two HTTP Event Collector tokens in Splunk - one for templates, one for encoded events.
+Create two HTTP Event Collector tokens in Splunk - one for templates, one for compact events.
 
 **Templates Token:**
 
@@ -68,7 +68,7 @@ Create two HTTP Event Collector tokens in Splunk - one for templates, one for en
 
 ### Step 3: Configure Forwarder
 
-Configure your log forwarder to send encoded events and templates to Splunk. See the [full documentation](https://doc.log10x.com/apps/receiver/compact/splunk/) for Fluent Bit, Fluentd, and OTel Collector examples.
+Configure your log forwarder to send compact events and templates to Splunk. See the [full documentation](https://doc.log10x.com/apps/receiver/compact/splunk/) for Fluent Bit, Fluentd, and OTel Collector examples.
 
 ### Step 4: Verify End-to-End
 
@@ -84,7 +84,7 @@ index=tenx_dml sourcetype=tenx_dml_raw_json | head 10
 | inputlookup tenx-dml-lookup | stats count
 ```
 
-**Check encoded events inflate:**
+**Check compact events expand:**
 ```spl
 index=your_logs_index | head 10
 ```
@@ -97,11 +97,11 @@ The app includes a built-in analytics dashboard providing real-time visibility i
 |--------|-------------|
 | **Total Encoded Events** | Count of optimized events ingested |
 | **Active Templates** | Number of unique patterns in KV Store |
-| **Compression Ratio** | Average reduction factor across all events |
+| **Reduction Ratio** | Average reduction factor across all events |
 | **Storage Savings** | Estimated bytes saved and percentage reduction |
-| **Event Volume Over Time** | Trend comparison of encoded vs original volume |
+| **Event Volume Over Time** | Trend comparison of compact vs original volume |
 | **Top Templates by Usage** | Most frequently matched patterns |
-| **Inflation Success Rate** | Percentage of events successfully decoded |
+| **Expansion Success Rate** | Percentage of events successfully expanded |
 
 ## Components
 
@@ -129,7 +129,7 @@ This repository is licensed under the [Apache License 2.0](LICENSE).
 
 ### Important: Log10x Product License Required
 
-This repository contains a Splunk app for decoding Log10x-encoded events. While the Splunk app itself is open source, **using the Log10x Receiver to encode events requires a commercial license**.
+This repository contains a Splunk app for expanding Log10x compact events. While the Splunk app itself is open source, **using the Log10x Receiver to compact events requires a commercial license**.
 
 | Component | License |
 |-----------|---------|
@@ -138,7 +138,7 @@ This repository contains a Splunk app for decoding Log10x-encoded events. While 
 
 **What this means:**
 - You can freely use, modify, and distribute this Splunk app
-- The Log10x Receiver that generates encoded events requires a paid subscription
+- The Log10x Receiver that generates compact events requires a paid subscription
 - A valid Log10x license is required to run the Receiver
 
 **Get Started:**
