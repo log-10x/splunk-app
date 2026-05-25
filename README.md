@@ -12,11 +12,11 @@ The app intercepts search requests and automatically inflates [encoded events](h
 
 ### Ingestion Flow
 
-Events are [encoded](https://doc.log10x.com/run/transform/#encoding) at the edge by the [Edge Optimizer](https://doc.log10x.com/apps/edge/optimizer/) and ingested into Splunk with reduced payload size:
+Events are [encoded](https://doc.log10x.com/run/transform/#encoding) at the edge by the [Receiver](https://doc.log10x.com/apps/receiver/) running in [Compact mode](https://doc.log10x.com/apps/receiver/compact/) and ingested into Splunk with reduced payload size:
 
 ```
-Optimizer  -->  Ingest (UF/HEC)  -->  KV Store (Templates)
-                                 -->  Index (Encoded Events)
+Receiver  -->  Ingest (UF/HEC)  -->  KV Store (Templates)
+                                -->  Index (Encoded Events)
 ```
 
 ### Search Flow
@@ -68,7 +68,7 @@ Create two HTTP Event Collector tokens in Splunk - one for templates, one for en
 
 ### Step 3: Configure Forwarder
 
-Configure your log forwarder to send encoded events and templates to Splunk. See the [full documentation](https://doc.log10x.com/apps/edge/optimizer/splunk/) for Fluent Bit, Fluentd, and OTel Collector examples.
+Configure your log forwarder to send encoded events and templates to Splunk. See the [full documentation](https://doc.log10x.com/apps/receiver/compact/splunk/) for Fluent Bit, Fluentd, and OTel Collector examples.
 
 ### Step 4: Verify End-to-End
 
@@ -119,8 +119,8 @@ The app includes a built-in analytics dashboard providing real-time visibility i
 
 For complete documentation including troubleshooting, advanced configuration, and integration guides, see:
 
-- [10x for Splunk Documentation](https://doc.log10x.com/apps/edge/optimizer/splunk/)
-- [Edge Optimizer Documentation](https://doc.log10x.com/apps/edge/optimizer/)
+- [10x for Splunk Documentation](https://doc.log10x.com/apps/receiver/compact/splunk/)
+- [Receiver Documentation](https://doc.log10x.com/apps/receiver/)
 - [Log10x Documentation](https://doc.log10x.com/)
 
 ## License
@@ -129,17 +129,17 @@ This repository is licensed under the [Apache License 2.0](LICENSE).
 
 ### Important: Log10x Product License Required
 
-This repository contains a Splunk app for decoding Log10x-encoded events. While the Splunk app itself is open source, **using the Log10x Edge Optimizer to encode events requires a commercial license**.
+This repository contains a Splunk app for decoding Log10x-encoded events. While the Splunk app itself is open source, **using the Log10x Receiver to encode events requires a commercial license**.
 
 | Component | License |
 |-----------|---------|
 | This repository (Splunk app) | Apache 2.0 (open source) |
-| Log10x Edge Optimizer | Commercial license required |
+| Log10x Receiver | Commercial license required |
 
 **What this means:**
 - You can freely use, modify, and distribute this Splunk app
-- The Log10x Edge Optimizer that generates encoded events requires a paid subscription
-- A valid Log10x license is required to run the Edge Optimizer
+- The Log10x Receiver that generates encoded events requires a paid subscription
+- A valid Log10x license is required to run the Receiver
 
 **Get Started:**
 - [Log10x Pricing](https://log10x.com/pricing)
