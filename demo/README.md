@@ -1,18 +1,18 @@
 ﻿
 
 # 10x Splunk Demo
-This manual is designed to allow you to test 10x decoding and search capabilities on your Splunk node using sample data.
+This manual is designed to allow you to test 10x expansion and search capabilities on your Splunk node using sample data.
 
 This demo consists of two main parts:
-1. Running a search on encoded data in your Splunk node, which decodes the data as part of it's execution.
-2. Converting a plain Splunk search to a 10x search based on encoded data maps.
+1. Running a search on compact data in your Splunk node, which expands the data as part of its execution.
+2. Converting a plain Splunk search to a 10x search based on compact data maps.
 
-The easiest way to search on 10x encoded data is to install the 10x app, as the app bundles all the resources needed to convert plain searches into 10x compatible ones, as well as decoding capabilities.
+The easiest way to search on 10x compact data is to install the 10x app, as the app bundles all the resources needed to convert plain searches into 10x compatible ones, as well as expansion capabilities.
 
 If you don't wish to install the app, you can manually add the needed parts for this demo.
 
 # Requirements
-For running a decoding search job on encoded data, you're going to need to do the following things:
+For running a expansion search job on compact data, you're going to need to do the following things:
 1. Create and populate a KV store collection.
 -- For Splunk enterprise, this can be done either by editing configuration files, or via Rest API.
 -- For Splunk cloud, this can be done by adding and using the [Splunk App for Lookup File Editing](https://splunkbase.splunk.com/app/1724)
@@ -37,7 +37,7 @@ Additional information about all the needed capabilities can be found in -
 - [Generating API tokens](https://docs.splunk.com/Documentation/Splunk/latest/Security/CreateAuthTokens)
 
 ## Upload the demo log
-The demo file is a 10x encoded version of a sample Spark log file taken from [Loghub](https://github.com/logpai/loghub/tree/master/Spark)
+The demo file is a 10x compact version of a sample Spark log file taken from [Loghub](https://github.com/logpai/loghub/tree/master/Spark)
 
 Download [tenx_encoded_spark_demo.log](/demo/tenx_encoded_spark_demo.log) and upload it to your Splunk node.
 The easiest way is via the web interface:
@@ -177,7 +177,7 @@ You can **verify** the field extraction works by:
 ![Verification search](/demo/images/Verification_Search.png)
 
 ## Add 10x decode macro
-The last part of decoding the 10x encoded data is to connect the encoded data, extracted 10x fields, and KV lookup with a macro.
+The last part of expansion the 10x compact data is to connect the compact data, extracted 10x fields, and KV lookup with a macro.
 
 1. From the **Search & Reporting** app, click on **Settings** > **Advanced search**
 
@@ -212,7 +212,7 @@ Other macro fields aren't needed, after you finish filling everything, click the
 3. Click **Save**
 
 ## Running a verification search
-Now that the macro is setup, we can pipe any search into it and it will decode the data.
+Now that the macro is setup, we can pipe any search into it and it will expand the data.
 We can simply run the same search from before, but pipe it into the macro:
 > source="tenx_encoded_spark_demo.log" | \`tenx-decode\`
 
@@ -251,6 +251,6 @@ For example, running the following:
 Will yield the following 10x search:
 > | search source=tenx_encoded_spark_demo.log ((slf4j) OR (tenx_hash IN (esszmA8cXJL,fSh3gng9Pq5,\$ifXGk6Kc6CS,kGeu7kVZHuz,\$bcj4ljY0Wn,\$fghIDle3lJk,dmwlbqMGyGL))) | \`tenx-decode\` | extract
 
-Running this search in splunk will return all the events with the word *slf4j* in them, in their decoded form.
+Running this search in splunk will return all the events with the word *slf4j* in them, in their expanded form.
 
 ![Decoded search](/demo/images/Decoded_Search.png)

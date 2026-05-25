@@ -1,6 +1,6 @@
 # 10x for Splunk - Log10x Log Optimization App
 
-A Splunk app that enables search-time inflation (decompression) of 10x-encoded log events. 10x compresses logs by replacing repetitive patterns with compact template hashes, achieving 50-80% storage reduction while maintaining full searchability.
+A Splunk app that enables search-time expansion of 10x compact log events. 10x replaces repetitive patterns with compact template hashes, achieving 50-80% storage reduction while maintaining full searchability.
 
 ## Table of Contents
 
@@ -19,7 +19,7 @@ A Splunk app that enables search-time inflation (decompression) of 10x-encoded l
 
 ### What is 10x?
 
-10x is a log optimization system that reduces log storage costs by identifying repetitive patterns in log events and replacing them with compact encoded representations. Instead of storing full log lines repeatedly, 10x stores:
+10x is a log optimization system that reduces log storage costs by identifying repetitive patterns in log events and replacing them with compact representations. Instead of storing full log lines repeatedly, 10x stores:
 
 1. **Templates**: The static pattern structure with placeholders for variable data
 2. **Encoded Events**: Compact representations containing only a hash reference and variable values
@@ -30,17 +30,17 @@ The 10x for Splunk app provides the infrastructure to:
 
 1. **Receive** template definitions from the 10x pipeline
 2. **Store** parsed template data in a KV store for efficient lookup
-3. **Inflate** encoded events back to their original form at search time
-4. **Search** encoded data transparently using standard SPL queries
+3. **Inflate** compact events back to their original form at search time
+4. **Search** compact data transparently using standard SPL queries
 
-### Compression Example
+### Reduction Example
 
 **Original log event:**
 ```
 2024-01-15T10:30:45.123Z INFO [main] com.example.Service - Processing request for user john_doe with transaction id TX-789012
 ```
 
-**10x encoded form:**
+**10x compact form:**
 ```
 ~abc123def,1705315845123,john_doe,TX-789012
 ```
@@ -99,7 +99,7 @@ At search time, the `tenx-inflate` macro reconstructs the original event by comb
                            +--------------------+
                            | Search Time        |
                            | `tenx-inflate`      |
-                           | macro inflation    |
+                           | macro expansion    |
                            +--------------------+
                                       |
                                       v
@@ -253,29 +253,29 @@ dispatch.latest_time = now
 
 ### Adding Custom Sourcetypes for Encoded Events
 
-To use 10x encoding with custom sourcetypes, add to `props.conf`:
+To use 10x with custom sourcetypes, add to `props.conf`:
 
 ```ini
 [my_custom_sourcetype]
 REPORT-tenx = tenx-hash-vars-extraction
 ```
 
-This applies the field extraction that parses encoded events into `tenx_hash`, `tenx_var_0`, and `tenx_vars` fields.
+This applies the field extraction that parses compact events into `tenx_hash`, `tenx_var_0`, and `tenx_vars` fields.
 
 ---
 
 ## Usage
 
-### Basic Inflation
+### Basic Expansion
 
-Search encoded events and inflate them:
+Search compact events and expand them:
 
 ```spl
 index=myindex sourcetype=tenx_encoded
 | `tenx-inflate`
 ```
 
-### Debugging Inflation
+### Debugging Expansion
 
 Keep intermediate fields to troubleshoot issues:
 
@@ -285,18 +285,18 @@ index=myindex sourcetype=tenx_encoded
 | table tenx_hash, tenx_var_0, tenx_vars, tenx_log_parts, _raw
 ```
 
-### Filtering Before Inflation
+### Filtering Before Expansion
 
-Apply filters on encoded data before inflating (more efficient):
+Apply filters on compact data before expanding (more efficient):
 
 ```spl
 index=myindex sourcetype=tenx_encoded tenx_hash="abc123*"
 | `tenx-inflate`
 ```
 
-### Search After Inflation
+### Search After Expansion
 
-Search for specific content after inflation:
+Search for specific content after expansion:
 
 ```spl
 index=myindex sourcetype=tenx_encoded
@@ -357,9 +357,9 @@ Wait 2-3 minutes for the "Consume KV" saved search to run, then verify:
 | stats count
 ```
 
-### Step 4: Test Inflation
+### Step 4: Test Expansion
 
-Search for encoded events and inflate:
+Search for compact events and expand:
 
 ```spl
 index=* sourcetype=tenx_encoded earliest=-15m
@@ -411,7 +411,7 @@ Examples:
 - `$(yyyy-MM-dd'T'HH:mm:ss.SSS'Z')` - ISO 8601 format
 - `$(epoch)` - Unix epoch milliseconds
 
-### Inflation Macro Logic
+### Expansion Macro Logic
 
 The `tenx-inflate` macro performs these operations:
 
@@ -572,14 +572,14 @@ index=tenx_encoded | stats min(_time) as earliest, max(_time) as latest
    | table templateHash, template
    ```
 
-### Inflation Returns Empty or Wrong Results
+### Expansion Returns Empty or Wrong Results
 
 1. **Check KV store has entry for hash:**
    ```spl
    | inputlookup tenx-dml-lookup where _key="<your_hash>"
    ```
 
-2. **Debug with inflate-debug macro:**
+2. **Debug with the `tenx-inflate-debug` macro:**
    ```spl
    index=* sourcetype=tenx_encoded tenx_hash="<your_hash>"
    | head 1
@@ -619,7 +619,7 @@ index=tenx_encoded | stats min(_time) as earliest, max(_time) as latest
    | `tenx-inflate`
    ```
 
-2. **Filter before inflation:**
+2. **Filter before expansion:**
    ```spl
    index=myindex sourcetype=tenx_encoded tenx_hash="known_hash*"
    | `tenx-inflate`
