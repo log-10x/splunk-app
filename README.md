@@ -2,9 +2,9 @@
 
 [![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 
-Search and visualize [compact](https://doc.log10x.com/run/transform/#compact) events in Splunk with zero data loss. This open-source app transparently expands compact events at search time, maintaining full querying, dashboard, and alerting capabilities while reducing ingestion costs by over 50%.
+Search and visualize [compact](https://doc.log10x.com/run/transform/#compact) events in Splunk with zero data loss. This open-source [Log10x](https://www.log10x.com/?utm_source=github&utm_medium=readme&utm_campaign=splunk-app&utm_content=hero) app transparently expands compact events at search time, maintaining full querying, dashboard, and alerting capabilities while reducing ingestion costs by over 50%.
 
-Use the [Cloud Reporter](https://doc.log10x.com/apps/cloud/reporter/) to identify optimization opportunities in your existing Splunk data.
+To find optimization opportunities in your existing Splunk data, point the [Log10x MCP server](https://doc.log10x.com/apps/mcp/) at your Splunk backend with read-only credentials and ask it to run a cost POC. It pulls a representative sample via SPL, runs the 10x engine locally to rank message types, and returns a per-pattern cost and savings report with drop/compact/offload actions. Install with `claude mcp add --transport stdio --env LOG10X_API_KEY=your-api-key log10x -- npx -y log10x-mcp`.
 
 ## How It Works
 
@@ -142,7 +142,7 @@ This repository contains a Splunk app for expanding Log10x compact events. While
 - A valid Log10x license is required to run the Receiver
 
 **Get Started:**
-- [Log10x Pricing](https://log10x.com/pricing)
+- [Log10x Pricing](https://www.log10x.com/pricing?utm_source=github&utm_medium=readme&utm_campaign=splunk-app&utm_content=footer)
 - [Documentation](https://doc.log10x.com)
 - [Contact Sales](mailto:sales@log10x.com)
 
