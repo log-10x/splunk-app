@@ -1,1 +1,5 @@
 pytest>=7.0.0
+# Modern parsimonious for the offline compiler tests. The app bundles a Python-3.7-era
+# parsimonious under tenx-for-splunk/lib/ that does not import on modern interpreters; the
+# grammar source is identical and parses under both. See tests/conftest.py.
+parsimonious>=0.10.0

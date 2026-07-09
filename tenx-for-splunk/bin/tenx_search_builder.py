@@ -82,6 +82,39 @@ class ResolvedState(Enum):
 	PENDING = auto()
 
 
+class BuildResult:
+	"""
+	Structured outcome of TenxSearchBuilder.build().
+
+	Carries the resolved SPL together with the facts a save-time caller needs to decide
+	policy, instead of forcing that caller to re-derive them by scanning the output text.
+
+	Attributes
+	----------
+	state : ResolvedState
+		Resolution state of the command chain.
+	resolved : str
+		The resolved SPL string (identical to what resolve() returns).
+	engaged : bool
+		True when the leading search actually compiled for 10x-compact data (i.e. the inflate
+		macro was appended). Distinguishes a natively-compiled search from a passthrough
+		without re-scanning the output for a macro name.
+	field_terms : list of str
+		The raw text of field conditions (e.g. 'status=500', 'level=error') on the leading
+		search, so a caller can inspect them (a string-valued field compiles into a `| where`
+		clause that may match nothing).
+	retryable : bool
+		True when the failure is a transient DML lookup failure rather than a permanent
+		unparseable search - a save-time caller should retry rather than drop the alert.
+	"""
+	def __init__(self, state, resolved, engaged=False, field_terms=None, retryable=False):
+		self.state = state
+		self.resolved = resolved
+		self.engaged = engaged
+		self.field_terms = field_terms if field_terms is not None else []
+		self.retryable = retryable
+
+
 class TenxSplCommand:
 	"""
 	Class representing a single Splunk SPL command, exposing some parts for us as we work
@@ -169,6 +202,7 @@ class TenxSearchCommand(TenxSplCommand):
 		self.user_search_terms = []
 		self.user_field_terms = []
 		self.no_dml_results = False
+		self.dml_search_failed = False
 		self.parsed_command = None
 		self.resolved_search = None
 
@@ -323,6 +357,10 @@ class TenxSearchCommand(TenxSplCommand):
 			# Logging already happens inside run_dml_search
 			#
 			self.has_errors = True
+			# This is a transient lookup failure (job timeout/busy indexer), NOT a permanent
+			# problem with the search itself. Save-time callers should retry, not drop the alert.
+			#
+			self.dml_search_failed = True
 			return
 
 		if len(dml_results) == 0:
@@ -424,6 +462,17 @@ class TenxSearchCommand(TenxSplCommand):
 			return ResolvedState.PENDING
 
 		return ResolvedState.SUCCESS
+
+	def engaged_tenx(self):
+		"""
+		Returns whether this search actually compiled for 10x-compact data.
+
+		True exactly when resolved() appends the inflate macro: the search targets compact
+		data (needs_tenx), it was not too complex to modify, it had no errors, and it parsed.
+		Save-time callers use this to tell a native compile from a passthrough without
+		scanning the resolved text for a macro name.
+		"""
+		return bool(self.needs_tenx and not self.too_complex and not self.has_errors and self.parsed_command is not None)
 
 	def has_dml_user_search_terms(self):
 		"""
@@ -635,6 +684,63 @@ class TenxSearchBuilder:
 
 		return commands
 
+	def build(self, base_search):
+		"""
+		Core resolution shared by resolve() (the interactive path) and the save-time
+		alert compiler (see tenx_alert_compiler.py).
+
+		Parses the search via Splunk's parser endpoint, creates TenxSplCommands, resolves
+		them, and returns a BuildResult so callers can inspect the resolution state (and the
+		engaged/field_terms/retryable facts) to decide policy - for example whether it is safe
+		to persist the resolved search into a scheduled alert, or whether it is too complex and
+		needs a fallback.
+
+		On an unparseable search returns BuildResult(ResolvedState.FAILURE, base_search),
+		mirroring resolve()'s historical "return the original untouched" behaviour.
+
+		Unlike resolve(), this does NOT swallow unexpected exceptions - callers that want
+		explicit failure handling (the compiler) can catch them; resolve() keeps its own
+		catch-all for the interactive path.
+		"""
+		commands = self.get_search_commands(base_search.strip())
+
+		if commands is None:
+			# Logging already happens inside get_search_commands. An unparseable search is a
+			# permanent problem (not retryable).
+			#
+			return BuildResult(ResolvedState.FAILURE, base_search)
+
+		tenx_commands = []
+		leading_search = None
+
+		for raw_command in commands:
+			tenx_command = None
+
+			if raw_command['command'] == 'search' and leading_search is None:
+				# We only need to decode the results coming from the first search.
+				# Any other chained searches are now working on decoded data and can be left as is.
+				#
+				tenx_command = TenxSearchCommand(raw_command, self.server_connection, self.tenx_config, self.search_manager, self.force_tenx, self.debug)
+				leading_search = tenx_command
+			else:
+				tenx_command = TenxSplCommand(raw_command, self.tenx_config, self.debug)
+
+			tenx_commands.append(tenx_command)
+
+		spl_commands = TenxSplCommands(tenx_commands, self.debug)
+		spl_commands.resolve()
+
+		engaged = leading_search.engaged_tenx() if leading_search is not None else False
+		field_terms = [term.text for term in leading_search.user_field_terms] if leading_search is not None else []
+		retryable = bool(leading_search is not None and leading_search.dml_search_failed)
+
+		return BuildResult(
+			spl_commands.resolved_state(),
+			spl_commands.resolved(),
+			engaged=engaged,
+			field_terms=field_terms,
+			retryable=retryable)
+
 	def resolve(self, base_search):
 		"""
 		Resolves a search to work on 10x encoded data.
@@ -644,34 +750,7 @@ class TenxSearchBuilder:
 		If the parser endpoint resulted in any failures, returns base_search.
 		"""
 		try:
-			commands = self.get_search_commands(base_search.strip())
-
-			if commands is None:
-				# Logging already happens inside get_search_commands.
-				#
-				return base_search
-
-			tenx_commands = []
-			found_search = False
-
-			for raw_command in commands:
-				tenx_command = None
-
-				if raw_command['command'] == 'search' and not found_search:
-					# We only need to decode the results coming from the first search.
-					# Any other chained searches are now working on decoded data and can be left as is.
-					#
-					tenx_command = TenxSearchCommand(raw_command, self.server_connection, self.tenx_config, self.search_manager, self.force_tenx, self.debug)
-					found_search = True
-				else:
-					tenx_command = TenxSplCommand(raw_command, self.tenx_config, self.debug)
-
-				tenx_commands.append(tenx_command)
-
-			spl_commands = TenxSplCommands(tenx_commands, self.debug)
-			spl_commands.resolve()
-
-			return spl_commands.resolved()
+			return self.build(base_search).resolved
 		except Exception as e:
 			logger.warning("Error while resolving {} - {}.".format(base_search, e), exc_info=1)
 			return tenx_util.splunk_message_macro("Failed building tenx search")
