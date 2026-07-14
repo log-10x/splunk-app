@@ -236,8 +236,52 @@ class TenxDMLBuilder:
 
 		The line format is "<pattern key> <processed pattern>", where the processed pattern is just the
 		pattern, stripped from variables separators and new lines, which might hinder actual search.
+
+		The "$0(" escape (a plain variable immediately followed by a literal '(', see
+		build_kv_record_data) is stripped as a pair, so the escape digit doesn't linger as a
+		stray "0" in the searchable preview text. Only a real, unescaped "$0(" marker is
+		collapsed this way - an escaped literal "$0(" occurring in the raw source text is left
+		alone, matching how build_kv_record_data decides what counts as escaped.
 		"""
-		return key + " " + pattern.replace(self.variable_separator, "").replace("\r\n", " ").replace("\n", " ")
+		normalized = self._collapse_dollar_zero_escape(pattern)
+
+		return key + " " + normalized.replace(self.variable_separator, "").replace("\r\n", " ").replace("\n", " ")
+
+	def _collapse_dollar_zero_escape(self, pattern):
+		"""
+		Removes the disambiguation '0' from every real (unescaped) "<variable_separator>0("
+		occurrence, leaving an escaped (literal) occurrence of the same three characters
+		untouched. Tracks escape_character state the same way build_kv_record_data does, so
+		the two functions agree on what counts as "escaped".
+		"""
+		sep = self.variable_separator
+		esc = self.escape_character
+		pattern_length = len(pattern)
+		result = []
+		currently_escaping = False
+		index = 0
+
+		while index < pattern_length:
+			current_char = pattern[index]
+
+			if current_char == esc:
+				currently_escaping = not currently_escaping
+				result.append(current_char)
+				index += 1
+				continue
+
+			if current_char == sep:
+				if currently_escaping:
+					currently_escaping = False
+				elif index < pattern_length - 2 and pattern[index+1] == '0' and pattern[index+2] == '(':
+					result.append(sep + '(')
+					index += 3
+					continue
+
+			result.append(current_char)
+			index += 1
+
+		return ''.join(result)
 
 	def build_kv_record_data(self, pattern_hash, base_pattern):
 		"""
@@ -291,6 +335,17 @@ class TenxDMLBuilder:
 						timestamp_end = index
 
 						timestamp_format = base_pattern[timestamp_start:timestamp_end]
+
+					elif index < pattern_length - 2 and base_pattern[index+1] == '0' and base_pattern[index+2] == '(':
+						# A plain (non-timestamp) variable whose value is immediately followed by a
+						# literal '(' is encoded as "$0(" rather than bare "$(", so it isn't misread
+						# as the start of a timestamp specifier. The '0' carries no value of its own
+						# (offset 0 always means "a new variable", never a back-reference) - skip it
+						# so it isn't glued onto the next pattern part as literal text.
+						#
+						pattern_parts.append(current_part)
+						current_part = ''
+						index += 1
 
 					else:
 						# Really a variable at this point, so we split.
