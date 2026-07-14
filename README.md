@@ -27,6 +27,26 @@ Searches are transparently transformed to [expand](https://doc.log10x.com/run/tr
 User Search  -->  Hook Intercept  -->  Transform (Add Macro)  -->  Inflate (Decode)  -->  Full Results
 ```
 
+## Receiver-side configuration
+
+This app does not decode template **back-references** (`$N` syntax, produced when the Receiver's
+[`varMaxRecurIndexes`](https://doc.log10x.com/run/template/#varmaxrecurindexes) setting reuses an
+earlier variable value instead of re-encoding it). If a compact event's template uses a
+back-reference, the app's inflate macro currently reconstructs the wrong text for that value —
+silently, since the search still returns a result, just not the original one.
+
+**Set `varMaxRecurIndexes: 0`** in the Receiver's pipeline configuration for any deployment that
+feeds this app. This is a whole-process setting, not a per-destination one: disabling it costs a
+small amount of the modeled compression (roughly half a percentage point, measured on a realistic
+Kubernetes/OTel corpus), in exchange for correct expansion of every event.
+
+**If the same Receiver also feeds ClickHouse or Elasticsearch** in a fan-out topology, this
+setting applies to that traffic too. That is not a correctness problem for those destinations —
+the [clickhouse-app](https://github.com/log-10x/clickhouse-app) and
+[elasticsearch-plugin](https://github.com/log-10x/elasticsearch-plugin) decoders already handle
+back-references correctly — it just means they forgo the same small compression gain for as long
+as the Receiver instance they share with Splunk has this setting disabled.
+
 ## Quickstart
 
 ### Prerequisites
