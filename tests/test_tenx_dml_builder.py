@@ -261,6 +261,47 @@ class TestDollarZeroEscape:
 
 		assert result == 'h1 status(pending)'
 
+	def test_pure_dml_line_leaves_an_escaped_dollar_zero_alone(self, builder):
+		# an escaped "$" immediately followed by literal "0(" is real source text, not the
+		# disambiguation marker - build_kv_record_data preserves it verbatim (via its own
+		# escape-tracking), and build_pure_dml_line must agree, not silently drop the '0'.
+		escaped_builder = TenxDMLBuilder(
+			timestamp_placeholder='__TENX_TS__',
+			variable_separator='$',
+			escape_character='/'
+		)
+
+		result = escaped_builder.build_pure_dml_line('h1', 'a/$0(b)c')
+
+		assert result == 'h1 a/0(b)c'
+
+	def test_pure_dml_line_dollar_zero_still_collapses_after_an_escaped_dollar(self, builder):
+		# a genuine (unescaped) $0( elsewhere in the same pattern must still collapse, even
+		# when an escaped literal $ also appears earlier in the pattern.
+		escaped_builder = TenxDMLBuilder(
+			timestamp_placeholder='__TENX_TS__',
+			variable_separator='$',
+			escape_character='/'
+		)
+
+		result = escaped_builder.build_pure_dml_line('h1', '/$100 then status$0(pending)')
+
+		assert result == 'h1 /100 then status(pending)'
+
+	def test_multiple_dollar_zero_escapes_in_one_pattern(self, builder):
+		result = builder.build_kv_record_data('h5', 'a$0(b)c$0(d)e')
+
+		assert result[RECORD_PART_0] == 'a'
+		assert result[RECORD_PATTERN_PARTS] == ['(b)c']
+		assert result[RECORD_PATTERN_TERMINATOR] == '(d)e'
+
+	def test_dollar_zero_escape_at_start_of_pattern(self, builder):
+		result = builder.build_kv_record_data('h6', '$0(x)')
+
+		assert result[RECORD_PART_0] == ''
+		assert result[RECORD_PATTERN_PARTS] == []
+		assert result[RECORD_PATTERN_TERMINATOR] == '(x)'
+
 
 class TestTenxDMLBuilderCustomConfig:
 	"""Tests for TenxDMLBuilder with custom configuration."""
