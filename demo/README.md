@@ -249,7 +249,7 @@ For example, running the following:
 > python tenx_search.py --host https://localhost:8089 --key eyJraWQiOiJz... --user splunk_user --search "source=tenx_encoded_spark_demo.log slf4j"
 
 Will yield the following 10x search:
-> | search source=tenx_encoded_spark_demo.log ((slf4j) OR (tenx_hash IN (esszmA8cXJL,fSh3gng9Pq5,\$ifXGk6Kc6CS,kGeu7kVZHuz,\$bcj4ljY0Wn,\$fghIDle3lJk,dmwlbqMGyGL))) | \`tenx-decode\` | extract
+> | search source=tenx_encoded_spark_demo.log ((slf4j) OR (tenx_hash IN ("esszmA8cXJL","fSh3gng9Pq5","\$ifXGk6Kc6CS","kGeu7kVZHuz","\$bcj4ljY0Wn","\$fghIDle3lJk","dmwlbqMGyGL"))) | \`tenx-decode\` | extract
 
 Running this search in splunk will return all the events with the word *slf4j* in them, in their expanded form.
 

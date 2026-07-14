@@ -5,3 +5,7 @@ __pycache__/
 
 # IDE
 .idea/
+
+# Test / local dev
+.pytest_cache/
+.venv/
