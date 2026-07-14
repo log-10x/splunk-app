@@ -74,33 +74,57 @@ store with no live instance.
 
 | Strategy | When | Stored SPL |
 |---|---|---|
-| **NATIVE** | search touches compact data | `search <mods> ((words) OR (tenx_hash IN (…))) \| \`tenx-inflate\` \| extract [\| where …] [\| search …] [\| …rest]` |
+| **NATIVE** | search touches compact data | `search <mods> ((words) OR (tenx_hash IN ("h1","h2"))) \| \`tenx-inflate\` \| extract [\| where …] [\| search …] [\| …rest]` |
 | **PASSTHROUGH** | search does not touch compact data | the original, unchanged |
-| **ESCAPE_HATCH** | too complex to compile statically (`ResolvedState.COMPLEX`) | `\| tenxsearch searchstring="<original>"` — correct but slower; `needs_review=True` |
 | **RETRYABLE** | transient DML lookup failure at compile time | nothing — keep the existing alert, retry later |
-| **REJECTED** | unparseable, or cannot be compiled safely (e.g. `NOT` on compact data) | nothing (surface the reason) |
+| **REJECTED** | unparseable, or cannot be compiled safely (`NOT` on compact data, or `ResolvedState.COMPLEX`) | nothing (surface the reason) |
 
 Each result also carries `needs_review` (a human should confirm before it is applied) and a
 `reason`. The compiler decides NATIVE vs PASSTHROUGH off a structured `engaged` flag from
 `build()` — not by scanning the output text for the inflate macro — so a user who types
 `` `tenx-inflate` `` into their own search can't fool the classification.
 
-**ESCAPE_HATCH is currently a defensive path.** The real builder does not emit
-`ResolvedState.COMPLEX` for the ambiguous searches you'd expect (see the measured table
-below); it passes them through as SUCCESS, and the safety net flags them as
-PASSTHROUGH + `needs_review`. ESCAPE_HATCH fires only if `build()` ever returns COMPLEX.
+**There is no auto-applied escape hatch.** An earlier design mapped `ResolvedState.COMPLEX` to
+an `ESCAPE_HATCH` strategy that auto-generated `` | tenxsearch searchstring="<original>" `` and
+certified it storable. That was retired: `tenxsearch` re-runs the same builder logic the
+compiler just failed to use, so a search too complex for one is generally too complex for the
+other, and `tenxsearch` carries its own cost (a nested proxied job, no streaming) and its own
+silent-failure modes (see `tenxsearch.py`). `COMPLEX` now maps straight to **REJECTED**, with
+the reason naming `| tenxsearch` as a manual option a human can still choose, understanding
+that trade-off — the compiler does not choose it for them. (The real builder does not emit
+`COMPLEX` for the ambiguous searches you'd expect anyway — see the measured table below; it
+passes them through as SUCCESS, and the safety net flags them as PASSTHROUGH + `needs_review`.
+`COMPLEX`→REJECTED is a defensive path for if/when the builder ever does emit it.)
 
 Notes on the NATIVE form:
-- The stored search is **hash-prefiltered** (`tenx_hash IN (…)`), which is the cheap, precise
-  path the handoff calls for — a hash *is* a message type. The `(words)` clause additionally
-  catches matches in the variable portion of encoded events, and the trailing `| search
-  <terms>` re-narrows to true matches, so both template-text and variable-value matches are
-  covered.
+- The stored search is **hash-prefiltered** (`tenx_hash IN ("h1","h2")`), which is the cheap,
+  precise path the handoff calls for — a hash *is* a message type. Hash literals are quoted:
+  real 10x hashes are dense, punctuation-heavy strings, and an unquoted hash containing `|` or
+  `[` would corrupt or break the generated SPL. The `(words)` clause additionally catches
+  matches in the variable portion of encoded events, and the trailing `| search <terms>`
+  re-narrows to true matches, so both template-text and variable-value matches are covered.
+- The DML **probe** (which finds the matching hashes) uses the user's own conjunction — the
+  terms AND'd together, exactly as typed — not an OR of every word. An OR probe matches every
+  template containing *any* one word, which can fan a multi-word search in to every unrelated
+  template sharing a single common term. AND loses no recall: a word absent from a matching
+  template's text must be present as a *variable value* instead, which the `(words)` keyword
+  clause still catches.
 - Output is normalized to the idiomatic saved-search form (leading `search`, not `| search` —
   the builder joins commands with a leading pipe).
 - Time windows come from the alert's `dispatch.earliest/latest` against indexed `_time`; the
   inflate macro rewrites `_raw` but not `_time`, so **`_time` must be correct at ingest/HEC**
   (a settled constraint, not this compiler's job).
+
+**NATIVE is flagged `needs_review` (not rejected) whenever it is storable but not fully
+trustworthy:**
+- **No keyword search terms at all** (a field-only alert like `status=500`, or a bare
+  `sourcetype=tenx_encoded` with no filter). No DML probe ever runs, so there is no hash
+  prefilter — the compiled search scans the entire compact sourcetype on every run.
+- **The DML probe found nothing** for terms that were given — the alert has no hash prefilter
+  and will only fire on a variable-value match, which may not be the intent.
+- **The DML probe was truncated** (matched more rows than the fetch cap) — the hash prefilter
+  may be missing some matching message types.
+- **A string-valued field condition** (see below) — the `| where` clause may match nothing.
 
 ## Empirical behavior (measured, not assumed)
 
@@ -109,37 +133,61 @@ measured against the real builder + a local template store, and pinned by tests.
 
 | Input | Strategy |
 |---|---|
-| `index=main sourcetype=tenx_encoded payment failed` | NATIVE (prefilter over payment templates) |
+| `index=main sourcetype=tenx_encoded payment failed` | NATIVE (prefilter over templates matching **both** words, AND probe) |
 | `sourcetype=tenx_encoded status=500 payment` | NATIVE (`\| where status=500`) |
 | `sourcetype=tenx_encoded payment \| stats count` | NATIVE (inflate before `stats`) |
-| `sourcetype=tenx_encoded` (no terms) | NATIVE (inflate all, no prefilter) |
+| `sourcetype=tenx_encoded` (no terms) | NATIVE + **needs_review** (no hash prefilter at all - full scan) |
+| `sourcetype=tenx_encoded status=500` (field only, no keyword) | NATIVE + **needs_review** (same - no prefilter) |
+| `sourcetype=tenx_encoded zzzznomatch` (DML probe found nothing) | NATIVE + **needs_review** |
 | `sourcetype=tenx_encoded level=error` | NATIVE + **needs_review** (string field value, see below) |
 | `index=main error` / `error` | PASSTHROUGH |
 | `index=main error NOT healthcheck` | PASSTHROUGH (NOT is fine off compact data) |
 | `sourcetype=tenx_encoded error OR sourcetype=other` | PASSTHROUGH + **needs_review** |
 | `sourcetype=tenx_* payment` | PASSTHROUGH + **needs_review** (wildcard, glob-matched) |
 | `sourcetype=tenx_encoded NOT payment` | **REJECTED** (negation, see below) |
+| `ResolvedState.COMPLEX` (defensive - not reachable via the real builder today) | **REJECTED** |
 | transient DML lookup failure at compile time | **RETRYABLE** |
 | empty / unparseable | REJECTED |
 
 ### Builder blind spots the compiler defends against
 
 An adversarial review found several places where the reused builder (and its parser) produce
-output that is wrong or a silent passthrough. The root fixes belong in the shared builder and
-must be verified on live Splunk (part of the wiring phase); until then the compiler refuses to
-**certify** these as clean:
+output that is wrong, over-broad, or a silent passthrough. Some are fixed directly in the
+shared builder (quoting, the AND probe); others are guarded by the compiler because the root
+fix needs live-Splunk verification (part of the wiring phase):
 
 - **`NOT` is silently dropped.** `TenxSearchAstNodeFactory` prunes negation nodes, so the
   builder compiles `sourcetype=tenx_encoded NOT payment` into the *positive* search — an
   inverted alert. The compiler detects the `NOT` operator (quote-aware) on a compact search
-  and **REJECTs** it rather than store a semantically-inverted alert. Root fix: stop pruning
-  `not_logical_expression` so `SpecifierFinder`'s negation handling is live again.
+  and **REJECTs** it rather than store a semantically-inverted alert. Root fix (not yet done):
+  stop pruning `not_logical_expression` so `SpecifierFinder`'s negation handling is live again.
+- **Hash literals were unquoted.** Real 10x hashes are dense, punctuation-heavy strings (`!`,
+  `|`, `[`, space, …), not plain alphanumeric; an unquoted hash containing SPL metacharacters
+  could corrupt or break the generated search. **Fixed**: hashes are quoted
+  (`tenx_util.escape_spl_string_literal`) in both the interactive `resolve()` path and the
+  compiler, so this benefits alerts and dashboards alike.
+- **The DML probe used OR, not AND.** Probing with every word OR'd together matches any
+  template containing *any* single word, which can fan a multi-word search in to every
+  unrelated template sharing one common term - and pushes the probe toward the fetch cap for
+  no benefit. **Fixed**: the probe now uses the user's own conjunction (AND, via `base_user_terms`);
+  the `(words)` keyword clause is untouched, so recall for variable-value matches is unaffected.
+- **An empty or truncated hash set was certified clean.** An empty DML match (`no_dml_results`)
+  or a probe truncated at the fetch cap (`dml_truncated`, `tenx_search_manager.DML_FETCH_LIMIT`)
+  used to compile to `NATIVE` with `needs_review=False`, silently certifying a prefilter that
+  might miss matching message types (or, for the empty case, an alert that only fires on a
+  variable-value match). **Fixed**: both are now surfaced on `BuildResult` and flagged
+  `needs_review` by the compiler.
+- **A field-only alert compiles to a full sourcetype scan, uncommented.** A search with no
+  keyword search terms (only field conditions, or no filter at all beyond `sourcetype=`) never
+  runs a DML probe, so the compiled search has no hash prefilter whatsoever - every run reads
+  the entire compact sourcetype. **Fixed**: flagged `needs_review` via the new
+  `BuildResult.has_search_terms` flag.
 - **String-valued field conditions compile to a dead `\| where`.** `where_fields()` emits
   `\| where level=error`, where the unquoted `error` is read by `where` as a *field
   reference*, so the clause matches nothing. Numeric literals (`status=500`) are the one RHS
   shape that works. The compiler flags any string-valued field condition as **needs_review**.
-  Root fix: quote non-numeric values, or translate `field=value` equality to a post-inflate
-  `\| search field=value` (search-command semantics, which is what the user wrote).
+  Root fix (not yet done): quote non-numeric values, or translate `field=value` equality to a
+  post-inflate `\| search field=value` (search-command semantics, which is what the user wrote).
 
 ### Passthrough safety net (heuristic)
 
@@ -174,8 +222,22 @@ pytest tests/
 The doubles (`tests/support/local_search_manager.py`) reproduce the two Splunk round-trips
 the builder makes — SPL command splitting and the `tenx_dml_pure` hash lookup — locally, so
 `compile()` is exercised against the real demo template CSV (`demo/tenx_templates_demo.csv`).
-They approximate Splunk (single-element `args.search`, no subsearch splitting, substring
-keyword matching); the compiled-SPL semantics they cannot prove must be checked live.
+They approximate Splunk (single-element `args.search`, no subsearch splitting, whole-token AND
+matching against the DML probe's conjunction); the compiled-SPL semantics they cannot prove
+must be checked live.
+
+**Separate, related correctness issue — not fixed by anything in this document.** A
+mass-corpus investigation (real 205MB encoder corpus) found the shipped `tenx-inflate` macro
+does not decode template *back-references* (`$N` value-reuse, `template.varMaxRecurIndexes`,
+default 10) or the `"$0("` escape, silently fabricating ~92% of expanded log lines when
+recurrence is in play. That bug is orthogonal to the alert compiler (it lives in
+`tenx_dml_builder.py` / `macros.conf`, and affects the *interactive* hook too, not just
+alerts) and is fixed separately: see the `fix/dml-builder-dollar-zero-escape` branch for the
+`$0` code fix, and the README's "Receiver-side configuration" section for the
+`varMaxRecurIndexes: 0` recommendation. Hash prefilter matching itself (this document's
+subject) is unaffected either way — a compiled `tenx_hash IN (...)` clause finds the right
+*events*; the back-reference bug is about whether the *inflate macro* then reconstructs their
+text correctly.
 
 ## Not built yet — the wiring plan
 
@@ -190,17 +252,18 @@ keyword matching); the compiled-SPL semantics they cannot prove must be checked 
    legacy `| tenxsearch` alerts to NATIVE, and to pick up template hashes that appeared after
    the alert was first saved.
 3. **UI control**: a small addition to the setup/search page that calls `/tenx-alert` and
-   surfaces `strategy` / `needs_review` / `reason` so a human confirms escape-hatch and
-   flagged-passthrough cases before scheduling.
-4. **Keep `| tenxsearch`** as the documented raw-text escape hatch (do not keep proxying jobs
-   as the default).
+   surfaces `strategy` / `needs_review` / `reason` so a human confirms REJECTED and
+   flagged-NATIVE/PASSTHROUGH cases before scheduling.
+4. **`| tenxsearch` remains available as a manual, human-chosen fallback** for a REJECTED
+   `COMPLEX` search - documented, not auto-applied by the compiler (see "There is no
+   auto-applied escape hatch" above).
 5. **Live verification** (per the handoff): confirm the compiled saved search fires correctly
    as a scheduled alert, the hash prefilter matches, `| search` vs `search` stored forms
    behave identically under the scheduler, and time windows select the right buckets. Also
-   verify the two builder blind spots above (fix `NOT` pruning and the `where_fields` string
-   case, then relax the compiler's REJECT/needs_review guards accordingly), and confirm the
-   `| tenxsearch searchstring="…"` escaping round-trips a value containing quotes and
-   backslashes under `commands.conf` `chunked=true` parsing.
+   verify the two remaining builder root fixes above (`NOT` pruning and the `where_fields`
+   string case, then relax the compiler's REJECT/needs_review guards accordingly), and
+   separately verify the `varMaxRecurIndexes`/`"$0("` decode fix (see the note above) on a
+   live instance with real back-reference-bearing templates.
 
 If a use case genuinely needs unchanged arbitrary SPL *and* original keyword semantics, the
 only real answer is a decoded sidecar index — not search-time config. Call that out; don't try

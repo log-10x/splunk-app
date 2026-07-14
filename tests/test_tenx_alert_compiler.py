@@ -3,7 +3,7 @@ Unit tests for tenx_alert_compiler.
 
 These exercise the save-time compiler end to end against a local template store, so no
 Splunk instance is needed (see tests/support/local_search_manager.py and conftest.py for
-the offline doubles). The COMPLEX -> escape-hatch path is driven with an injected stub
+the offline doubles). ResolvedState.COMPLEX -> REJECTED is driven with an injected stub
 builder, since that state is awkward to trigger through the grammar and dependency
 injection is the more robust way to pin the mapping.
 """
@@ -17,8 +17,6 @@ from tenx_alert_compiler import (
 	TenxAlertCompiler,
 	AlertStrategy,
 	AlertCompileResult,
-	escape_spl_option_value,
-	escape_hatch_search,
 	_normalize_native,
 	_referenced_tenx_sources,
 	_specifier_values,
@@ -30,9 +28,10 @@ from support.local_search_manager import LocalSearchManager, CsvTemplateStore
 from conftest import DEMO_TEMPLATES_CSV
 
 
-# A small, deterministic template set. Hashes are chosen so the IN (...) clause is easy to
-# assert on. build_pure_dml_line prepends the hash and strips '$', so the searchable words
-# are the non-$ tokens of each pattern.
+# A small, deterministic template set. build_pure_dml_line prepends the hash and strips '$',
+# so the searchable words are the non-$ tokens of each pattern. The DML probe now uses AND
+# semantics (matching the real base_user_terms fix), so h_pay and h_pay2 deliberately share
+# "payment" but differ on "failed"/"declined", to exercise that precision.
 CONTROLLED_TEMPLATES = [
 	('h_pay', 'payment $ failed for user $'),
 	('h_pay2', 'payment declined for account $'),
@@ -53,9 +52,9 @@ def make_config(source_types=('tenx_encoded',), sources=()):
 	}
 
 
-def make_compiler(templates=CONTROLLED_TEMPLATES, config=None, fail_dml=False):
+def make_compiler(templates=CONTROLLED_TEMPLATES, config=None, fail_dml=False, truncate_dml=False):
 	store = CsvTemplateStore(templates)
-	manager = LocalSearchManager(store, fail_dml=fail_dml)
+	manager = LocalSearchManager(store, fail_dml=fail_dml, truncate_dml=truncate_dml)
 	builder = tenx_search_builder.TenxSearchBuilder(
 		server_connection=None,
 		tenx_config=config or make_config(),
@@ -66,9 +65,13 @@ def make_compiler(templates=CONTROLLED_TEMPLATES, config=None, fail_dml=False):
 class StubBuilder:
 	"""A builder whose build() returns a fixed BuildResult - for pinning compiler policy."""
 	def __init__(self, state, resolved, engaged=False, field_terms=None, retryable=False,
+				has_search_terms=True, no_dml_results=False, dml_truncated=False,
 				tenx_config=None, raises=None):
 		self._result = BuildResult(state, resolved, engaged=engaged,
-									field_terms=field_terms, retryable=retryable)
+									field_terms=field_terms, retryable=retryable,
+									has_search_terms=has_search_terms,
+									no_dml_results=no_dml_results,
+									dml_truncated=dml_truncated)
 		self.tenx_config = tenx_config or make_config()
 		self._raises = raises
 
@@ -84,13 +87,17 @@ class StubBuilder:
 
 class TestNativeCompile:
 	def test_message_type_alert_compiles_to_hash_prefilter(self):
+		# "payment failed" probes the DML with AND semantics: only h_pay contains BOTH
+		# words (h_pay2 lacks "failed"), so the prefilter is precise, not "every template
+		# mentioning payment".
 		result = make_compiler().compile('index=main sourcetype=tenx_encoded payment failed')
 
 		assert result.strategy == AlertStrategy.NATIVE
 		assert result.storable
 		assert not result.needs_review
-		# hash prefilter over the two "payment" templates, OR the raw words
-		assert 'tenx_hash IN (h_pay,h_pay2)' in result.compiled_search
+		# hash prefilter over just h_pay, quoted (real hashes are punctuation-heavy and
+		# would otherwise corrupt or break the generated SPL)
+		assert 'tenx_hash IN ("h_pay")' in result.compiled_search
 		assert '(payment OR failed)' in result.compiled_search
 		# expansion is applied and results are re-narrowed to true matches
 		assert '`tenx-inflate`' in result.compiled_search
@@ -130,23 +137,82 @@ class TestNativeCompile:
 		result = make_compiler().compile('sourcetype=tenx_encoded "payment failed"')
 
 		assert result.strategy == AlertStrategy.NATIVE
-		assert 'tenx_hash IN (h_pay,h_pay2)' in result.compiled_search
+		assert 'tenx_hash IN ("h_pay")' in result.compiled_search
 
-	def test_encoded_sourcetype_with_no_terms_still_inflates(self):
+	def test_multi_word_matches_only_templates_with_all_words(self):
+		# "payment declined" should resolve to h_pay2 only, not h_pay (which lacks "declined").
+		result = make_compiler().compile('sourcetype=tenx_encoded payment declined')
+
+		assert result.strategy == AlertStrategy.NATIVE
+		assert 'tenx_hash IN ("h_pay2")' in result.compiled_search
+
+
+# ---------------------------------------------------------------------------
+# B6: a search with no keyword terms at all has no hash prefilter -> full scan
+# ---------------------------------------------------------------------------
+
+class TestFieldOnlyFullScanGuard:
+	def test_encoded_sourcetype_with_no_terms_is_flagged(self):
 		result = make_compiler().compile('sourcetype=tenx_encoded')
 
 		assert result.strategy == AlertStrategy.NATIVE
 		assert '`tenx-inflate`' in result.compiled_search
 		assert 'tenx_hash IN' not in result.compiled_search  # nothing to prefilter on
+		assert result.storable
+		assert result.needs_review
+		assert 'no keyword search terms' in result.reason
 
-	def test_term_matching_no_template_still_native(self):
+	def test_field_only_alert_is_flagged(self):
+		# status=500 alone: a field condition but no keyword term, so no DML probe ever
+		# runs and the compiled search scans the whole compact sourcetype every run.
+		result = make_compiler().compile('sourcetype=tenx_encoded status=500')
+
+		assert result.strategy == AlertStrategy.NATIVE
+		assert 'tenx_hash IN' not in result.compiled_search
+		assert result.needs_review
+		assert 'no keyword search terms' in result.reason
+
+	def test_keyword_plus_field_is_not_flagged_for_this_reason(self):
+		# a search WITH a keyword term still gets a prefilter, so this guard doesn't fire
+		# (the string-field-value guard is a separate, unrelated check - see TestFieldValueGuard)
+		result = make_compiler().compile('sourcetype=tenx_encoded status=500 payment')
+
+		assert result.strategy == AlertStrategy.NATIVE
+		assert not result.needs_review
+
+
+# ---------------------------------------------------------------------------
+# B3: an empty or truncated hash set must not be certified as fully clean
+# ---------------------------------------------------------------------------
+
+class TestHashSetIntegrityGuard:
+	def test_term_matching_no_template_is_flagged(self):
 		# "zzzznomatch" is in no template: no hash clause, but it still runs on compact
-		# data so it must be inflated.
+		# data so it must be inflated. Since the DML genuinely found nothing, flag it -
+		# the alert will only fire on a variable-value match, which may not be the intent.
 		result = make_compiler().compile('sourcetype=tenx_encoded zzzznomatch')
 
 		assert result.strategy == AlertStrategy.NATIVE
 		assert '`tenx-inflate`' in result.compiled_search
 		assert 'tenx_hash IN' not in result.compiled_search
+		assert result.storable
+		assert result.needs_review
+		assert 'no message type currently matches' in result.reason
+
+	def test_truncated_dml_probe_is_flagged(self):
+		result = make_compiler(truncate_dml=True).compile('sourcetype=tenx_encoded payment')
+
+		assert result.strategy == AlertStrategy.NATIVE
+		assert 'tenx_hash IN' in result.compiled_search  # some hashes were still found
+		assert result.storable
+		assert result.needs_review
+		assert 'more message types than could be fetched' in result.reason
+
+	def test_healthy_match_is_not_flagged(self):
+		result = make_compiler().compile('sourcetype=tenx_encoded payment failed')
+
+		assert result.strategy == AlertStrategy.NATIVE
+		assert not result.needs_review
 
 
 # ---------------------------------------------------------------------------
@@ -209,48 +275,31 @@ class TestPassthroughSafetyNet:
 
 
 # ---------------------------------------------------------------------------
-# ESCAPE_HATCH: too-complex searches fall back to the generating command
+# COMPLEX -> REJECTED: too-complex searches are not auto-scheduled via a broken fallback
 # ---------------------------------------------------------------------------
 
-class TestEscapeHatch:
-	def test_complex_state_maps_to_escape_hatch(self):
+class TestComplexIsRejected:
+	def test_complex_state_is_rejected_not_auto_scheduled(self):
+		# ESCAPE_HATCH (auto-generating `| tenxsearch ...`) was retired: tenxsearch re-runs
+		# the same builder logic, so a search too complex for this compiler is generally too
+		# complex for that command too, and it carries its own cost (a nested proxied job).
 		builder = StubBuilder(ResolvedState.COMPLEX, 'irrelevant')
 		result = TenxAlertCompiler(builder).compile('sourcetype=tenx_encoded weird OR stuff')
 
-		assert result.strategy == AlertStrategy.ESCAPE_HATCH
+		assert result.strategy == AlertStrategy.REJECTED
+		assert not result.storable
+		assert result.compiled_search is None
+		assert 'tenxsearch' in result.reason  # still named as a manual, human-chosen option
+
+	def test_ambiguous_mixed_sourcetype_via_real_builder_is_passthrough_not_complex(self):
+		# The real builder does NOT emit ResolvedState.COMPLEX for this shape; it passes the
+		# search through (state SUCCESS, not engaged), and the safety net flags it instead.
+		# COMPLEX->REJECTED is a defensive path reachable only if build() ever returns COMPLEX.
+		result = make_compiler().compile('sourcetype=tenx_encoded a OR sourcetype=other')
+
+		assert result.strategy == AlertStrategy.PASSTHROUGH
+		assert result.state == ResolvedState.SUCCESS
 		assert result.needs_review
-		assert result.storable
-		assert result.compiled_search.startswith('| tenxsearch searchstring="')
-
-	def test_escape_hatch_wraps_the_original(self):
-		builder = StubBuilder(ResolvedState.COMPLEX, 'irrelevant')
-		result = TenxAlertCompiler(builder).compile('sourcetype=tenx_encoded a OR b')
-
-		assert result.compiled_search == '| tenxsearch searchstring="sourcetype=tenx_encoded a OR b"'
-
-
-class TestEscapeHatchConstruction:
-	def test_plain_search(self):
-		assert escape_hatch_search('sourcetype=tenx_encoded error') == \
-			'| tenxsearch searchstring="sourcetype=tenx_encoded error"'
-
-	def test_embedded_double_quotes_are_escaped(self):
-		out = escape_hatch_search('sourcetype=tenx_encoded msg="hard down"')
-		assert out == '| tenxsearch searchstring="sourcetype=tenx_encoded msg=\\"hard down\\""'
-
-	def test_backslash_is_escaped_before_quotes(self):
-		# a literal backslash and a literal quote in the source
-		assert escape_spl_option_value('a\\b"c') == 'a\\\\b\\"c'
-
-	def test_escaping_is_reversible_shape(self):
-		# every embedded quote ends up backslash-escaped; the wrapper quotes stay balanced
-		raw = 'field="v1" other="v2"'
-		out = escape_hatch_search(raw)
-		assert out.startswith('| tenxsearch searchstring="')
-		assert out.endswith('"')
-		inner = out[len('| tenxsearch searchstring="'):-1]
-		assert '\\"' in inner
-		assert inner.count('\\"') == raw.count('"')
 
 
 # ---------------------------------------------------------------------------
@@ -357,20 +406,20 @@ class TestNegationGuard:
 
 class TestFieldValueGuard:
 	def test_string_field_value_flagged_for_review(self):
-		result = make_compiler().compile('sourcetype=tenx_encoded level=error')
+		result = make_compiler().compile('sourcetype=tenx_encoded payment level=error')
 
 		assert result.strategy == AlertStrategy.NATIVE
 		assert result.needs_review
 		assert 'level=error' in result.reason
 
 	def test_numeric_field_value_not_flagged(self):
-		result = make_compiler().compile('sourcetype=tenx_encoded status=500')
+		result = make_compiler().compile('sourcetype=tenx_encoded payment status=500')
 
 		assert result.strategy == AlertStrategy.NATIVE
 		assert not result.needs_review
 
 	def test_quoted_field_value_not_flagged(self):
-		result = make_compiler().compile('sourcetype=tenx_encoded level="error"')
+		result = make_compiler().compile('sourcetype=tenx_encoded payment level="error"')
 
 		assert result.strategy == AlertStrategy.NATIVE
 		assert not result.needs_review
@@ -431,7 +480,7 @@ class TestGlobAwareSafetyNet:
 
 
 # ---------------------------------------------------------------------------
-# The DML double approximates Splunk segmentation (whole tokens, not substrings)
+# The DML double approximates Splunk segmentation (whole tokens, AND semantics)
 # ---------------------------------------------------------------------------
 
 class TestDmlDoubleTokenMatching:
@@ -447,21 +496,14 @@ class TestDmlDoubleTokenMatching:
 		assert store.matching_hashes('pay*') == ['h_pay']
 		assert store.matching_hashes('zzz*') == []
 
-
-# ---------------------------------------------------------------------------
-# Ambiguous-compact search through the REAL builder (documents actual behavior)
-# ---------------------------------------------------------------------------
-
-class TestAmbiguousCompactRealBuilder:
-	def test_ambiguous_mixed_sourcetype_is_passthrough_with_review(self):
-		# The real builder does NOT emit ResolvedState.COMPLEX here; it passes the search
-		# through (state SUCCESS, not engaged), and the safety net flags it. ESCAPE_HATCH is a
-		# defensive path reachable only if build() ever returns COMPLEX.
-		result = make_compiler().compile('sourcetype=tenx_encoded a OR sourcetype=other')
-
-		assert result.strategy == AlertStrategy.PASSTHROUGH
-		assert result.state == ResolvedState.SUCCESS
-		assert result.needs_review
+	def test_and_semantics_require_all_words(self):
+		store = CsvTemplateStore(CONTROLLED_TEMPLATES)
+		# both words present only in h_pay
+		assert store.matching_hashes('payment failed') == ['h_pay']
+		# both words present only in h_pay2
+		assert store.matching_hashes('payment declined') == ['h_pay2']
+		# "payment" alone matches both
+		assert store.matching_hashes('payment') == ['h_pay', 'h_pay2']
 
 
 # ---------------------------------------------------------------------------
@@ -503,10 +545,30 @@ class TestBuilderResolveContract:
 		engaged = builder.build('sourcetype=tenx_encoded status=500 payment')
 		assert engaged.engaged is True
 		assert 'status=500' in engaged.field_terms
+		assert engaged.has_search_terms is True
 
 		plain = builder.build('index=main error')
 		assert plain.engaged is False
 		assert plain.field_terms == []
+
+	def test_build_exposes_no_dml_results_and_has_search_terms(self):
+		builder = self._builder()
+
+		no_match = builder.build('sourcetype=tenx_encoded zzzznomatch')
+		assert no_match.no_dml_results is True
+		assert no_match.has_search_terms is True
+
+		field_only = builder.build('sourcetype=tenx_encoded status=500')
+		assert field_only.has_search_terms is False
+
+	def test_build_exposes_dml_truncated(self):
+		store = CsvTemplateStore(CONTROLLED_TEMPLATES)
+		manager = LocalSearchManager(store, truncate_dml=True)
+		builder = tenx_search_builder.TenxSearchBuilder(
+			server_connection=None, tenx_config=make_config(), search_manager=manager)
+
+		result = builder.build('sourcetype=tenx_encoded payment')
+		assert result.dml_truncated is True
 
 
 # ---------------------------------------------------------------------------
@@ -531,9 +593,10 @@ class TestDemoCsvIntegration:
 		assert 'tenx_hash IN (' in result.compiled_search
 		assert '`tenx-inflate`' in result.compiled_search
 
-	def test_absent_word_compiles_native_without_hashes(self, compiler):
+	def test_absent_word_compiles_native_flagged(self, compiler):
 		result = compiler.compile('sourcetype=tenx_encoded zzz_not_in_any_template_zzz')
 
 		assert result.strategy == AlertStrategy.NATIVE
 		assert 'tenx_hash IN' not in result.compiled_search
 		assert '`tenx-inflate`' in result.compiled_search
+		assert result.needs_review

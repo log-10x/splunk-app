@@ -16,9 +16,11 @@ LocalSplParser.parse_search_string
 CsvTemplateStore / LocalSearchManager.run_dml_search
     Reproduce `search sourcetype=tenx_dml_pure <words>` against a set of templates. The
     searchable "pure" line is built with the app's own TenxDMLBuilder, so what we match
-    against is exactly what Splunk would index. Matching is a case-insensitive substring
-    test per OR'd word - lenient relative to Splunk's segment tokenizer, but deterministic
-    and sufficient for asserting which hashes a search resolves to.
+    against is exactly what Splunk would index. dml_search is the user's own conjunction
+    (space-separated terms, implicit AND - matching what TenxSearchCommand.resolve() sends
+    the DML probe since the OR-vs-AND fix), so a hash matches only when ALL given words are
+    present as whole tokens - lenient relative to Splunk's segment tokenizer, but
+    deterministic and sufficient for asserting which hashes a search resolves to.
 """
 import csv
 import re
@@ -157,19 +159,20 @@ class CsvTemplateStore:
 
 		return cls(templates)
 
-	def matching_hashes(self, or_based_search):
+	def matching_hashes(self, dml_search):
 		"""
-		Returns the hashes whose pure line contains any of the OR'd search words as a token.
+		Returns the hashes whose pure line contains ALL the given words as tokens (AND
+		semantics, matching Splunk's implicit AND for space-separated search terms).
 
-		or_based_search is the ' OR '-joined word list the builder passes to run_dml_search.
+		dml_search is the user's own conjunction, as sent by TenxSearchCommand.resolve().
 		"""
-		words = [word.strip().lower() for word in or_based_search.split(' OR ') if word.strip()]
+		words = [word.strip('"').strip().lower() for word in dml_search.split() if word.strip('"').strip()]
 
 		if not words:
 			return []
 
 		hits = [pattern_hash for pattern_hash, tokens in self._token_sets
-				if any(self._word_matches(word, tokens) for word in words)]
+				if all(self._word_matches(word, tokens) for word in words)]
 
 		return sorted(set(hits))
 
@@ -182,14 +185,17 @@ class LocalSearchManager(LocalSplParser):
 	non-subsearch path: parse_search_string (from LocalSplParser) and run_dml_search.
 	"""
 
-	def __init__(self, template_store, fail_dml=False):
+	def __init__(self, template_store, fail_dml=False, truncate_dml=False):
 		self.store = template_store
-		# When True, run_dml_search returns None to exercise the compile-time DML failure
-		# path (which the builder surfaces as ResolvedState.FAILURE -> REJECTED).
+		# When True, run_dml_search returns (None, False) to exercise the compile-time DML
+		# failure path (which the builder surfaces as ResolvedState.FAILURE, retryable).
 		self.fail_dml = fail_dml
+		# When True, run_dml_search reports truncated=True alongside real matches, to
+		# exercise the "hash set may be incomplete" needs_review path.
+		self.truncate_dml = truncate_dml
 
 	def run_dml_search(self, dml_search, max_time_ms=2000, poll_interval_ms=50):
 		if self.fail_dml:
-			return None
+			return None, False
 
-		return self.store.matching_hashes(dml_search)
+		return self.store.matching_hashes(dml_search), self.truncate_dml

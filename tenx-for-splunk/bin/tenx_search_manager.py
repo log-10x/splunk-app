@@ -71,6 +71,13 @@ class JobState(Enum):
 	TIMEOUT = auto()
 
 
+# Cap on raw DML rows fetched per search. If a job actually matched more events than this,
+# get_dml_results reports truncated=True - the returned hash set may be missing hashes that
+# only appeared past the cap, so callers baking it into a persisted search should not treat
+# it as a complete answer.
+DML_FETCH_LIMIT = 25000
+
+
 class TenxSearchManager:
 	"""
 	Class for handling common search related operations with the Splunk cluster.
@@ -213,20 +220,37 @@ class TenxSearchManager:
 
 	def get_dml_results(self, sid):
 		"""
-		Returns a list of all the unique hashes from a provided search job on the 10x DML.
-		
-		Returns None if any errors occured when trying to get the results.
+		Returns (hashes, truncated) for a provided search job on the 10x DML.
+
+		hashes is a list of all the unique hashes among the fetched rows (up to
+		DML_FETCH_LIMIT). truncated is True when the job matched more raw rows than we
+		fetched - past that cap, additional unique hashes may exist that this result set
+		does not include, so it must not be treated as a complete answer.
+
+		Returns (None, False) if any errors occured when trying to get the results.
 
 		Note that a None result indicates an actual error, while an empty list is actually ok, it's quite possible
 		no actual matches were found for a specific search.
 		"""
-		# TODO - iterate count or request stats
-		search_results = self.get_search_results(sid, {"f": self.dml_key, "count": 25000})
+		search_results = self.get_search_results(sid, {"f": self.dml_key, "count": DML_FETCH_LIMIT})
 
 		if not search_results or 'results' not in search_results:
-			return None
+			return None, False
 
-		return list(set([result[self.dml_key] for result in search_results['results'] if self.dml_key in result]))
+		raw_rows = search_results['results']
+		hashes = list(set([result[self.dml_key] for result in raw_rows if self.dml_key in result]))
+
+		job_details = self.get_search_job_details(sid)
+		total_results = tenx_util.get_internal(job_details, 'resultCount') if job_details else None
+
+		try:
+			truncated = int(total_results) > DML_FETCH_LIMIT
+		except (TypeError, ValueError):
+			# Couldn't confirm the true total - fall back to the one signal we do have:
+			# fetching exactly the cap is itself a sign there may be more.
+			truncated = len(raw_rows) >= DML_FETCH_LIMIT
+
+		return hashes, truncated
 
 	def run_dml_search(self, dml_search, max_time_ms=2000, poll_interval_ms=50):
 		"""
@@ -234,7 +258,7 @@ class TenxSearchManager:
 
 		Basically a wrapper for create_dml_search -> poll_for_job_end -> get_dml_results.
 
-		Returns None in case of any errors along the way.
+		Returns (hashes, truncated); (None, False) in case of any errors along the way.
 		"""
 		logger.info("About to dml search - {}".format(dml_search))
 
@@ -242,25 +266,29 @@ class TenxSearchManager:
 
 		if dml_sid is None:
 			logger.warning("Failed creating dml search for - {}.".format(dml_search))
-			
-			return None
+
+			return None, False
 
 		state = self.poll_for_job_end(dml_sid, max_time_ms, poll_interval_ms)
-		
+
 		if state != JobState.SUCCESS:
 			logger.warning("Failed waiting for job {} - {} - {}.".format(dml_sid, dml_search, state))
 
-			return None
+			return None, False
 
-		dml_results = self.get_dml_results(dml_sid)
+		dml_results, truncated = self.get_dml_results(dml_sid)
 
 		if dml_results is None:
 			logger.warning("Failed getting dml results for job {} - {}.".format(dml_sid, dml_search))
-			return None
+			return None, False
+
+		if truncated:
+			logger.warning("DML search truncated at {} rows for {} - {}; hash set may be incomplete.".format(
+				DML_FETCH_LIMIT, dml_sid, dml_search))
 
 		logger.info("Got {} results for dml {} - {}.".format(len(dml_results), dml_sid, dml_search))
 
-		return dml_results
+		return dml_results, truncated
 
 	def parse_search_string_url(self):
 		"""

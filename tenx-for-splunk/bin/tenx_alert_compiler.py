@@ -26,15 +26,26 @@ What it produces
 compile(user_search) returns an AlertCompileResult classifying the search into one of:
 
 - NATIVE:       the search touches 10x-compact data and was compiled to a native
-                hash-prefilter + inflate pipeline. This is the common, fast case - an
-                alert over a message type or a field. Store `compiled_search`.
+                hash-prefilter + inflate pipeline. This is the common case - an alert over
+                a message type or a field. Store `compiled_search`. Flagged needs_review
+                when the compile is storable but not fully trustworthy (see below).
 - PASSTHROUGH:  the search does not touch compact data; it is stored unchanged.
-- ESCAPE_HATCH: the search is too complex to compile statically. Falls back to the
-                `| tenxsearch` generating command (correct but slower, and flagged
-                needs_review so the save layer can ask a human before applying it).
-- REJECTED:     the search could not be parsed / resolved (e.g. a transient DML lookup
-                error at compile time). Nothing is stored; the caller should surface the
-                reason and let the user retry or simplify.
+- RETRYABLE:    a transient DML lookup failure (e.g. a busy indexer) - not a permanent
+                problem with the search. Nothing is stored; the save layer should retry
+                rather than drop or overwrite a live alert.
+- REJECTED:     the search could not be parsed/resolved, or cannot be compiled safely
+                (unparseable, a NOT on compact data, or too complex for the builder to
+                modify - see resolve_state COMPLEX). Nothing is stored; the caller should
+                surface the reason. A search this compiler rejects can still be scheduled
+                manually via the `| tenxsearch` generating command (see tenxsearch.py) -
+                that path is correct but proxies a nested job and is materially slower, so
+                it is a human's call to make, not something this compiler auto-applies.
+
+A NATIVE (or PASSTHROUGH) result is flagged needs_review, rather than rejected outright,
+whenever the compile is storable but the compiler cannot fully vouch for it: an empty or
+truncated hash prefilter, a string-valued field condition, a search with no hash prefilter
+at all (full sourcetype scan), or a passthrough that still selects a configured compact
+source. See AlertCompileResult and TenxAlertCompiler._compile_native for the exact cases.
 
 Purity / testability
 ---------------------
@@ -66,7 +77,6 @@ class AlertStrategy(Enum):
 	"""How a search was (or could not be) compiled for use as a scheduled alert."""
 	NATIVE = auto()        # compiled to a native hash-prefilter + inflate pipeline
 	PASSTHROUGH = auto()   # not on compact data - stored unchanged
-	ESCAPE_HATCH = auto()  # too complex to compile - fall back to `| tenxsearch`
 	RETRYABLE = auto()     # transient failure (e.g. DML lookup timed out) - retry, don't drop
 	REJECTED = auto()      # could not parse/resolve, or cannot be compiled safely - do not store
 
@@ -74,7 +84,7 @@ class AlertStrategy(Enum):
 # Strategies whose compiled_search is safe to persist into savedsearches.conf.
 # RETRYABLE and REJECTED are NOT storable: RETRYABLE means "keep the existing alert and retry
 # later", REJECTED means "surface the reason and store nothing".
-_STORABLE = (AlertStrategy.NATIVE, AlertStrategy.PASSTHROUGH, AlertStrategy.ESCAPE_HATCH)
+_STORABLE = (AlertStrategy.NATIVE, AlertStrategy.PASSTHROUGH)
 
 
 class AlertCompileResult:
@@ -114,28 +124,6 @@ class AlertCompileResult:
 	def __repr__(self):
 		return "AlertCompileResult(strategy={}, storable={}, needs_review={}, reason={!r})".format(
 			self.strategy.name, self.storable, self.needs_review, self.reason)
-
-
-def escape_spl_option_value(value):
-	"""
-	Escapes a string for embedding inside a double-quoted SPL option value.
-
-	SPL option values use backslash escaping inside double quotes, so a literal backslash
-	becomes '\\\\' and a literal double quote becomes '\\"'. Backslashes are escaped first so
-	we don't double-escape the backslash we introduce for the quotes.
-	"""
-	return value.replace('\\', '\\\\').replace('"', '\\"')
-
-
-def escape_hatch_search(original_search):
-	"""
-	Builds the `| tenxsearch` generating-command form of a search.
-
-	tenxsearch runs the given search string as its own job (through the same builder) and
-	streams inflated results, so it is a correct - if slower - way to alert on compact data
-	when static compilation is not possible.
-	"""
-	return '| tenxsearch searchstring="{}"'.format(escape_spl_option_value(original_search.strip()))
 
 
 def _normalize_native(resolved_search):
@@ -315,12 +303,16 @@ class TenxAlertCompiler:
 			return self._compile_passthrough(original, result)
 
 		if state == ResolvedState.COMPLEX:
+			# Do not auto-fall-back to `| tenxsearch`: it re-runs the same builder logic on
+			# the same search, so a shape too complex for this compiler is generally too
+			# complex for that command too, and it carries its own cost (a nested proxied
+			# job, no streaming). Surface the reason; a human can still choose to schedule
+			# `| tenxsearch searchstring="..."` manually, understanding that trade-off.
 			return AlertCompileResult(
-				AlertStrategy.ESCAPE_HATCH, escape_hatch_search(original), original, state,
-				needs_review=True,
+				AlertStrategy.REJECTED, None, original, state,
 				reason=("search is too complex to compile into a native saved search; "
-						"falling back to the `| tenxsearch` generating command, which is "
-						"slower and should be reviewed before scheduling"))
+						"rewrite it, or schedule it manually via the `| tenxsearch` "
+						"generating command (correct but slower - proxies a nested job)"))
 
 		# A transient DML lookup failure is not a permanent problem with the search: the save
 		# layer should retry rather than drop or overwrite a live alert.
@@ -337,8 +329,12 @@ class TenxAlertCompiler:
 
 	def _compile_native(self, original, result):
 		"""
-		Builds a NATIVE result for a search that engaged 10x compilation, guarding two
-		constructs the builder mis-handles on compact data.
+		Builds a NATIVE result for a search that engaged 10x compilation, guarding constructs
+		the builder mis-handles (or under-informs about) on compact data.
+
+		NOT is a hard REJECT (the compiled alert would be inverted, not just imprecise).
+		Everything else the builder cannot fully vouch for is NATIVE + needs_review: the
+		compile is genuinely storable, but a human should confirm it before scheduling.
 		"""
 		# The builder silently drops NOT (its parser prunes negation nodes), so a negated alert
 		# would compile into its exact opposite. Refuse to store it rather than certify a
@@ -351,18 +347,41 @@ class TenxAlertCompiler:
 						"alert); rewrite without NOT or use a decoded sidecar index"))
 
 		compiled = _normalize_native(result.resolved)
+		review_reasons = []
+
+		if not result.has_search_terms:
+			# No keyword search terms at all (a field-only search like 'status=500', or no
+			# filter beyond sourcetype) means no DML probe ever ran, so the compiled search
+			# carries no hash prefilter - it scans the entire compact sourcetype every run.
+			review_reasons.append(
+				"this alert has no keyword search terms, so the compiled search has no hash "
+				"prefilter and scans the entire compact sourcetype on every run")
+		else:
+			if result.no_dml_results:
+				review_reasons.append(
+					"no message type currently matches these terms; this alert will only fire "
+					"if a term appears as a variable value, not as template text - confirm "
+					"that is the intent, or recompile once a matching template exists")
+
+			if result.dml_truncated:
+				review_reasons.append(
+					"the template lookup matched more message types than could be fetched; "
+					"the hash prefilter may be missing some matching message types")
 
 		# A string-valued field condition compiles to a `| where field=value` clause whose
 		# unquoted value is read as a field reference, so it matches nothing. Flag for review.
 		risky = _stringy_field_terms(result.field_terms)
 
 		if risky:
+			review_reasons.append(
+				"field condition(s) {} compare against an unquoted string value; the generated "
+				"`| where` clause may match nothing - quote the value or verify on a live "
+				"instance".format(", ".join(risky)))
+
+		if review_reasons:
 			return AlertCompileResult(
 				AlertStrategy.NATIVE, compiled, original, result.state,
-				needs_review=True,
-				reason=("field condition(s) {} compare against an unquoted string value; the "
-						"generated `| where` clause may match nothing - quote the value or verify "
-						"on a live instance").format(", ".join(risky)))
+				needs_review=True, reason="; ".join(review_reasons))
 
 		return AlertCompileResult(AlertStrategy.NATIVE, compiled, original, result.state)
 

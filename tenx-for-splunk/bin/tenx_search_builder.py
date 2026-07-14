@@ -106,13 +106,30 @@ class BuildResult:
 	retryable : bool
 		True when the failure is a transient DML lookup failure rather than a permanent
 		unparseable search - a save-time caller should retry rather than drop the alert.
+	has_search_terms : bool
+		True when the leading search had at least one keyword search term (as opposed to
+		only field conditions). False for a field-only search like 'status=500', which
+		never probes the DML and compiles with no hash prefilter at all - a full scan of
+		the compact sourcetype on every run.
+	no_dml_results : bool
+		True when the leading search had keyword terms but none matched any template in the
+		DML - the compile has no hash prefilter, only the raw keyword clause (which still
+		catches a variable-value match).
+	dml_truncated : bool
+		True when the DML probe matched more rows than were fetched (see
+		tenx_search_manager.DML_FETCH_LIMIT) - the hash set may be missing hashes that only
+		appeared past that cap.
 	"""
-	def __init__(self, state, resolved, engaged=False, field_terms=None, retryable=False):
+	def __init__(self, state, resolved, engaged=False, field_terms=None, retryable=False,
+				has_search_terms=False, no_dml_results=False, dml_truncated=False):
 		self.state = state
 		self.resolved = resolved
 		self.engaged = engaged
 		self.field_terms = field_terms if field_terms is not None else []
 		self.retryable = retryable
+		self.has_search_terms = has_search_terms
+		self.no_dml_results = no_dml_results
+		self.dml_truncated = dml_truncated
 
 
 class TenxSplCommand:
@@ -203,6 +220,7 @@ class TenxSearchCommand(TenxSplCommand):
 		self.user_field_terms = []
 		self.no_dml_results = False
 		self.dml_search_failed = False
+		self.dml_truncated = False
 		self.parsed_command = None
 		self.resolved_search = None
 
@@ -347,9 +365,18 @@ class TenxSearchCommand(TenxSplCommand):
 
 		self.needs_original_search_check = (or_based_search != base_user_terms)
 
+		# The DML PROBE uses the user's own conjunction (AND, via plain space-separation - the
+		# same terms as typed), not an OR of every word. An OR probe matches every template
+		# containing ANY single word, which can fan a multi-word search in to every unrelated
+		# template sharing one common term and push the probe past DML_FETCH_LIMIT for no
+		# benefit. Probing with AND loses no recall: if a word is absent from a template's
+		# text it must be present as a VARIABLE VALUE for a real match, which the
+		# or_based_search keyword clause below still catches.
+		#
 		# TODO - allow configurable timeouts for the dml search
 		#
-		dml_results = self.search_manager.run_dml_search(or_based_search)
+		dml_results, dml_truncated = self.search_manager.run_dml_search(base_user_terms)
+		self.dml_truncated = dml_truncated
 
 		# Specifically None check, as empty is ok
 		#
@@ -368,9 +395,14 @@ class TenxSearchCommand(TenxSplCommand):
 			self.resolved_search = or_based_search
 			return
 
-		# Build new search from the user terms and the dml_results
+		# Build new search from the user terms and the dml_results. Hashes are quoted: real
+		# 10x hashes are dense, punctuation-heavy strings (not plain alphanumeric), and an
+		# unquoted hash containing e.g. '|' or '[' would corrupt or break the SPL the
+		# compiled search dispatches.
 		#
-		dml_resolved_search = "tenx_hash IN (" + ",".join(dml_results) + ")"
+		quoted_hashes = ",".join(
+			'"{}"'.format(tenx_util.escape_spl_string_literal(dml_hash)) for dml_hash in dml_results)
+		dml_resolved_search = "tenx_hash IN (" + quoted_hashes + ")"
 
 		self.resolved_search = "((" + or_based_search + ") OR (" + dml_resolved_search + "))"
 
@@ -733,13 +765,19 @@ class TenxSearchBuilder:
 		engaged = leading_search.engaged_tenx() if leading_search is not None else False
 		field_terms = [term.text for term in leading_search.user_field_terms] if leading_search is not None else []
 		retryable = bool(leading_search is not None and leading_search.dml_search_failed)
+		has_search_terms = bool(leading_search is not None and len(leading_search.user_search_terms) > 0)
+		no_dml_results = bool(leading_search is not None and leading_search.no_dml_results)
+		dml_truncated = bool(leading_search is not None and leading_search.dml_truncated)
 
 		return BuildResult(
 			spl_commands.resolved_state(),
 			spl_commands.resolved(),
 			engaged=engaged,
 			field_terms=field_terms,
-			retryable=retryable)
+			retryable=retryable,
+			has_search_terms=has_search_terms,
+			no_dml_results=no_dml_results,
+			dml_truncated=dml_truncated)
 
 	def resolve(self, base_search):
 		"""

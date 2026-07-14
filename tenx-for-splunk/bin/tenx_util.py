@@ -315,3 +315,15 @@ def strip_string(val):
 		return val[1:-1]
 
 	return val
+
+
+def escape_spl_string_literal(value):
+	"""
+	Escapes a string for embedding inside a double-quoted SPL string literal (e.g. a quoted
+	value in `IN ("a","b")`, or a quoted option value like `searchstring="..."`).
+
+	SPL uses backslash escaping inside double quotes, so a literal backslash becomes '\\\\'
+	and a literal double quote becomes '\\"'. Backslashes are escaped first so we don't
+	double-escape the backslash we introduce for the quotes.
+	"""
+	return value.replace('\\', '\\\\').replace('"', '\\"')
