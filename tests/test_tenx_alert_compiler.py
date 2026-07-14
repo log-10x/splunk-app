@@ -214,6 +214,20 @@ class TestHashSetIntegrityGuard:
 		assert result.strategy == AlertStrategy.NATIVE
 		assert not result.needs_review
 
+	def test_truncated_and_no_results_together_gives_one_coherent_reason(self):
+		# no_dml_results and dml_truncated are independent flags and can both be true (the
+		# probe can be truncated before it happens to reach a matching row). The two review
+		# reasons must not just be concatenated - that reads as "nothing matched" and "too
+		# much matched" at once, which is self-contradictory.
+		result = make_compiler(truncate_dml=True).compile('sourcetype=tenx_encoded zzzznomatch')
+
+		assert result.strategy == AlertStrategy.NATIVE
+		assert 'tenx_hash IN' not in result.compiled_search
+		assert result.needs_review
+		assert 'no message type currently matches' not in result.reason
+		assert 'more message types than could be fetched' not in result.reason
+		assert 'truncated before finishing' in result.reason
+
 
 # ---------------------------------------------------------------------------
 # PASSTHROUGH: searches that don't touch compact data are stored unchanged

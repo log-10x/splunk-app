@@ -33,7 +33,7 @@ Workflow
 1. User runs: | tenxsearch searchstring="error"
 2. Command parses "error" and searches tenx_dml_pure for matching templates
 3. Finds template hashes that contain "error"
-4. Creates new search: (error OR tenx_hash IN (hash1,hash2)) | `tenx-inflate`
+4. Creates new search: (error OR tenx_hash IN ("hash1","hash2")) | `tenx-inflate`
 5. Runs search and streams inflated results
 
 Logging

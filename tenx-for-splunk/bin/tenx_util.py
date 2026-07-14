@@ -320,10 +320,13 @@ def strip_string(val):
 def escape_spl_string_literal(value):
 	"""
 	Escapes a string for embedding inside a double-quoted SPL string literal (e.g. a quoted
-	value in `IN ("a","b")`, or a quoted option value like `searchstring="..."`).
+	hash value in `IN ("a","b")`).
 
 	SPL uses backslash escaping inside double quotes, so a literal backslash becomes '\\\\'
 	and a literal double quote becomes '\\"'. Backslashes are escaped first so we don't
-	double-escape the backslash we introduce for the quotes.
+	double-escape the backslash we introduce for the quotes. Raw newline/carriage-return/tab
+	bytes are also escaped to their backslash form, since left raw they could terminate a
+	conf-file value or search string line early.
 	"""
-	return value.replace('\\', '\\\\').replace('"', '\\"')
+	escaped = value.replace('\\', '\\\\').replace('"', '\\"')
+	return escaped.replace('\n', '\\n').replace('\r', '\\r').replace('\t', '\\t')

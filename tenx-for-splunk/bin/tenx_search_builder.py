@@ -17,7 +17,8 @@ Search Resolution Process
    a. Check if it targets an 10x-encoded sourcetype/source
    b. Extract search terms (index expressions, field expressions)
    c. Search the tenx_dml_pure sourcetype for matching template hashes
-   d. Build new search: (original_terms OR tenx_hash IN (hashes))
+   d. Build new search: (original_terms OR tenx_hash IN ("hash1","hash2")) - each hash quoted
+      and escaped, since real hashes are dense, punctuation-heavy strings
 3. Append tenx-inflate macro to decode results
 4. Return the resolved search string
 
@@ -27,7 +28,7 @@ Original:
     search index=main sourcetype=tenx_encoded error
 
 After resolution:
-    search index=main sourcetype=tenx_encoded ((error) OR (tenx_hash IN (hash1,hash2)))
+    search index=main sourcetype=tenx_encoded ((error) OR (tenx_hash IN ("hash1","hash2")))
     | `tenx-inflate`
     | extract
 

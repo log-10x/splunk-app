@@ -165,6 +165,12 @@ class CsvTemplateStore:
 		semantics, matching Splunk's implicit AND for space-separated search terms).
 
 		dml_search is the user's own conjunction, as sent by TenxSearchCommand.resolve().
+
+		Scope: this double models implicit-AND multi-word conjunctions only. It does not
+		recognize bare AND/OR/NOT as SPL boolean operators - real Splunk would, but here
+		"payment OR failed" is treated as three required literal tokens ("payment", "or",
+		"failed"), not a disjunction. Don't assert hash-set content against this double for
+		a search containing an explicit boolean keyword.
 		"""
 		words = [word.strip('"').strip().lower() for word in dml_search.split() if word.strip('"').strip()]
 

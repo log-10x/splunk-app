@@ -356,6 +356,12 @@ class TenxAlertCompiler:
 			review_reasons.append(
 				"this alert has no keyword search terms, so the compiled search has no hash "
 				"prefilter and scans the entire compact sourcetype on every run")
+		elif result.no_dml_results and result.dml_truncated:
+			review_reasons.append(
+				"the template lookup was truncated before finishing, and none of the message "
+				"types it did examine matched these terms; the hash prefilter is omitted since "
+				"a matching template may still exist past the truncation point - recompile once "
+				"cardinality is more assured, or verify on a live instance")
 		else:
 			if result.no_dml_results:
 				review_reasons.append(
@@ -363,7 +369,7 @@ class TenxAlertCompiler:
 					"if a term appears as a variable value, not as template text - confirm "
 					"that is the intent, or recompile once a matching template exists")
 
-			if result.dml_truncated:
+			elif result.dml_truncated:
 				review_reasons.append(
 					"the template lookup matched more message types than could be fetched; "
 					"the hash prefilter may be missing some matching message types")
