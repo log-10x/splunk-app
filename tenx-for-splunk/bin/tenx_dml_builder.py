@@ -236,8 +236,15 @@ class TenxDMLBuilder:
 
 		The line format is "<pattern key> <processed pattern>", where the processed pattern is just the
 		pattern, stripped from variables separators and new lines, which might hinder actual search.
+
+		The "$0(" escape (a plain variable immediately followed by a literal '(', see
+		build_kv_record_data) is stripped as a pair, so the escape digit doesn't linger as a
+		stray "0" in the searchable preview text.
 		"""
-		return key + " " + pattern.replace(self.variable_separator, "").replace("\r\n", " ").replace("\n", " ")
+		escaped_paren = self.variable_separator + '0('
+		normalized = pattern.replace(escaped_paren, "(")
+
+		return key + " " + normalized.replace(self.variable_separator, "").replace("\r\n", " ").replace("\n", " ")
 
 	def build_kv_record_data(self, pattern_hash, base_pattern):
 		"""
@@ -291,6 +298,17 @@ class TenxDMLBuilder:
 						timestamp_end = index
 
 						timestamp_format = base_pattern[timestamp_start:timestamp_end]
+
+					elif index < pattern_length - 2 and base_pattern[index+1] == '0' and base_pattern[index+2] == '(':
+						# A plain (non-timestamp) variable whose value is immediately followed by a
+						# literal '(' is encoded as "$0(" rather than bare "$(", so it isn't misread
+						# as the start of a timestamp specifier. The '0' carries no value of its own
+						# (offset 0 always means "a new variable", never a back-reference) - skip it
+						# so it isn't glued onto the next pattern part as literal text.
+						#
+						pattern_parts.append(current_part)
+						current_part = ''
+						index += 1
 
 					else:
 						# Really a variable at this point, so we split.

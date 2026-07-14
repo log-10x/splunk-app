@@ -204,6 +204,64 @@ class TestTenxDMLBuilder:
 		# The escaped $ should not be treated as a variable separator
 
 
+class TestDollarZeroEscape:
+	"""
+	Tests for the "$0(" escape: a plain (non-timestamp) variable whose value is immediately
+	followed by a literal '(' in the source text is encoded as "$0(" rather than bare "$(",
+	so it isn't misread as the start of a "$(<timestamp>)" specifier. Offset 0 always means
+	"a new variable" (never a back-reference), so the '0' carries no value of its own and
+	must not leak into the reassembled text.
+	"""
+
+	@pytest.fixture
+	def builder(self):
+		return TenxDMLBuilder(
+			timestamp_placeholder='__TENX_TS__',
+			variable_separator='$'
+		)
+
+	def test_dollar_zero_does_not_leak_into_terminator(self, builder):
+		result = builder.build_kv_record_data('h1', 'status$0(pending)')
+
+		assert result[RECORD_PART_0] == 'status'
+		assert result[RECORD_PATTERN_PARTS] == []
+		assert result[RECORD_PATTERN_TERMINATOR] == '(pending)'
+		assert result[RECORD_TIMESTAMP_FORMAT] == ''
+
+	def test_dollar_zero_reassembles_correctly(self, builder):
+		result = builder.build_kv_record_data('h1', 'status$0(pending)')
+
+		reassembled = result[RECORD_PART_0] + '200' + ''.join(result[RECORD_PATTERN_PARTS]) + result[RECORD_PATTERN_TERMINATOR]
+
+		assert reassembled == 'status200(pending)'
+
+	def test_dollar_zero_mid_pattern(self, builder):
+		# the escape can occur on ANY variable in the pattern, not just the last one
+		result = builder.build_kv_record_data('h2', 'a$0(b)c$d')
+
+		assert result[RECORD_PART_0] == 'a'
+		assert result[RECORD_PATTERN_PARTS] == ['(b)c']
+		assert result[RECORD_PATTERN_TERMINATOR] == 'd'
+
+	def test_dollar_zero_is_not_confused_with_a_real_timestamp(self, builder):
+		# bare "$(" must still be read as a timestamp specifier, unaffected by the $0 fix
+		result = builder.build_kv_record_data('h3', '$(epoch) Event occurred')
+
+		assert result[RECORD_TIMESTAMP_FORMAT] == '%s%Q'
+
+	def test_dollar_followed_by_literal_digit_zero_then_other_text_is_still_a_variable(self, builder):
+		# "$0x" ('(' does not follow) is just a plain variable; the literal "0x" is ordinary text
+		result = builder.build_kv_record_data('h4', 'a$0x')
+
+		assert result[RECORD_PART_0] == 'a'
+		assert result[RECORD_PATTERN_TERMINATOR] == '0x'
+
+	def test_pure_dml_line_strips_the_escape_digit_too(self, builder):
+		result = builder.build_pure_dml_line('h1', 'status$0(pending)')
+
+		assert result == 'h1 status(pending)'
+
+
 class TestTenxDMLBuilderCustomConfig:
 	"""Tests for TenxDMLBuilder with custom configuration."""
 
