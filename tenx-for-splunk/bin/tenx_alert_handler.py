@@ -179,6 +179,77 @@ class TenxAlertHandler(PersistentServerConnectionApplication):
 			server_connection.post(base_url, create_data)
 			return 'created'
 
+	def list_managed_savedsearches(self, server_connection, user):
+		"""
+		Returns a stanza dict {name, search, tenx_original_search} for every savedsearches stanza
+		in this app namespace, read via configs/conf-savedsearches (which exposes the custom
+		tenx_original_search key that saved/searches hides). The caller filters to the ones the
+		compiler actually manages.
+		"""
+		url = '/servicesNS/' + user + '/' + APP_NAME + '/configs/conf-savedsearches'
+		res = server_connection.get(url, {'count': 0})
+
+		stanzas = []
+
+		for entry in res.get('entry', []) or []:
+			content = entry.get('content', {}) or {}
+			stanzas.append({
+				'name': entry.get('name'),
+				'search': content.get('search', ''),
+				tenx_alert_persist.ORIGINAL_SEARCH_KEY: content.get(tenx_alert_persist.ORIGINAL_SEARCH_KEY, ''),
+			})
+
+		return stanzas
+
+	def recompile_all(self, server_connection, user, compiler):
+		"""
+		Recompiles every managed saved search from its human original, applying only clean,
+		storable results whose compiled form actually changed. This migrates legacy
+		`| tenxsearch` alerts to native compiled searches, and refreshes existing compiles to
+		pick up template hashes that appeared after the alert was first saved.
+
+		A recompile is conservative: it never auto-applies a needs_review result (a human must
+		confirm those via /tenx-alert), never touches a RETRYABLE/REJECTED result, and skips
+		unchanged compiles so it does not churn live alerts.
+		"""
+		summary = {'examined': 0, 'recompiled': 0, 'migrated': 0, 'unchanged': 0,
+			'needs_review': 0, 'skipped': 0, 'errors': 0, 'updated': []}
+
+		for stanza in self.list_managed_savedsearches(server_connection, user):
+			source = tenx_alert_persist.recompile_source(stanza)
+
+			if source is None:
+				continue
+
+			summary['examined'] += 1
+			name = stanza['name']
+			is_legacy = tenx_alert_persist.is_legacy_tenxsearch(stanza)
+
+			try:
+				result = compiler.compile(source)
+				decision = tenx_alert_persist.decide(result, confirm=False)
+
+				if decision.action != tenx_alert_persist.APPLY:
+					summary['needs_review' if decision.action == tenx_alert_persist.REVIEW else 'skipped'] += 1
+					continue
+
+				# Only rewrite when the compiled search actually changed, so a recompile pass over
+				# already-current alerts is a no-op rather than needless churn.
+				if result.compiled_search == stanza['search']:
+					summary['unchanged'] += 1
+					continue
+
+				self.write_saved_search(server_connection, user, name, {'search': result.compiled_search})
+				self.write_original_search(server_connection, user, name, result.original_search)
+
+				summary['migrated' if is_legacy else 'recompiled'] += 1
+				summary['updated'].append(name)
+			except Exception as e:
+				logger.warning("Recompile failed for {} - {}".format(name, e))
+				summary['errors'] += 1
+
+		return summary
+
 	def handle(self, in_string):
 		"""
 		Main handler: parse -> compile -> decide -> (maybe) write -> respond.
@@ -199,14 +270,7 @@ class TenxAlertHandler(PersistentServerConnectionApplication):
 			user = in_string_json["session"]["user"]
 
 			form = self.extract_form(in_string_json.get('form', []))
-
-			original_search = form.get('search')
-
-			if not original_search:
-				return {'payload': "Missing required 'search' parameter", 'status': 400}
-
-			name = form.get('name')
-			confirm = str(form.get('confirm', '')).lower() == 'true'
+			action = (form.get('action') or '').lower()
 
 			tenx_config = tenx_util.get_tenx_config(server_uri=server_uri, token=token)
 
@@ -225,6 +289,20 @@ class TenxAlertHandler(PersistentServerConnectionApplication):
 				search_manager=search_manager)
 
 			compiler = tenx_alert_compiler.TenxAlertCompiler(search_builder)
+
+			# Bulk recompile/migrate: recompile every managed alert from its stored original.
+			if action == 'recompile':
+				summary = self.recompile_all(server_connection, user, compiler)
+				logger.info("Recompile pass - {}".format(summary))
+				return {'payload': summary, 'status': 200}
+
+			original_search = form.get('search')
+
+			if not original_search:
+				return {'payload': "Missing required 'search' parameter", 'status': 400}
+
+			name = form.get('name')
+			confirm = str(form.get('confirm', '')).lower() == 'true'
 
 			result = compiler.compile(original_search)
 

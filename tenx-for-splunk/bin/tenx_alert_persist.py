@@ -29,7 +29,17 @@ See Also
 - SAVE_TIME_ALERTS.md:    the wiring plan this implements (item 1).
 """
 
+import re
+
 from tenx_alert_compiler import AlertStrategy
+
+
+# A legacy alert that decodes at runtime via the generating command:
+#   | tenxsearch searchstring="<human search>"
+# The searchstring is the human search; recompiling it migrates the alert from the per-run
+# proxy to a native compiled saved search.
+_TENXSEARCH_RE = re.compile(
+	r'\|\s*tenxsearch\s+searchstring\s*=\s*"((?:[^"\\]|\\.)*)"', re.IGNORECASE)
 
 
 # Handler-control form keys that must NOT be forwarded as saved-search attributes.
@@ -161,3 +171,43 @@ def build_original_search_data(original_search):
 	recover what the user typed.
 	"""
 	return {ORIGINAL_SEARCH_KEY: original_search}
+
+
+def recompile_source(saved_search):
+	"""
+	Given a saved-search stanza (a dict with at least 'search', and optionally the stored
+	ORIGINAL_SEARCH_KEY), return the human-authored search the recompile pass should re-compile,
+	or None if this saved search is not one the alert compiler manages.
+
+	Two managed shapes, in priority order:
+	- A stored `tenx_original_search`: a search /tenx-alert already compiled. Recompiling it
+	  picks up template hashes that appeared since it was saved (a better hash prefilter), or a
+	  fixed compile after a builder change.
+	- A legacy `| tenxsearch searchstring="..."` alert: the searchstring is the human search;
+	  recompiling migrates it from the per-run generating-command proxy to a native compiled
+	  saved search.
+
+	A stored original wins over a tenxsearch match (an already-migrated alert keeps its original
+	as the source of truth even if its compiled body still mentions tenxsearch for some reason).
+	"""
+	original = (saved_search.get(ORIGINAL_SEARCH_KEY) or '').strip()
+
+	if original:
+		return original
+
+	match = _TENXSEARCH_RE.search(saved_search.get('search') or '')
+
+	if match:
+		# unescape the SPL string literal: \" -> " and \\ -> \
+		return match.group(1).replace('\\"', '"').replace('\\\\', '\\')
+
+	return None
+
+
+def is_legacy_tenxsearch(saved_search):
+	"""
+	Whether a saved search is a legacy `| tenxsearch ...` alert with no stored original yet -
+	i.e. recompiling it is a migration (proxy -> native), not a refresh of an existing compile.
+	"""
+	return (not (saved_search.get(ORIGINAL_SEARCH_KEY) or '').strip()
+		and _TENXSEARCH_RE.search(saved_search.get('search') or '') is not None)

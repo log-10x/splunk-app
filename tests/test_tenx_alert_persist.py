@@ -135,3 +135,41 @@ class TestBuildOriginalSearchData:
 		data = tenx_alert_persist.build_original_search_data('sourcetype=tenx_encoded payment failed')
 
 		assert data == {tenx_alert_persist.ORIGINAL_SEARCH_KEY: 'sourcetype=tenx_encoded payment failed'}
+
+
+class TestRecompileSource:
+	K = tenx_alert_persist.ORIGINAL_SEARCH_KEY
+
+	def test_stored_original_is_the_source(self):
+		stanza = {'name': 'a', 'search': 'search ... | `tenx-inflate`', self.K: 'sourcetype=tenx_encoded payment'}
+
+		assert tenx_alert_persist.recompile_source(stanza) == 'sourcetype=tenx_encoded payment'
+
+	def test_legacy_tenxsearch_searchstring_is_the_source(self):
+		stanza = {'name': 'a', 'search': '| tenxsearch searchstring="sourcetype=tenx_encoded error"', self.K: ''}
+
+		assert tenx_alert_persist.recompile_source(stanza) == 'sourcetype=tenx_encoded error'
+
+	def test_tenxsearch_searchstring_is_unescaped(self):
+		stanza = {'name': 'a', 'search': r'| tenxsearch searchstring="host=\"web1\" AND path=\\x"', self.K: ''}
+
+		assert tenx_alert_persist.recompile_source(stanza) == r'host="web1" AND path=\x'
+
+	def test_stored_original_wins_over_a_tenxsearch_body(self):
+		stanza = {'name': 'a', 'search': '| tenxsearch searchstring="something else"', self.K: 'sourcetype=tenx_encoded payment'}
+
+		assert tenx_alert_persist.recompile_source(stanza) == 'sourcetype=tenx_encoded payment'
+
+	def test_unmanaged_saved_search_returns_none(self):
+		stanza = {'name': 'a', 'search': 'index=main error | stats count', self.K: ''}
+
+		assert tenx_alert_persist.recompile_source(stanza) is None
+
+	def test_is_legacy_tenxsearch(self):
+		legacy = {'name': 'a', 'search': '| tenxsearch searchstring="x"', self.K: ''}
+		migrated = {'name': 'a', 'search': 'search x | `tenx-inflate`', self.K: 'x'}
+		plain = {'name': 'a', 'search': 'index=main error', self.K: ''}
+
+		assert tenx_alert_persist.is_legacy_tenxsearch(legacy) is True
+		assert tenx_alert_persist.is_legacy_tenxsearch(migrated) is False
+		assert tenx_alert_persist.is_legacy_tenxsearch(plain) is False
