@@ -295,9 +295,11 @@ Not part of this feature but verified alongside it: the whole app now imports an
 Splunk 10 / Python 3.13 (the vendored `parsimonious`/`six` were Python-3.7-era) - see the deps
 modernization. Still open for a future pass: `NOT` on compact data (intentionally REJECTED, see
 above) and the `varMaxRecurIndexes`/`"$0("` back-reference decode on real back-reference-bearing
-templates. The **UI's rendered interaction has not been browser smoke-tested** here - the view
-loads and the `/tenx-alert` endpoint it calls is fully verified, but the form's DOM behaviour
-should be checked in a browser before release.
+templates. The **UI has been browser smoke-tested** (headless Chrome via Puppeteer against live
+Splunk): the view loads and the form drives `/tenx-alert` end to end - PASSTHROUGH renders the
+compiled search, a NATIVE `needs_review` result renders and surfaces the Confirm button, a REJECTED
+result renders its reason from the 422 error body, and a string error body (e.g. the 400 for an
+apply with no name) renders as a message rather than a blank box.
 
 If a use case genuinely needs unchanged arbitrary SPL *and* original keyword semantics, the
 only real answer is a decoded sidecar index — not search-time config. Call that out; don't try
