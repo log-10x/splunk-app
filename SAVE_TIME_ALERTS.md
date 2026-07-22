@@ -302,3 +302,25 @@ should be checked in a browser before release.
 If a use case genuinely needs unchanged arbitrary SPL *and* original keyword semantics, the
 only real answer is a decoded sidecar index — not search-time config. Call that out; don't try
 to fake it.
+
+## Security posture
+
+`/tenx-alert` requires authentication (`restmap.conf` `requireAuthentication = true`) and does
+all of its Splunk I/O through the **caller's own session token**, so two design choices that look
+like exposure are bounded by Splunk's own capability checks:
+
+- **Form-field forwarding is a denylist, not an allowlist.** `build_saved_search_data` forwards
+  every non-control form field verbatim as a saved-search attribute (so the handler is agnostic to
+  the exact alert schema). A caller could therefore try to set `action.*`, `dispatch.*`, or other
+  savedsearches.conf attributes. That is not an escalation: the `saved/searches` write runs as the
+  caller, so Splunk rejects any attribute the caller's role could not set through the normal
+  `saved/searches` endpoint. Do not expose `/tenx-alert` to roles you would not trust to create
+  saved searches and alert actions directly.
+- **The trailing SPL pipeline is preserved verbatim.** A compiled alert keeps the user's trailing
+  `| ...` commands (including potentially destructive ones like `| delete`). The scheduled search
+  runs as its owner under the same trust boundary as any other saved search - a user can only
+  schedule SPL they are already permitted to run interactively. The compiler adds no privilege.
+
+Hash literals embedded into the `tenx_hash IN (...)` clause are quoted and escaped
+(`tenx_util.escape_spl_string_literal`, including control characters), so DML-derived hash text
+cannot break out of the generated SPL.
