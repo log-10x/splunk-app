@@ -1,8 +1,8 @@
 # Save-time alert compilation for 10x-compact data
 
-Status: **prototype** — the compiler and its tests are built and green. Wiring it into the
-saved-search save/update flow (a REST handler + a UI control + a bulk-migrate pass) and
-verifying on a live Splunk instance are the next steps, described at the end.
+Status: **built and verified end-to-end** on live Splunk 9.4 (Python 3.9) and Splunk 10.4.1
+(Python 3.13). The compiler, its REST handler (`/tenx-alert`), the recompile/migrate pass, and
+a UI control (the "10x Compile Alert" view) are all in place; the wiring is described at the end.
 
 ## Why this exists
 
@@ -159,8 +159,14 @@ fix needs live-Splunk verification (part of the wiring phase):
 - **`NOT` is silently dropped.** `TenxSearchAstNodeFactory` prunes negation nodes, so the
   builder compiles `sourcetype=tenx_encoded NOT payment` into the *positive* search — an
   inverted alert. The compiler detects the `NOT` operator (quote-aware) on a compact search
-  and **REJECTs** it rather than store a semantically-inverted alert. Root fix (not yet done):
-  stop pruning `not_logical_expression` so `SpecifierFinder`'s negation handling is live again.
+  and **REJECTs** it rather than store a semantically-inverted alert. This REJECT is an
+  intentional, safe limitation, not a gap to close casually: excluding a term on compact data
+  cannot be expressed by the hash-prefilter (a term can be template text *or* a variable value),
+  so a correct compile would need decoded data. The honest answer is to reject and point the
+  user at the manual `\| tenxsearch` fallback (which proxies a decoded job) or a decoded sidecar
+  index. Reviving `not_logical_expression` in the parser is deferred until that exclusion
+  semantics is designed and can be verified end-to-end - shipping it half-done would silently
+  invert alerts, which is worse than rejecting them.
 - **Hash literals were unquoted.** Real 10x hashes are dense, punctuation-heavy strings (`!`,
   `|`, `[`, space, …), not plain alphanumeric; an unquoted hash containing SPL metacharacters
   could corrupt or break the generated search. **Fixed**: hashes are quoted
@@ -182,12 +188,18 @@ fix needs live-Splunk verification (part of the wiring phase):
   runs a DML probe, so the compiled search has no hash prefilter whatsoever - every run reads
   the entire compact sourcetype. **Fixed**: flagged `needs_review` via the new
   `BuildResult.has_search_terms` flag.
-- **String-valued field conditions compile to a dead `\| where`.** `where_fields()` emits
-  `\| where level=error`, where the unquoted `error` is read by `where` as a *field
-  reference*, so the clause matches nothing. Numeric literals (`status=500`) are the one RHS
-  shape that works. The compiler flags any string-valued field condition as **needs_review**.
-  Root fix (not yet done): quote non-numeric values, or translate `field=value` equality to a
-  post-inflate `\| search field=value` (search-command semantics, which is what the user wrote).
+- **Field conditions compiled to a dead `\| where`.** `where_fields()` emitted
+  `\| where level=error`, where the unquoted `error` is read by `where` as a *field reference*,
+  so the clause matched nothing. Live testing showed the deeper cause: after `\| tenx-inflate`
+  rewrites `_raw`, a plain `\| extract` re-applies the encoded sourcetype's own comma extraction
+  (which does not match the decoded text), so the decoded `key=value` pairs are never extracted -
+  both string *and* numeric conditions were affected. **Fixed** (`field_search()`): force generic
+  key=value extraction on the decoded `_raw`, then filter with search-command semantics -
+  `\| extract kvdelim="=" pairdelim=" " \| search <conditions>`. Verified on live Splunk that a
+  `payment level=error` alert compiles NATIVE and returns only the decoded `level=error` events.
+  The needs_review guard for string field values is retired. Known limitation: the generic
+  extraction assumes space-separated `key=value` pairs; decoded events in other shapes (e.g. JSON)
+  may not extract every field.
 
 ### Passthrough safety net (heuristic)
 
@@ -239,31 +251,52 @@ subject) is unaffected either way — a compiled `tenx_hash IN (...)` clause fin
 *events*; the back-reference bug is about whether the *inflate macro* then reconstructs their
 text correctly.
 
-## Not built yet — the wiring plan
+## The wiring — built
 
-1. **`/tenx-alert` REST handler** (persistent, sibling of `tenx_search_handler.py`): `POST`
-   with a human `search` + alert attributes → compile → dispatch on strategy: on `storable`,
-   write the compiled SPL plus the human original to `saved/searches`; on `needs_review`,
-   return the candidate without applying it; on `RETRYABLE`, keep the existing alert and
-   reschedule the compile; on `REJECTED`, return the reason and store nothing. Register in
-   `restmap.conf` / `web.conf`.
-2. **Recompile / migrate**: an endpoint (or the existing "Consume KV" cadence) that reads
-   existing alerts carrying a stored human original and recompiles them — both to migrate
-   legacy `| tenxsearch` alerts to NATIVE, and to pick up template hashes that appeared after
-   the alert was first saved.
-3. **UI control**: a small addition to the setup/search page that calls `/tenx-alert` and
-   surfaces `strategy` / `needs_review` / `reason` so a human confirms REJECTED and
-   flagged-NATIVE/PASSTHROUGH cases before scheduling.
+1. **`/tenx-alert` REST handler** (`tenx_alert_handler.py`, persistent, sibling of
+   `tenx_search_handler.py`; registered in `restmap.conf` / `web.conf`): `POST` with a human
+   `search` + alert attributes → compile → dispatch on strategy. On a storable result it writes
+   the compiled SPL to `saved/searches` (create or update) and stashes the human original under
+   the `tenx_original_search` stanza key via `configs/conf-savedsearches` (the `saved/searches`
+   EAI endpoint rejects unknown args, so the original cannot ride along as a normal attribute).
+   A `needs_review` result is returned but **not** applied unless `confirm=true`; `RETRYABLE`
+   returns 503 and leaves the existing alert untouched; `REJECTED` returns 422 and stores
+   nothing. A failed saved-search write propagates Splunk's real status + message. The decision
+   logic lives in the offline-tested `tenx_alert_persist.py`.
+2. **Recompile / migrate** (`POST /tenx-alert action=recompile`): lists every savedsearches
+   stanza (via `configs/conf-savedsearches`, which exposes the custom original key), recompiles
+   each managed alert from its stored original - or, for a legacy `| tenxsearch searchstring=…`
+   alert, from that searchstring - and applies only clean, storable results whose compiled form
+   actually changed. It migrates legacy proxy alerts to native compiled searches and refreshes
+   hash prefilters as new templates arrive, never auto-applying a `needs_review` result and
+   never touching `RETRYABLE`/`REJECTED`.
+3. **UI control** (the "10x Compile Alert" nav view, `tenx_alert_compile.xml` +
+   `tenx_alert_compile.js`): a form that calls `/tenx-alert`, surfaces
+   `strategy` / `needs_review` / `reason` / `compiled_search`, offers "Confirm and schedule" for
+   a flagged result, and has a "Recompile all managed alerts" button.
 4. **`| tenxsearch` remains available as a manual, human-chosen fallback** for a REJECTED
    `COMPLEX` search - documented, not auto-applied by the compiler (see "There is no
    auto-applied escape hatch" above).
-5. **Live verification** (per the handoff): confirm the compiled saved search fires correctly
-   as a scheduled alert, the hash prefilter matches, `| search` vs `search` stored forms
-   behave identically under the scheduler, and time windows select the right buckets. Also
-   verify the two remaining builder root fixes above (`NOT` pruning and the `where_fields`
-   string case, then relax the compiler's REJECT/needs_review guards accordingly), and
-   separately verify the `varMaxRecurIndexes`/`"$0("` decode fix (see the note above) on a
-   live instance with real back-reference-bearing templates.
+
+### Verified on live Splunk (9.4 / py3.9 and 10.4.1 / py3.13)
+
+- `/tenx-alert` for every dispatch path: PASSTHROUGH apply, NATIVE `needs_review` held without
+  `confirm` / applied with it (compiled SPL stored, original stashed + read back), REJECTED 422,
+  bad alert spec 400 with Splunk's message.
+- **Full decode fire test**: a NATIVE alert compiled to `… ((declined) OR (tenx_hash IN ("hpay")))
+  | `tenx-inflate` | extract`, and running it decoded `hpay,4001` → `payment 4001 declined`.
+- **Field conditions**: `payment level=error` compiled NATIVE and returned only the decoded
+  `level=error` events.
+- **Recompile/migrate**: a legacy `| tenxsearch` alert migrated to native, and an existing alert
+  picked up a newly-added matching template on recompile.
+
+Not part of this feature but verified alongside it: the whole app now imports and runs on
+Splunk 10 / Python 3.13 (the vendored `parsimonious`/`six` were Python-3.7-era) - see the deps
+modernization. Still open for a future pass: `NOT` on compact data (intentionally REJECTED, see
+above) and the `varMaxRecurIndexes`/`"$0("` back-reference decode on real back-reference-bearing
+templates. The **UI's rendered interaction has not been browser smoke-tested** here - the view
+loads and the `/tenx-alert` endpoint it calls is fully verified, but the form's DOM behaviour
+should be checked in a browser before release.
 
 If a use case genuinely needs unchanged arbitrary SPL *and* original keyword semantics, the
 only real answer is a decoded sidecar index — not search-time config. Call that out; don't try
