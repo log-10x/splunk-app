@@ -239,18 +239,21 @@ They approximate Splunk (single-element `args.search`, no subsearch splitting, w
 matching against the DML probe's conjunction); the compiled-SPL semantics they cannot prove
 must be checked live.
 
-**Separate, related correctness issue — not fixed by anything in this document.** A
-mass-corpus investigation (real 205MB encoder corpus) found the shipped `tenx-inflate` macro
-does not decode template *back-references* (`$N` value-reuse, `template.varMaxRecurIndexes`,
-default 10) or the `"$0("` escape, silently fabricating ~92% of expanded log lines when
-recurrence is in play. That bug is orthogonal to the alert compiler (it lives in
-`tenx_dml_builder.py` / `macros.conf`, and affects the *interactive* hook too, not just
-alerts) and is fixed separately: see the `fix/dml-builder-dollar-zero-escape` branch for the
-`$0` code fix, and the README's "Receiver-side configuration" section for the
-`varMaxRecurIndexes: 0` recommendation. Hash prefilter matching itself (this document's
-subject) is unaffected either way — a compiled `tenx_hash IN (...)` clause finds the right
-*events*; the back-reference bug is about whether the *inflate macro* then reconstructs their
-text correctly.
+**Separate, related correctness issue — resolved by configuration, not by anything in this
+document.** A mass-corpus investigation (real 205MB encoder corpus) found the shipped
+`tenx-inflate` macro does not decode template *back-references* (`$N` value-reuse,
+`template.varMaxRecurIndexes`, default 10), silently reconstructing the wrong text when
+value-reuse is in play. That gap is orthogonal to the alert compiler (it lives in
+`macros.conf`, and affects the *interactive* hook too, not just alerts). **Its adopted
+resolution is a Receiver setting — `varMaxRecurIndexes: 0` — documented in the README's
+"Receiver-side configuration" section**, verified 100% correct on the same corpus at a cost of
+roughly half a percentage point of modeled compression. This is not a stopgap awaiting a code
+fix: a macro-side `$N` decode was prototyped and rejected (2.5–7× slower for ~96% correctness,
+strictly worse than the config path, which is exact). The related `"$0("` escape *is* a code
+fix and is already merged on `main` (`_collapse_dollar_zero_escape` in `tenx_dml_builder.py`).
+Hash prefilter matching itself (this document's subject) is unaffected either way — a compiled
+`tenx_hash IN (...)` clause finds the right *events*; the back-reference gap is only about
+whether the *inflate macro* then reconstructs their text correctly.
 
 ## The wiring — built
 
@@ -293,9 +296,10 @@ text correctly.
 
 Not part of this feature but verified alongside it: the whole app now imports and runs on
 Splunk 10 / Python 3.13 (the vendored `parsimonious`/`six` were Python-3.7-era) - see the deps
-modernization. Still open for a future pass: `NOT` on compact data (intentionally REJECTED, see
-above) and the `varMaxRecurIndexes`/`"$0("` back-reference decode on real back-reference-bearing
-templates. The **UI has been browser smoke-tested** (headless Chrome via Puppeteer against live
+modernization. One case remains intentionally out of scope: `NOT` on compact data (deliberately
+REJECTED, see above). The `$N` back-reference decode is *not* an open item — it has an adopted
+resolution (`varMaxRecurIndexes: 0` on the Receiver; see the "Separate, related correctness
+issue" note above), not a pending code fix. The **UI has been browser smoke-tested** (headless Chrome via Puppeteer against live
 Splunk): the view loads and the form drives `/tenx-alert` end to end - PASSTHROUGH renders the
 compiled search, a NATIVE `needs_review` result renders and surfaces the Confirm button, a REJECTED
 result renders its reason from the 422 error body, and a string error body (e.g. the 400 for an
