@@ -21,7 +21,6 @@ from tenx_alert_compiler import (
 	_referenced_tenx_sources,
 	_specifier_values,
 	_has_negation,
-	_stringy_field_terms,
 )
 
 from support.local_search_manager import LocalSearchManager, CsvTemplateStore
@@ -118,11 +117,14 @@ class TestNativeCompile:
 		assert result.original_search == original
 		assert result.compiled_search != original
 
-	def test_field_condition_becomes_where_clause(self):
+	def test_field_condition_becomes_search_clause(self):
 		result = make_compiler().compile('sourcetype=tenx_encoded status=500 payment')
 
 		assert result.strategy == AlertStrategy.NATIVE
-		assert '| where status=500' in result.compiled_search
+		# field conditions filter post-inflate: force generic key=value extraction on the decoded
+		# _raw, then filter with search-command semantics (works for string + numeric values).
+		assert '| extract kvdelim="=" pairdelim=" "' in result.compiled_search
+		assert '| search status=500' in result.compiled_search
 
 	def test_trailing_pipeline_is_preserved(self):
 		result = make_compiler().compile('sourcetype=tenx_encoded payment | stats count')
@@ -415,35 +417,32 @@ class TestNegationGuard:
 
 
 # ---------------------------------------------------------------------------
-# Field-value guard: a string-valued field condition -> `| where` matches nothing
+# Field conditions: string and numeric values both compile to a working post-inflate
+# `| extract kvdelim=... | search field=value` filter (verified on live Splunk), so neither
+# is flagged needs_review.
 # ---------------------------------------------------------------------------
 
-class TestFieldValueGuard:
-	def test_string_field_value_flagged_for_review(self):
+class TestFieldConditions:
+	def test_string_field_value_compiles_clean(self):
 		result = make_compiler().compile('sourcetype=tenx_encoded payment level=error')
 
 		assert result.strategy == AlertStrategy.NATIVE
-		assert result.needs_review
-		assert 'level=error' in result.reason
+		assert not result.needs_review
+		assert '| extract kvdelim="=" pairdelim=" "' in result.compiled_search
+		assert '| search level=error' in result.compiled_search
 
-	def test_numeric_field_value_not_flagged(self):
+	def test_numeric_field_value_compiles_clean(self):
 		result = make_compiler().compile('sourcetype=tenx_encoded payment status=500')
 
 		assert result.strategy == AlertStrategy.NATIVE
 		assert not result.needs_review
+		assert '| search status=500' in result.compiled_search
 
-	def test_quoted_field_value_not_flagged(self):
+	def test_quoted_field_value_compiles_clean(self):
 		result = make_compiler().compile('sourcetype=tenx_encoded payment level="error"')
 
 		assert result.strategy == AlertStrategy.NATIVE
 		assert not result.needs_review
-
-	def test_helper_classifies_values(self):
-		assert _stringy_field_terms(['status=500']) == []
-		assert _stringy_field_terms(['level="error"']) == []
-		assert _stringy_field_terms(['level=error']) == ['level=error']
-		assert _stringy_field_terms(['code>=400']) == []
-		assert _stringy_field_terms(['host IN (web1,web2)']) == ['host IN (web1,web2)']
 
 
 # ---------------------------------------------------------------------------

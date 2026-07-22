@@ -547,14 +547,19 @@ class TenxSearchCommand(TenxSplCommand):
 		"""
 		return " | " + tenx_util.splunk_inflate_macro(self.debug) + " | extract"
 
-	def where_fields(self):
+	def field_search(self):
 		"""
-		Returns the "where" search clause that matches the fields search the user requested for.
+		Returns the clause that filters on the field conditions the user requested.
 
-		Because the 10x data is encoded, and fields were not extracted before the search, we manually
-		extract the fields and need to search on them afterwards, with a "where clause"
+		The decoded events carry the user's original key=value pairs, but the encoded sourcetype's
+		own extraction is the compact comma form, which does not match the decoded text - so
+		`| extract` alone leaves those fields unextracted. We force generic key=value extraction on
+		the decoded _raw, then filter with search-command semantics (which is what the user wrote;
+		unlike `| where`, `| search field=value` reads a bare value as a literal, not a field
+		reference, so a string value like `level=error` matches instead of silently comparing two
+		fields). This handles string and numeric values, and IN(...) lists, uniformly.
 		"""
-		return " | where " + " AND ".join([item.text for item in self.user_field_terms])
+		return ' | extract kvdelim="=" pairdelim=" " | search ' + " ".join([item.text for item in self.user_field_terms])
 
 	def original_search_terms(self):
 		"""
@@ -607,7 +612,7 @@ class TenxSearchCommand(TenxSplCommand):
 		result += self.inflate_suffix()
 
 		if len(self.user_field_terms) > 0:
-			result += self.where_fields()
+			result += self.field_search()
 
 		if self.needs_original_search_check:
 			result += self.original_search_terms()
