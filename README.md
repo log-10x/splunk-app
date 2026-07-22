@@ -21,11 +21,13 @@ Receiver  -->  Ingest (UF/HEC)  -->  KV Store (Templates)
 
 ### Search Flow
 
-Searches are transparently transformed to [expand](https://doc.log10x.com/run/transform/#expand) compact events:
+Interactive searches are transparently transformed to [expand](https://doc.log10x.com/run/transform/#expand) compact events via a browser hook:
 
 ```
 User Search  -->  Hook Intercept  -->  Transform (Add Macro)  -->  Inflate (Decode)  -->  Full Results
 ```
+
+Scheduled alerts run server-side, where the browser hook never fires. They are instead **compiled once at save time** into native SPL — a template hash prefilter plus the inflate macro — so the scheduler runs an ordinary saved search. This is handled by the `/tenx-alert` REST endpoint and the **10x Compile Alert** view (with a recompile pass that migrates legacy alerts and refreshes prefilters as templates appear). See [SAVE_TIME_ALERTS.md](SAVE_TIME_ALERTS.md).
 
 ## Receiver-side configuration
 
@@ -53,7 +55,7 @@ as the Receiver instance they share with Splunk has this setting disabled.
 
 | Requirement | Description |
 |-------------|-------------|
-| Splunk Enterprise | Version 8.0 or later |
+| Splunk Enterprise | Version 8.x, 9.x, or 10.x (bundled Python 3.7 through 3.13) |
 | Admin Access | Required for app installation and KV Store setup |
 
 ### Step 1: Install Splunk App
@@ -129,6 +131,8 @@ The app includes a built-in analytics dashboard providing real-time visibility i
 |-----------|-------------|
 | **Search Hook** | JavaScript module intercepting all search requests |
 | **Search Handler** | REST endpoint transforming SPL queries |
+| **Alert Compiler** | `/tenx-alert` REST endpoint compiling a search into a native scheduled alert at save time (with a recompile/migrate pass) |
+| **Compile Alert View** | UI to compile, review, and recompile save-time alerts |
 | **KV Store** | Template patterns for event reconstruction |
 | **Inflate Macro** | SPL macro joining events with templates |
 | **Consume KV Search** | Scheduled search populating KV store from templates |
@@ -140,6 +144,7 @@ The app includes a built-in analytics dashboard providing real-time visibility i
 For complete documentation including troubleshooting, advanced configuration, and integration guides, see:
 
 - [10x for Splunk Documentation](https://doc.log10x.com/apps/receiver/compact/splunk/)
+- [Save-time alert compilation](SAVE_TIME_ALERTS.md) — how scheduled alerts on compact data are compiled and kept current
 - [Receiver Documentation](https://doc.log10x.com/apps/receiver/)
 - [Log10x Documentation](https://doc.log10x.com/)
 
