@@ -153,9 +153,6 @@ def _normalize_native(resolved_search):
 # Only a real '=' (not '!=', '<=', '>=') is captured, so exclusions are not treated as targeting.
 _SPECIFIER_RE = re.compile(r'(?<![!<>])\b(?:sourcetype|source)\s*=\s*(?:"([^"]*)"|([^\s"()]+))', re.IGNORECASE)
 
-# A numeric literal (the one RHS shape Splunk's `where` reads as a value, not a field ref).
-_NUMERIC_RE = re.compile(r'^-?\d+(?:\.\d+)?$')
-
 
 def _specifier_values(original_search):
 	"""Returns the sourcetype/source values a search selects on (may contain glob chars)."""
@@ -223,42 +220,6 @@ def _has_negation(original_search):
 
 	return bool(_NOT_RE.search(unquoted))
 
-
-def _stringy_field_terms(field_terms):
-	"""
-	Returns field conditions whose value is an unquoted non-numeric string.
-
-	Such a condition compiles into a `| where field=value` clause where the unquoted value is
-	read as a field reference, so the clause matches nothing (a silently dead alert). Numeric
-	and quoted values are safe.
-	"""
-	risky = []
-
-	for term in field_terms or []:
-		# split on the first comparison operator or IN
-		parts = re.split(r'(!=|<=|>=|=|<|>|\bIN\b)', term, maxsplit=1, flags=re.IGNORECASE)
-
-		if len(parts) < 3:
-			continue
-
-		rhs = parts[2].strip()
-
-		if rhs.startswith('(') and rhs.endswith(')'):
-			candidates = [value.strip() for value in rhs[1:-1].split(',')]
-		else:
-			candidates = [rhs]
-
-		for value in candidates:
-			if not value:
-				continue
-
-			if value.startswith('"') or _NUMERIC_RE.match(value):
-				continue
-
-			risky.append(term)
-			break
-
-	return risky
 
 
 class TenxAlertCompiler:
@@ -374,15 +335,18 @@ class TenxAlertCompiler:
 					"the template lookup matched more message types than could be fetched; "
 					"the hash prefilter may be missing some matching message types")
 
-		# A string-valued field condition compiles to a `| where field=value` clause whose
-		# unquoted value is read as a field reference, so it matches nothing. Flag for review.
-		risky = _stringy_field_terms(result.field_terms)
-
-		if risky:
+		# Field conditions filter post-inflate via generic key=value extraction from the decoded
+		# event text (logfmt-style, space-separated). That works, but it depends on the decoded
+		# events actually carrying these as extractable fields: on a differently-shaped payload
+		# (JSON, key:value, quoted values with spaces) the field may not extract and the alert
+		# would silently never fire, or a bare key=value fragment elsewhere could over-match.
+		# Flag for a human to confirm against real data rather than certifying it clean.
+		if result.field_terms:
 			review_reasons.append(
-				"field condition(s) {} compare against an unquoted string value; the generated "
-				"`| where` clause may match nothing - quote the value or verify on a live "
-				"instance".format(", ".join(risky)))
+				"filters on field condition(s) {} via key=value extraction from the decoded event "
+				"text; confirm those decode as real fields (space-separated key=value) - other "
+				"payload shapes may not extract, and the alert would then not fire".format(
+					", ".join(result.field_terms)))
 
 		if review_reasons:
 			return AlertCompileResult(

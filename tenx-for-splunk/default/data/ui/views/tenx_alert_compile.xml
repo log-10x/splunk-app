@@ -1,0 +1,25 @@
+<dashboard script="tenx_alert_compile.js" version="1.1">
+	<label>10x Compile Alert</label>
+	<description>Compile a search once, at save time, into native SPL so a scheduled alert on 10x-compact data runs as an ordinary saved search - no browser hook.</description>
+	<row>
+		<panel>
+			<html>
+				<div class="tenx-alert-compile" style="padding:8px 4px;">
+					<div style="margin-bottom:6px;">
+						<label for="tenx-alert-search"><b>Search</b></label>
+						<textarea id="tenx-alert-search" rows="3" style="width:100%; font-family:monospace;" placeholder="sourcetype=tenx_encoded payment failed"></textarea>
+					</div>
+					<div style="margin-bottom:6px;">
+						<label for="tenx-alert-name"><b>Alert (saved-search) name</b></label>
+						<input id="tenx-alert-name" type="text" style="width:100%;" placeholder="Payment failures"/>
+					</div>
+					<div style="margin:8px 0;">
+						<button id="tenx-alert-compile" class="btn btn-primary">Compile</button>
+						<button id="tenx-alert-recompile" class="btn" title="Recompile every managed alert - migrate legacy | tenxsearch alerts and pick up new templates">Recompile all managed alerts</button>
+					</div>
+					<div id="tenx-alert-result" style="margin-top:10px;"></div>
+				</div>
+			</html>
+		</panel>
+	</row>
+</dashboard>

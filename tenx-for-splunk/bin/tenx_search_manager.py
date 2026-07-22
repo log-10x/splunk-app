@@ -238,7 +238,14 @@ class TenxSearchManager:
 			return None, False
 
 		raw_rows = search_results['results']
-		hashes = list(set([result[self.dml_key] for result in raw_rows if self.dml_key in result]))
+		# sorted(), not list(set()): the hash list is baked verbatim into the compiled
+		# `tenx_hash IN (...)` clause and persisted in savedsearches.conf. A plain set's
+		# iteration order is randomized per process (PYTHONHASHSEED), so the same matching
+		# templates would produce a different clause string on each save/recompile - making the
+		# recompile pass's "only rewrite if the compiled search changed" guard always fire and
+		# churn every multi-template alert. A stable, sorted order makes the compiled SPL a
+		# deterministic function of the matching template set.
+		hashes = sorted(set(result[self.dml_key] for result in raw_rows if self.dml_key in result))
 
 		job_details = self.get_search_job_details(sid)
 		total_results = tenx_util.get_internal(job_details, 'resultCount') if job_details else None
