@@ -88,7 +88,7 @@ class TestDecide:
 
 
 class TestBuildSavedSearchData:
-	def test_replaces_search_with_compiled_and_stashes_original(self):
+	def test_replaces_search_with_compiled_and_forwards_attrs(self):
 		form = {
 			'search': 'sourcetype=tenx_encoded payment failed',
 			'name': 'Payment failures',
@@ -103,11 +103,19 @@ class TestBuildSavedSearchData:
 
 		# compiled SPL replaces the human search
 		assert data['search'] == 'COMPILED'
-		# the human original is stashed for later recompilation
-		assert data[tenx_alert_persist.ORIGINAL_SEARCH_KEY] == 'sourcetype=tenx_encoded payment failed'
 		# alert attributes are forwarded verbatim
 		assert data['cron_schedule'] == '*/5 * * * *'
 		assert data['alert_type'] == 'number of events'
+
+	def test_original_is_not_a_saved_search_attribute(self):
+		# the saved/searches EAI endpoint rejects unknown args, so the human original must NOT
+		# ride along in this payload - it is written separately via configs/conf-savedsearches
+		form = {'search': 'human', 'name': 'A'}
+		result = _result(AlertStrategy.NATIVE, compiled='C', original='human')
+
+		data = tenx_alert_persist.build_saved_search_data(form, result)
+
+		assert tenx_alert_persist.ORIGINAL_SEARCH_KEY not in data
 
 	def test_control_keys_are_not_forwarded_as_attributes(self):
 		form = {'search': 'x', 'name': 'A', 'confirm': 'true', 'method': 'POST', 'output_mode': 'json'}
@@ -120,3 +128,10 @@ class TestBuildSavedSearchData:
 		assert 'confirm' not in data
 		assert 'method' not in data
 		assert 'output_mode' not in data
+
+
+class TestBuildOriginalSearchData:
+	def test_single_key_payload(self):
+		data = tenx_alert_persist.build_original_search_data('sourcetype=tenx_encoded payment failed')
+
+		assert data == {tenx_alert_persist.ORIGINAL_SEARCH_KEY: 'sourcetype=tenx_encoded payment failed'}

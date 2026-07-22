@@ -126,6 +126,35 @@ class TenxAlertHandler(PersistentServerConnectionApplication):
 		"""
 		return '/servicesNS/' + user + '/' + APP_NAME + '/saved/searches'
 
+	def conf_savedsearches_url(self, user, name):
+		"""
+		URL for the raw conf-editing endpoint for a single savedsearches stanza. Unlike the
+		saved/searches EAI endpoint, this accepts arbitrary stanza keys, which is how the
+		human-original search is stored (the EAI endpoint rejects unknown arguments).
+		"""
+		return ('/servicesNS/' + user + '/' + APP_NAME +
+			'/configs/conf-savedsearches/' + urllib.parse.quote(name, safe=''))
+
+	def _read_error_body(self, http_error):
+		"""
+		Best-effort extraction of Splunk's error message from an HTTPError, so the caller sees
+		the real reason (e.g. 'Invalid alert_comparator') instead of a bare status code.
+		"""
+		try:
+			return http_error.read().decode('utf-8', 'replace')
+		except Exception:
+			return str(http_error)
+
+	def write_original_search(self, server_connection, user, name, original_search):
+		"""
+		Stashes the human-authored original on the saved-search stanza via configs/conf-
+		savedsearches, so the alert can be recompiled when new templates arrive. The stanza
+		already exists at this point (write_saved_search ran first).
+		"""
+		server_connection.post(
+			self.conf_savedsearches_url(user, name),
+			tenx_alert_persist.build_original_search_data(original_search))
+
 	def write_saved_search(self, server_connection, user, name, data):
 		"""
 		Creates the saved search if the stanza is new, or updates it if it already exists.
@@ -210,7 +239,25 @@ class TenxAlertHandler(PersistentServerConnectionApplication):
 					return {'payload': "Applying a compiled alert requires a 'name'", 'status': 400}
 
 				data = tenx_alert_persist.build_saved_search_data(form, result)
-				write_result = self.write_saved_search(server_connection, user, name, data)
+
+				try:
+					write_result = self.write_saved_search(server_connection, user, name, data)
+
+					# The saved/searches EAI endpoint rejects unknown args, so the human original
+					# is stashed as a raw stanza key via configs/conf-savedsearches (the stanza
+					# exists now that write_saved_search has run).
+					self.write_original_search(server_connection, user, name, result.original_search)
+				except urllib.error.HTTPError as write_error:
+					# Splunk rejected the write (e.g. an incomplete alert spec). Surface its real
+					# status and message rather than collapsing it into an opaque 500 - the compile
+					# itself was fine, the saved-search attributes the caller sent were not.
+					detail = self._read_error_body(write_error)
+					logger.warning("Saved-search write failed - name={} status={} detail={}".format(
+						name, write_error.code, detail))
+
+					decision.payload['applied'] = False
+					decision.payload['saved_search_error'] = detail
+					return {'payload': decision.payload, 'status': write_error.code}
 
 				logger.info("Saved search {} - name={}".format(write_result, name))
 

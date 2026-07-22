@@ -130,11 +130,14 @@ def build_saved_search_data(form, result):
 
 	Every non-control key the caller sent (cron_schedule, alert_type, actions,
 	dispatch.earliest_time, ...) is forwarded verbatim as a saved-search attribute, so the
-	handler is agnostic to the exact alert schema. `search` is set to the COMPILED SPL, and
-	the human original is stashed under ORIGINAL_SEARCH_KEY for later recompilation.
+	handler is agnostic to the exact alert schema. `search` is set to the COMPILED SPL.
 
-	`name` is NOT included here - it identifies the stanza and is used by the handler to
-	choose create vs update, not written as an attribute.
+	The human original is NOT included here: the saved/searches EAI endpoint rejects unknown
+	arguments ("Argument ... is not supported by this handler"), so the original is written
+	separately as a raw stanza key via configs/conf-savedsearches (see
+	build_original_search_data and the handler's write_original_search). `name` is likewise
+	excluded - it identifies the stanza (URL for update / added by the handler for create),
+	not an attribute.
 	"""
 	data = {}
 
@@ -144,6 +147,17 @@ def build_saved_search_data(form, result):
 		data[key] = value
 
 	data['search'] = result.compiled_search
-	data[ORIGINAL_SEARCH_KEY] = result.original_search
 
 	return data
+
+
+def build_original_search_data(original_search):
+	"""
+	The single-key payload that stashes the human-authored original under ORIGINAL_SEARCH_KEY.
+
+	Written via configs/conf-savedsearches (a raw conf write that accepts arbitrary stanza
+	keys), because the saved/searches EAI endpoint rejects unknown arguments. It reads back on
+	both the conf endpoint and the saved-search content, so the recompile/migrate pass can
+	recover what the user typed.
+	"""
+	return {ORIGINAL_SEARCH_KEY: original_search}
