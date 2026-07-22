@@ -335,6 +335,19 @@ class TenxAlertCompiler:
 					"the template lookup matched more message types than could be fetched; "
 					"the hash prefilter may be missing some matching message types")
 
+		# Field conditions filter post-inflate via generic key=value extraction from the decoded
+		# event text (logfmt-style, space-separated). That works, but it depends on the decoded
+		# events actually carrying these as extractable fields: on a differently-shaped payload
+		# (JSON, key:value, quoted values with spaces) the field may not extract and the alert
+		# would silently never fire, or a bare key=value fragment elsewhere could over-match.
+		# Flag for a human to confirm against real data rather than certifying it clean.
+		if result.field_terms:
+			review_reasons.append(
+				"filters on field condition(s) {} via key=value extraction from the decoded event "
+				"text; confirm those decode as real fields (space-separated key=value) - other "
+				"payload shapes may not extract, and the alert would then not fire".format(
+					", ".join(result.field_terms)))
+
 		if review_reasons:
 			return AlertCompileResult(
 				AlertStrategy.NATIVE, compiled, original, result.state,

@@ -44,12 +44,18 @@ _TENXSEARCH_RE = re.compile(
 
 # Handler-control form keys that must NOT be forwarded as saved-search attributes.
 # `search` is replaced by the compiled SPL; `name` is the target stanza; `confirm` gates
-# needs_review application; `method`/`output_mode` are transport, not alert config.
-CONTROL_KEYS = frozenset(['search', 'name', 'confirm', 'method', 'output_mode'])
+# needs_review application; `action` selects recompile vs compile; `method`/`output_mode` are
+# transport, not alert config.
+CONTROL_KEYS = frozenset(['search', 'name', 'confirm', 'action', 'method', 'output_mode'])
 
 # The saved-search attribute under which we stash the human-authored original, so the alert
 # can be recompiled later (when new templates arrive) and the UI can show what the user typed.
 ORIGINAL_SEARCH_KEY = 'tenx_original_search'
+
+# A fingerprint of the compiled SPL we last wrote into this alert's `search`. The recompile pass
+# uses it to tell its own output apart from an operator's manual edit: if the live `search` no
+# longer equals this fingerprint, a human changed it, and recompile must NOT overwrite that.
+COMPILED_SEARCH_KEY = 'tenx_compiled_search'
 
 
 # Action constants (plain strings so payloads/logs are readable and tests are obvious).
@@ -142,12 +148,11 @@ def build_saved_search_data(form, result):
 	dispatch.earliest_time, ...) is forwarded verbatim as a saved-search attribute, so the
 	handler is agnostic to the exact alert schema. `search` is set to the COMPILED SPL.
 
-	The human original is NOT included here: the saved/searches EAI endpoint rejects unknown
-	arguments ("Argument ... is not supported by this handler"), so the original is written
-	separately as a raw stanza key via configs/conf-savedsearches (see
-	build_original_search_data and the handler's write_original_search). `name` is likewise
-	excluded - it identifies the stanza (URL for update / added by the handler for create),
-	not an attribute.
+	The 10x metadata (human original + compiled fingerprint) is NOT included here: the
+	saved/searches EAI endpoint rejects unknown arguments ("Argument ... is not supported by
+	this handler"), so it is written separately as raw stanza keys via configs/conf-savedsearches
+	(see build_tenx_metadata and the handler's write_tenx_metadata). `name` is likewise excluded -
+	it identifies the stanza (URL for update / added by the handler for create), not an attribute.
 	"""
 	data = {}
 
@@ -161,16 +166,29 @@ def build_saved_search_data(form, result):
 	return data
 
 
-def build_original_search_data(original_search):
+def build_tenx_metadata(original_search, compiled_search):
 	"""
-	The single-key payload that stashes the human-authored original under ORIGINAL_SEARCH_KEY.
+	The payload that stashes the alert's 10x metadata: the human-authored original (for
+	recompilation and UI display) and a fingerprint of the compiled SPL we wrote (for drift
+	detection). Written via configs/conf-savedsearches - a raw conf write that accepts arbitrary
+	stanza keys, because the saved/searches EAI endpoint rejects unknown arguments. Both keys
+	read back on the saved-search content, so the recompile pass can recover them.
+	"""
+	return {ORIGINAL_SEARCH_KEY: original_search, COMPILED_SEARCH_KEY: compiled_search}
 
-	Written via configs/conf-savedsearches (a raw conf write that accepts arbitrary stanza
-	keys), because the saved/searches EAI endpoint rejects unknown arguments. It reads back on
-	both the conf endpoint and the saved-search content, so the recompile/migrate pass can
-	recover what the user typed.
+
+def is_drifted(saved_search):
 	"""
-	return {ORIGINAL_SEARCH_KEY: original_search}
+	Whether an operator has manually edited a previously-compiled alert's search away from what
+	the compiler last wrote.
+
+	True only when there IS a stored compiled fingerprint and the live search differs from it -
+	i.e. a human changed a search we own. A legacy `| tenxsearch` alert (no fingerprint yet) is
+	NOT drift: it has never been compiled, so the recompile pass should migrate it. Recompile
+	must skip a drifted alert rather than clobber the human's edit.
+	"""
+	fingerprint = (saved_search.get(COMPILED_SEARCH_KEY) or '').strip()
+	return bool(fingerprint) and (saved_search.get('search') or '') != fingerprint
 
 
 def recompile_source(saved_search):

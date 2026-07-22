@@ -34,7 +34,14 @@ require([
 	}
 
 	function renderResult(data) {
-		if (!data) { $result.html('<span style="color:#a00;">No response.</span>'); return; }
+		if (data == null) { $result.html('<span style="color:#a00;">No response.</span>'); return; }
+
+		// 400/405/500 responses carry a plain string body (e.g. "Missing required 'search'"),
+		// not a compile-result object. Render it as an error rather than a blank box.
+		if (typeof data !== 'object') {
+			$result.html('<span style="color:#a00;">' + escapeHtml(data) + '</span>');
+			return;
+		}
 
 		var badge = escapeHtml(data.strategy) + (data.needs_review ? ' <span style="color:#b58900;">(needs review)</span>' : '');
 		var html = '<div><b>Strategy:</b> ' + badge + '</div>';

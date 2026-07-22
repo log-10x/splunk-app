@@ -175,12 +175,13 @@ class TestFieldOnlyFullScanGuard:
 		assert 'no keyword search terms' in result.reason
 
 	def test_keyword_plus_field_is_not_flagged_for_this_reason(self):
-		# a search WITH a keyword term still gets a prefilter, so this guard doesn't fire
-		# (the string-field-value guard is a separate, unrelated check - see TestFieldValueGuard)
+		# a search WITH a keyword term still gets a prefilter, so the FULL-SCAN guard doesn't fire.
+		# (it is separately flagged for its field condition - see TestFieldConditions - so assert on
+		# the specific reason rather than needs_review overall.)
 		result = make_compiler().compile('sourcetype=tenx_encoded status=500 payment')
 
 		assert result.strategy == AlertStrategy.NATIVE
-		assert not result.needs_review
+		assert 'no keyword search terms' not in (result.reason or '')
 
 
 # ---------------------------------------------------------------------------
@@ -417,32 +418,66 @@ class TestNegationGuard:
 
 
 # ---------------------------------------------------------------------------
-# Field conditions: string and numeric values both compile to a working post-inflate
-# `| extract kvdelim=... | search field=value` filter (verified on live Splunk), so neither
-# is flagged needs_review.
+# Field conditions compile to a working post-inflate
+# `| extract kvdelim=... | search field=value` filter (verified on live Splunk), but they
+# depend on the decoded events being logfmt-shaped, so they are stored NATIVE + needs_review
+# for a human to confirm against real data (not silently certified clean).
 # ---------------------------------------------------------------------------
 
 class TestFieldConditions:
-	def test_string_field_value_compiles_clean(self):
+	def test_string_field_value_compiles_native_and_is_flagged(self):
 		result = make_compiler().compile('sourcetype=tenx_encoded payment level=error')
 
 		assert result.strategy == AlertStrategy.NATIVE
-		assert not result.needs_review
+		assert result.storable
+		assert result.needs_review
+		assert 'field condition' in result.reason
 		assert '| extract kvdelim="=" pairdelim=" "' in result.compiled_search
 		assert '| search level=error' in result.compiled_search
 
-	def test_numeric_field_value_compiles_clean(self):
+	def test_numeric_field_value_compiles_native_and_is_flagged(self):
 		result = make_compiler().compile('sourcetype=tenx_encoded payment status=500')
 
 		assert result.strategy == AlertStrategy.NATIVE
-		assert not result.needs_review
+		assert result.needs_review
 		assert '| search status=500' in result.compiled_search
 
-	def test_quoted_field_value_compiles_clean(self):
-		result = make_compiler().compile('sourcetype=tenx_encoded payment level="error"')
+	def test_alert_with_no_field_condition_is_not_field_flagged(self):
+		result = make_compiler().compile('sourcetype=tenx_encoded payment failed')
 
 		assert result.strategy == AlertStrategy.NATIVE
-		assert not result.needs_review
+		# a healthy keyword-only match carries no field-condition flag
+		assert result.reason is None or 'field condition' not in (result.reason or '')
+
+
+# ---------------------------------------------------------------------------
+# Determinism of the compiled hash prefilter. The hash list is baked verbatim into the stored
+# search and compared, string-wise, by the recompile pass to decide whether to rewrite. If the
+# order were a plain set's (randomized per process), the recompile guard would always fire and
+# churn every multi-template alert. The hashes must be sorted / stable.
+# ---------------------------------------------------------------------------
+
+class TestHashPrefilterDeterminism:
+	def _hashes(self, compiled):
+		import re
+		m = re.search(r'tenx_hash IN \(([^)]*)\)', compiled or '')
+		if not m:
+			return None
+		return [h.strip().strip('"') for h in m.group(1).split(',')]
+
+	def test_multi_hash_prefilter_is_sorted(self):
+		# 'payment' matches h_pay and h_pay2
+		result = make_compiler().compile('sourcetype=tenx_encoded payment')
+		hashes = self._hashes(result.compiled_search)
+
+		assert hashes is not None and len(hashes) >= 2
+		assert hashes == sorted(hashes)
+
+	def test_same_search_compiles_identically(self):
+		a = make_compiler().compile('sourcetype=tenx_encoded payment')
+		b = make_compiler().compile('sourcetype=tenx_encoded payment')
+
+		assert a.compiled_search == b.compiled_search
 
 
 # ---------------------------------------------------------------------------

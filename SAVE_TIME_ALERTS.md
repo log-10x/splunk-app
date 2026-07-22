@@ -197,9 +197,10 @@ fix needs live-Splunk verification (part of the wiring phase):
   key=value extraction on the decoded `_raw`, then filter with search-command semantics -
   `\| extract kvdelim="=" pairdelim=" " \| search <conditions>`. Verified on live Splunk that a
   `payment level=error` alert compiles NATIVE and returns only the decoded `level=error` events.
-  The needs_review guard for string field values is retired. Known limitation: the generic
-  extraction assumes space-separated `key=value` pairs; decoded events in other shapes (e.g. JSON)
-  may not extract every field.
+  Because the extraction assumes space-separated `key=value` (logfmt) and a decoded event in
+  another shape (JSON, `key:value`, quoted values) may not extract - so the alert would silently
+  never fire - a field-condition alert is stored NATIVE but **flagged `needs_review`** for a human
+  to confirm against real data, rather than silently certified clean.
 
 ### Passthrough safety net (heuristic)
 

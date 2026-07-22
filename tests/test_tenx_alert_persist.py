@@ -130,11 +130,35 @@ class TestBuildSavedSearchData:
 		assert 'output_mode' not in data
 
 
-class TestBuildOriginalSearchData:
-	def test_single_key_payload(self):
-		data = tenx_alert_persist.build_original_search_data('sourcetype=tenx_encoded payment failed')
+class TestBuildTenxMetadata:
+	def test_stashes_original_and_fingerprint(self):
+		data = tenx_alert_persist.build_tenx_metadata('sourcetype=tenx_encoded payment', 'search ... | `tenx-inflate`')
 
-		assert data == {tenx_alert_persist.ORIGINAL_SEARCH_KEY: 'sourcetype=tenx_encoded payment failed'}
+		assert data == {
+			tenx_alert_persist.ORIGINAL_SEARCH_KEY: 'sourcetype=tenx_encoded payment',
+			tenx_alert_persist.COMPILED_SEARCH_KEY: 'search ... | `tenx-inflate`',
+		}
+
+
+class TestIsDrifted:
+	C = tenx_alert_persist.COMPILED_SEARCH_KEY
+
+	def test_live_search_matches_fingerprint_is_not_drift(self):
+		stanza = {'search': 'search X | `tenx-inflate`', self.C: 'search X | `tenx-inflate`'}
+
+		assert tenx_alert_persist.is_drifted(stanza) is False
+
+	def test_live_search_differs_from_fingerprint_is_drift(self):
+		# an operator hand-edited a search we previously compiled
+		stanza = {'search': 'search X | `tenx-inflate` | head 5', self.C: 'search X | `tenx-inflate`'}
+
+		assert tenx_alert_persist.is_drifted(stanza) is True
+
+	def test_no_fingerprint_is_not_drift(self):
+		# a legacy | tenxsearch alert (never compiled) must be migratable, not treated as drift
+		stanza = {'search': '| tenxsearch searchstring="x"', self.C: ''}
+
+		assert tenx_alert_persist.is_drifted(stanza) is False
 
 
 class TestRecompileSource:

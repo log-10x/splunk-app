@@ -145,15 +145,16 @@ class TenxAlertHandler(PersistentServerConnectionApplication):
 		except Exception:
 			return str(http_error)
 
-	def write_original_search(self, server_connection, user, name, original_search):
+	def write_tenx_metadata(self, server_connection, user, name, original_search, compiled_search):
 		"""
-		Stashes the human-authored original on the saved-search stanza via configs/conf-
-		savedsearches, so the alert can be recompiled when new templates arrive. The stanza
-		already exists at this point (write_saved_search ran first).
+		Stashes the alert's 10x metadata (human original + compiled fingerprint) on the stanza via
+		configs/conf-savedsearches. The stanza must already exist (a create writes the search
+		first). The original is the source of truth for recompilation; the fingerprint lets the
+		recompile pass tell its own output from a manual edit.
 		"""
 		server_connection.post(
 			self.conf_savedsearches_url(user, name),
-			tenx_alert_persist.build_original_search_data(original_search))
+			tenx_alert_persist.build_tenx_metadata(original_search, compiled_search))
 
 	def write_saved_search(self, server_connection, user, name, data):
 		"""
@@ -197,6 +198,7 @@ class TenxAlertHandler(PersistentServerConnectionApplication):
 				'name': entry.get('name'),
 				'search': content.get('search', ''),
 				tenx_alert_persist.ORIGINAL_SEARCH_KEY: content.get(tenx_alert_persist.ORIGINAL_SEARCH_KEY, ''),
+				tenx_alert_persist.COMPILED_SEARCH_KEY: content.get(tenx_alert_persist.COMPILED_SEARCH_KEY, ''),
 			})
 
 		return stanzas
@@ -209,11 +211,12 @@ class TenxAlertHandler(PersistentServerConnectionApplication):
 		pick up template hashes that appeared after the alert was first saved.
 
 		A recompile is conservative: it never auto-applies a needs_review result (a human must
-		confirm those via /tenx-alert), never touches a RETRYABLE/REJECTED result, and skips
-		unchanged compiles so it does not churn live alerts.
+		confirm those via /tenx-alert), never touches a RETRYABLE/REJECTED result, skips unchanged
+		compiles so it does not churn live alerts, and - via the compiled fingerprint - refuses to
+		overwrite an alert an operator has manually edited (counted as `drifted`).
 		"""
 		summary = {'examined': 0, 'recompiled': 0, 'migrated': 0, 'unchanged': 0,
-			'needs_review': 0, 'skipped': 0, 'errors': 0, 'updated': []}
+			'needs_review': 0, 'skipped': 0, 'drifted': 0, 'errors': 0, 'updated': []}
 
 		for stanza in self.list_managed_savedsearches(server_connection, user):
 			source = tenx_alert_persist.recompile_source(stanza)
@@ -225,6 +228,11 @@ class TenxAlertHandler(PersistentServerConnectionApplication):
 			name = stanza['name']
 			is_legacy = tenx_alert_persist.is_legacy_tenxsearch(stanza)
 
+			# A search we compiled that a human has since hand-edited: never clobber it.
+			if tenx_alert_persist.is_drifted(stanza):
+				summary['drifted'] += 1
+				continue
+
 			try:
 				result = compiler.compile(source)
 				decision = tenx_alert_persist.decide(result, confirm=False)
@@ -233,14 +241,20 @@ class TenxAlertHandler(PersistentServerConnectionApplication):
 					summary['needs_review' if decision.action == tenx_alert_persist.REVIEW else 'skipped'] += 1
 					continue
 
-				# Only rewrite when the compiled search actually changed, so a recompile pass over
-				# already-current alerts is a no-op rather than needless churn.
+				# Only rewrite when the compiled search actually changed. With hashes sorted
+				# deterministically (tenx_search_manager), an unchanged template set yields the
+				# identical compiled string, so this is a real no-op rather than churn.
 				if result.compiled_search == stanza['search']:
 					summary['unchanged'] += 1
 					continue
 
+				# Stash the human original + the new fingerprint FIRST, then overwrite the search.
+				# For a legacy alert the original lives only in the `| tenxsearch` body we are about
+				# to replace; writing metadata first means a failure of the search write cannot lose
+				# it. If the search write then fails, the alert simply stays as it was (still
+				# functional) and is safely re-examined on a later pass.
+				self.write_tenx_metadata(server_connection, user, name, result.original_search, result.compiled_search)
 				self.write_saved_search(server_connection, user, name, {'search': result.compiled_search})
-				self.write_original_search(server_connection, user, name, result.original_search)
 
 				summary['migrated' if is_legacy else 'recompiled'] += 1
 				summary['updated'].append(name)
@@ -318,13 +332,10 @@ class TenxAlertHandler(PersistentServerConnectionApplication):
 
 				data = tenx_alert_persist.build_saved_search_data(form, result)
 
+				# Write the saved search first (a create must exist before its stanza can take the
+				# conf-only metadata keys). If THIS fails, nothing was applied.
 				try:
 					write_result = self.write_saved_search(server_connection, user, name, data)
-
-					# The saved/searches EAI endpoint rejects unknown args, so the human original
-					# is stashed as a raw stanza key via configs/conf-savedsearches (the stanza
-					# exists now that write_saved_search has run).
-					self.write_original_search(server_connection, user, name, result.original_search)
 				except urllib.error.HTTPError as write_error:
 					# Splunk rejected the write (e.g. an incomplete alert spec). Surface its real
 					# status and message rather than collapsing it into an opaque 500 - the compile
@@ -338,8 +349,20 @@ class TenxAlertHandler(PersistentServerConnectionApplication):
 					return {'payload': decision.payload, 'status': write_error.code}
 
 				logger.info("Saved search {} - name={}".format(write_result, name))
-
 				decision.payload['saved_search'] = write_result
+
+				# The compiled alert is now live. Stash the human original + compiled fingerprint
+				# (conf-savedsearches, since the EAI endpoint rejects unknown args). If ONLY this
+				# fails, the alert is still applied - report it honestly rather than as applied=false,
+				# and warn that the recompile pass will not manage it until it is re-saved.
+				try:
+					self.write_tenx_metadata(
+						server_connection, user, name, result.original_search, result.compiled_search)
+				except urllib.error.HTTPError as meta_error:
+					detail = self._read_error_body(meta_error)
+					logger.warning("Metadata stash failed - name={} status={} detail={}".format(
+						name, meta_error.code, detail))
+					decision.payload['metadata_error'] = detail
 
 			return {'payload': decision.payload, 'status': decision.status}
 		except Exception as e:
