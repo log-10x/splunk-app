@@ -4,6 +4,8 @@
 
 Search and visualize [compact](https://doc.log10x.com/run/transform/#compact) events in Splunk with zero data loss. This open-source [Log10x](https://www.log10x.com/?utm_source=github&utm_medium=readme&utm_campaign=splunk-app&utm_content=hero) app transparently expands compact events at search time, maintaining full querying, dashboard, and alerting capabilities while reducing ingestion costs by over 50%.
 
+> **Blog:** [Search compact logs in Splunk using the 10x app](https://www.log10x.com/blog/cutting-splunk-log-storage/?utm_source=github&utm_medium=readme&utm_campaign=splunk-app&utm_content=blog). How Splunk stores fewer bytes and still returns the original log lines.
+
 To find optimization opportunities in your existing Splunk data, point the [Log10x MCP server](https://doc.log10x.com/apps/mcp/) at your Splunk backend with read-only credentials and ask it to run a cost POC. It pulls a representative sample via SPL, runs the 10x engine locally to rank message types, and returns a per-pattern cost and savings report with drop/compact/offload actions. Install with `claude mcp add --transport stdio --env LOG10X_API_KEY=your-api-key log10x -- npx -y log10x-mcp`.
 
 ## How It Works
