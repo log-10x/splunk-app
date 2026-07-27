@@ -1,6 +1,6 @@
 # 10x for Splunk
 
-[![License](https://img.shields.io/badge/License-Apache%202.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
+[![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
 Search and visualize [compact](https://doc.log10x.com/run/transform/#compact) events in Splunk with zero data loss. This open-source [Log10x](https://www.log10x.com/?utm_source=github&utm_medium=readme&utm_campaign=splunk-app&utm_content=hero) app transparently expands compact events at search time, maintaining full querying, dashboard, and alerting capabilities while reducing ingestion costs by over 50%.
 
@@ -152,7 +152,7 @@ For complete documentation including troubleshooting, advanced configuration, an
 
 ## License
 
-This repository is licensed under the [Apache License 2.0](LICENSE).
+This repository is licensed under the [MIT License](LICENSE).
 
 ### Important: Log10x Product License Required
 
@@ -160,7 +160,7 @@ This repository contains a Splunk app for expanding Log10x compact events. While
 
 | Component | License |
 |-----------|---------|
-| This repository (Splunk app) | Apache 2.0 (open source) |
+| This repository (Splunk app) | MIT (open source) |
 | Log10x Receiver | Commercial license required |
 
 **What this means:**
