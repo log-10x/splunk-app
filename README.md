@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-Search and visualize [compact](https://doc.log10x.com/run/transform/#compact) events in Splunk with zero data loss. This open-source [Log10x](https://www.log10x.com/?utm_source=github&utm_medium=readme&utm_campaign=splunk-app&utm_content=hero) app transparently expands compact events at search time, maintaining full querying, dashboard, and alerting capabilities while reducing ingestion costs by over 50%.
+Search and visualize [compact](https://doc.log10x.com/run/transform/#compact) events in Splunk with zero data loss. This open-source [Log10x](https://www.log10x.com/?utm_source=github&utm_medium=readme&utm_campaign=splunk-app&utm_content=hero) app transparently expands compact events at search time, maintaining full querying, dashboard, and alerting capabilities while reducing ingested volume, and with it the license bill.
 
 > **Blog:** [Search compact logs in Splunk using the 10x app](https://www.log10x.com/blog/cutting-splunk-log-storage/?utm_source=github&utm_medium=readme&utm_campaign=splunk-app&utm_content=blog). How Splunk stores fewer bytes and still returns the original log lines.
 
@@ -44,12 +44,12 @@ feeds this app. This is a whole-process setting, not a per-destination one: disa
 small amount of the modeled compression (roughly half a percentage point, measured on a realistic
 Kubernetes/OTel corpus), in exchange for correct expansion of every event.
 
-**If the same Receiver also feeds ClickHouse or Elasticsearch** in a fan-out topology, this
-setting applies to that traffic too. That is not a correctness problem for those destinations —
-the [clickhouse-app](https://github.com/log-10x/clickhouse-app) and
-[elasticsearch-plugin](https://github.com/log-10x/elasticsearch-plugin) decoders already handle
-back-references correctly — it just means they forgo the same small compression gain for as long
-as the Receiver instance they share with Splunk has this setting disabled.
+**If the same Receiver also feeds Elasticsearch** in a fan-out topology, this setting applies to
+that traffic too. That is not a correctness problem for Elasticsearch, because the
+[elasticsearch-plugin](https://github.com/log-10x/elasticsearch-plugin) decoder handles
+back-references correctly. It means only that the Elasticsearch traffic forgoes the same small
+compression gain for as long as the Receiver instance it shares with Splunk has this setting
+disabled.
 
 ## Quickstart
 
