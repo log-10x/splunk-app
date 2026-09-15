@@ -1,6 +1,6 @@
 # 10x for Splunk - Log10x Log Optimization App
 
-A Splunk app that enables search-time expansion of 10x compact log events. 10x replaces repetitive patterns with compact template hashes, achieving 50-80% storage reduction while maintaining full searchability.
+A Splunk app that enables search-time expansion of 10x compact log events. 10x replaces repetitive patterns with compact template hashes, cutting stored volume while maintaining full searchability.
 
 ## Table of Contents
 
