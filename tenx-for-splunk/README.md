@@ -635,7 +635,11 @@ index=tenx_encoded | stats min(_time) as earliest, max(_time) as latest
 
 ## License
 
-Copyright (c) Log10x. All rights reserved.
+This app is released under the [MIT License](../LICENSE). The bundled Splunk SDK
+for Python under `lib/splunklib` stays under its own Apache 2.0 license.
+
+Compacting events requires the Log10x Receiver, which is commercial. The app in
+this directory, which expands those events at search time, is not.
 
 ---
 
