@@ -44,6 +44,24 @@ feeds this app. This is a whole-process setting, not a per-destination one: disa
 small amount of the modeled compression (roughly half a percentage point, measured on a realistic
 Kubernetes/OTel corpus), in exchange for correct expansion of every event.
 
+### Timestamps
+
+**Set `timestampZone: UTC`** in the Receiver's pipeline configuration as well.
+
+A timestamp that carries no zone marker of its own, `2025-10-02 06:35:34,498`,
+is only a time once something decides which zone it was written in. The Receiver
+decides, and by default it uses the clock of the host it runs on. That choice is
+not recorded in the compact event, so this app cannot recover it: the same line
+compacted on a host in New York and on a host in UTC produces two different
+events, and nothing downstream can tell them apart.
+
+Pinning the Receiver to UTC makes that choice fixed and knowable, and this app's
+inflate macro renders in UTC to match. Without it, expansion returns a time
+shifted by the difference between the Receiver's host clock and UTC.
+
+Timestamps that do carry their own zone, anything ending in `Z` or an offset,
+are unaffected either way.
+
 **If the same Receiver also feeds Elasticsearch** in a fan-out topology, this setting applies to
 that traffic too. That is not a correctness problem for Elasticsearch, because the
 [elasticsearch-plugin](https://github.com/log-10x/elasticsearch-plugin) decoder handles
