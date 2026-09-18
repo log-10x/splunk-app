@@ -86,17 +86,29 @@ def check_config_read(splunk):
 	return 'GET tenx-config returned %d keys' % len(payload)
 
 
+def mark(splunk, sourcetype):
+	return splunk.call('tenx-config/sourcetype/' + sourcetype, data={'x': '1'}, method='POST')
+
+
+def unmark(splunk, sourcetype):
+	return splunk.call('tenx-config/sourcetype/' + sourcetype, method='DELETE')
+
+
+def is_marked(splunk, sourcetype):
+	_status, body = splunk.call('tenx-config')
+	return sourcetype in body
+
+
 def check_config_round_trip(splunk, sourcetype):
 	"""Mark a throwaway sourcetype as carrying compact events, then unmark it."""
-	status, body = splunk.call('tenx-config/' + sourcetype, data={'x': '1'}, method='POST')
+	status, body = mark(splunk, sourcetype)
 
 	if status not in (200, 201):
 		raise CheckFailed('POST tenx-config/%s returned %s: %s' % (sourcetype, status, body[:300]))
 
-	status, body = splunk.call('tenx-config')
-	marked = sourcetype in body
+	marked = is_marked(splunk, sourcetype)
 
-	status, delete_body = splunk.call('tenx-config/' + sourcetype, method='DELETE')
+	status, delete_body = unmark(splunk, sourcetype)
 
 	if status not in (200, 204):
 		raise CheckFailed('DELETE tenx-config/%s returned %s: %s'
@@ -105,9 +117,7 @@ def check_config_round_trip(splunk, sourcetype):
 	if not marked:
 		raise CheckFailed('a sourcetype marked through the endpoint did not appear in the config')
 
-	status, body = splunk.call('tenx-config')
-
-	if sourcetype in body:
+	if is_marked(splunk, sourcetype):
 		raise CheckFailed('a sourcetype unmarked through the endpoint is still in the config')
 
 	return 'POST and DELETE tenx-config round-tripped %s' % sourcetype
@@ -204,7 +214,7 @@ def check_static_assets(splunk, app_dir, web_url):
 	return '%d static assets referenced by the app all resolve' % len(referenced)
 
 
-def check_search_expands(splunk, index, term):
+def check_search_expands(splunk, index, term, sourcetype):
 	"""
 	The endpoint's whole job is to make a search written against the original text work on
 	compact events. So the same search is run twice: once through the endpoint and once as
@@ -213,6 +223,17 @@ def check_search_expands(splunk, index, term):
 	the term. Either half passing alone would not show the endpoint did anything.
 	"""
 	query = 'search index=%s %s' % (index, term)
+	restore = not is_marked(splunk, sourcetype)
+	mark(splunk, sourcetype)
+
+	try:
+		return _search_expands(splunk, query, term)
+	finally:
+		if restore:
+			unmark(splunk, sourcetype)
+
+
+def _search_expands(splunk, query, term):
 
 	status, body = splunk.call('%s/services/search/jobs' % splunk.url,
 	                           data={'search': query, 'earliest_time': '0',
@@ -311,6 +332,9 @@ def main():
 	parser.add_argument('--term', required=True,
 	                    help='a literal that appears in the original text and not in the '
 	                         'compact event, so expansion is what makes it findable')
+	parser.add_argument('--sourcetype', default='tenx_encoded',
+	                    help='the sourcetype carrying compact events; the search endpoint only '
+	                         'rewrites a search once this is marked in the app config')
 	parser.add_argument('--alert-name', default='tenx-live-endpoint-check')
 	parser.add_argument('--app-dir',
 	                    help='the app directory, to check that every /static/app path its own '
@@ -325,7 +349,8 @@ def main():
 		('config read', lambda: check_config_read(splunk)),
 		('config round trip', lambda: check_config_round_trip(splunk, 'tenx_live_check_st')),
 
-		('search expands', lambda: check_search_expands(splunk, args.index, args.term)),
+		('search expands', lambda: check_search_expands(splunk, args.index, args.term,
+		                                                args.sourcetype)),
 		('alert compiles', lambda: check_alert_compiles(splunk, args.index, args.term,
 		                                                args.alert_name)),
 	]
