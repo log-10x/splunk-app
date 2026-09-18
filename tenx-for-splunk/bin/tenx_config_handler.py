@@ -1,5 +1,3 @@
-from future import standard_library
-standard_library.install_aliases()
 
 import os
 import sys
@@ -17,8 +15,6 @@ sys.path.append(os.path.join(apphome, 'lib'))
 
 import tenx_util
 import tenx_consts
-
-from splunklib import six
 
 tenx_util.setup_logger('tenx_config_handler', logging.INFO)
 logger = logging.getLogger(__name__)
@@ -122,7 +118,7 @@ class TenxConfigHandler(PersistentServerConnectionApplication):
 
 		stanza = props_conf[name]
 
-		for key, value in six.iteritems(stanza.content):
+		for key, value in stanza.content.items():
 			if key == tenx_config.get(tenx_consts.TENX_EXTRACTION_NAME) and value:
 				message = "Already have tenx extraction defined for {} - {}.".format(logging_str, name)
 
@@ -169,7 +165,7 @@ class TenxConfigHandler(PersistentServerConnectionApplication):
 
 		stanza = props_conf[name]
 		
-		for key, value in six.iteritems(stanza.content):
+		for key, value in stanza.content.items():
 			if key == tenx_config.get(tenx_consts.TENX_EXTRACTION_NAME) and value:
 				logger.info("Going to delete tenx extraction in stanza for {} {} in props.conf.".format(logging_str, name))
 

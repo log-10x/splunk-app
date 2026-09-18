@@ -58,8 +58,6 @@ See Also
 - tenx_search_builder.py: Search resolution logic
 """
 
-from future import standard_library
-standard_library.install_aliases()
 
 import os
 import sys
