@@ -78,6 +78,20 @@ class TenxKVInterface:
 
 		self.KV_KEY = "_key"
 
+	def kv_key(self, record_key):
+		"""
+		The KV store key for a template hash.
+
+		Splunk's search-time field extraction trims surrounding whitespace from the
+		value it extracts, and the inflate macro looks the hash up with that value.
+		A hash the engine emits with a trailing space would be stored under one key
+		and looked up under another, and never match: on the E21 capture that was 43
+		of 2,986 hashes and every one of their 45 events came back unexpanded. Keying
+		on the trimmed hash stores it under the key the search will ask for. The
+		pattern_hash field in the record keeps the hash exactly as emitted.
+		"""
+		return record_key.strip()
+
 	def build_collection_url(self):
 		"""
 		Returns the base url for collection-wide based actions.
@@ -104,7 +118,7 @@ class TenxKVInterface:
 		Note that while trying to get a missing entry will throw an HTTPError, we don't treat it as an actual problem.
 		"""
 		try:
-			record_url = self.build_record_url(record_key)
+			record_url = self.build_record_url(self.kv_key(record_key))
 
 			return self.server_connection.get(record_url)
 		except urllib.error.HTTPError as e:
@@ -124,7 +138,7 @@ class TenxKVInterface:
 		"""
 		try:
 			collection_url = self.build_collection_url()
-			record = {self.KV_KEY: record_key}
+			record = {self.KV_KEY: self.kv_key(record_key)}
 			record.update(record_data)
 
 			self.server_connection.post(collection_url, json.dumps(record))

@@ -261,7 +261,15 @@ def update_kv_store(settings):
 				skipped_invalid += 1
 				continue
 
-			if kv_intf.get_entry(record_key):
+			existing = kv_intf.get_entry(record_key)
+			if existing:
+				# Two hashes that differ only by surrounding whitespace share a KV key,
+				# because search-time extraction cannot tell them apart either. The
+				# first one stored wins; say so, since the second one's events would
+				# then expand with the first one's template.
+				stored = existing.get(tenx_dml_builder.RECORD_PATTERN_HASH) if isinstance(existing, dict) else None
+				if stored is not None and stored != record_key:
+					logger.warning("KV key collision: {!r} is already stored and {!r} trims to the same key; the second is not stored.".format(stored, record_key))
 				logger.debug("Already has entry for {}, skipping.".format(record_key))
 				skipped_existing += 1
 				continue
