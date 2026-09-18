@@ -222,7 +222,10 @@ def check_search_expands(splunk, index, term, sourcetype):
 	in the compact event, and the endpoint's must find events whose expanded text carries
 	the term. Either half passing alone would not show the endpoint did anything.
 	"""
-	query = 'search index=%s %s' % (index, term)
+	# The sourcetype is named in the search, not only marked in the config. The endpoint
+	# rewrites on the sourcetype it can see in the search string, so a search that gives only
+	# an index is passed through untouched.
+	query = 'search index=%s sourcetype=%s %s' % (index, sourcetype, term)
 	restore = not is_marked(splunk, sourcetype)
 	mark(splunk, sourcetype)
 
