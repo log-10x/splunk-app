@@ -133,7 +133,7 @@ def convert_timestamp_segment(char, count):
 		return '%H'  # Note: Splunk always zero-pads
 
 	# Hour in am/pm (0-11): K or h
-	if char == 'K' or char == 'H':
+	if char == 'K' or char == 'h':
 		return '%I'  # Note: Splunk always zero-pads
 
 	# Minute in hour

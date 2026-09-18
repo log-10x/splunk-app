@@ -69,6 +69,17 @@ class TestConvertTimestampSegment:
 	def test_microseconds(self):
 		assert convert_timestamp_segment('S', 6) == '%6Q'
 
+	def test_hour_12_lowercase_h(self):
+		# Java: h is the 12-hour clock, K is the 0-11 variant. The branch read
+		# "K or H", and H had already been consumed by the 24-hour case above, so
+		# the 12-hour branch never fired and h fell through as unrecognised.
+		assert convert_timestamp_segment('h', 2) == '%I'
+		assert convert_timestamp_segment('K', 2) == '%I'
+
+	def test_hour_24_unaffected_by_the_12_hour_branch(self):
+		assert convert_timestamp_segment('H', 2) == '%H'
+		assert convert_timestamp_segment('k', 2) == '%H'
+
 	def test_timezone_abbreviated(self):
 		assert convert_timestamp_segment('z', 1) == '%Z'
 
@@ -154,6 +165,15 @@ class TestToSplunkTimeFormat:
 		# Java would reject this pattern. Here it degrades to a literal tail
 		# rather than failing the alert action that fills the KV store.
 		assert to_splunk_time_format("yyyy'T") == '%YT'
+
+
+
+class TestTwelveHourPatterns:
+	"""The engine ships 12-hour patterns; they have to survive conversion."""
+
+	def test_us_style_12_hour_with_meridiem(self):
+		# "MMM dd, yyyy h:mm:ss a" is in the engine's shipped pattern list.
+		assert to_splunk_time_format('MMM dd, yyyy h:mm:ss a') == '%b %d, %Y %I:%M:%S %p'
 
 
 class TestTenxDMLBuilder:
