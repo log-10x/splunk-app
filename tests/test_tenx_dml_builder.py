@@ -117,11 +117,43 @@ class TestToSplunkTimeFormat:
 		result = to_splunk_time_format('yyyy%MM%dd')
 		assert result == '%Y%%%m%%%d'
 
-	def test_quoted_literals_simplified(self):
-		# Single quotes are just passed through (not alpha)
-		result = to_splunk_time_format("yyyy-MM-dd'T'HH:mm:ss")
-		# The 'T' becomes just T (alpha T is unrecognized, kept as-is)
-		assert 'T' in result
+	def test_quoted_literal_is_emitted_without_its_quotes(self):
+		# Java single quotes delimit literal text. The letter inside is not a
+		# pattern letter and the quotes themselves do not reach strftime.
+		assert to_splunk_time_format("yyyy-MM-dd'T'HH:mm:ss") == '%Y-%m-%dT%H:%M:%S'
+
+	def test_iso8601_with_quoted_zulu(self):
+		# The module docstring's own example, and the pattern the E21 Splunk
+		# licence run found stored as %Y-%m-%d'T'%H:%M:%S.%3Q'%z'. That form
+		# rendered 2025-10-02T06:35:34.470Z as 2025-10-02'T'06:35:34.470'+0000',
+		# with the quotes in the output and the literal Z turned into an offset.
+		assert to_splunk_time_format("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'") == '%Y-%m-%dT%H:%M:%S.%3QZ'
+
+	def test_iso8601_with_nine_fraction_digits(self):
+		# The most common stored form in that run carried nine fraction digits.
+		assert to_splunk_time_format("yyyy-MM-dd'T'HH:mm:ss.SSSSSSSSS'Z'") == '%Y-%m-%dT%H:%M:%S.%9QZ'
+
+	def test_quoted_pattern_letter_is_not_converted(self):
+		# A quoted letter that would otherwise be a pattern letter stays literal.
+		assert to_splunk_time_format("'y'yyyy") == 'y%Y'
+		assert to_splunk_time_format("HH'H'") == '%HH'
+
+	def test_unquoted_zulu_is_still_an_offset(self):
+		# Only quoting changes. A bare Z is still the RFC 822 offset it always was.
+		assert to_splunk_time_format("yyyy-MM-dd HH:mm:ss Z") == '%Y-%m-%d %H:%M:%S %z'
+
+	def test_doubled_quote_is_a_literal_quote(self):
+		# Java: '' is a single quote, inside or outside a quoted section.
+		assert to_splunk_time_format("HH 'o''clock' a") == "%H o'clock %p"
+		assert to_splunk_time_format("HH''mm") == "%H'%M"
+
+	def test_percent_inside_quoted_literal_is_still_escaped(self):
+		assert to_splunk_time_format("yyyy'%'MM") == '%Y%%%m'
+
+	def test_unterminated_quote_is_literal_to_the_end(self):
+		# Java would reject this pattern. Here it degrades to a literal tail
+		# rather than failing the alert action that fills the KV store.
+		assert to_splunk_time_format("yyyy'T") == '%YT'
 
 
 class TestTenxDMLBuilder:
@@ -167,6 +199,17 @@ class TestTenxDMLBuilder:
 		assert '__TENX_TS__' in result[RECORD_PATTERN_TERMINATOR] or any(
 			'__TENX_TS__' in part for part in result[RECORD_PATTERN_PARTS]
 		)
+
+	def test_build_kv_record_iso8601_quoted_timestamp(self, builder):
+		# End to end through the template parser: the quoted T and Z survive the
+		# $(...) extraction and come out of the record as plain characters.
+		result = builder.build_kv_record_data(
+			'hash_iso',
+			"$(yyyy-MM-dd'T'HH:mm:ss.SSS'Z')\tinfo\tTraces\t$"
+		)
+
+		assert result[RECORD_TIMESTAMP_FORMAT] == '%Y-%m-%dT%H:%M:%S.%3QZ'
+		assert "'" not in result[RECORD_TIMESTAMP_FORMAT]
 
 	def test_build_kv_record_pattern_starts_with_text(self, builder):
 		result = builder.build_kv_record_data('hash3', 'Starting text $ middle $ end')

@@ -32,6 +32,9 @@ Java SimpleDateFormat patterns are converted to Splunk strftime format:
 - ss -> %S (second)
 - SSS -> %3Q (milliseconds)
 - Z -> %z (timezone)
+- 'text' -> text (Java single-quoted literals are emitted as they are, so the
+  'T' and 'Z' in an ISO-8601 pattern come through as T and Z, not as pattern
+  letters); '' -> a literal single quote
 
 Usage
 -----
@@ -165,6 +168,19 @@ def convert_timestamp_segment(char, count):
 def to_splunk_time_format(s):
 	"""
 	Returns a Splunk strftime compatible time format string.
+
+	Java SimpleDateFormat quoting is honoured: text between single quotes is
+	literal and is emitted as it is rather than converted, and '' is a literal
+	single quote. So yyyy-MM-dd'T'HH:mm:ss.SSS'Z' becomes %Y-%m-%dT%H:%M:%S.%3QZ,
+	with the T and the Z carried through as the characters they are. Without
+	this the quotes were passed through and the letters inside them converted,
+	so 'Z' came out as '%z' and rendered as a quoted numeric offset in the
+	viewer's timezone instead of the Z that was in the event.
+
+	An unterminated quote is treated as literal to the end of the pattern. Java
+	rejects such a pattern outright; this runs inside an alert action, where a
+	template that reaches the KV store with a literal tail beats one that never
+	reaches it at all.
 	"""
 	if not s:
 		return ""
@@ -178,12 +194,10 @@ def to_splunk_time_format(s):
 	result = ''
 	current_alpha = ''
 	current_alpha_count = 0
+	in_quote = False
 
-	for char in s:
-		if char == current_alpha:
-			current_alpha_count += 1
-			continue
-
+	def flush_alpha():
+		nonlocal result, current_alpha, current_alpha_count
 		if current_alpha_count > 0:
 			segment = convert_timestamp_segment(current_alpha, current_alpha_count)
 			# Handle unrecognized timestamp characters - keep them as-is
@@ -191,19 +205,45 @@ def to_splunk_time_format(s):
 			current_alpha = ''
 			current_alpha_count = 0
 
+	i = 0
+	while i < len(s):
+		char = s[i]
+
+		if char == "'":
+			# '' is a literal single quote whether or not a quoted section is open
+			if i + 1 < len(s) and s[i + 1] == "'":
+				flush_alpha()
+				result += "'"
+				i += 2
+				continue
+			flush_alpha()
+			in_quote = not in_quote
+			i += 1
+			continue
+
+		if in_quote:
+			# Literal text: nothing converts, but % still has to be escaped for strftime
+			result += '%%' if char == '%' else char
+			i += 1
+			continue
+
+		if char == current_alpha:
+			current_alpha_count += 1
+			i += 1
+			continue
+
+		flush_alpha()
+
 		if char.isalpha():
 			current_alpha = char
 			current_alpha_count = 1
-			continue
-
-		if char == '%':
+		elif char == '%':
 			result += '%%'  # Splunk strftime timestamp parts with %, so for actual % we need to use %%
 		else:
 			result += char
+		i += 1
 
-	if current_alpha_count > 0:
-		segment = convert_timestamp_segment(current_alpha, current_alpha_count)
-		result += segment if segment is not None else (current_alpha * current_alpha_count)
+	flush_alpha()
 
 	return result
 
