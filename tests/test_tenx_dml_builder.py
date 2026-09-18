@@ -19,7 +19,8 @@ from tenx_dml_builder import (
 	RECORD_PATTERN_PARTS,
 	RECORD_PART_0,
 	RECORD_PATTERN_TERMINATOR,
-	RECORD_TIMESTAMP_FORMAT
+	RECORD_TIMESTAMP_FORMAT,
+	RECORD_EXPAND_UNSAFE
 )
 
 
@@ -402,3 +403,57 @@ class TestTenxDMLBuilderCustomConfig:
 
 		# The result should have the escaped $ preserved
 		assert result[RECORD_PATTERN] == 'Price is \\$100 for $'
+
+
+class TestExpandUnsafeDetection:
+	"""
+	A pattern this app cannot reconstruct is marked rather than expanded wrongly.
+
+	Both causes are prevented at the Receiver, by varMaxRecurIndexes: 0 and maxPerObject: 1,
+	so a correctly configured deployment marks nothing. These tests are the falsifier for
+	that claim: they pin what counts as unsafe and, just as importantly, what does not.
+	"""
+
+	@pytest.fixture
+	def builder(self):
+		return TenxDMLBuilder(
+			timestamp_placeholder='__TENX_TS__',
+			variable_separator='$'
+		)
+
+	def test_plain_variable_is_safe(self, builder):
+		assert builder.scan_expand_unsafe('pod-$-$ started') == ''
+
+	def test_single_timestamp_is_safe(self, builder):
+		assert builder.scan_expand_unsafe('$(yyyy-MM-dd HH:mm:ss) INFO $') == ''
+
+	def test_dollar_zero_paren_is_the_escape_not_a_back_reference(self, builder):
+		# "$0(" is a plain variable followed by a literal "(", not an offset.
+		assert builder.scan_expand_unsafe('method $0(arg) called') == ''
+
+	def test_back_reference_is_unsafe(self, builder):
+		assert builder.scan_expand_unsafe('[KAFKA_PORT_$_TCP_PORT, $1]') == 'back-reference'
+
+	def test_every_back_reference_offset_is_caught(self, builder):
+		for digit in '123456789':
+			assert builder.scan_expand_unsafe('a $ b $%s' % digit) == 'back-reference'
+
+	def test_escaped_dollar_before_a_digit_is_literal_text(self, builder):
+		# A price in the log line is escaped by the engine, so it is not an offset.
+		assert builder.scan_expand_unsafe('price was /$5 today') == ''
+
+	def test_two_timestamps_are_unsafe(self, builder):
+		pattern = '[$(yyyy-MM-dd HH:mm:ss,SSS)] INFO Kafka startTimeMs: $(+%s)'
+		assert builder.scan_expand_unsafe(pattern) == 'multiple-timestamps'
+
+	def test_both_reasons_are_reported(self, builder):
+		pattern = '$(yyyy) $1 $(HH)'
+		assert builder.scan_expand_unsafe(pattern) == 'back-reference,multiple-timestamps'
+
+	def test_record_carries_the_reason(self, builder):
+		record = builder.build_kv_record_data('hash1', '[PORT_$_TCP, $1]')
+		assert record[RECORD_EXPAND_UNSAFE] == 'back-reference'
+
+	def test_record_is_empty_for_a_safe_pattern(self, builder):
+		record = builder.build_kv_record_data('hash2', 'pod-$ started')
+		assert record[RECORD_EXPAND_UNSAFE] == ''

@@ -8,7 +8,7 @@
 #
 
 []
-access = read : [ * ], write : [ admin, power ]
+access = read : [ * ], write : [ admin, sc_admin, power ]
 
 ### EVENT TYPES
 
@@ -41,15 +41,15 @@ access = read : [ * ], write : [ * ]
 export = system
 
 [macros/tenx-inflate]
-access = read : [ * ], write : [ admin, power ]
+access = read : [ * ], write : [ admin, sc_admin, power ]
 export = system
 
 [macros/tenx-inflate-debug]
-access = read : [ * ], write : [ admin, power ]
+access = read : [ * ], write : [ admin, sc_admin, power ]
 export = system
 
 [macros/tenx-message%281%29]
-access = read : [ * ], write : [ admin, power ]
+access = read : [ * ], write : [ admin, sc_admin, power ]
 export = system
 
 [collections/tenx_dml]
