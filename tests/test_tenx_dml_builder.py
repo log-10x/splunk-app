@@ -188,15 +188,15 @@ class TestTenxDMLBuilder:
 
 	def test_build_pure_dml_line_simple(self, builder):
 		result = builder.build_pure_dml_line('abc123', '$INFO User $ logged in')
-		assert result == 'abc123 INFO User  logged in'
+		assert result == 'abc123\tINFO User  logged in'
 
 	def test_build_pure_dml_line_no_variables(self, builder):
 		result = builder.build_pure_dml_line('xyz', 'Static message')
-		assert result == 'xyz Static message'
+		assert result == 'xyz\tStatic message'
 
 	def test_build_pure_dml_line_newlines_removed(self, builder):
 		result = builder.build_pure_dml_line('key', 'Line1\nLine2\r\nLine3')
-		assert result == 'key Line1 Line2 Line3'
+		assert result == 'key\tLine1 Line2 Line3'
 
 	def test_build_kv_record_simple_pattern(self, builder):
 		result = builder.build_kv_record_data('hash1', '$INFO User $ logged in')
@@ -322,7 +322,7 @@ class TestDollarZeroEscape:
 	def test_pure_dml_line_strips_the_escape_digit_too(self, builder):
 		result = builder.build_pure_dml_line('h1', 'status$0(pending)')
 
-		assert result == 'h1 status(pending)'
+		assert result == 'h1\tstatus(pending)'
 
 	def test_pure_dml_line_leaves_an_escaped_dollar_zero_alone(self, builder):
 		# an escaped "$" immediately followed by literal "0(" is real source text, not the
@@ -336,7 +336,7 @@ class TestDollarZeroEscape:
 
 		result = escaped_builder.build_pure_dml_line('h1', 'a/$0(b)c')
 
-		assert result == 'h1 a/0(b)c'
+		assert result == 'h1\ta/0(b)c'
 
 	def test_pure_dml_line_dollar_zero_still_collapses_after_an_escaped_dollar(self, builder):
 		# a genuine (unescaped) $0( elsewhere in the same pattern must still collapse, even
@@ -349,7 +349,7 @@ class TestDollarZeroEscape:
 
 		result = escaped_builder.build_pure_dml_line('h1', '/$100 then status$0(pending)')
 
-		assert result == 'h1 /100 then status(pending)'
+		assert result == 'h1\t/100 then status(pending)'
 
 	def test_multiple_dollar_zero_escapes_in_one_pattern(self, builder):
 		result = builder.build_kv_record_data('h5', 'a$0(b)c$0(d)e')
@@ -389,7 +389,7 @@ class TestTenxDMLBuilderCustomConfig:
 		result = builder.build_pure_dml_line('key', '@INFO User @ logged in')
 
 		# @ should be removed like $ normally is
-		assert result == 'key INFO User  logged in'
+		assert result == 'key\tINFO User  logged in'
 
 	def test_custom_escape_character(self):
 		builder = TenxDMLBuilder(
@@ -402,3 +402,46 @@ class TestTenxDMLBuilderCustomConfig:
 
 		# The result should have the escaped $ preserved
 		assert result[RECORD_PATTERN] == 'Price is \\$100 for $'
+
+
+class TestPureDmlLineDelimiter:
+	"""
+	The pure line is how a search term becomes a template hash, so where the hash ends has to
+	be unambiguous. A template hash is not identifier-shaped: on the E21 capture the 2,991
+	hashes used 85 distinct printable characters and 345 of them contained a space. A space
+	delimiter cannot mark the end of a hash that contains spaces, and the extraction that read
+	one resolved almost nothing.
+	"""
+
+	@pytest.fixture
+	def builder(self):
+		return TenxDMLBuilder(
+			timestamp_placeholder='__TENX_TS__',
+			variable_separator='$'
+		)
+
+	def test_delimiter_is_a_tab(self, builder):
+		line = builder.build_pure_dml_line('abc', 'some text')
+
+		assert line.split('\t', 1)[0] == 'abc'
+
+	def test_a_hash_full_of_punctuation_survives(self, builder):
+		# Taken from the E21 capture, where hashes like this are the common case.
+		awkward = '-C}eem@/@?F'
+		line = builder.build_pure_dml_line(awkward, 'INFO started')
+
+		assert line.split('\t', 1)[0] == awkward
+
+	def test_a_hash_containing_a_space_survives(self, builder):
+		# 345 of 2,991 hashes on that capture contain one. This is the case a space
+		# delimiter cannot represent at all.
+		spaced = 'ab cd ef'
+		line = builder.build_pure_dml_line(spaced, 'INFO started')
+
+		assert line.split('\t', 1)[0] == spaced
+
+	def test_the_template_never_introduces_a_tab(self, builder):
+		# The extraction reads to the first tab, so exactly one may appear in the line.
+		line = builder.build_pure_dml_line('h', 'Line1\nLine2\r\nLine3')
+
+		assert line.count('\t') == 1
