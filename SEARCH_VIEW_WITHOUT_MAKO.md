@@ -2,6 +2,8 @@
 
 Design note, 2026-09-19. What the app's search tab is built on, what Splunk is
 removing, what can replace it, and what was measured on live Splunk to choose.
+Every measurement below was taken with `tests/live_render.js` against Splunk
+9.4.15 and 10.4.3 stood up by the E21 benchmark harness.
 
 ## Why this exists
 
@@ -211,8 +213,20 @@ hook installed on 9.4.15 in the first render of the night. The replacement
 works on the floor of the supported range and in the future past the removal,
 from one file.
 
-TO FILL: the search typed through the form, on 9.4 and on 10.4 with the switch
-on, after the readiness fix.
+**The search works, with the switch on.** On Splunk 10.4.3 with
+`deactivate_custom_mako_templates = true`, the dashboard installed, 8,487
+compact events and their 2,991 templates loaded and the KV store backfilled,
+the check typed `index=tenx_enc sourcetype=tenx_encoded ProducerStateManager`
+into the form and submitted it, twice. Both times: dashboard body present,
+hook installed by the behavioural probe, the page's one job POST going to
+`.../tenx-for-splunk/tenx-search`, and the term appearing forty times in the
+rendered events panel, which is twenty events per page carrying it twice each.
+That term is only in the original lines; the compact events do not contain it.
+Without the hook fix the same search returned nothing on 9.4.15 and 10.4.3.
+
+The four failed responses on those renders are Splunk's own, two to
+`conf-limits/structured_data_service` and one to `server/scs/tenantinfo`, and
+appear on every page of this instance.
 
 ## The decision
 
