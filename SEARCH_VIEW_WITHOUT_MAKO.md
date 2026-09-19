@@ -230,6 +230,14 @@ appear on every page of this instance.
 
 ## The decision
 
+**Withdrawn on 2026-09-19, before merge.** The dashboard below was chosen
+against a tab measured as blank. The product requirement, stated once this was
+read, is that Splunk's own search experience keeps working on compact data, as
+the Mako page provided when it worked. A form on a dashboard does not meet
+that, and the hook fix has moved to its own pull request, #22, so it can ship
+without this question. Everything measured below still stands; what follows
+is the candidate that was chosen and why, kept as the record.
+
 **The 10x Search tab becomes a classic dashboard, and the app ships no
 template of any kind.** Candidate B.
 
