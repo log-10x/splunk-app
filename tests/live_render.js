@@ -62,8 +62,18 @@ const [view, out, term] = process.argv.slice(2);
       searchTitle: text('.search-title'),
       dashboardBody: !!q('.dashboard-body'),
       applicationJsLoaded: !!window.__tenx_application_js_loaded,
-      hookInstalled: !!(window.$ && window.$.ajaxSettings && typeof window.$.ajaxSettings.beforeSend === 'function'
-                        && String(window.$.ajaxSettings.beforeSend).indexOf('tenx-search') !== -1),
+      // Behavioural probe: hand the installed beforeSend a fake POST to /search/jobs
+      // and see whether it rewrites the URL to /tenx-search. Source inspection cannot
+      // tell, because the handler names the endpoint through a variable.
+      hookInstalled: (() => { try {
+        const bs = window.$ && window.$.ajaxSettings && window.$.ajaxSettings.beforeSend;
+        if (typeof bs !== 'function') return false;
+        // Both the pre-9 path and the v2 path Splunk 9 and later actually use.
+        const s1 = { type: 'POST', url: '/en-US/splunkd/__raw/servicesNS/admin/tenx-for-splunk/search/jobs' };
+        const s2 = { type: 'POST', url: '/en-US/splunkd/__raw/servicesNS/admin/tenx-for-splunk/search/v2/jobs' };
+        bs({ setRequestHeader() {} }, s1); bs({ setRequestHeader() {} }, s2);
+        return /\/tenx-search$/.test(s1.url) && /\/tenx-search$/.test(s2.url);
+      } catch (e) { return false; } })(),
       someBeforeSend: !!(window.$ && window.$.ajaxSettings && typeof window.$.ajaxSettings.beforeSend === 'function'),
       appBar: !!(q('#placeholder-app-bar') || q('.app-bar') || q('[data-role="app-nav"]')),
       h1: text('h1') || text('h2'),
@@ -108,7 +118,7 @@ const [view, out, term] = process.argv.slice(2);
 
   console.log(JSON.stringify({
     view, url, signals, searchResult,
-    searchJobsPostedTo: posted.filter(u => /search\/jobs|tenx-search/.test(u)).map(u => u.replace(BASE, '')).slice(0, 6),
+    searchJobsPostedTo: posted.filter(u => /search\/(v2\/)?jobs|tenx-search/.test(u)).map(u => u.replace(BASE, '')).slice(0, 6),
     consoleErrors: consoleErrors.slice(0, 5),
     failedResponses: failed.slice(0, 8),
     allPosts: posted.map(u => u.replace(BASE, '').slice(0, 100)).slice(0, 10),
