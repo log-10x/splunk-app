@@ -205,6 +205,7 @@ For complete documentation including troubleshooting, advanced configuration, an
 
 - [10x for Splunk Documentation](https://doc.log10x.com/apps/receiver/compact/splunk/)
 - [Save-time alert compilation](SAVE_TIME_ALERTS.md): how scheduled alerts on compact data are compiled and kept current
+- [The search view without Mako](SEARCH_VIEW_WITHOUT_MAKO.md): why the 10x Search tab is a classic dashboard, what Splunk deprecated, and what was measured to choose
 - [Receiver Documentation](https://doc.log10x.com/apps/receiver/)
 - [Log10x Documentation](https://doc.log10x.com/)
 
