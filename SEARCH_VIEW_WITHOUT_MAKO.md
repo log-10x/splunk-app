@@ -231,9 +231,8 @@ the next one to be invented would be the next one to be deprecated.
 
 For someone who wants Splunk's own search page with expansion, the answer is the
 one that needs no page at all: `| tenxsearch searchstring="..."` in any search
-bar on any version, Studio included. It is slower than the endpoint, which is
-why the tab exists, and it is the path that outlives every UI decision Splunk
-makes.
+bar on any version, Studio included. Slower than the endpoint, which is why
+the tab exists, and the path that outlives every UI decision Splunk makes.
 
 ## What "support for both" means here
 
@@ -273,9 +272,9 @@ Branch `fix/search-view-without-mako`, five files and two deletions.
   search input defaulting to the compact index, a time picker, a notice panel
   and an events panel. Same view name, so the nav entry and the default-search
   marker are untouched and the tab's URL does not change.
-- `appserver/static/tenx_search_view.js` is the dashboard's script. It does not
-  install the hook, because `dashboard.js` already has; it runs the
-  configuration check against the notice panel.
+- `appserver/static/tenx_search_view.js` is the dashboard's script. Rather than
+  install the hook, which `dashboard.js` already has, it runs the configuration
+  check against the notice panel.
 - `javascript/views/tenx_search_page.js`: `checkConfig` takes a target
   selector, since a dashboard has no `.search-title` to append to.
 - `appserver/static/pages/tenx_template_slim.html` and
@@ -284,7 +283,7 @@ Branch `fix/search-view-without-mako`, five files and two deletions.
 - `dashboard.js`'s comment, which named the template as the example of a page
   that loads the hook by hand, now says there is no such page.
 - `tests/live_render.js`, a browser render of any view, reporting the signals
-  that decide whether a page is alive. It is the check that would have caught
+  that decide whether a page is alive, and the check that would have caught
   the blank tab on the day it shipped.
 
 Nothing in `bin/` changes. The REST handlers, the KV alert, the generating
