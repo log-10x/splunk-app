@@ -94,6 +94,21 @@ do not expand, not events that expand to the wrong text. The zone setting is the
 Receiver on a non-UTC clock cannot be detected from the data, which is why it is pinned rather
 than checked.
 
+### Event time on compact events
+
+A compact event's `_time` is the time Splunk indexed it, not the time in the original log
+line. Measured on Splunk 10.4.3: `_time` equals `_indextime` for every event in the
+compact index.
+
+This matters when you search by time range. A search over the last hour selects events
+that arrived in the last hour, and the lines they expand to may carry any timestamp. The
+original time is still there, as an epoch in the event's first variable, and the expanded
+text shows it; it is simply not what Splunk sorts and filters on.
+
+Making `_time` the original event time is possible but is not a setting, because not every
+template carries a timestamp slot and those that do vary between millisecond and
+nanosecond precision, which one `TIME_FORMAT` cannot express.
+
 ## Quickstart
 
 ### Prerequisites
