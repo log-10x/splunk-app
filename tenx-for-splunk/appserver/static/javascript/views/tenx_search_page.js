@@ -5,11 +5,13 @@ define(function(require, exports, module) {
 
 	const APP_NAME = 'tenx-for-splunk';
 
-	var displayConfigWarning = function() {
-		$(".search-title").append('<h2 style="color:red;">Warning, no tenx source/sourcetype defined. See documentation on how to add one</h2>')
+	// target: a selector for where the warning goes. The Mako page appended it to
+	// Splunk's own .search-title; a dashboard has no such element, so it names one.
+	var displayConfigWarning = function(target) {
+		$(target || ".search-title").append('<h2 style="color:red;">Warning, no tenx source/sourcetype defined. See documentation on how to add one</h2>')
 	}
 
-	var checkConfig = function() {
+	var checkConfig = function(target) {
 		var namespace = {
 			app: APP_NAME,
 			sharing: "app",
@@ -34,7 +36,7 @@ define(function(require, exports, module) {
 			if ((tenxConfig.tenx_source_types.length == 0) &&
 				(tenxConfig.tenx_sources.length == 0)) {
 
-				displayConfigWarning();
+				displayConfigWarning(target);
 			}
 		});
 	};

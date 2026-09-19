@@ -10,19 +10,32 @@ define(function(require, exports, module) {
 
 	var execute = function(restartSearchManagers) {
 		const originalSearchType = "POST";
-		const originalSearchPath = "/search/jobs";
+		// Splunk 9 and later create search jobs at /search/v2/jobs; older Splunk Web used
+		// /search/jobs. The hook matched only the old path, so on every dashboard of every
+		// version this app supports it installed and never fired: jobs went to Splunk
+		// unrewritten and searches on compact events returned compact events. Found by
+		// reading the browser's POST list on 9.4.15 and 10.4.3, not by any test that
+		// runs without a browser.
+		const originalSearchPaths = ["/search/v2/jobs", "/search/jobs"];
 
 		const newSearchPath = "/tenx-search";
 
 		$.ajaxSetup({
 			beforeSend: function (xhr, settings) {
-				if ((settings.type == originalSearchType) &&
-					(settings.url.endsWith(originalSearchPath))) {
+				if (settings.type != originalSearchType) {
+					return;
+				}
 
-					// Remove the original search path, and add our own instead.
-					//
-					var baseUrl = settings.url.substring(0, settings.url.length - originalSearchPath.length);
-					settings.url = baseUrl + newSearchPath;
+				for (var i = 0; i < originalSearchPaths.length; i++) {
+					var path = originalSearchPaths[i];
+
+					if (settings.url.endsWith(path)) {
+						// Remove the original search path, and add our own instead.
+						//
+						var baseUrl = settings.url.substring(0, settings.url.length - path.length);
+						settings.url = baseUrl + newSearchPath;
+						return;
+					}
 				}
 			}
 		});
