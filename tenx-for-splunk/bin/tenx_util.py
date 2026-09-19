@@ -88,6 +88,19 @@ def get_app_service(server_uri, token):
 SPLUNK_SOURCE_PREFIX = 'source::'
 
 
+def _unique(names):
+	"""The names in the order first seen, without repeats."""
+	seen = set()
+	result = []
+
+	for name in names:
+		if name not in seen:
+			seen.add(name)
+			result.append(name)
+
+	return result
+
+
 def get_tenx_config(service=None, server_uri=None, token=None):
 	"""
 	Builds the config needed by 10x to work, from the tenx_config.conf and props.conf files.
@@ -109,10 +122,18 @@ def get_tenx_config(service=None, server_uri=None, token=None):
 
 		result = {}
 
-		for key in tenx_consts.DEFAULT_CONFIG.keys():
-			result[key] = config_stanza.get(key, tenx_consts.DEFAULT_CONFIG.get(key))
+		for key, default in tenx_consts.DEFAULT_CONFIG.items():
+			value = config_stanza.get(key, default)
+
+			# A copy, not the default object itself. Two of these defaults are lists and both
+			# are filled in by appending below. Handing out the module-level list meant every
+			# call appended to the same one for the life of the process, and a persistent REST
+			# handler is one process: the sourcetype list grew by an entry per call without
+			# bound, and went on naming sourcetypes whose props stanza had since been deleted.
+			result[key] = list(value) if isinstance(value, list) else value
 
 		props_conf = service.confs['props']
+		sources, source_types = [], []
 
 		for stanza in props_conf:
 			for key, value in stanza.content.items():
@@ -120,17 +141,25 @@ def get_tenx_config(service=None, server_uri=None, token=None):
 					# The stanza name is the name of the source/sourcetype
 					#
 					if stanza.name.startswith(SPLUNK_SOURCE_PREFIX):
-						result['tenx_sources'].append(stanza.name[len(SPLUNK_SOURCE_PREFIX):])
+						sources.append(stanza.name[len(SPLUNK_SOURCE_PREFIX):])
 					else:
 						# TODO - check this is actually a sourcetype
 						#
-						result['tenx_source_types'].append(stanza.name)
+						source_types.append(stanza.name)
+
+		# One entry per name, in the order first seen. props_conf returns a stanza once per
+		# configuration layer that defines it, and that is still one sourcetype.
+		result['tenx_sources'] = _unique(sources)
+		result['tenx_source_types'] = _unique(source_types)
 
 		return result
 
 	except Exception as e:
 		logger.warning("Unexpected error getting tenx config - {}".format(e), exc_info=1)
-		return tenx_consts.DEFAULT_CONFIG
+		# A copy here too: returning the module-level dict lets a caller's edit become
+		# everyone's default for the life of the process.
+		return {k: list(v) if isinstance(v, list) else v
+		        for k, v in tenx_consts.DEFAULT_CONFIG.items()}
 
 
 def splunk_home():
