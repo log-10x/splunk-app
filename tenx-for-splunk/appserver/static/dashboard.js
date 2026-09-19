@@ -14,12 +14,12 @@ How it works:
 
 Alternatively, the code can be added independently to any dashboard it's required in.
 
-Note that if there are non-dashboard pages in an app which still require 10x search capabilities,
-they also need to have the 'tenx_search_hook.js' include and 'TenxSearchHook.execute' call to be done
-manually in their code.
-
-An example of this is the way the '10x Search' tab works in the 10x app, which is defined by the
-following files: search.xml, tenx_template_slim.html, and tenx_search.js
+Every page this app ships is a dashboard, including the '10x Search' tab (search.xml, a classic
+form), so this file is the only place the hook is installed. It used to be loaded by hand on that
+tab from a Mako template; Splunk 10.4 deprecates app-shipped Mako templates, and the by-hand
+include was where the tab's 404 lived, so the tab became a dashboard and inherits the hook from
+here like the others. A non-dashboard page would have to load 'tenx_search_hook.js' and call
+'TenxSearchHook.execute' itself, and there is no supported way left to ship one.
 */
 require([
 	"/static/app/tenx-for-splunk/javascript/search/tenx_search_hook.js",
