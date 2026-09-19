@@ -1,4 +1,4 @@
-# Copyright © 2011-2026 Splunk, Inc.
+# Copyright © 2011-2024 Splunk, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"): you may
 # not use this file except in compliance with the License. You may obtain
@@ -12,9 +12,9 @@
 # License for the specific language governing permissions and limitations
 # under the License.
 
+from abc import ABCMeta, abstractmethod
 import sys
 import xml.etree.ElementTree as ET
-from abc import ABCMeta, abstractmethod
 from urllib.parse import urlsplit
 
 from ..client import Service
@@ -35,8 +35,7 @@ class Script(metaclass=ABCMeta):
     """
 
     def __init__(self):
-        self._server_uri = None
-        self._session_key = None
+        self._input_definition = None
         self._service = None
 
     def run(self, args):
@@ -64,10 +63,8 @@ class Script(metaclass=ABCMeta):
                 # This script is running as an input. Input definitions will be
                 # passed on stdin as XML, and the script will write events on
                 # stdout and log entries on stderr.
-                input_definition = InputDefinition.parse(input_stream)
-                self._server_uri = input_definition.metadata["server_uri"]
-                self._session_key = input_definition.metadata["session_key"]
-                self.stream_events(input_definition, event_writer)
+                self._input_definition = InputDefinition.parse(input_stream)
+                self.stream_events(self._input_definition, event_writer)
                 event_writer.close()
                 return 0
 
@@ -86,8 +83,6 @@ class Script(metaclass=ABCMeta):
 
             if args[1].lower() == "--validate-arguments":
                 validation_definition = ValidationDefinition.parse(input_stream)
-                self._server_uri = validation_definition.metadata["server_uri"]
-                self._session_key = validation_definition.metadata["session_key"]
                 try:
                     self.validate_input(validation_definition)
                     return 0
@@ -124,16 +119,19 @@ class Script(metaclass=ABCMeta):
         if self._service is not None:
             return self._service
 
-        if self._server_uri is None and self._session_key is None:
+        if self._input_definition is None:
             return None
 
-        splunkd = urlsplit(self._server_uri, allow_fragments=False)
+        splunkd_uri = self._input_definition.metadata["server_uri"]
+        session_key = self._input_definition.metadata["session_key"]
+
+        splunkd = urlsplit(splunkd_uri, allow_fragments=False)
 
         self._service = Service(
             scheme=splunkd.scheme,
             host=splunkd.hostname,
             port=splunkd.port,
-            token=self._session_key,
+            token=session_key,
         )
 
         return self._service
