@@ -64,8 +64,6 @@ See Also
 - SAVE_TIME_ALERTS.md:     the wiring plan.
 """
 
-from future import standard_library
-standard_library.install_aliases()
 
 import os
 import sys

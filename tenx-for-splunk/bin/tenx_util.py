@@ -59,7 +59,7 @@ import logging.handlers
 import urllib.request
 import urllib.parse
 
-from splunklib import client, six
+from splunklib import client
 
 import tenx_consts
 
@@ -109,13 +109,13 @@ def get_tenx_config(service=None, server_uri=None, token=None):
 
 		result = {}
 
-		for key in six.iterkeys(tenx_consts.DEFAULT_CONFIG):
+		for key in tenx_consts.DEFAULT_CONFIG.keys():
 			result[key] = config_stanza.get(key, tenx_consts.DEFAULT_CONFIG.get(key))
 
 		props_conf = service.confs['props']
 
 		for stanza in props_conf:
-			for key, value in six.iteritems(stanza.content):
+			for key, value in stanza.content.items():
 				if key == result[tenx_consts.TENX_EXTRACTION_NAME] and value == result[tenx_consts.TENX_EXTRACTION]:
 					# The stanza name is the name of the source/sourcetype
 					#
