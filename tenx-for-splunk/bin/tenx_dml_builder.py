@@ -254,10 +254,18 @@ RECORD_PATTERN_PARTS = "pattern_parts"
 RECORD_PART_0 = "part_0"
 RECORD_PATTERN_TERMINATOR = "pattern_terminator"
 RECORD_TIMESTAMP_FORMAT = "timestamp_format"
+RECORD_EXPAND_UNSAFE = "expand_unsafe"
 
 RECORD_HEADERS = [
-	RECORD_PATTERN_HASH, RECORD_PATTERN, RECORD_PATTERN_PARTS, RECORD_PART_0, RECORD_PATTERN_TERMINATOR, RECORD_TIMESTAMP_FORMAT
+	RECORD_PATTERN_HASH, RECORD_PATTERN, RECORD_PATTERN_PARTS, RECORD_PART_0, RECORD_PATTERN_TERMINATOR, RECORD_TIMESTAMP_FORMAT,
+	RECORD_EXPAND_UNSAFE
 ]
+
+# Reasons this app cannot reconstruct a pattern's original text. Stored on the record and
+# read by the inflate macro, which then leaves the compact event alone instead of printing
+# text that is wrong.
+UNSAFE_BACK_REFERENCE = "back-reference"
+UNSAFE_MULTIPLE_TIMESTAMPS = "multiple-timestamps"
 
 
 class TenxDMLBuilder:
@@ -330,6 +338,80 @@ class TenxDMLBuilder:
 			index += 1
 
 		return ''.join(result)
+
+	def scan_expand_unsafe(self, base_pattern):
+		"""
+		Returns a comma-separated list of reasons this pattern cannot be expanded back to its
+		original text, or "" when it can.
+
+		Two things defeat reconstruction, and both are silent: the search still returns a
+		result, just not the line that went in. Rather than print wrong text, the record is
+		marked and the macro leaves the compact event as it is.
+
+		* A back-reference. The Receiver writes "<sep><digit>" when it reuses an earlier
+		  variable's value instead of encoding it again. This app has no value to put there,
+		  and the parser reads the digit as literal text. The Receiver setting
+		  varMaxRecurIndexes: 0 stops them being produced; this catches the ones produced
+		  anyway. The one exception is "<sep>0(", which is not a back-reference at all but
+		  the escape for a plain variable followed by a literal "(".
+		* More than one timestamp. The record carries a single timestamp_format, so a pattern
+		  with two slots can only render one of them. The Receiver setting maxPerObject: 1
+		  keeps it to one; this catches the rest.
+
+		Escaping is tracked exactly as build_kv_record_data and _collapse_dollar_zero_escape
+		track it, so an escaped literal "$5" in the source text is not read as a
+		back-reference.
+		"""
+		sep = self.variable_separator
+		esc = self.escape_character
+		pattern_length = len(base_pattern)
+		currently_escaping = False
+		timestamps = 0
+		back_reference = False
+		index = 0
+
+		while index < pattern_length:
+			current_char = base_pattern[index]
+
+			if current_char == esc:
+				currently_escaping = not currently_escaping
+				index += 1
+				continue
+
+			if current_char == sep:
+				if currently_escaping:
+					currently_escaping = False
+					index += 1
+					continue
+
+				following = base_pattern[index+1] if index + 1 < pattern_length else ''
+
+				if following == '(':
+					timestamps += 1
+					index += 2
+					while index < pattern_length and base_pattern[index] != ')':
+						index += 1
+					index += 1
+					continue
+
+				if following == '0' and index + 2 < pattern_length and base_pattern[index+2] == '(':
+					index += 3
+					continue
+
+				if following.isdigit():
+					back_reference = True
+
+			index += 1
+
+		reasons = []
+
+		if back_reference:
+			reasons.append(UNSAFE_BACK_REFERENCE)
+
+		if timestamps > 1:
+			reasons.append(UNSAFE_MULTIPLE_TIMESTAMPS)
+
+		return ",".join(reasons)
 
 	def build_kv_record_data(self, pattern_hash, base_pattern):
 		"""
@@ -429,5 +511,6 @@ class TenxDMLBuilder:
 			RECORD_PATTERN_PARTS: actual_parts,
 			RECORD_PART_0: part_0,
 			RECORD_PATTERN_TERMINATOR: pattern_terminator,
-			RECORD_TIMESTAMP_FORMAT: timestamp_format
+			RECORD_TIMESTAMP_FORMAT: timestamp_format,
+			RECORD_EXPAND_UNSAFE: self.scan_expand_unsafe(base_pattern)
 		}
