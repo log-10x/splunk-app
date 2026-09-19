@@ -282,8 +282,16 @@ class TenxDMLBuilder:
 		"""
 		Returns a line to store in the pure dml sourcetype.
 
-		The line format is "<pattern key> <processed pattern>", where the processed pattern is just the
-		pattern, stripped from variables separators and new lines, which might hinder actual search.
+		The line format is "<pattern key>\t<processed pattern>", where the processed pattern is
+		just the pattern, stripped from variables separators and new lines, which might hinder
+		actual search.
+
+		The delimiter is a tab, not a space. This line is how a search term becomes a template
+		hash: the sourcetype extracts the hash from the front of it, and the hash is then used
+		to prefilter the compact events. A template hash is not an identifier-shaped string. On
+		the E21 capture, its 2,991 hashes drew on 85 distinct printable characters between
+		ordinal 32 and 125, and 345 of them contained a space, so a space delimiter cannot
+		mark where the hash ends. None contained a tab, a newline or a carriage return.
 
 		The "$0(" escape (a plain variable immediately followed by a literal '(', see
 		build_kv_record_data) is stripped as a pair, so the escape digit doesn't linger as a
@@ -293,7 +301,7 @@ class TenxDMLBuilder:
 		"""
 		normalized = self._collapse_dollar_zero_escape(pattern)
 
-		return key + " " + normalized.replace(self.variable_separator, "").replace("\r\n", " ").replace("\n", " ")
+		return key + "\t" + normalized.replace(self.variable_separator, "").replace("\r\n", " ").replace("\n", " ")
 
 	def _collapse_dollar_zero_escape(self, pattern):
 		"""

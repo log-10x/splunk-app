@@ -209,11 +209,19 @@ class TenxSearchManager:
 
 		Returns the search job SID, or None in case of errors.
 		"""
+		# The index is named, not just the sourcetype. Splunk searches only a user's default
+		# indexes when none is given, which is 'main' out of the box, so a deployment keeping
+		# its templates anywhere else resolved every search term to zero hashes. The search
+		# then ran with the user's terms still in front of the inflate macro, matched nothing
+		# and returned no results with no error, because the text being searched for is in the
+		# original line and not in the compact event.
 		search_data = {
 			'earliest_time': '0',
 			'latest_time': 'now',
 			'rf': self.dml_key,
-			'search': 'search sourcetype=%s %s' % (self.tenx_config['dml_source_type'], dml_search)
+			'search': 'search index=%s sourcetype=%s %s' % (self.tenx_config['dest_dml_index'],
+			                                               self.tenx_config['dml_source_type'],
+			                                               dml_search)
 		}
 
 		return self.create_search_job(search_data)
