@@ -284,13 +284,28 @@ def _search_expands(splunk, query, term):
 	        'endpoint could not find' % (len(rows), term))
 
 
-def check_alert_compiles(splunk, index, term, name):
+def check_alert_compiles(splunk, index, term, name, sourcetype):
 	"""
 	Compile a search into a saved search and take it away again. This is the path a browser
 	never touches and the scheduler depends on.
 	"""
+	# Marked and named, exactly as the search check does. Without both, the compiler has
+	# nothing to recognise and answers PASSTHROUGH, which tells us only that the endpoint
+	# replied, not that it can compile a 10x alert.
+	restore = not is_marked(splunk, sourcetype)
+	mark(splunk, sourcetype)
+
+	try:
+		return _alert_compiles(splunk, index, term, name, sourcetype)
+	finally:
+		if restore:
+			unmark(splunk, sourcetype)
+
+
+def _alert_compiles(splunk, index, term, name, sourcetype):
 	status, body = splunk.call('tenx-alert',
-	                           data={'search': 'search index=%s %s' % (index, term),
+	                           data={'search': 'search index=%s sourcetype=%s %s'
+	                                           % (index, sourcetype, term),
 	                                 'name': name,
 	                                 'cron_schedule': '*/30 * * * *',
 	                                 'is_scheduled': '1'},
@@ -355,7 +370,7 @@ def main():
 		('search expands', lambda: check_search_expands(splunk, args.index, args.term,
 		                                                args.sourcetype)),
 		('alert compiles', lambda: check_alert_compiles(splunk, args.index, args.term,
-		                                                args.alert_name)),
+		                                                args.alert_name, args.sourcetype)),
 	]
 
 	if args.app_dir:
