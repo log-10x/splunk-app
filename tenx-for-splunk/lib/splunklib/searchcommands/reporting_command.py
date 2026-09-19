@@ -1,4 +1,6 @@
-# Copyright © 2011-2026 Splunk, Inc.
+# coding=utf-8
+#
+# Copyright © 2011-2024 Splunk, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"): you may
 # not use this file except in compliance with the License. You may obtain
@@ -13,13 +15,12 @@
 # under the License.
 
 from itertools import chain
-from json.encoder import encode_basestring_ascii as json_encode_string
 
-from splunklib.searchcommands.decorators import ConfigurationSetting, Option
-from splunklib.searchcommands.internals import ConfigurationSettingsType
-from splunklib.searchcommands.search_command import SearchCommand
-from splunklib.searchcommands.streaming_command import StreamingCommand
-from splunklib.searchcommands.validators import Set
+from .internals import ConfigurationSettingsType, json_encode_string
+from .decorators import ConfigurationSetting, Option
+from .streaming_command import StreamingCommand
+from .search_command import SearchCommand
+from .validators import Set
 
 
 class ReportingCommand(SearchCommand):
@@ -89,14 +90,16 @@ class ReportingCommand(SearchCommand):
     def prepare(self):
         if self.phase == "map":
             if self._has_custom_method("map"):
-                phase_method = self.__class__.map
+                phase_method = getattr(self.__class__, "map")
                 self._configuration = phase_method.ConfigurationSettings(self)
             else:
                 self._configuration = self.ConfigurationSettings(self)
             return
 
         if self.phase == "reduce":
-            streaming_preop = chain((self.name, 'phase="map"', str(self._options)), self.fieldnames)
+            streaming_preop = chain(
+                (self.name, 'phase="map"', str(self._options)), self.fieldnames
+            )
             self._configuration.streaming_preop = " ".join(streaming_preop)
             return
 
@@ -216,13 +219,14 @@ class ReportingCommand(SearchCommand):
             doc="""
             Specifies the maximum number of events that can be passed to the command for each invocation.
 
-            This limit cannot exceed the value of `maxresultrows` in `limits.conf
-            <http://docs.splunk.com/Documentation/Splunk/latest/admin/Limitsconf>`_. Under SCP 1 you must specify this
-            value in `commands.conf <http://docs.splunk.com/Documentation/Splunk/latest/Admin/Commandsconf>`_.
+            This limit cannot exceed the value of `maxresultrows` in limits.conf_. Under SCP 1 you must specify this
+            value in commands.conf_.
 
             Default: The value of `maxresultrows`.
 
             Supported by: SCP 2
+
+            .. _limits.conf: http://docs.splunk.com/Documentation/Splunk/latest/admin/Limitsconf
 
             """
         )

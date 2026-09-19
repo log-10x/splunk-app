@@ -1,4 +1,6 @@
-# Copyright © 2011-2026 Splunk, Inc.
+# coding=utf-8
+#
+# Copyright © 2011-2024 Splunk, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License"): you may
 # not use this file except in compliance with the License. You may obtain
@@ -13,10 +15,10 @@
 # under the License.
 
 
-import sys
-from logging import StreamHandler, getLogger, root
+from logging import getLogger, root, StreamHandler
 from logging.config import fileConfig
-from os import chdir, environ, getcwd, path
+from os import chdir, environ, path, getcwd
+import sys
 
 
 def configure_logging(logger_name, filename=None):
@@ -35,10 +37,10 @@ def configure_logging(logger_name, filename=None):
     This function looks for a logging configuration file at each of these locations, loading the first, if any,
     logging configuration file that it finds::
 
-        local / {name}.logging.conf
-        default / {name}.logging.conf
-        local / logging.conf
-        default / logging.conf
+        local/{name}.logging.conf
+        default/{name}.logging.conf
+        local/logging.conf
+        default/logging.conf
 
     The current working directory is set to *<app-root>* before the logging configuration file is loaded. Hence, paths
     in the logging configuration file are relative to *<app-root>*. The current directory is reset before return.
@@ -57,7 +59,7 @@ def configure_logging(logger_name, filename=None):
     :returns: The named logger and the location of the logging configuration file loaded.
     :rtype: tuple
 
-    .. _ConfigParser format: https://docs.python.org/3/library/logging.config.html#configuration-file-format
+    .. _ConfigParser format: https://docs.python.org/2/library/logging.config.html#configuration-file-format
 
     """
     if filename is None:
@@ -97,12 +99,6 @@ def configure_logging(logger_name, filename=None):
         global _current_logging_configuration_file
         filename = path.realpath(filename)
 
-        app_root_real = path.realpath(app_root)
-        if path.commonpath([filename, app_root_real]) != app_root_real:  # pyright: ignore[reportUnknownArgumentType]
-            raise ValueError(
-                f'Logging configuration file "{filename}" is outside the app directory'
-            )
-
         if filename != _current_logging_configuration_file:
             working_directory = getcwd()
             chdir(app_root)
@@ -120,21 +116,9 @@ def configure_logging(logger_name, filename=None):
 
 _current_logging_configuration_file = None
 
-
-def _find_app_root(app_file: str, splunk_home: str) -> str:
-    """Return the app root directory for a search command script."""
-    splunk_apps_dir = path.join(splunk_home, "etc", "apps")
-    app_relpath = path.relpath(path.abspath(app_file), splunk_apps_dir)
-    app_dir = app_relpath.split(path.sep, 1)[0]
-    if app_dir == path.pardir:  # app_file not in $SPLUNK_HOME/etc/apps
-        return path.dirname(path.abspath(path.dirname(app_file)))
-
-    return path.join(splunk_apps_dir, app_dir)
-
-
 splunk_home = path.abspath(path.join(getcwd(), environ.get("SPLUNK_HOME", "")))
 app_file = getattr(sys.modules["__main__"], "__file__", sys.executable)
-app_root = _find_app_root(app_file, splunk_home)
+app_root = path.dirname(path.abspath(path.dirname(app_file)))
 
 splunklib_logger, logging_configuration = configure_logging("splunklib")
 
