@@ -18,7 +18,7 @@ the template as a warning, not a failure. This is a scheduled removal with an
 unknown date and a switch that brings it forward, and the app should stop
 depending on it before either happens.
 
-## What the tab actually is
+## What the tab is
 
 Less than it looks. The template inherits Splunk's base page for the chrome,
 draws three empty placeholder divs, prints "Loading...", and loads one script.
@@ -28,8 +28,8 @@ user's terms against the template store and expand the results; and a page
 module whose whole job is to append a red warning to Splunk's search title when
 no sourcetype is marked as carrying compact events.
 
-The hook is the only thing the template does that matters. It exists here at
-all because the tab is an HTML view rather than a dashboard. The app's
+The hook is the only thing the template does that matters, and the template
+only loads it because the tab is an HTML view rather than a dashboard. The app's
 `dashboard.js` applies the hook to every dashboard in the app automatically;
 an HTML view is outside that, so the template loads the hook by hand. That
 script tag is the same one that named an app which does not exist and returned
@@ -89,20 +89,20 @@ UCC, the framework Splunk generates its own add-ons with, took a fourth road. It
 removed Mako by making its page template plain HTML with values filled in at
 build time, loading Splunk's configuration and translation bundles by relative
 URL and then its own entry module, and drawing its own chrome. That template
-inherits nothing from Splunk Web. It is a whole application shipped as static
+inherits nothing from Splunk Web: a whole application shipped as static
 files, not a page that borrows Splunk's search UI.
 
 One more fact decides how AppInspect sees all this. Run locally on two
 variants, the checker reported "No custom Mako template files found" both for a
 `type="html"` view whose template contains no Mako syntax and for the view
-replaced by a dashboard. It classifies a template by its content, not by the
-view type or where the file sits.
+replaced by a dashboard. The checker classifies a template by its content,
+not by the view type or where the file sits.
 
 ## The candidates
 
 **A. Keep the HTML view, strip the template to plain HTML.** No inherit, no
-Python block, no `${}`; a hardcoded script path. UCC's road. It passes
-AppInspect today. What it loses is the inheritance from Splunk's base page,
+Python block, no `${}`; a hardcoded script path. UCC's road, and one that
+passes AppInspect today. What it loses is the inheritance from Splunk's base page,
 which is where the chrome and the search UI came from, so the page would have
 to build everything itself. Whether Splunk Web even renders it once the switch
 is on is the first thing to measure.
@@ -113,16 +113,16 @@ warning. The hook arrives for free through `dashboard.js`, which already covers
 every dashboard in the app, so the by-hand script tag that caused the 404 goes
 away with the template. Works on 9.4 through 10.4 today and is the one
 destination Splunk still documents for custom script. What it gives up is
-Splunk's real search page: no search assistant, no field sidebar, no save-as
+Splunk's own search page: no search assistant, no field sidebar, no save-as
 flows on that tab.
 
-**C. No view override at all, hook the real search page.** Delete `search.xml`
+**C. No view override at all, hook Splunk's own search page.** Delete `search.xml`
 and let the app's nav entry fall through to Splunk's own search view, then get
 the hook onto it some other way. The only candidate mechanism is
 `appserver/static/application.js`, which older Splunk loaded on every page of
 an app. Whether current Splunk still does is a yes or no question a render
-answers. If yes, this is the best outcome: the real search page, expanded, with
-no template. If no, C is not available.
+answers. If yes, this is the best outcome: Splunk's own search page, expanded,
+with no template. If no, C is not available.
 
 **D. Dashboard Studio.** Preferred by Splunk, and unable to run the hook. A
 Studio page for this tab would be a search box that returns compact events.
@@ -130,10 +130,11 @@ Not a candidate for this feature.
 
 **E. No page at all: the generating command.** `| tenxsearch
 searchstring="..."` already exists, resolves terms to template hashes and
-streams expanded results, and needs no browser, no hook and no template. It is
-slower than the endpoint for interactive use, which is why the endpoint exists.
-It is also the one path that survives every UI deprecation Splunk could make,
-so the design has to say what its role is even if it is not the tab.
+streams expanded results, and needs no browser, no hook and no template. The
+command is slower than the endpoint for interactive use, which is why the
+endpoint exists, and is also the one path that survives every UI deprecation
+Splunk could make, so the design has to say what its role is even if it is not
+the tab.
 
 ## How it was measured
 
@@ -181,7 +182,7 @@ cannot host the hook, because nothing on that page defines a module loader, and
 it does not survive the switch.
 
 **Splunk no longer loads `application.js`.** With no view override, the tab
-falls through to Splunk's real search page rendered under the app's
+falls through to Splunk's own search page rendered under the app's
 navigation, which is a good page, and the marker in `application.js` never
 set. The first pass read the hook as installed there; that was Splunk's own
 `beforeSend`, which carries its CSRF header, and the signal now requires the
@@ -215,20 +216,20 @@ whether or not custom templates are blocked.
 
 What it costs is honest to state and turns out to be nothing. The dashboard is
 not Splunk's search page: no search assistant, no field sidebar, no save-as on
-that tab. But the tab was never Splunk's search page either. It was a blank
-page with the word "Loading..." on it, on every version, and the assumption it
+that tab. But the tab was never Splunk's search page either. What shipped was
+a blank page with the word "Loading..." on it, on every version, and the assumption it
 was built on, that an app view can host the search bundle, is one Splunk's own
 templates reject. Measured against what shipped, the dashboard is not a
-compromise. It is the first time the tab has worked.
+compromise. The tab works for the first time.
 
 Two things are deliberately not attempted. The tab does not try to reproduce
 Splunk's search experience inside a dashboard, because the pieces that make it
 that experience are not available to a dashboard and a half-copy would be
-worse than a plain form. And the app does not try to reach Splunk's real
+worse than a plain form. And the app does not try to reach Splunk's own
 search page any other way, because the render shows there is no way left, and
 the next one to be invented would be the next one to be deprecated.
 
-For someone who wants the real search page with expansion, the answer is the
+For someone who wants Splunk's own search page with expansion, the answer is the
 one that needs no page at all: `| tenxsearch searchstring="..."` in any search
 bar on any version, Studio included. It is slower than the endpoint, which is
 why the tab exists, and it is the path that outlives every UI decision Splunk
