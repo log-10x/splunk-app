@@ -193,6 +193,18 @@ way to run the app's script on Splunk's search page.
 with it off and on: title, body, hook. That is the whole point of choosing the
 mechanism Splunk still documents.
 
+**The hook was dead too.** Typing a search into the new dashboard and reading
+the browser's POST list showed the job going to
+`.../tenx-for-splunk/search/v2/jobs`. The hook matched only URLs ending in
+`/search/jobs`, the path Splunk Web used before version 9. On 9.4.15 and
+10.4.3 alike it installed on every dashboard and never fired, so a search for
+words from the original line ran unrewritten against compact events and
+returned nothing. Nothing that runs without a browser could have seen this:
+the endpoint answered, the unit tests passed, the assets resolved. The hook
+now matches both paths. This is the second time tonight that a feature
+described as working turned out never to have run, and both times the only
+instrument that could tell was a rendered page.
+
 **Nothing version-specific is needed.** A classic `version="1.1"` dashboard is
 what the app's Compile Alert view already is, and that view rendered with the
 hook installed on 9.4.15 in the first render of the night. The replacement
@@ -282,6 +294,9 @@ Branch `fix/search-view-without-mako`, five files and two deletions.
   existed only to be loaded by it.
 - `dashboard.js`'s comment, which named the template as the example of a page
   that loads the hook by hand, now says there is no such page.
+- `javascript/search/tenx_search_hook.js` matches `/search/v2/jobs` as well as
+  `/search/jobs`, the v2 path first. Without this the dashboard would render and
+  expand nothing, exactly as every other dashboard in the app has.
 - `tests/live_render.js`, a browser render of any view, reporting the signals
   that decide whether a page is alive, and the check that would have caught
   the blank tab on the day it shipped.
