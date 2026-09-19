@@ -29,15 +29,18 @@ Interactive searches are transparently transformed to [expand](https://doc.log10
 User Search  -->  Hook Intercept  -->  Transform (Add Macro)  -->  Inflate (Decode)  -->  Full Results
 ```
 
-Scheduled alerts run server-side, where the browser hook never fires. They are instead **compiled once at save time** into native SPL — a template hash prefilter plus the inflate macro — so the scheduler runs an ordinary saved search. This is handled by the `/tenx-alert` REST endpoint and the **10x Compile Alert** view (with a recompile pass that migrates legacy alerts and refreshes prefilters as templates appear). See [SAVE_TIME_ALERTS.md](SAVE_TIME_ALERTS.md).
+Scheduled alerts run server-side, where the browser hook never fires. They are instead **compiled once at save time** into native SPL, a template hash prefilter plus the inflate macro, so the scheduler runs an ordinary saved search. This is handled by the `/tenx-alert` REST endpoint and the **10x Compile Alert** view (with a recompile pass that migrates legacy alerts and refreshes prefilters as templates appear). See [SAVE_TIME_ALERTS.md](SAVE_TIME_ALERTS.md).
 
 ## Receiver-side configuration
 
 This app does not decode template **back-references** (`$N` syntax, produced when the Receiver's
 [`varMaxRecurIndexes`](https://doc.log10x.com/run/template/#varmaxrecurindexes) setting reuses an
-earlier variable value instead of re-encoding it). If a compact event's template uses a
-back-reference, the app's inflate macro currently reconstructs the wrong text for that value —
-silently, since the search still returns a result, just not the original one.
+earlier variable value instead of re-encoding it). It has no value to put there.
+
+Such a template is detected when it is stored and marked `expand_unsafe`. The inflate macro then
+leaves the compact event as it is and sets `tenx_expand_refused` on the result, rather than
+printing text that is not the original line. Earlier versions expanded it anyway and returned the
+wrong text silently, since the search still returned a result.
 
 **Set `varMaxRecurIndexes: 0`** in the Receiver's pipeline configuration for any deployment that
 feeds this app. This is a whole-process setting, not a per-destination one: disabling it costs a
@@ -69,13 +72,50 @@ back-references correctly. It means only that the Elasticsearch traffic forgoes 
 compression gain for as long as the Receiver instance it shares with Splunk has this setting
 disabled.
 
+### One timestamp per event
+
+**Set `maxPerObject: 1`** in the Receiver's timestamp configuration.
+
+The Receiver records every timestamp it finds in an event as its own slot. This app stores one
+timestamp format per template and reconstructs one, so a template carrying two slots can only
+render one of them, and the one it renders is not the one the format describes. At `1` the first
+timestamp keeps its slot and any later one becomes an ordinary variable whose literal text
+round-trips unchanged.
+
+A template with more than one slot is detected when it is stored and refused in the same way as a
+back-reference, so the failure is visible rather than silent.
+
+### What happens if these are not set
+
+Nothing is expanded wrongly. Both back-references and multi-timestamp templates are detected at
+store time, and the macro declines to expand the events that use them, leaving the compact text
+and a `tenx_expand_refused` field naming the reason. The cost of missing a setting is events that
+do not expand, not events that expand to the wrong text. The zone setting is the exception: a
+Receiver on a non-UTC clock cannot be detected from the data, which is why it is pinned rather
+than checked.
+
+### Event time on compact events
+
+A compact event's `_time` is the time Splunk indexed it, not the time in the original log
+line. Measured on Splunk 10.4.3: `_time` equals `_indextime` for every event in the
+compact index.
+
+This matters when you search by time range. A search over the last hour selects events
+that arrived in the last hour, and the lines they expand to may carry any timestamp. The
+original time is still there, as an epoch in the event's first variable, and the expanded
+text shows it; it is simply not what Splunk sorts and filters on.
+
+Making `_time` the original event time is possible but is not a setting, because not every
+template carries a timestamp slot and those that do vary between millisecond and
+nanosecond precision, which one `TIME_FORMAT` cannot express.
+
 ## Quickstart
 
 ### Prerequisites
 
 | Requirement | Description |
 |-------------|-------------|
-| Splunk Enterprise | Version 8.x, 9.x, or 10.x (bundled Python 3.7 through 3.13) |
+| Splunk Enterprise | 9.4 through 10.4 |
 | Admin Access | Required for app installation and KV Store setup |
 
 ### Step 1: Install Splunk App
@@ -164,7 +204,7 @@ The app includes a built-in analytics dashboard providing real-time visibility i
 For complete documentation including troubleshooting, advanced configuration, and integration guides, see:
 
 - [10x for Splunk Documentation](https://doc.log10x.com/apps/receiver/compact/splunk/)
-- [Save-time alert compilation](SAVE_TIME_ALERTS.md) — how scheduled alerts on compact data are compiled and kept current
+- [Save-time alert compilation](SAVE_TIME_ALERTS.md): how scheduled alerts on compact data are compiled and kept current
 - [Receiver Documentation](https://doc.log10x.com/apps/receiver/)
 - [Log10x Documentation](https://doc.log10x.com/)
 
