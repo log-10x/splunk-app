@@ -281,62 +281,51 @@ This applies the field extraction that parses compact events into `tenx_hash`, `
 
 ### Searching Compact Events
 
-Compact events do not contain the constant words of the log line, so a plain search for
-one of those words finds nothing. There are two ways to search them as if they were the
-original lines.
+A compact event holds a template hash and the event's variable values; the constant words
+live in the KV Store. Two paths put them back.
 
-**Classic dashboards: nothing to change.** The app ships `appserver/static/dashboard.js`,
-which Splunk loads on every classic (Simple XML) dashboard in the app that carries it. It
-routes each panel's search through the app's REST endpoint, which rewrites it and returns
-an ordinary job, so panels keep their SPL and get the expanded events. To cover the
-dashboards of another app, copy `dashboard.js` into that app's `appserver/static/`. The
-search bar and Dashboard Studio load no app JavaScript, so this does not reach them.
+**Classic dashboards.** `dashboard.js` loads on every classic dashboard in the app that
+carries it and routes the panel's search through the app's REST endpoint. Panels keep
+their SPL. To cover another app's dashboards, copy the file into that app's
+`appserver/static/` and restart. The search bar and Dashboard Studio load no app
+JavaScript and are not covered.
 
-**Everywhere else: the `tenxsearch` command.** In the Search & Reporting bar, a saved
-search, an alert or the REST API, wrap the search in the command:
+**Everywhere else.** Wrap the search in the `tenxsearch` command:
 
 ```spl
 | tenxsearch searchstring="index=myindex sourcetype=tenx_encoded error"
 ```
 
-A quoted phrase inside the search is escaped: `searchstring="index=myindex \"payment failed\""`.
+Escape a quoted phrase inside the wrapper: `searchstring="index=myindex \"payment failed\""`.
+The command runs in the search bar, saved searches, alerts and the REST API.
 
-Both paths do the same thing. Each word is looked up in the template dictionary, the
-compact events whose template or variable values carry it are selected, expanded, and
-the search is applied again to the expanded lines. `NOT`, `OR`, `AND`, parenthesised
-groups, quoted phrases, wildcards, field conditions including `IN (...)`, inline
-`earliest=`/`latest=` and a trailing pipeline all work as on the original data, with
-Splunk's own precedence. Values Splunk indexes as one token but the pipeline stores in
-pieces, such as an IP address, a hostname or a region name, are matched piece by piece.
-The time picker is honoured.
+Both paths resolve each word against the templates, select the compact events whose
+template text or variable values carry it, expand them, and re-apply the search. `NOT`,
+`OR`, `AND`, parenthesised groups, wildcards, field conditions including `IN (...)`,
+inline `earliest=`/`latest=` and a trailing pipeline behave as they do on the original
+data, with Splunk's precedence. An IP address, hostname or region name is matched piece
+by piece, since the pipeline stores it in pieces.
 
-Three things to know:
+**Limits.**
 
-- **A search that leaves the command out is not an error.** A bare
-  `index=myindex sourcetype=tenx_encoded error` returns zero events, because the word is
-  in the dictionary and not in the event. Keep compact indexes out of users' default index
-  sets and name them so the omission is visible.
-- **A search that cannot be rewritten is refused, not run as typed.** In the search bar
-  the job fails with a message; on a dashboard the panel shows the message instead of a
-  number. The detail is in `tenx_search_command.log` or `tenx_search_handler.log` under
-  `$SPLUNK_HOME/var/log/splunk/`. The one shape the rewrite does not follow is a
-  sourcetype inside an OR with something else, `sourcetype=x OR host=y`; put the compact
-  sourcetype in a plain `sourcetype=...` term.
-- **The command is the slower path for large results.** A generating command has to
-  write every event out itself. Measured on one laptop container: a dashboard panel or
-  the REST endpoint returns 20,000 expanded events in about 3 seconds; the command takes
-  about 2 seconds plus one millisecond per event, so 2,000 events in 3 seconds and
-  20,000 in 21. Alerts are better compiled once at save time with the "10x Compile
-  Alert" view, which stores native SPL the scheduler runs directly; see
-  [SAVE_TIME_ALERTS.md](../SAVE_TIME_ALERTS.md).
+- A search without the command returns zero events, not an error. Keep compact indexes out
+  of default index sets and name them so the omission is visible.
+- A search that cannot be rewritten is refused. The job fails with a message, and a
+  dashboard panel shows it in place of a number. The unsupported shape is a sourcetype
+  inside an OR, `sourcetype=x OR host=y`.
+- A word matching more than 25,000 templates is dropped from the prefilter, so the search
+  scans the sourcetype and checks that word after expansion.
 
-How it scales with the dictionary, measured at 32,962 templates on the same container:
-one dictionary lookup takes about a second even for a word in 30,000 templates; a word in
-30,000 templates compiles to a 540,000-character search that Splunk accepts and runs in
-about 10 seconds; and a word in more than 25,000 templates is left out of the prefilter
-(the events are expanded and the word is checked afterwards), which is correct and a
-full scan of the compact sourcetype. A word in that many templates is in nearly every
-event anyway.
+**Speed**, 20,000 expanded events:
+
+| path | time |
+|------|------|
+| Dashboard panel, REST endpoint | 1 to 3.5 s |
+| `tenxsearch` | 21 s |
+
+A generating command writes every event out itself, which costs about a millisecond per
+event on top of a two-second floor. Alerts avoid it: the **10x Compile Alert** view stores
+native SPL that the scheduler runs directly, see [SAVE_TIME_ALERTS.md](../SAVE_TIME_ALERTS.md).
 
 ### Basic Expansion
 
