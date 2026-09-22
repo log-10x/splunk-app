@@ -6,15 +6,16 @@ a UI control (the "10x Compile Alert" view) are all in place; the wiring is desc
 
 ## Why this exists
 
-The interactive path makes compact (encoded) events searchable transparently: a browser
-hook (`appserver/static/javascript/search/tenx_search_hook.js`) intercepts the search the
-dashboard POSTs to `/search/jobs`, points it at `/tenx-search`, and the REST handler
-rewrites the SPL (hash prefilter + `` `tenx-inflate` ``) before the job runs.
+The interactive paths make compact (encoded) events searchable: on a classic dashboard, a
+browser hook (`appserver/static/javascript/search/tenx_search_hook.js`, loaded by
+`dashboard.js`) points the search the dashboard POSTs to `/search/v2/jobs` at
+`/tenx-search`, and the REST handler rewrites the SPL (hash prefilter +
+`` `tenx-inflate` ``) before the job runs; in the search bar, which loads no app
+JavaScript, the `| tenxsearch` generating command does the same rewrite.
 
 An **alert is a saved search the scheduler runs server-side**. No browser is involved, so
-that hook never fires. The only pre-existing fallback is typing the `| tenxsearch` generating
-command into every alert, which proxies a nested job and re-streams every event through
-Python — slow, and not transparent.
+the hook never fires. `| tenxsearch` works there, but it proxies a nested job and
+re-streams every event through Python — slow, and not transparent.
 
 Two Splunk-internals findings (validated externally; see the handoff and consult transcript
 under `dotcom/blog/review-agendas/`) frame the fix:
@@ -77,7 +78,7 @@ store with no live instance.
 | **NATIVE** | search touches compact data | `search <mods> ((words) OR (tenx_hash IN ("h1","h2"))) \| \`tenx-inflate\` \| extract [\| where …] [\| search …] [\| …rest]` |
 | **PASSTHROUGH** | search does not touch compact data | the original, unchanged |
 | **RETRYABLE** | transient DML lookup failure at compile time | nothing — keep the existing alert, retry later |
-| **REJECTED** | unparseable, or cannot be compiled safely (`NOT` on compact data, or `ResolvedState.COMPLEX`) | nothing (surface the reason) |
+| **REJECTED** | unparseable, or cannot be compiled safely (`ResolvedState.COMPLEX`) | nothing (surface the reason) |
 
 Each result also carries `needs_review` (a human should confirm before it is applied) and a
 `reason`. The compiler decides NATIVE vs PASSTHROUGH off a structured `engaged` flag from

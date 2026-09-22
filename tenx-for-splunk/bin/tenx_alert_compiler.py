@@ -34,8 +34,8 @@ compile(user_search) returns an AlertCompileResult classifying the search into o
                 problem with the search. Nothing is stored; the save layer should retry
                 rather than drop or overwrite a live alert.
 - REJECTED:     the search could not be parsed/resolved, or cannot be compiled safely
-                (unparseable, a NOT on compact data, or too complex for the builder to
-                modify - see resolve_state COMPLEX). Nothing is stored; the caller should
+                (unparseable, or too complex for the builder to modify - see resolve_state
+                COMPLEX). Nothing is stored; the caller should
                 surface the reason. A search this compiler rejects can still be scheduled
                 manually via the `| tenxsearch` generating command (see tenxsearch.py) -
                 that path is correct but proxies a nested job and is materially slower, so
@@ -44,8 +44,9 @@ compile(user_search) returns an AlertCompileResult classifying the search into o
 A NATIVE (or PASSTHROUGH) result is flagged needs_review, rather than rejected outright,
 whenever the compile is storable but the compiler cannot fully vouch for it: an empty or
 truncated hash prefilter, a string-valued field condition, a search with no hash prefilter
-at all (full sourcetype scan), or a passthrough that still selects a configured compact
-source. See AlertCompileResult and TenxAlertCompiler._compile_native for the exact cases.
+at all (full sourcetype scan, including a search whose every keyword is negated), or a
+passthrough that still selects a configured compact source. See AlertCompileResult and
+TenxAlertCompiler._compile_native for the exact cases.
 
 Purity / testability
 ---------------------
@@ -209,9 +210,12 @@ def _has_negation(original_search):
 	"""
 	Whether a search uses the `NOT` boolean operator outside quotes.
 
-	The parser prunes NOT nodes, so the builder can silently drop an exclusion and compile a
-	negated alert into its exact opposite. On a compact search that is unsafe. Quoted spans are
-	removed first so a literal "NOT" inside a phrase is not mistaken for the operator.
+	The builder keeps negation and applies it after expansion, where the words are back, so
+	a negated alert compiles correctly. What it cannot do is use the exclusion to narrow the
+	compact events first (the prefilter is a superset, and the complement of a superset is
+	not one), so the compiled alert scans wider than the positive form would. Flagged for
+	review on that account. Quoted spans are removed first so a literal "NOT" inside a
+	phrase is not mistaken for the operator.
 	"""
 	if not original_search:
 		return False
@@ -293,47 +297,47 @@ class TenxAlertCompiler:
 		Builds a NATIVE result for a search that engaged 10x compilation, guarding constructs
 		the builder mis-handles (or under-informs about) on compact data.
 
-		NOT is a hard REJECT (the compiled alert would be inverted, not just imprecise).
-		Everything else the builder cannot fully vouch for is NATIVE + needs_review: the
-		compile is genuinely storable, but a human should confirm it before scheduling.
+		Everything the builder cannot fully vouch for is NATIVE + needs_review: the compile
+		is genuinely storable, but a human should confirm it before scheduling.
 		"""
-		# The builder silently drops NOT (its parser prunes negation nodes), so a negated alert
-		# would compile into its exact opposite. Refuse to store it rather than certify a
-		# semantically-inverted alert as clean.
-		if _has_negation(original):
-			return AlertCompileResult(
-				AlertStrategy.REJECTED, None, original, result.state,
-				reason=("search uses the NOT operator on compact data, which the compiler "
-						"cannot honour (the exclusion would be silently dropped, inverting the "
-						"alert); rewrite without NOT or use a decoded sidecar index"))
-
 		compiled = _normalize_native(result.resolved)
 		review_reasons = []
 
-		if not result.has_search_terms:
+		if _has_negation(original):
+			# Correct, and wider than it looks: the exclusion is applied after expansion, so
+			# it does not narrow the compact events the way the positive terms do.
+			review_reasons.append(
+				"this alert uses NOT; the exclusion is applied after expansion, so the compact "
+				"events are prefiltered by the positive terms only and the search scans wider "
+				"than the same alert without the exclusion")
+
+		if result.dml_truncated:
+			# The builder leaves a keyword whose lookup was cut short out of the prefilter
+			# entirely (a cut hash list can be relied on neither way), so the compiled search
+			# is correct and wider than it could be.
+			review_reasons.append(
+				"the template lookup for at least one keyword was cut short (more message types "
+				"matched than could be fetched); that keyword is left out of the prefilter, so "
+				"the compiled search is correct but scans wider - recompile once cardinality is "
+				"more assured, or verify on a live instance")
+
+		if result.no_prefilter:
+			review_reasons.append(
+				"none of this alert's keywords restricts the compact events (each is negated, "
+				"or its template lookup was cut short), so the compiled search scans the entire "
+				"compact sourcetype on every run and applies the keywords after expansion")
+		elif not result.has_search_terms:
 			# No keyword search terms at all (a field-only search like 'status=500', or no
 			# filter beyond sourcetype) means no DML probe ever ran, so the compiled search
 			# carries no hash prefilter - it scans the entire compact sourcetype every run.
 			review_reasons.append(
 				"this alert has no keyword search terms, so the compiled search has no hash "
 				"prefilter and scans the entire compact sourcetype on every run")
-		elif result.no_dml_results and result.dml_truncated:
+		elif result.no_dml_results:
 			review_reasons.append(
-				"the template lookup was truncated before finishing, and none of the message "
-				"types it did examine matched these terms; the hash prefilter is omitted since "
-				"a matching template may still exist past the truncation point - recompile once "
-				"cardinality is more assured, or verify on a live instance")
-		else:
-			if result.no_dml_results:
-				review_reasons.append(
-					"no message type currently matches these terms; this alert will only fire "
-					"if a term appears as a variable value, not as template text - confirm "
-					"that is the intent, or recompile once a matching template exists")
-
-			elif result.dml_truncated:
-				review_reasons.append(
-					"the template lookup matched more message types than could be fetched; "
-					"the hash prefilter may be missing some matching message types")
+				"no message type currently matches these terms; this alert will only fire "
+				"if a term appears as a variable value, not as template text - confirm "
+				"that is the intent, or recompile once a matching template exists")
 
 		# Field conditions filter post-inflate via generic key=value extraction from the decoded
 		# event text (logfmt-style, space-separated). That works, but it depends on the decoded

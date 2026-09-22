@@ -398,6 +398,11 @@ class SpecifierFinder:
 			#
 			return []
 
+		if node.rule_type == "p_logical_expression":
+			# A parenthesised group. Its children are an implicit AND, exactly like the root.
+			#
+			return intersect([self._internal_process(child, fail_on_contact) for child in node.children])
+
 		if node.rule_type == "not_logical_expression":
 			# We have a NOT logical node.
 			#
@@ -507,12 +512,27 @@ class TenxSearchAstNodeFactory(TenxAstNodeFactory):
 	def __init__(self, debug=False):
 		TenxAstNodeFactory.__init__(self, debug)
 
+	# Pruned nodes hand their children to their parent, which is what flattens the grammar's
+	# right-nested implicit-AND chain into a flat list under the search root. Two logical nodes
+	# carry meaning that must not be flattened away:
+	#
+	# - not_logical_expression. Pruning it promoted the negated term as if it were positive, so
+	#   `NOT bootstrap` compiled into the same search as `bootstrap` and returned the exact
+	#   complement of what was asked (6 events against a truth of 19,992).
+	# - p_logical_expression. Pruning it spliced a group into an OR, so `c OR (a b)` became a
+	#   four-child OR node and lost the grouping.
+	KEPT_LOGICAL_NODES = ("not_logical_expression", "p_logical_expression")
+
 	def is_relevant_node(self, node_name):
 		"""
 		Checks if a node is relevant, allowing us to prune some clutter from the raw ast.
 
-		A node is defined as relevant if it has a non-empty lowercase name, and isn't a logical_expression node
+		A node is defined as relevant if it has a non-empty lowercase name, and isn't a
+		logical_expression node, other than the two that carry structure (see KEPT_LOGICAL_NODES).
 		"""
+		if node_name in self.KEPT_LOGICAL_NODES:
+			return True
+
 		return super().is_relevant_node(node_name) and not node_name.endswith("logical_expression")
 
 	def create_node(self, parse_node, children):

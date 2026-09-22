@@ -94,10 +94,11 @@ class TestNativeCompile:
 		assert result.strategy == AlertStrategy.NATIVE
 		assert result.storable
 		assert not result.needs_review
-		# hash prefilter over just h_pay, quoted (real hashes are punctuation-heavy and
-		# would otherwise corrupt or break the generated SPL)
-		assert 'tenx_hash IN ("h_pay")' in result.compiled_search
-		assert '(payment OR failed)' in result.compiled_search
+		# each word is either in the compact raw or in a template containing it; the
+		# template is selected by the phrase "~<hash>" (a field predicate on the hash
+		# cannot match hashes containing a space or a '*')
+		assert '("payment" OR ("~h_pay" OR "~h_pay2")) AND ("failed" OR ("~h_pay"))' in result.compiled_search
+		assert 'tenx_hash IN' not in result.compiled_search
 		# expansion is applied and results are re-narrowed to true matches
 		assert '`tenx-inflate`' in result.compiled_search
 		assert result.compiled_search.endswith('| search payment failed')
@@ -139,14 +140,19 @@ class TestNativeCompile:
 		result = make_compiler().compile('sourcetype=tenx_encoded "payment failed"')
 
 		assert result.strategy == AlertStrategy.NATIVE
-		assert 'tenx_hash IN ("h_pay")' in result.compiled_search
+		# a phrase is every word present; each word selects the templates containing it
+		assert '("payment" OR ("~h_pay" OR "~h_pay2")) AND ("failed" OR ("~h_pay"))' in result.compiled_search
+		assert result.compiled_search.endswith('| search "payment failed"')
 
 	def test_multi_word_matches_only_templates_with_all_words(self):
-		# "payment declined" should resolve to h_pay2 only, not h_pay (which lacks "declined").
+		# "declined" selects h_pay2 only, not h_pay (which lacks it); an event whose template
+		# is h_pay can still qualify through the "payment" clause and is then removed by the
+		# post-expansion search, which is what keeps a word-in-a-variable match reachable.
 		result = make_compiler().compile('sourcetype=tenx_encoded payment declined')
 
 		assert result.strategy == AlertStrategy.NATIVE
-		assert 'tenx_hash IN ("h_pay2")' in result.compiled_search
+		assert '("declined" OR ("~h_pay2"))' in result.compiled_search
+		assert '("payment" OR ("~h_pay" OR "~h_pay2"))' in result.compiled_search
 
 
 # ---------------------------------------------------------------------------
@@ -203,13 +209,15 @@ class TestHashSetIntegrityGuard:
 		assert 'no message type currently matches' in result.reason
 
 	def test_truncated_dml_probe_is_flagged(self):
+		# a keyword whose lookup was cut short is left out of the prefilter: correct, wider
 		result = make_compiler(truncate_dml=True).compile('sourcetype=tenx_encoded payment')
 
 		assert result.strategy == AlertStrategy.NATIVE
-		assert 'tenx_hash IN' in result.compiled_search  # some hashes were still found
+		assert '"~' not in result.compiled_search
+		assert result.compiled_search.endswith('| search payment')
 		assert result.storable
 		assert result.needs_review
-		assert 'more message types than could be fetched' in result.reason
+		assert 'cut short' in result.reason
 
 	def test_healthy_match_is_not_flagged(self):
 		result = make_compiler().compile('sourcetype=tenx_encoded payment failed')
@@ -225,11 +233,10 @@ class TestHashSetIntegrityGuard:
 		result = make_compiler(truncate_dml=True).compile('sourcetype=tenx_encoded zzzznomatch')
 
 		assert result.strategy == AlertStrategy.NATIVE
-		assert 'tenx_hash IN' not in result.compiled_search
+		assert '"~' not in result.compiled_search
 		assert result.needs_review
 		assert 'no message type currently matches' not in result.reason
-		assert 'more message types than could be fetched' not in result.reason
-		assert 'truncated before finishing' in result.reason
+		assert 'cut short' in result.reason
 
 
 # ---------------------------------------------------------------------------
@@ -387,23 +394,36 @@ class TestReferencedTenxSources:
 # ---------------------------------------------------------------------------
 
 class TestNegationGuard:
-	def test_not_on_compact_search_is_rejected(self):
-		# The builder's parser prunes NOT, so `sourcetype=tenx_encoded NOT payment` would
-		# otherwise compile to the same thing as the positive search (inverted alert).
+	def test_not_alone_compiles_to_a_flagged_full_scan(self):
+		# The builder keeps NOT and applies it after expansion: correct, and a scan of the
+		# whole compact sourcetype, which is what the review flag says.
 		result = make_compiler().compile('sourcetype=tenx_encoded NOT payment')
 
-		assert result.strategy == AlertStrategy.REJECTED
-		assert not result.storable
-		assert 'NOT' in result.reason
+		assert result.strategy == AlertStrategy.NATIVE
+		assert result.storable
+		assert result.needs_review
+		assert result.compiled_search.endswith('| search NOT payment')
+		assert '"~' not in result.compiled_search and 'tenx_hash="' not in result.compiled_search
+		assert 'NOT' in result.reason and 'each is negated' in result.reason
 
-	def test_excluding_term_on_compact_is_rejected(self):
+	def test_excluding_term_on_compact_is_native_and_flagged(self):
 		result = make_compiler().compile('sourcetype=tenx_encoded error NOT healthcheck')
-		assert result.strategy == AlertStrategy.REJECTED
 
-	def test_not_sourcetype_form_is_rejected(self):
-		# would otherwise inflate the very sourcetype the user asked to exclude
+		assert result.strategy == AlertStrategy.NATIVE
+		assert result.needs_review
+		assert '("error" OR ("~h_err"))' in result.compiled_search
+		assert result.compiled_search.endswith('| search error NOT healthcheck')
+		assert 'NOT' in result.reason
+		assert 'each is negated' not in result.reason
+
+	def test_not_sourcetype_form_is_not_inflated(self):
+		# excluding the compact sourcetype: the search does not target compact data and is
+		# passed through, flagged because it still names a configured compact source
 		result = make_compiler().compile('NOT sourcetype=tenx_encoded error')
-		assert result.strategy == AlertStrategy.REJECTED
+
+		assert result.strategy == AlertStrategy.PASSTHROUGH
+		assert result.needs_review
+		assert '`tenx-inflate`' not in result.compiled_search
 
 	def test_not_on_non_compact_search_is_fine(self):
 		# Splunk handles NOT natively off compact data; don't over-reject.
@@ -460,10 +480,10 @@ class TestFieldConditions:
 class TestHashPrefilterDeterminism:
 	def _hashes(self, compiled):
 		import re
-		m = re.search(r'tenx_hash IN \(([^)]*)\)', compiled or '')
+		m = re.search(r'\("payment" OR \(([^)]*)\)\)', compiled or '')
 		if not m:
 			return None
-		return [h.strip().strip('"') for h in m.group(1).split(',')]
+		return [h.strip().strip('"').lstrip('~') for h in m.group(1).split(' OR ')]
 
 	def test_multi_hash_prefilter_is_sorted(self):
 		# 'payment' matches h_pay and h_pay2
@@ -638,13 +658,15 @@ class TestDemoCsvIntegration:
 		result = compiler.compile('sourcetype=tenx_encoded binding')
 
 		assert result.strategy == AlertStrategy.NATIVE
-		assert 'tenx_hash IN (' in result.compiled_search
+		assert '("binding" OR ("~' in result.compiled_search
 		assert '`tenx-inflate`' in result.compiled_search
 
 	def test_absent_word_compiles_native_flagged(self, compiler):
-		result = compiler.compile('sourcetype=tenx_encoded zzz_not_in_any_template_zzz')
+		# one word with no breakers in it: an underscore is a breaker, and "not", "in" and
+		# "template" are ordinary words that templates do contain
+		result = compiler.compile('sourcetype=tenx_encoded zzznotinanytemplatezzz')
 
 		assert result.strategy == AlertStrategy.NATIVE
-		assert 'tenx_hash IN' not in result.compiled_search
+		assert '"~' not in result.compiled_search
 		assert '`tenx-inflate`' in result.compiled_search
 		assert result.needs_review

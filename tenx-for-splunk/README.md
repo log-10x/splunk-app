@@ -141,10 +141,23 @@ The `tenx_dml` collection stores parsed template data with fields:
 | `tenx-inflate-debug` | Same as above but keeps intermediate fields for debugging |
 | `tenx-message(1)` | Utility macro to display messages in search results |
 
+#### Search Surfaces
+
+| Surface | Purpose |
+|---------|---------|
+| `tenxsearch searchstring="..."` | Generating command: runs a search over compact events as if on the original lines (see Usage) |
+| `appserver/static/dashboard.js` + `javascript/search/tenx_search_hook.js` | Loaded on every classic dashboard in an app that carries `dashboard.js`; routes panel searches through `/tenx-search` |
+| `/tenx-search` REST endpoint | Rewrites a search and returns an ordinary job id; what the dashboard hook calls |
+
 #### Python Scripts
 
 | Script | Purpose |
 |--------|---------|
+| `tenxsearch.py` | The `tenxsearch` generating command |
+| `tenx_search_builder.py` | Compiles a user search into a search over compact events |
+| `tenx_spl_parser.py` | Grammar and AST for the search terms the builder rewrites |
+| `tenx_search_manager.py` | Search jobs and the template dictionary lookups |
+| `tenx_alert_compiler.py` | Save-time compile of an alert into native SPL |
 | `tenx_dml_to_kv.py` | Alert action that populates KV store from template JSON |
 | `tenx_dml_builder.py` | Core logic for parsing templates into KV-storable format |
 | `tenx_util.py` | Utility functions (REST client, logging, config loading) |
@@ -265,6 +278,54 @@ This applies the field extraction that parses compact events into `tenx_hash`, `
 ---
 
 ## Usage
+
+### Searching Compact Events
+
+Compact events do not contain the constant words of the log line, so a plain search for
+one of those words finds nothing. There are two ways to search them as if they were the
+original lines.
+
+**Classic dashboards: nothing to change.** The app ships `appserver/static/dashboard.js`,
+which Splunk loads on every classic (Simple XML) dashboard in the app that carries it. It
+routes each panel's search through the app's REST endpoint, which rewrites it and returns
+an ordinary job, so panels keep their SPL and get the expanded events. To cover the
+dashboards of another app, copy `dashboard.js` into that app's `appserver/static/`. The
+search bar and Dashboard Studio load no app JavaScript, so this does not reach them.
+
+**Everywhere else: the `tenxsearch` command.** In the Search & Reporting bar, a saved
+search, an alert or the REST API, wrap the search in the command:
+
+```spl
+| tenxsearch searchstring="index=myindex sourcetype=tenx_encoded error"
+```
+
+A quoted phrase inside the search is escaped: `searchstring="index=myindex \"payment failed\""`.
+
+Both paths do the same thing. Each word is looked up in the template dictionary, the
+compact events whose template or variable values carry it are selected, expanded, and
+the search is applied again to the expanded lines. `NOT`, `OR`, quoted phrases, field
+conditions and a trailing pipeline all work as on the original data, and values Splunk
+indexes as one token but the pipeline stores in pieces, such as an IP address, a hostname
+or a region name, are matched piece by piece. The time picker is honoured.
+
+Three things to know:
+
+- **A search that leaves the command out is not an error.** A bare
+  `index=myindex sourcetype=tenx_encoded error` returns zero events, because the word is
+  in the dictionary and not in the event. Keep compact indexes out of users' default index
+  sets and name them so the omission is visible.
+- **A search the command cannot rewrite is refused, not run as typed.** The job fails with
+  a message naming the compact sourcetype; the detail is in
+  `$SPLUNK_HOME/var/log/splunk/tenx_search_command.log`. Two shapes the rewrite does not
+  follow: a parenthesised group followed by more terms, `(a OR b) c`, and a sourcetype
+  inside an OR, `sourcetype=x OR host=y`.
+- **The command is the slower path for large results.** A generating command has to
+  write every event out itself. Measured on one laptop container: a dashboard panel or
+  the REST endpoint returns 20,000 expanded events in about 3 seconds; the command takes
+  about 2 seconds plus one millisecond per event, so 2,000 events in 3 seconds and
+  20,000 in 21. Alerts are better compiled once at save time with the "10x Compile
+  Alert" view, which stores native SPL the scheduler runs directly; see
+  [SAVE_TIME_ALERTS.md](../SAVE_TIME_ALERTS.md).
 
 ### Basic Expansion
 
