@@ -314,7 +314,8 @@ by piece, since the pipeline stores it in pieces.
   dashboard panel shows it in place of a number. The unsupported shape is a sourcetype
   inside an OR, `sourcetype=x OR host=y`.
 - A word matching more than 25,000 templates is dropped from the prefilter, so the search
-  scans the sourcetype and checks that word after expansion.
+  scans the sourcetype and checks that word after expansion. A word whose dictionary lookup
+  does not finish inside the search's 30-second lookup budget is dropped the same way.
 
 **Speed**, 20,000 expanded events:
 

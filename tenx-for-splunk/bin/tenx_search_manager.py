@@ -287,7 +287,9 @@ class TenxSearchManager:
 
 		Basically a wrapper for create_dml_search -> poll_for_job_end -> get_dml_results.
 
-		Returns (hashes, truncated); (None, False) in case of any errors along the way.
+		Returns (hashes, truncated). (None, True) when the probe did not finish inside
+		max_time_ms, which the caller treats as "no usable hash list" rather than an error.
+		(None, False) in case of any actual errors along the way.
 		"""
 		logger.info("About to dml search - {}".format(dml_search))
 
@@ -299,6 +301,15 @@ class TenxSearchManager:
 			return None, False
 
 		state = self.poll_for_job_end(dml_sid, max_time_ms, poll_interval_ms)
+
+		if state == JobState.TIMEOUT:
+			# Did not finish inside its budget. That is not a failure of the search, and the
+			# caller can carry on without this probe: a piece with no hash list is simply not
+			# used to narrow, which is correct and wider. Reported as incomplete, the same as
+			# a truncated result, rather than as an error.
+			logger.warning("Dml probe {} did not finish in {}ms - {}.".format(dml_sid, max_time_ms, dml_search))
+
+			return None, True
 
 		if state != JobState.SUCCESS:
 			logger.warning("Failed waiting for job {} - {} - {}.".format(dml_sid, dml_search, state))

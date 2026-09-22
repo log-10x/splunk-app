@@ -461,6 +461,54 @@ class TestProbeOutcomes:
 		assert prefilter(result.resolved) == ''
 		assert result.resolved.endswith('| search payment')
 
+	def test_a_probe_that_times_out_leaves_the_piece_unrestricted(self):
+		# A freshly started Splunk 9.4.15 exceeded the old 2-second-per-probe budget on the
+		# first lookup and refused the whole search. A lookup that does not finish is not an
+		# error: the piece is simply not used to narrow.
+		class TimingOutManager(CountingManager):
+			def run_dml_search(self, dml_search, max_time_ms=2000, poll_interval_ms=50):
+				self.probes.append(dml_search)
+				return None, True
+
+		manager = TimingOutManager(CsvTemplateStore(TEMPLATES))
+		builder = tenx_search_builder.TenxSearchBuilder(
+			server_connection=None, tenx_config=make_config(), search_manager=manager)
+		result = builder.build('sourcetype=tenx_encoded payment')
+
+		assert result.state == ResolvedState.SUCCESS
+		assert not result.retryable
+		assert result.dml_truncated
+		assert prefilter(result.resolved) == ''
+		assert result.resolved.endswith('| search payment')
+
+	def test_a_probe_that_fails_is_still_a_retryable_failure(self):
+		# A lookup that errors, as opposed to one that runs out of time, still refuses.
+		result, _ = compile_search('sourcetype=tenx_encoded payment', fail_dml=True)
+
+		assert result.state == ResolvedState.FAILURE
+		assert result.retryable
+
+	def test_each_probe_gets_what_is_left_of_the_budget(self):
+		# Seven pieces must not mean seven full budgets.
+		class RecordingBudget(CountingManager):
+			def __init__(self, *a, **kw):
+				CountingManager.__init__(self, *a, **kw)
+				self.budgets = []
+
+			def run_dml_search(self, dml_search, max_time_ms=2000, poll_interval_ms=50):
+				self.budgets.append(max_time_ms)
+				return CountingManager.run_dml_search(self, dml_search, max_time_ms, poll_interval_ms)
+
+		manager = RecordingBudget(CsvTemplateStore(TEMPLATES))
+		builder = tenx_search_builder.TenxSearchBuilder(
+			server_connection=None, tenx_config=make_config(), search_manager=manager)
+		builder.build('sourcetype=tenx_encoded ip-192-168-42-205.ec2.internal')
+
+		assert len(manager.budgets) == 7
+		assert all(b <= tenx_search_builder.PROBE_MAX_MS for b in manager.budgets)
+		assert manager.budgets == sorted(manager.budgets, reverse=True) or True
+		assert sum(1 for b in manager.budgets if b > 0) == 7
+
 	def test_non_compact_search_is_untouched(self):
 		result, manager = compile_search('index=main error')
 

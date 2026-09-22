@@ -123,6 +123,15 @@ SEGMENT_BREAKERS = frozenset("[]<>(){}|!;,'\"\n\r\t &?+/:=@.-$#%\\_")
 # repeat a long hash list once per piece. Either shape is a correct superset.
 PER_PIECE_HASH_LIMIT = 500
 
+# Total time one search may spend looking words up in the dictionary, and the most any
+# single lookup may take. The budget is shared: a term cut into seven pieces is seven
+# lookups, and before this was a budget it was 2 seconds EACH, which a freshly started
+# Splunk 9.4.15 exceeded on the first lookup of the first search and refused the whole
+# search over. Warm, a lookup takes about 0.3 seconds. A piece whose lookup does not fit
+# in what is left is not used to narrow, which is correct and wider.
+PROBE_BUDGET_MS = 30000
+PROBE_MAX_MS = 10000
+
 # A hash containing '*' cannot be matched as a whole phrase, because the '*' is a wildcard
 # even inside quotes. The text before the first '*' is matched instead, when it is long
 # enough to be a filter: "~-" matched 12,648 of 20,000 events and "~" matched 16,746.
@@ -384,6 +393,7 @@ class TenxSearchCommand(TenxSplCommand):
 		# user typed twice is probed once.
 		self._probe_cache = {}
 		self._template_hits = 0
+		self._probe_deadline = None
 
 		parsed_command = self._get_parsed_command()
 
@@ -417,14 +427,30 @@ class TenxSearchCommand(TenxSplCommand):
 		complete, which the caller turns into a retryable FAILURE rather than a guess.
 		"""
 		if piece not in self._probe_cache:
-			hashes, truncated = self.search_manager.run_dml_search(quoted_term(piece))
+			remaining = PROBE_BUDGET_MS if self._probe_deadline is None else (
+				self._probe_deadline - tenx_util.current_time_ms())
+
+			if remaining <= 0:
+				# The budget is spent. Do not dispatch: report the piece as unusable, which
+				# leaves it out of the prefilter.
+				logger.warning("Dictionary budget spent before probing {}.".format(piece))
+				self._probe_cache[piece] = ([], True)
+				return self._probe_cache[piece]
+
+			hashes, incomplete = self.search_manager.run_dml_search(
+				quoted_term(piece), min(remaining, PROBE_MAX_MS))
 
 			# Specifically None check, as empty is ok
 			#
 			if hashes is None:
-				raise DmlProbeFailed(piece)
+				if not incomplete:
+					raise DmlProbeFailed(piece)
 
-			self._probe_cache[piece] = (hashes, truncated)
+				# Did not finish in its budget. Correct to carry on without it.
+				#
+				hashes = []
+
+			self._probe_cache[piece] = (hashes, incomplete)
 
 		return self._probe_cache[piece]
 
@@ -630,6 +656,8 @@ class TenxSearchCommand(TenxSplCommand):
 		#
 		# TODO - allow configurable timeouts for the dml search
 		#
+		self._probe_deadline = tenx_util.current_time_ms() + PROBE_BUDGET_MS
+
 		try:
 			self.resolved_search = conjoin([self._prefilter(child) for child in self.parsed_command.children])
 		except DmlProbeFailed as e:
