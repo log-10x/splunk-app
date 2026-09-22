@@ -2,7 +2,11 @@
   <view name="tenx_dashboard" default='true' label="10x Analytics" />
   <view name="tenx_diagnostics" label="10x Diagnostics" />
   <view name="tenx_alert_compile" label="10x Compile Alert" />
-  <view name="search" default_search='true' />
+  <!-- Splunk's own search view. The app's copy, which carried a browser-side rewrite of the
+       search bar, is gone: Splunk's search page loads no app JavaScript (measured on 10.4.3),
+       so the copy was a plain search bar wearing the app's label. Compact data is searched
+       from any search bar with the tenxsearch command; see the README. -->
+  <view name="search" />
   <view name="alerts" />
   <view name="dashboards" />
 </nav>

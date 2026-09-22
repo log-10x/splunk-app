@@ -80,9 +80,21 @@ sys.path.append(os.path.join(apphome, 'lib'))
 import tenx_util
 import tenx_search_manager
 import tenx_search_builder
+import tenx_alert_compiler
 
 tenx_util.setup_logger('tenx_search_handler', logging.INFO)
 logger = logging.getLogger(__name__)
+
+
+def refusal(message):
+	"""
+	The response for a search this endpoint will not run. Shaped like splunkd's own
+	rejection of a search job (HTTP 400 with a FATAL message), which is what the caller,
+	a dashboard's search manager, already knows how to show in the panel.
+	"""
+	logger.warning(message)
+
+	return {'payload': {'messages': [{'type': 'FATAL', 'text': message}]}, 'status': 400}
 
 
 class TenxSearchHandler(PersistentServerConnectionApplication):
@@ -142,6 +154,11 @@ class TenxSearchHandler(PersistentServerConnectionApplication):
 
 			logger.info("Loaded config - {}".format(json.dumps(tenx_config)))
 
+			if not tenx_config.get(tenx_util.CONFIG_LOADED, True):
+				return refusal("10x: the app's configuration could not be read, so this search was not "
+					"run (built on the defaults it would look for templates in the wrong index and "
+					"return the wrong events). See tenx_search_handler.log.")
+
 			server_connection = tenx_util.ServerConnection(
 				server_uri=server_uri,
 				user=in_string_json["session"]["user"],
@@ -165,9 +182,37 @@ class TenxSearchHandler(PersistentServerConnectionApplication):
 
 				# Create a 10x compatible search on encoded data.
 				#
-				new_search = search_builder.resolve(original_search)
+				build_result = search_builder.build(original_search)
+				new_search = build_result.resolved
 
-				logger.info("Original search - {} ..xxx.. New search - {}".format(original_search, new_search))
+				logger.info("Original search - {} ..xxx.. New search - {} ({})".format(
+					original_search, new_search, build_result.state))
+
+				# A search that could not be rewritten must not run as typed. On compact data
+				# the words are not in the events, so a dashboard panel would show zero and
+				# "Search has completed": measured, a panel reading `(error OR warn) kubernetes`
+				# showed 0 against a truth of 468 this way. Refuse instead, the same three
+				# ways tenxsearch.py does.
+				#
+				if build_result.state == tenx_search_builder.ResolvedState.FAILURE:
+					if build_result.retryable:
+						return refusal("10x: the template lookup did not complete, so this search was not run "
+							"(run as typed it would return the wrong events). Run it again.")
+
+					return refusal("10x: this search could not be parsed for compact data, so it was not "
+						"run. See tenx_search_handler.log for the parse error.")
+
+				if build_result.state == tenx_search_builder.ResolvedState.COMPLEX:
+					return refusal("10x: this search mixes sourcetypes or fields in a way the rewrite cannot "
+						"follow, so it was not run. Put the compact sourcetype in a plain sourcetype=... term.")
+
+				if not build_result.engaged:
+					compact_sources = tenx_alert_compiler._referenced_tenx_sources(original_search, tenx_config)
+
+					if compact_sources:
+						return refusal("10x: this search names the compact source(s) {} but could not be "
+							"rewritten for compact data, so it was not run. See tenx_search_handler.log.".format(
+								", ".join(sorted(compact_sources))))
 
 				search_data['search'] = new_search
 

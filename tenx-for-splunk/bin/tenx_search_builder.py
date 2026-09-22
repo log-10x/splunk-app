@@ -16,11 +16,39 @@ Search Resolution Process
 2. For each 'search' command in the SPL chain:
    a. Check if it targets an 10x-encoded sourcetype/source
    b. Extract search terms (index expressions, field expressions)
-   c. Search the tenx_dml_pure sourcetype for matching template hashes
-   d. Build new search: (original_terms OR tenx_hash IN ("hash1","hash2")) - each hash quoted
-      and escaped, since real hashes are dense, punctuation-heavy strings
+   c. Compile the keyword terms into a PREFILTER over the compact events (see below)
 3. Append tenx-inflate macro to decode results
-4. Return the resolved search string
+4. Re-apply the user's own terms to the decoded events
+5. Return the resolved search string
+
+The prefilter
+-------------
+A compact event holds the template hash and the variable values; the template's constant
+words are only in the dictionary (sourcetype tenx_dml_pure). So a word the user searched
+for is in the original line if it is in the compact event's raw text OR in the text of the
+event's template. The prefilter only has to be a SUPERSET of the true matches, because the
+user's terms are applied again after expansion (step 4), which removes anything the
+prefilter let through by accident.
+
+Each keyword is first cut into PIECES at Splunk's own segmentation breakers, because the
+engine splits values there too: an IP `192.168.45.200` is stored as four variables
+`192,168,45,200` and a hostname `ip-192-168-42-205.ec2.internal` as the template
+`ip$$$$.ec2.internal` plus `-192,-168,-42,-205`. Neither the compact event nor the template
+contains the whole value as one token, so it has to be matched piece by piece. Each piece is
+looked up in the dictionary, and then:
+
+- a piece no template contains MUST be in the compact raw, so it is required there;
+- a piece some templates contain is either in the raw or in one of those templates:
+  ("piece" OR <those hashes>).
+
+Boolean structure is compiled the same way: AND of supersets is a superset, OR of supersets
+is a superset, and a negated term contributes nothing to the prefilter (its exclusion is
+applied after expansion, where the words are back).
+
+A hash is matched as the phrase "~<hash>" rather than tenx_hash="<hash>": the tilde is not
+a breaker, so the indexed token is `~KC`, not `KC`, and a field predicate on the hash was
+pushed down to the lexicon and found nothing for every hash containing a space (305 of 2,991)
+or a `*` (372 of 2,991, since `*` is a live wildcard even inside quotes).
 
 Example Resolution
 ------------------
@@ -28,9 +56,10 @@ Original:
     search index=main sourcetype=tenx_encoded error
 
 After resolution:
-    search index=main sourcetype=tenx_encoded ((error) OR (tenx_hash IN ("hash1","hash2")))
+    search index=main sourcetype=tenx_encoded ("error" OR ("~hash1" OR "~hash2"))
     | `tenx-inflate`
     | extract
+    | search error
 
 Classes
 -------
@@ -83,6 +112,133 @@ class ResolvedState(Enum):
 	PENDING = auto()
 
 
+# Splunk's default segmenters (etc/system/default/segmenters.conf), major and minor
+# breakers together, as single characters. '*' is a major breaker for the indexer but a live
+# wildcard in a search term, so it stays attached to its piece. The multi-character majors
+# ('--' and the %XX escapes) are covered by their single characters.
+SEGMENT_BREAKERS = frozenset("[]<>(){}|!;,'\"\n\r\t &?+/:=@.-$#%\\_")
+
+# A piece that matches more templates than this does not get its own ("piece" OR <hashes>)
+# clause; every such piece shares one clause instead, so the compiled search does not
+# repeat a long hash list once per piece. Either shape is a correct superset.
+PER_PIECE_HASH_LIMIT = 500
+
+# Total time one search may spend looking words up in the dictionary, and the most any
+# single lookup may take. The budget is shared: a term cut into seven pieces is seven
+# lookups, and before this was a budget it was 2 seconds EACH, which a freshly started
+# Splunk 9.4.15 exceeded on the first lookup of the first search and refused the whole
+# search over. Warm, a lookup takes about 0.3 seconds. A piece whose lookup does not fit
+# in what is left is not used to narrow, which is correct and wider.
+PROBE_BUDGET_MS = 30000
+PROBE_MAX_MS = 10000
+
+# A hash containing '*' cannot be matched as a whole phrase, because the '*' is a wildcard
+# even inside quotes. The text before the first '*' is matched instead, when it is long
+# enough to be a filter: "~-" matched 12,648 of 20,000 events and "~" matched 16,746.
+HASH_PREFIX_MIN = 2
+
+
+class DmlProbeFailed(Exception):
+	"""The dictionary lookup for a piece did not complete (timeout, busy indexer, REST error)."""
+
+
+def split_pieces(word):
+	"""
+	Cuts one search word into the pieces Splunk indexes it as: the runs between segment
+	breakers. A piece made only of wildcards is dropped, since it matches everything.
+
+	    split_pieces('192.168.45.200')                  -> ['192', '168', '45', '200']
+	    split_pieces('ip-192-168-42-205.ec2.internal')  -> ['ip', '192', '168', '42', '205', 'ec2', 'internal']
+	    split_pieces('err*')                            -> ['err*']
+	"""
+	pieces = []
+	buf = []
+
+	for ch in word:
+		if ch in SEGMENT_BREAKERS:
+			if buf:
+				pieces.append(''.join(buf))
+				buf = []
+		else:
+			buf.append(ch)
+
+	if buf:
+		pieces.append(''.join(buf))
+
+	return [piece for piece in pieces if piece.strip('*')]
+
+
+def quoted_term(text):
+	"""A search term as a double-quoted SPL phrase. A '*' inside stays a wildcard."""
+	return '"' + tenx_util.escape_spl_string_literal(text) + '"'
+
+
+def hash_predicate(dml_hash):
+	"""
+	The SPL that selects the compact events of one template.
+
+	Phrase "~<hash>" when the hash has no '*'; phrase "~<prefix>" for the text before the
+	first '*' when that prefix is at least HASH_PREFIX_MIN characters (a superset, since other
+	hashes may share the prefix); otherwise a field predicate, which Splunk answers by
+	extraction rather than from the lexicon and which is itself a wildcard match. All three
+	are supersets at worst, and the post-expansion search removes the excess. Measured
+	coverage on 2,991 templates: 20,000 of 20,000 events.
+	"""
+	if '*' not in dml_hash:
+		return quoted_term('~' + dml_hash)
+
+	prefix = dml_hash.split('*', 1)[0]
+
+	if len(prefix) >= HASH_PREFIX_MIN:
+		return quoted_term('~' + prefix)
+
+	return 'tenx_hash=' + quoted_term(dml_hash)
+
+
+def hash_clause(hashes):
+	"""
+	One parenthesised OR over the predicates for a set of hashes, sorted and de-duplicated so
+	the same template set always compiles to the same text (the compiled search is persisted
+	in savedsearches.conf, and a recompile pass rewrites only when the text changed).
+	"""
+	return '(' + ' OR '.join(sorted(set(hash_predicate(dml_hash) for dml_hash in hashes))) + ')'
+
+
+def conjoin(parts):
+	"""
+	The implicit-AND of the given prefilter parts. None means 'unrestricted' and is dropped;
+	if nothing is left the whole conjunction is unrestricted (None).
+	"""
+	parts = [part for part in parts if part]
+
+	if not parts:
+		return None
+
+	if len(parts) == 1:
+		return parts[0]
+
+	return ' AND '.join(part if is_wrapped(part) else '(' + part + ')' for part in parts)
+
+
+def is_wrapped(text):
+	"""Whether the text is one parenthesised group, so it needs no further parentheses."""
+	if not (text.startswith('(') and text.endswith(')')):
+		return False
+
+	depth = 0
+
+	for index, ch in enumerate(text):
+		if ch == '(':
+			depth += 1
+		elif ch == ')':
+			depth -= 1
+
+			if depth == 0:
+				return index == len(text) - 1
+
+	return False
+
+
 class BuildResult:
 	"""
 	Structured outcome of TenxSearchBuilder.build().
@@ -117,12 +273,19 @@ class BuildResult:
 		DML - the compile has no hash prefilter, only the raw keyword clause (which still
 		catches a variable-value match).
 	dml_truncated : bool
-		True when the DML probe matched more rows than were fetched (see
-		tenx_search_manager.DML_FETCH_LIMIT) - the hash set may be missing hashes that only
-		appeared past that cap.
+		True when a DML probe matched more rows than were fetched (see
+		tenx_search_manager.DML_FETCH_LIMIT). A piece whose probe was truncated is left out
+		of the prefilter altogether (the only safe treatment), so the compiled search is
+		still correct but wider than it could be.
+	no_prefilter : bool
+		True when the leading search had keyword terms but none of them restricted the
+		compact events at all, which happens when every keyword is negated: `NOT bootstrap`
+		compiles to a full scan of the compact sourcetype, with the exclusion applied after
+		expansion. Correct, and a scan.
 	"""
 	def __init__(self, state, resolved, engaged=False, field_terms=None, retryable=False,
-				has_search_terms=False, no_dml_results=False, dml_truncated=False):
+				has_search_terms=False, no_dml_results=False, dml_truncated=False,
+				no_prefilter=False):
 		self.state = state
 		self.resolved = resolved
 		self.engaged = engaged
@@ -131,6 +294,7 @@ class BuildResult:
 		self.has_search_terms = has_search_terms
 		self.no_dml_results = no_dml_results
 		self.dml_truncated = dml_truncated
+		self.no_prefilter = no_prefilter
 
 
 class TenxSplCommand:
@@ -224,6 +388,12 @@ class TenxSearchCommand(TenxSplCommand):
 		self.dml_truncated = False
 		self.parsed_command = None
 		self.resolved_search = None
+		self.resolved_done = False
+		# Dictionary lookups by piece, shared across every term of this search: a piece the
+		# user typed twice is probed once.
+		self._probe_cache = {}
+		self._template_hits = 0
+		self._probe_deadline = None
 
 		parsed_command = self._get_parsed_command()
 
@@ -246,19 +416,142 @@ class TenxSearchCommand(TenxSplCommand):
 		self.user_search_terms = self.parsed_command.get_typed_children(tenx_spl_parser.SearchNodeType.INDEX)
 		self.user_field_terms = self.parsed_command.get_typed_children(tenx_spl_parser.SearchNodeType.FIELD)
 
-		self.user_search_words = []
+		# The prefilter is a superset, so the user's own terms are always re-applied to the
+		# expanded events (see original_search_terms). The name is kept for its callers.
+		self.needs_original_search_check = len(self.user_search_terms) > 0
 
-		for search_term in self.user_search_terms:
-			self._fill_user_search_words(search_term)
+	def _probe(self, piece):
+		"""
+		Returns (hashes, truncated) for the templates whose text contains the piece, via one
+		dictionary search per distinct piece. Raises DmlProbeFailed when the lookup did not
+		complete, which the caller turns into a retryable FAILURE rather than a guess.
+		"""
+		if piece not in self._probe_cache:
+			remaining = PROBE_BUDGET_MS if self._probe_deadline is None else (
+				self._probe_deadline - tenx_util.current_time_ms())
 
-	def _fill_user_search_words(self, search_term):
-		if search_term.rule_type == 'binary_expression':
-			self._fill_user_search_words(search_term.children[0])
-			self._fill_user_search_words(search_term.children[2])
-		elif search_term.rule_type == 'index_expression':
-			text = tenx_util.strip_string(search_term.text)
+			if remaining <= 0:
+				# The budget is spent. Do not dispatch: report the piece as unusable, which
+				# leaves it out of the prefilter.
+				logger.warning("Dictionary budget spent before probing {}.".format(piece))
+				self._probe_cache[piece] = ([], True)
+				return self._probe_cache[piece]
 
-			self.user_search_words.extend(text.split(' '))
+			hashes, incomplete = self.search_manager.run_dml_search(
+				quoted_term(piece), min(remaining, PROBE_MAX_MS))
+
+			# Specifically None check, as empty is ok
+			#
+			if hashes is None:
+				if not incomplete:
+					raise DmlProbeFailed(piece)
+
+				# Did not finish in its budget. Correct to carry on without it.
+				#
+				hashes = []
+
+			self._probe_cache[piece] = (hashes, incomplete)
+
+		return self._probe_cache[piece]
+
+	def _term_prefilter(self, term_text):
+		"""
+		The prefilter for one keyword term (a bare word or a quoted phrase).
+
+		Every piece of every word must be present in the original line, so the pieces are
+		conjoined. Each piece is either in the compact raw or in the template text:
+
+		- no template contains it  -> it must be in the raw: required there
+		- some templates contain it -> ("piece" OR <those templates' hashes>)
+
+		Pieces that match many templates share one clause, ((p1 OR p2 ...) OR <hashes of the
+		templates containing all of them>), which is the same superset argument applied to
+		the group: if all of them are template text the hash clause selects it, otherwise at
+		least one is in the raw and the OR of pieces selects it. A piece whose probe was
+		truncated is left unrestricted, because a cut hash list cannot be relied on either way.
+		"""
+		pieces = []
+
+		for word in tenx_util.strip_string(term_text).split():
+			for piece in split_pieces(word):
+				if piece not in pieces:
+					pieces.append(piece)
+
+		if not pieces:
+			return None
+
+		conjuncts = []
+		shared_pieces = []
+		shared_hashes = None
+
+		for piece in pieces:
+			hashes, truncated = self._probe(piece)
+
+			if truncated:
+				self.dml_truncated = True
+				continue
+
+			if not hashes:
+				conjuncts.append(quoted_term(piece))
+				continue
+
+			self._template_hits += 1
+
+			if len(hashes) <= PER_PIECE_HASH_LIMIT:
+				conjuncts.append('(' + quoted_term(piece) + ' OR ' + hash_clause(hashes) + ')')
+				continue
+
+			shared_pieces.append(piece)
+			shared_hashes = set(hashes) if shared_hashes is None else shared_hashes & set(hashes)
+
+		if shared_pieces:
+			shared = ' OR '.join(quoted_term(piece) for piece in shared_pieces)
+
+			if shared_hashes:
+				shared = '(' + shared + ') OR ' + hash_clause(shared_hashes)
+
+			conjuncts.append('(' + shared + ')')
+
+		return conjoin(conjuncts)
+
+	def _prefilter(self, node):
+		"""
+		Compiles one node of the parsed search into its prefilter over compact events, or
+		None when the node does not restrict them.
+
+		Modifiers (index=, sourcetype=) are emitted separately by search_modifiers(). Field
+		conditions are applied after expansion by field_search(). A negated term is
+		unrestricted here and excluded after expansion by original_search_terms(): the
+		prefilter is a superset, and the complement of a superset is not a superset.
+
+		An OR node's children are its operands (the parser keeps Splunk's precedence, so
+		`a OR b c` arrives as the OR of a and b, then c). An OR is unrestricted as soon as
+		one operand is, since the OR of a superset with everything is everything.
+		"""
+		rule_type = node.rule_type
+
+		if rule_type == 'index_expression':
+			return self._term_prefilter(node.text)
+
+		if rule_type in ('not_logical_expression', 'field_modifier', 'search_modifier'):
+			return None
+
+		if rule_type == 'or_expression':
+			parts = [self._prefilter(child) for child in node.children]
+
+			if any(part is None for part in parts):
+				return None
+
+			return ' OR '.join(part if is_wrapped(part) else '(' + part + ')' for part in parts)
+
+		if node.children:
+			# A parenthesised group, or any other grouping: an implicit AND of its children.
+			#
+			return conjoin([self._prefilter(child) for child in node.children])
+
+		# A leaf this compiler does not know. Unrestricted is always safe here.
+		#
+		return None
 
 	def _get_parsed_command(self):
 		"""
@@ -358,32 +651,19 @@ class TenxSearchCommand(TenxSplCommand):
 			#
 			return
 
-		# Because the result can come from either the dml (pattern) or actual index (variables)
-		# we need to perform an OR based search, and split any phrases
-		#
-		or_based_search = " OR ".join(self.user_search_words)
-		base_user_terms = " ".join([item.text for item in self.user_search_terms])
-
-		self.needs_original_search_check = (or_based_search != base_user_terms)
-
-		# The DML PROBE uses the user's own conjunction (AND, via plain space-separation - the
-		# same terms as typed), not an OR of every word. An OR probe matches every template
-		# containing ANY single word, which can fan a multi-word search in to every unrelated
-		# template sharing one common term and push the probe past DML_FETCH_LIMIT for no
-		# benefit. Probing with AND loses no recall: if a word is absent from a template's
-		# text it must be present as a VARIABLE VALUE for a real match, which the
-		# or_based_search keyword clause below still catches.
+		# The whole search body is an implicit AND of the root's children. Modifiers and
+		# field conditions compile to None here and are emitted by their own methods.
 		#
 		# TODO - allow configurable timeouts for the dml search
 		#
-		dml_results, dml_truncated = self.search_manager.run_dml_search(base_user_terms)
-		self.dml_truncated = dml_truncated
+		self._probe_deadline = tenx_util.current_time_ms() + PROBE_BUDGET_MS
 
-		# Specifically None check, as empty is ok
-		#
-		if dml_results is None:
+		try:
+			self.resolved_search = conjoin([self._prefilter(child) for child in self.parsed_command.children])
+		except DmlProbeFailed as e:
 			# Logging already happens inside run_dml_search
 			#
+			logger.warning("Dictionary lookup did not complete for piece {} of '{}'.".format(e, self.simple_resolved()))
 			self.has_errors = True
 			# This is a transient lookup failure (job timeout/busy indexer), NOT a permanent
 			# problem with the search itself. Save-time callers should retry, not drop the alert.
@@ -391,21 +671,12 @@ class TenxSearchCommand(TenxSplCommand):
 			self.dml_search_failed = True
 			return
 
-		if len(dml_results) == 0:
-			self.no_dml_results = True
-			self.resolved_search = or_based_search
-			return
-
-		# Build new search from the user terms and the dml_results. Hashes are quoted: real
-		# 10x hashes are dense, punctuation-heavy strings (not plain alphanumeric), and an
-		# unquoted hash containing e.g. '|' or '[' would corrupt or break the SPL the
-		# compiled search dispatches.
+		self.resolved_done = True
+		# No template contained any piece the user typed: the search can only match on
+		# variable values, and the compiled search says so by carrying no hash clause. A
+		# truncated probe is not evidence either way, so it does not count as "none".
 		#
-		quoted_hashes = ",".join(
-			'"{}"'.format(tenx_util.escape_spl_string_literal(dml_hash)) for dml_hash in dml_results)
-		dml_resolved_search = "tenx_hash IN (" + quoted_hashes + ")"
-
-		self.resolved_search = "((" + or_based_search + ") OR (" + dml_resolved_search + "))"
+		self.no_dml_results = (self._template_hits == 0 and not self.dml_truncated)
 
 	def check_needs_tenx(self):
 		"""
@@ -485,13 +756,15 @@ class TenxSearchCommand(TenxSplCommand):
 		if self.too_complex:
 			return ResolvedState.COMPLEX
 
-		if not self.has_dml_user_search_terms():
+		if len(self.user_search_terms) == 0:
+			# Nothing to look up. The search still gets the inflate suffix (see resolved).
+			#
 			return ResolvedState.SUCCESS
 
 		if self.has_errors:
 			return ResolvedState.FAILURE
 
-		if self.resolved_search is None:
+		if not self.resolved_done:
 			return ResolvedState.PENDING
 
 		return ResolvedState.SUCCESS
@@ -541,11 +814,21 @@ class TenxSearchCommand(TenxSplCommand):
 	def inflate_suffix(self):
 		"""
 		Returns the suffix needed to chain into the 'tenx-inflate' macro, as well as chaining into SPL 'extract'
-		so we will restore the user defined extractions after we decode.
+		so we will restore the user defined extractions after we decode, and 'spath' so a decoded JSON
+		or XML line gets its structured fields back: 'extract' alone leaves them out, so a search for
+		kubernetes.container_name=accounting after expansion found 0 of 69. On a plain-text line 'spath'
+		extracts nothing and costs little.
+
+		'extract' re-runs every search-time extraction of the compact sourcetype on the expanded line,
+		including the compact-format one, whose regex matches any line containing a comma. That put a
+		tenx_hash of '{"stream":"stdout"' and a tenx_vars of the rest of the line on every expanded
+		event, in the field sidebar. Those three are removed again; tenx_expand_refused, which the
+		macro keeps on purpose, is not.
 
 		Different macro chosen if we're running in debug mode or not, either 'tenx-inflate' or 'tenx-inflate-debug'
 		"""
-		return " | " + tenx_util.splunk_inflate_macro(self.debug) + " | extract"
+		return (" | " + tenx_util.splunk_inflate_macro(self.debug)
+				+ " | extract | spath | fields - tenx_hash, tenx_var_0, tenx_vars")
 
 	def field_search(self):
 		"""
@@ -774,6 +1057,7 @@ class TenxSearchBuilder:
 		has_search_terms = bool(leading_search is not None and len(leading_search.user_search_terms) > 0)
 		no_dml_results = bool(leading_search is not None and leading_search.no_dml_results)
 		dml_truncated = bool(leading_search is not None and leading_search.dml_truncated)
+		no_prefilter = bool(has_search_terms and leading_search.resolved_done and leading_search.resolved_search is None)
 
 		return BuildResult(
 			spl_commands.resolved_state(),
@@ -783,7 +1067,8 @@ class TenxSearchBuilder:
 			retryable=retryable,
 			has_search_terms=has_search_terms,
 			no_dml_results=no_dml_results,
-			dml_truncated=dml_truncated)
+			dml_truncated=dml_truncated,
+			no_prefilter=no_prefilter)
 
 	def resolve(self, base_search):
 		"""

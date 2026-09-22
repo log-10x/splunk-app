@@ -71,10 +71,13 @@ class JobState(Enum):
 	TIMEOUT = auto()
 
 
-# Cap on raw DML rows fetched per search. If a job actually matched more events than this,
-# get_dml_results reports truncated=True - the returned hash set may be missing hashes that
-# only appeared past the cap, so callers baking it into a persisted search should not treat
-# it as a complete answer.
+# Cap on distinct template hashes fetched per probe. If a probe matched more templates than
+# this, get_dml_results reports truncated=True and the builder leaves that piece
+# unrestricted, which is correct and a full scan. Measured on Splunk 10.4.3: a clause of
+# 30,000 hash phrases is a 540,000-character search that Splunk accepts and runs in about
+# 10 seconds, so the cap is not a Splunk limit; it bounds the compiled search's size. The
+# probe collapses the dictionary rows to distinct hashes first (a template re-sent to the
+# dictionary index is two rows and one hash), so the cap counts templates, not rows.
 DML_FETCH_LIMIT = 25000
 
 
@@ -219,35 +222,46 @@ class TenxSearchManager:
 			'earliest_time': '0',
 			'latest_time': 'now',
 			'rf': self.dml_key,
-			'search': 'search index=%s sourcetype=%s %s' % (self.tenx_config['dest_dml_index'],
-			                                               self.tenx_config['dml_source_type'],
-			                                               dml_search)
+			'search': 'search index=%s sourcetype=%s %s | stats count by %s' % (
+				self.tenx_config['dest_dml_index'], self.tenx_config['dml_source_type'],
+				dml_search, self.dml_key)
 		}
 
 		return self.create_search_job(search_data)
+
+	def get_search_job_results_url(self, sid):
+		"""
+		Returns the url for a search job's transformed results (as opposed to its events).
+		"""
+		return self.get_search_job_url(sid) + '/results'
 
 	def get_dml_results(self, sid):
 		"""
 		Returns (hashes, truncated) for a provided search job on the 10x DML.
 
-		hashes is a list of all the unique hashes among the fetched rows (up to
-		DML_FETCH_LIMIT). truncated is True when the job matched more raw rows than we
-		fetched - past that cap, additional unique hashes may exist that this result set
-		does not include, so it must not be treated as a complete answer.
+		The probe ends in `stats count by dml_hash`, so each result row is one distinct
+		template. hashes is the sorted list of those (up to DML_FETCH_LIMIT). truncated is
+		True when the job produced more distinct hashes than were fetched, so the list must
+		not be treated as a complete answer.
 
 		Returns (None, False) if any errors occured when trying to get the results.
 
 		Note that a None result indicates an actual error, while an empty list is actually ok, it's quite possible
 		no actual matches were found for a specific search.
 		"""
-		search_results = self.get_search_results(sid, {"f": self.dml_key, "count": DML_FETCH_LIMIT})
+		try:
+			search_results = self.server_connection.get(
+				self.get_search_job_results_url(sid), {"f": self.dml_key, "count": DML_FETCH_LIMIT})
+		except Exception as e:
+			logger.error("Failed getting dml results for {} - {}.".format(sid, e), exc_info=1)
+			return None, False
 
 		if not search_results or 'results' not in search_results:
 			return None, False
 
 		raw_rows = search_results['results']
 		# sorted(), not list(set()): the hash list is baked verbatim into the compiled
-		# `tenx_hash IN (...)` clause and persisted in savedsearches.conf. A plain set's
+		# hash clause and persisted in savedsearches.conf. A plain set's
 		# iteration order is randomized per process (PYTHONHASHSEED), so the same matching
 		# templates would produce a different clause string on each save/recompile - making the
 		# recompile pass's "only rewrite if the compiled search changed" guard always fire and
@@ -273,7 +287,9 @@ class TenxSearchManager:
 
 		Basically a wrapper for create_dml_search -> poll_for_job_end -> get_dml_results.
 
-		Returns (hashes, truncated); (None, False) in case of any errors along the way.
+		Returns (hashes, truncated). (None, True) when the probe did not finish inside
+		max_time_ms, which the caller treats as "no usable hash list" rather than an error.
+		(None, False) in case of any actual errors along the way.
 		"""
 		logger.info("About to dml search - {}".format(dml_search))
 
@@ -285,6 +301,15 @@ class TenxSearchManager:
 			return None, False
 
 		state = self.poll_for_job_end(dml_sid, max_time_ms, poll_interval_ms)
+
+		if state == JobState.TIMEOUT:
+			# Did not finish inside its budget. That is not a failure of the search, and the
+			# caller can carry on without this probe: a piece with no hash list is simply not
+			# used to narrow, which is correct and wider. Reported as incomplete, the same as
+			# a truncated result, rather than as an error.
+			logger.warning("Dml probe {} did not finish in {}ms - {}.".format(dml_sid, max_time_ms, dml_search))
+
+			return None, True
 
 		if state != JobState.SUCCESS:
 			logger.warning("Failed waiting for job {} - {} - {}.".format(dml_sid, dml_search, state))

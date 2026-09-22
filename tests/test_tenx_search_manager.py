@@ -25,6 +25,7 @@ class RecordingConnection:
 
 	def __init__(self):
 		self.posted = []
+		self.user = 'admin'
 
 	def post(self, url, data=None, **kwargs):
 		self.posted.append((url, data))
@@ -52,7 +53,7 @@ def test_resolution_search_names_the_index(manager, monkeypatch):
 	manager.create_dml_search('ProducerStateManager')
 
 	assert captured['search'] == (
-		'search index=tenx_dml sourcetype=tenx_dml_pure ProducerStateManager')
+		'search index=tenx_dml sourcetype=tenx_dml_pure ProducerStateManager | stats count by dml_hash')
 
 
 def test_resolution_search_follows_a_relocated_index(manager, monkeypatch):
@@ -75,3 +76,45 @@ def test_resolution_search_covers_all_time(manager, monkeypatch):
 
 	assert captured['earliest_time'] == '0'
 	assert captured['latest_time'] == 'now'
+
+
+class ResultsConnection(RecordingConnection):
+	"""Answers the results endpoint with a fixed set of rows and the job with a resultCount."""
+	def __init__(self, rows, result_count):
+		RecordingConnection.__init__(self)
+		self.rows = rows
+		self.result_count = result_count
+		self.gets = []
+
+	def get(self, url, params=None, **kwargs):
+		self.gets.append((url, params))
+
+		if url.endswith('/results'):
+			return {'results': self.rows}
+
+		return {'entry': [{'content': {'resultCount': self.result_count}}]}
+
+
+def test_results_are_distinct_hashes_read_from_the_results_endpoint():
+	# The probe collapses rows to distinct hashes with stats, so the results endpoint, not
+	# the events endpoint, is where the answer is; and the cap counts those hashes.
+	connection = ResultsConnection([{'dml_hash': 'h_b'}, {'dml_hash': 'h_a'}], result_count=2)
+	manager = TenxSearchManager(connection, dict(CONFIG))
+
+	hashes, truncated = manager.get_dml_results('sid-1')
+
+	assert hashes == ['h_a', 'h_b']
+	assert truncated is False
+	assert connection.gets[0][0].endswith('/search/jobs/sid-1/results')
+	assert connection.gets[0][1]['f'] == 'dml_hash'
+
+
+def test_more_distinct_hashes_than_fetched_is_truncated():
+	from tenx_search_manager import DML_FETCH_LIMIT
+	connection = ResultsConnection([{'dml_hash': 'h_a'}], result_count=DML_FETCH_LIMIT + 1)
+	manager = TenxSearchManager(connection, dict(CONFIG))
+
+	hashes, truncated = manager.get_dml_results('sid-2')
+
+	assert hashes == ['h_a']
+	assert truncated is True

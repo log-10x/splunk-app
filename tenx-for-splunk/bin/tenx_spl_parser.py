@@ -17,10 +17,18 @@ The parser enables 10x to:
 Grammar
 -------
 The SPL grammar handles common search constructs:
-- Search modifiers: index, sourcetype, host, source, eventtype
-- Logical expressions: AND, OR, NOT
+- Search modifiers: index, sourcetype, host, source, eventtype, earliest, latest
+- Logical expressions: AND, OR, NOT, with Splunk's precedence: NOT binds tightest, then
+  OR, then AND (explicit or the implicit AND of adjacent terms), so `a OR b c` is
+  `(a OR b) AND c` and `NOT a OR b` is `(NOT a) OR b`. A parenthesised group can appear
+  anywhere a term can, including before further terms: `(a OR b) c`.
 - Field comparisons: field=value, field!=value, field IN (...)
 - Index expressions: unquoted or quoted search terms
+
+The AST it builds is flat where Splunk's meaning is flat: the implicit AND of a search
+body is the list of the root's children, and a parenthesised group's children are its
+implicit AND. An OR is an `or_expression` node whose children are its operands; a NOT is
+a `not_logical_expression` node with one child.
 
 The grammar is based on Splunk's BNF but simplified for 10x's needs.
 Ideally, we would use `splunk btool searchbnf list` output directly,
@@ -83,15 +91,16 @@ spl_grammar = Grammar(
 	"""
 	search					= "search" (WS+ logical_expression)?
 
-	logical_expression		= p_logical_expression / not_logical_expression / binary_expression / (t_logical_expression WS+ logical_expression) / t_logical_expression
+	logical_expression		= and_expression
 
-	p_logical_expression	= ("(" logical_expression ")")
+	and_expression			= or_expression (WS+ ("AND" WS+)? or_expression)*
+	or_expression			= unary_expression (WS+ "OR" WS+ unary_expression)*
+	unary_expression		= not_logical_expression / p_logical_expression / t_logical_expression
+
+	p_logical_expression	= "(" WS* logical_expression WS* ")"
 	t_logical_expression	= search_modifier / field_modifier / index_expression
 
-	binary_expression		= (t_logical_expression / p_logical_expression) WS+ binary_operator WS+ logical_expression WS*
-	binary_operator			= ("AND" / "OR")
-
-	not_logical_expression	= "NOT" WS+ logical_expression
+	not_logical_expression	= "NOT" WS+ unary_expression
 	index_expression		= (STR_CHAR+ / Q_STRING)
 
 	field_modifier			= (field_cmp / field_in_list)
@@ -100,9 +109,10 @@ spl_grammar = Grammar(
 	field_in_list			= field_name WS+ "IN" WS+ "(" WS* field_value (WS* "," WS* field_value)* ")"
 
 	field_name				= FIELD_CHAR+
-	field_value				= (num / term)
+	field_value				= (Q_STRING / FIELD_VALUE_CHAR+)
 
-	search_modifier			= (index_specifier / sourcetype_specifier / host_specifier / source_specifier / eventtype_specifier / eventtypetag_specifier / hosttag_specifier)
+	search_modifier			= (index_specifier / sourcetype_specifier / host_specifier / source_specifier / eventtype_specifier / eventtypetag_specifier / hosttag_specifier / time_specifier)
+	time_specifier			= ("_index_earliest" / "_index_latest" / "earliest" / "latest") value_separator term
 
 	index_specifier			= "index" value_separator term
 	sourcetype_specifier	= "sourcetype" value_separator term
@@ -132,6 +142,7 @@ spl_grammar = Grammar(
 	QOATATION_CHAR		= "\\\x22"
 
 	STR_CHAR			= ("!" / ~r"[\\u0023-\\u0027]"u / ~r"[\\u002A-\\u005A]"u / ~r"[\\u005E-\\uFFFF]"u)
+	FIELD_VALUE_CHAR	= ("!" / ~r"[\\u0023-\\u0027]"u / ~r"[\\u002A-\\u002B]"u / ~r"[\\u002D-\\u005A]"u / ~r"[\\u005E-\\uFFFF]"u)
 	SPECIAL_CHAR		= ( "(" / ")" / "[" / "]" / "\\\\")
 
 	FIELD_CHAR			= ~"[a-zA-Z0-9_*-]"i
@@ -214,13 +225,23 @@ class TenxAstNodeFactory:
 		"""
 		pass
 
+	def keeps_grouping(self, node_name):
+		"""
+		Whether a node that is not relevant on its own must still be kept, rather than have
+		its children spliced into its parent, once it has two or more children. The base
+		factory keeps nothing this way.
+		"""
+		return False
+
 	def _build(self, parse_node):
 		"""
 		Recursively builds an TenxAstNode tree from the provided grammar parsed ast.
 
 		Prunes away any non-relevant nodes, if possible.
 		We only prune away non-relevant nodes if they have a single child (returning the child),
-		or if they have no children at all (returning None)
+		or if they have no children at all (returning None). A non-relevant node with two or
+		more children is created and then spliced into its parent, which is what flattens the
+		grammar's implicit-AND chain, unless keeps_grouping says its boundary carries meaning.
 		"""
 		children = []
 
@@ -229,7 +250,7 @@ class TenxAstNodeFactory:
 				child_ast = self._build(child)
 
 				if child_ast:
-					if self.is_relevant_node(child_ast.rule_type):
+					if self.is_relevant_node(child_ast.rule_type) or self.keeps_grouping(child_ast.rule_type):
 						children.append(child_ast)
 					else:
 						for child_ast_child in child_ast.children:
@@ -398,6 +419,11 @@ class SpecifierFinder:
 			#
 			return []
 
+		if node.rule_type == "p_logical_expression":
+			# A parenthesised group. Its children are an implicit AND, exactly like the root.
+			#
+			return intersect([self._internal_process(child, fail_on_contact) for child in node.children])
+
 		if node.rule_type == "not_logical_expression":
 			# We have a NOT logical node.
 			#
@@ -413,31 +439,10 @@ class SpecifierFinder:
 			#
 			return []
 
-		if node.rule_type == "binary_expression":
-			# We have a binary node.
+		if node.rule_type == "or_expression":
+			# An OR: the specifiers that pass are the union of what passes each operand.
 			#
-			# We validate the node (shouldn't fail, but exceptions are bad), and then proceed with either
-			# doing a union or intersection on the result.
-			#
-			if len(node.children) == 3:
-				first = self._internal_process(node.children[0], fail_on_contact)
-				second = self._internal_process(node.children[2], fail_on_contact)
-
-				binary_operator = node.children[1].text
-
-				if binary_operator == "AND":
-					return intersect([first, second])
-
-				if binary_operator == "OR":
-					return union([first, second])
-
-				# Should never get here, but just in case.
-				#
-				return first
-
-			# Should never get here, but just in case.
-			#
-			return []
+			return union([self._internal_process(child, fail_on_contact) for child in node.children])
 
 		# Our node is of a type that simply doesn't concern us, yay.
 		#
@@ -466,7 +471,6 @@ class TenxSearchAstNode(TenxAstNode):
 				'index_expression':	SearchNodeType.INDEX,
 				'field_modifier':	SearchNodeType.FIELD,
 				'search_modifier':	SearchNodeType.MODIFIER,
-				'binary_operator':	SearchNodeType.IRRELEVANT
 			}.get(self.rule_type, SearchNodeType.UNKNOWN)
 
 			return
@@ -507,13 +511,37 @@ class TenxSearchAstNodeFactory(TenxAstNodeFactory):
 	def __init__(self, debug=False):
 		TenxAstNodeFactory.__init__(self, debug)
 
+	# Pruned nodes hand their children to their parent, which is what flattens the grammar's
+	# implicit-AND chain (logical_expression, and_expression, unary_expression) into a flat
+	# list under the search root or a parenthesised group. Three nodes carry meaning that
+	# must not be flattened away:
+	#
+	# - not_logical_expression. Pruning it promoted the negated term as if it were positive, so
+	#   `NOT bootstrap` compiled into the same search as `bootstrap` and returned the exact
+	#   complement of what was asked (6 events against a truth of 19,992).
+	# - p_logical_expression. Pruning it spliced a group into its parent and lost the grouping.
+	# - or_expression, once it has two operands. With one it is just its operand.
+	KEPT_LOGICAL_NODES = ("not_logical_expression", "p_logical_expression")
+	FLATTENED_NODES = ("logical_expression", "and_expression", "unary_expression", "or_expression", "t_logical_expression")
+
 	def is_relevant_node(self, node_name):
 		"""
 		Checks if a node is relevant, allowing us to prune some clutter from the raw ast.
 
-		A node is defined as relevant if it has a non-empty lowercase name, and isn't a logical_expression node
+		A node is defined as relevant if it has a non-empty lowercase name and is not one of
+		the grammar's structural chain nodes, other than the ones that carry meaning.
 		"""
-		return super().is_relevant_node(node_name) and not node_name.endswith("logical_expression")
+		if node_name in self.KEPT_LOGICAL_NODES:
+			return True
+
+		if node_name in self.FLATTENED_NODES:
+			return False
+
+		return super().is_relevant_node(node_name)
+
+	def keeps_grouping(self, node_name):
+		"""An OR with two or more operands keeps its boundary; see FLATTENED_NODES."""
+		return node_name == "or_expression"
 
 	def create_node(self, parse_node, children):
 		"""

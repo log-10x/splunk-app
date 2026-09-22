@@ -141,10 +141,23 @@ The `tenx_dml` collection stores parsed template data with fields:
 | `tenx-inflate-debug` | Same as above but keeps intermediate fields for debugging |
 | `tenx-message(1)` | Utility macro to display messages in search results |
 
+#### Search Surfaces
+
+| Surface | Purpose |
+|---------|---------|
+| `tenxsearch searchstring="..."` | Generating command: runs a search over compact events as if on the original lines (see Usage) |
+| `appserver/static/dashboard.js` + `javascript/search/tenx_search_hook.js` | Loaded on every classic dashboard in an app that carries `dashboard.js`; routes panel searches through `/tenx-search` |
+| `/tenx-search` REST endpoint | Rewrites a search and returns an ordinary job id; what the dashboard hook calls |
+
 #### Python Scripts
 
 | Script | Purpose |
 |--------|---------|
+| `tenxsearch.py` | The `tenxsearch` generating command |
+| `tenx_search_builder.py` | Compiles a user search into a search over compact events |
+| `tenx_spl_parser.py` | Grammar and AST for the search terms the builder rewrites |
+| `tenx_search_manager.py` | Search jobs and the template dictionary lookups |
+| `tenx_alert_compiler.py` | Save-time compile of an alert into native SPL |
 | `tenx_dml_to_kv.py` | Alert action that populates KV store from template JSON |
 | `tenx_dml_builder.py` | Core logic for parsing templates into KV-storable format |
 | `tenx_util.py` | Utility functions (REST client, logging, config loading) |
@@ -265,6 +278,55 @@ This applies the field extraction that parses compact events into `tenx_hash`, `
 ---
 
 ## Usage
+
+### Searching Compact Events
+
+A compact event holds a template hash and the event's variable values; the constant words
+live in the KV Store. Two paths put them back.
+
+**Classic dashboards.** `dashboard.js` loads on every classic dashboard in the app that
+carries it and routes the panel's search through the app's REST endpoint. Panels keep
+their SPL. To cover another app's dashboards, copy the file into that app's
+`appserver/static/` and restart. The search bar and Dashboard Studio load no app
+JavaScript and are not covered.
+
+**Everywhere else.** Wrap the search in the `tenxsearch` command:
+
+```spl
+| tenxsearch searchstring="index=myindex sourcetype=tenx_encoded error"
+```
+
+Escape a quoted phrase inside the wrapper: `searchstring="index=myindex \"payment failed\""`.
+The command runs in the search bar, saved searches, alerts and the REST API.
+
+Both paths resolve each word against the templates, select the compact events whose
+template text or variable values carry it, expand them, and re-apply the search. `NOT`,
+`OR`, `AND`, parenthesised groups, wildcards, field conditions including `IN (...)`,
+inline `earliest=`/`latest=` and a trailing pipeline behave as they do on the original
+data, with Splunk's precedence. An IP address, hostname or region name is matched piece
+by piece, since the pipeline stores it in pieces.
+
+**Limits.**
+
+- A search without the command returns zero events, not an error. Keep compact indexes out
+  of default index sets and name them so the omission is visible.
+- A search that cannot be rewritten is refused. The job fails with a message, and a
+  dashboard panel shows it in place of a number. The unsupported shape is a sourcetype
+  inside an OR, `sourcetype=x OR host=y`.
+- A word matching more than 25,000 templates is dropped from the prefilter, so the search
+  scans the sourcetype and checks that word after expansion. A word whose dictionary lookup
+  does not finish inside the search's 30-second lookup budget is dropped the same way.
+
+**Speed**, 20,000 expanded events:
+
+| path | time |
+|------|------|
+| Dashboard panel, REST endpoint | 1 to 3.5 s |
+| `tenxsearch` | 21 s |
+
+A generating command writes every event out itself, which costs about a millisecond per
+event on top of a two-second floor. Alerts avoid it: the **10x Compile Alert** view stores
+native SPL that the scheduler runs directly, see [SAVE_TIME_ALERTS.md](../SAVE_TIME_ALERTS.md).
 
 ### Basic Expansion
 

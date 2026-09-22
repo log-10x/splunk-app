@@ -13,9 +13,10 @@ Usage in SPL
 The command:
 1. Parses the user's search string
 2. Searches the DML sourcetype to find matching template hashes
-3. Creates a new search that includes both:
-   - Original search terms (for variable data)
-   - Template hashes (for encoded data)
+3. Creates a new search that selects an event when each piece of each term is either
+   in the compact event (a variable value) or in the event's template (see
+   tenx_search_builder for the rules, including sub-token pieces such as the octets of
+   an IP address)
 4. Runs the search with tenx-inflate macro
 5. Streams results back to the user
 
@@ -33,8 +34,12 @@ Workflow
 1. User runs: | tenxsearch searchstring="error"
 2. Command parses "error" and searches tenx_dml_pure for matching templates
 3. Finds template hashes that contain "error"
-4. Creates new search: (error OR tenx_hash IN ("hash1","hash2")) | `tenx-inflate`
+4. Creates new search: ("error" OR ("~hash1" OR "~hash2")) | `tenx-inflate` | extract | search error
 5. Runs search and streams inflated results
+
+A search the builder cannot rewrite (a failed template lookup, a parse error, a shape it
+cannot follow) is reported as an error and not run: run as typed on compact data it would
+return the wrong events with no sign that anything was off.
 
 Logging
 -------
@@ -70,8 +75,14 @@ from splunklib.searchcommands import dispatch, GeneratingCommand, Configuration,
 import tenx_util
 import tenx_search_manager
 import tenx_search_builder
+import tenx_alert_compiler
 
 tenx_util.setup_logger('tenx_search_command', logging.INFO)
+
+# How long to wait for the expanded search. Expanding 20,000 events took 54 seconds on a
+# laptop container, so the previous 60 seconds was one bigger index away from returning
+# nothing. The nested job is bounded by Splunk's own search limits either way.
+MAX_WAIT_MS = 30 * 60 * 1000
 
 
 @Configuration()
@@ -103,6 +114,12 @@ class TenxSearchCommand(GeneratingCommand):
 
 			self.logger.info("Loaded config - {}".format(json.dumps(tenx_config)))
 
+			if not tenx_config.get(tenx_util.CONFIG_LOADED, True):
+				self.write_error("10x: the app's configuration could not be read, so this search was not run "
+					"(built on the defaults it would look for templates in the wrong index and return the "
+					"wrong events). See tenx_search_command.log.")
+				return
+
 			server_connection = tenx_util.ServerConnection(
 					server_uri=server_uri,
 					user=self._metadata.searchinfo.username,
@@ -129,9 +146,46 @@ class TenxSearchCommand(GeneratingCommand):
 
 			# Converting the input search into a matching 10x encoded search.
 			#
-			new_search = search_builder.resolve(self.searchstring)
+			build_result = search_builder.build(self.searchstring)
+			new_search = build_result.resolved
 
-			self.logger.info("Original search {} - {} ..xxx.. New search - {}".format(original_job_sid, self.searchstring, new_search))
+			self.logger.info("Original search {} - {} ..xxx.. New search - {} ({})".format(
+				original_job_sid, self.searchstring, new_search, build_result.state))
+
+			# A search that could not be rewritten must not run as typed: on compact data the
+			# words are not in the events, so the bare search returns nothing, or the wrong
+			# thing, with no sign that anything went wrong. Say so instead. A failed
+			# dictionary lookup is transient (retry); a shape the rewrite cannot handle is not.
+			#
+			if build_result.state == tenx_search_builder.ResolvedState.FAILURE:
+				if build_result.retryable:
+					self.write_error("10x: the template lookup did not complete, so this search was not run "
+						"(running it as typed would return the wrong events). Run it again.")
+				else:
+					self.write_error("10x: this search could not be parsed for compact data, so it was not run. "
+						"See tenx_search_command.log for the parse error.")
+				return
+
+			if build_result.state == tenx_search_builder.ResolvedState.COMPLEX:
+				self.write_error("10x: this search mixes sourcetypes or fields in a way the rewrite cannot "
+					"follow, so it was not run (running it as typed would return the wrong events). "
+					"Put the compact sourcetype in a plain sourcetype=... term.")
+				return
+
+			# A parse failure and a shape the grammar cannot follow both come back as a
+			# passthrough of the search as typed. On a search that names a compact sourcetype
+			# that is the silent wrong answer again, so it is refused the same way.
+			#
+			if not build_result.engaged:
+				compact_sources = tenx_alert_compiler._referenced_tenx_sources(self.searchstring, tenx_config)
+
+				if compact_sources:
+					self.write_error("10x: this search names the compact source(s) {} but could not be rewritten "
+						"for compact data, so it was not run (as typed it would return the wrong events). "
+						"Check the search for a shape the rewrite does not follow, such as a parenthesised "
+						"group followed by more terms, or a sourcetype inside an OR; the parse error is in "
+						"tenx_search_command.log.".format(", ".join(sorted(compact_sources))))
+					return
 
 			actual_search = self.searchstring if new_search is None else new_search
 
@@ -154,10 +208,15 @@ class TenxSearchCommand(GeneratingCommand):
 
 			# Waiting for the job to finish.
 			#
-			search_job_state = search_manager.poll_for_job_end(search_sid, 60000, 100)  # TODO - infinity?
+			search_job_state = search_manager.poll_for_job_end(search_sid, MAX_WAIT_MS, 100)
 
 			if search_job_state != tenx_search_manager.JobState.SUCCESS:
 				self.logger.warning("Job {} didn't finish, state is {} ({}).".format(search_sid, search_job_state, original_job_sid))
+				# Returning nothing here would look like "no matches". It is not.
+				#
+				self.write_error("10x: the expanded search {} did not finish ({}); no results were returned, "
+					"which is not the same as no matches. Narrow the time range or run it again.".format(
+						search_sid, search_job_state.name))
 				return
 
 			self.logger.info("Done running {} ({}).".format(search_sid, original_job_sid))
@@ -176,7 +235,18 @@ class TenxSearchCommand(GeneratingCommand):
 
 			self.logger.info("Job {} has {} events ({}).".format(search_sid, event_count, original_job_sid))
 
-			increment = 100  # TODO - config?
+			# Rows fetched from the nested job per REST call. At 100 rows, 20,000 events were 200
+			# round trips and 41 seconds end to end; at 5,000 rows, with the fields below dropped,
+			# 21 seconds. The remaining time is this process writing the rows out one by one,
+			# which is the cost of a generating command and the reason dashboards use the REST
+			# handler instead (see tenx_search_handler.py).
+			#
+			increment = 5000
+
+			# Splunk regenerates these for the outer job, so carrying them through only adds
+			# to the bytes this process has to write.
+			#
+			regenerated_fields = ('_bkt', '_cd', '_si', '_kv', '_serial', '_indextime', '_sourcetype')
 
 			# Streaming back the results from the search job.
 			#
@@ -209,6 +279,9 @@ class TenxSearchCommand(GeneratingCommand):
 						len(actual_results), start_offset, start_offset + event_count_to_request, search_sid, original_job_sid))
 
 				for result in actual_results:
+					for field in regenerated_fields:
+						result.pop(field, None)
+
 					yield result
 
 		except Exception as e:
