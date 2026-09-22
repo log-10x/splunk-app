@@ -281,6 +281,69 @@ class TestCompiledPrefilter:
 
 
 # ---------------------------------------------------------------------------
+# Grammar: the shapes people actually type, with Splunk's precedence
+# ---------------------------------------------------------------------------
+
+class TestGrammarShapes:
+	def test_group_followed_by_terms(self):
+		# `(error OR warn) kubernetes` on a real dashboard panel showed 0 against a truth of
+		# 468: the old grammar could not parse a group followed by more terms, and the
+		# unparsed search ran as typed.
+		result, _ = compile_search('sourcetype=tenx_encoded (payment OR login) zzz')
+
+		assert result.state == ResolvedState.SUCCESS and result.engaged
+		assert prefilter(result.resolved) == (
+			'(("payment" OR ("~h_pay" OR "~h_pay2")) OR ("login" OR ("~h_login"))) AND ("zzz")')
+		assert result.resolved.endswith('| search (payment OR login) zzz')
+
+	def test_two_groups_with_explicit_and(self):
+		result, _ = compile_search('sourcetype=tenx_encoded (payment OR login) AND (zzz OR failed)')
+		assert prefilter(result.resolved) == (
+			'(("payment" OR ("~h_pay" OR "~h_pay2")) OR ("login" OR ("~h_login"))) AND '
+			'(("zzz") OR ("failed" OR ("~h_pay")))')
+
+	def test_or_binds_tighter_than_explicit_and(self):
+		# Splunk: `a OR b AND c` is `(a OR b) AND c`
+		result, _ = compile_search('sourcetype=tenx_encoded payment OR login AND zzz')
+		assert prefilter(result.resolved) == (
+			'(("payment" OR ("~h_pay" OR "~h_pay2")) OR ("login" OR ("~h_login"))) AND ("zzz")')
+
+	def test_not_binds_tighter_than_or(self):
+		# Splunk: `NOT a OR b` is `(NOT a) OR b`, which is unrestricted, and NOT a b is (NOT a) AND b
+		result, _ = compile_search('sourcetype=tenx_encoded NOT payment OR login')
+		assert prefilter(result.resolved) == ''
+		assert result.resolved.endswith('| search NOT payment OR login')
+
+		result, _ = compile_search('sourcetype=tenx_encoded NOT payment login')
+		assert prefilter(result.resolved) == '("login" OR ("~h_login"))'
+
+	def test_inline_time_modifier_is_a_modifier(self):
+		# `earliest=-24h error` on a dashboard panel showed 0 against 438: the old grammar
+		# read -24h as a number and failed on the h
+		result, _ = compile_search('sourcetype=tenx_encoded earliest=-24h latest=now payment')
+
+		assert result.engaged
+		assert result.resolved.startswith(' | search sourcetype=tenx_encoded earliest=-24h latest=now ("payment"')
+		assert '| search payment' in result.resolved and 'earliest' not in result.resolved.split('| `tenx-inflate`')[1]
+
+	def test_in_list_is_a_field_condition(self):
+		result, _ = compile_search('sourcetype=tenx_encoded status IN (500, 502) payment')
+
+		assert result.field_terms == ['status IN (500, 502)']
+		assert prefilter(result.resolved) == '("payment" OR ("~h_pay" OR "~h_pay2"))'
+
+	def test_negative_field_value(self):
+		result, _ = compile_search('sourcetype=tenx_encoded delta=-1 payment')
+		assert result.field_terms == ['delta=-1']
+
+	def test_sourcetype_group_is_still_targeted(self):
+		result, manager = compile_search('(sourcetype=tenx_encoded OR sourcetype=other) payment')
+
+		assert result.engaged
+		assert result.resolved.startswith(' | search (sourcetype=tenx_encoded OR sourcetype=other) ("payment"')
+
+
+# ---------------------------------------------------------------------------
 # D2: negation
 # ---------------------------------------------------------------------------
 

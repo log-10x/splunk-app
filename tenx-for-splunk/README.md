@@ -303,10 +303,12 @@ A quoted phrase inside the search is escaped: `searchstring="index=myindex \"pay
 
 Both paths do the same thing. Each word is looked up in the template dictionary, the
 compact events whose template or variable values carry it are selected, expanded, and
-the search is applied again to the expanded lines. `NOT`, `OR`, quoted phrases, field
-conditions and a trailing pipeline all work as on the original data, and values Splunk
-indexes as one token but the pipeline stores in pieces, such as an IP address, a hostname
-or a region name, are matched piece by piece. The time picker is honoured.
+the search is applied again to the expanded lines. `NOT`, `OR`, `AND`, parenthesised
+groups, quoted phrases, wildcards, field conditions including `IN (...)`, inline
+`earliest=`/`latest=` and a trailing pipeline all work as on the original data, with
+Splunk's own precedence. Values Splunk indexes as one token but the pipeline stores in
+pieces, such as an IP address, a hostname or a region name, are matched piece by piece.
+The time picker is honoured.
 
 Three things to know:
 
@@ -314,11 +316,12 @@ Three things to know:
   `index=myindex sourcetype=tenx_encoded error` returns zero events, because the word is
   in the dictionary and not in the event. Keep compact indexes out of users' default index
   sets and name them so the omission is visible.
-- **A search the command cannot rewrite is refused, not run as typed.** The job fails with
-  a message naming the compact sourcetype; the detail is in
-  `$SPLUNK_HOME/var/log/splunk/tenx_search_command.log`. Two shapes the rewrite does not
-  follow: a parenthesised group followed by more terms, `(a OR b) c`, and a sourcetype
-  inside an OR, `sourcetype=x OR host=y`.
+- **A search that cannot be rewritten is refused, not run as typed.** In the search bar
+  the job fails with a message; on a dashboard the panel shows the message instead of a
+  number. The detail is in `tenx_search_command.log` or `tenx_search_handler.log` under
+  `$SPLUNK_HOME/var/log/splunk/`. The one shape the rewrite does not follow is a
+  sourcetype inside an OR with something else, `sourcetype=x OR host=y`; put the compact
+  sourcetype in a plain `sourcetype=...` term.
 - **The command is the slower path for large results.** A generating command has to
   write every event out itself. Measured on one laptop container: a dashboard panel or
   the REST endpoint returns 20,000 expanded events in about 3 seconds; the command takes
@@ -326,6 +329,14 @@ Three things to know:
   20,000 in 21. Alerts are better compiled once at save time with the "10x Compile
   Alert" view, which stores native SPL the scheduler runs directly; see
   [SAVE_TIME_ALERTS.md](../SAVE_TIME_ALERTS.md).
+
+How it scales with the dictionary, measured at 32,962 templates on the same container:
+one dictionary lookup takes about a second even for a word in 30,000 templates; a word in
+30,000 templates compiles to a 540,000-character search that Splunk accepts and runs in
+about 10 seconds; and a word in more than 25,000 templates is left out of the prefilter
+(the events are expanded and the word is checked afterwards), which is correct and a
+full scan of the compact sourcetype. A word in that many templates is in nearly every
+event anyway.
 
 ### Basic Expansion
 

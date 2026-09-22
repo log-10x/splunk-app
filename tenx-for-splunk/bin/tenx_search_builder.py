@@ -498,31 +498,25 @@ class TenxSearchCommand(TenxSplCommand):
 		unrestricted here and excluded after expansion by original_search_terms(): the
 		prefilter is a superset, and the complement of a superset is not a superset.
 
-		A binary node's children are [left, operator, right, more...]: the parser's
-		right-recursion plus flattening leaves any trailing implicit-AND siblings after the
-		right operand, which is also how Splunk reads `a OR b c`, as `(a OR b) AND c`.
+		An OR node's children are its operands (the parser keeps Splunk's precedence, so
+		`a OR b c` arrives as the OR of a and b, then c). An OR is unrestricted as soon as
+		one operand is, since the OR of a superset with everything is everything.
 		"""
 		rule_type = node.rule_type
 
 		if rule_type == 'index_expression':
 			return self._term_prefilter(node.text)
 
-		if rule_type in ('not_logical_expression', 'field_modifier', 'search_modifier', 'binary_operator'):
+		if rule_type in ('not_logical_expression', 'field_modifier', 'search_modifier'):
 			return None
 
-		if rule_type == 'binary_expression' and len(node.children) >= 3 and node.children[1].rule_type == 'binary_operator':
-			left = self._prefilter(node.children[0])
-			right = self._prefilter(node.children[2])
+		if rule_type == 'or_expression':
+			parts = [self._prefilter(child) for child in node.children]
 
-			if node.children[1].text == 'OR':
-				if left is None or right is None:
-					head = None
-				else:
-					head = ' OR '.join(part if is_wrapped(part) else '(' + part + ')' for part in (left, right))
-			else:
-				head = conjoin([left, right])
+			if any(part is None for part in parts):
+				return None
 
-			return conjoin([head] + [self._prefilter(child) for child in node.children[3:]])
+			return ' OR '.join(part if is_wrapped(part) else '(' + part + ')' for part in parts)
 
 		if node.children:
 			# A parenthesised group, or any other grouping: an implicit AND of its children.

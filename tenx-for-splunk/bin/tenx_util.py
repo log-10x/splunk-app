@@ -87,6 +87,10 @@ def get_app_service(server_uri, token):
 
 SPLUNK_SOURCE_PREFIX = 'source::'
 
+# Key on the config dict get_tenx_config returns: True when the app's own configuration
+# was read, False when it fell back to the built-in defaults because it could not be.
+CONFIG_LOADED = 'config_loaded'
+
 
 def _unique(names):
 	"""The names in the order first seen, without repeats."""
@@ -151,15 +155,21 @@ def get_tenx_config(service=None, server_uri=None, token=None):
 		# configuration layer that defines it, and that is still one sourcetype.
 		result['tenx_sources'] = _unique(sources)
 		result['tenx_source_types'] = _unique(source_types)
+		result[CONFIG_LOADED] = True
 
 		return result
 
 	except Exception as e:
 		logger.warning("Unexpected error getting tenx config - {}".format(e), exc_info=1)
 		# A copy here too: returning the module-level dict lets a caller's edit become
-		# everyone's default for the life of the process.
-		return {k: list(v) if isinstance(v, list) else v
-		        for k, v in tenx_consts.DEFAULT_CONFIG.items()}
+		# everyone's default for the life of the process. The defaults name the wrong
+		# dictionary index for any real deployment, so a search built on them finds no
+		# templates and returns the wrong events; callers that run searches check the flag
+		# and refuse instead.
+		result = {k: list(v) if isinstance(v, list) else v
+		          for k, v in tenx_consts.DEFAULT_CONFIG.items()}
+		result[CONFIG_LOADED] = False
+		return result
 
 
 def splunk_home():

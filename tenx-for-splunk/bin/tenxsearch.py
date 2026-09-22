@@ -114,6 +114,12 @@ class TenxSearchCommand(GeneratingCommand):
 
 			self.logger.info("Loaded config - {}".format(json.dumps(tenx_config)))
 
+			if not tenx_config.get(tenx_util.CONFIG_LOADED, True):
+				self.write_error("10x: the app's configuration could not be read, so this search was not run "
+					"(built on the defaults it would look for templates in the wrong index and return the "
+					"wrong events). See tenx_search_command.log.")
+				return
+
 			server_connection = tenx_util.ServerConnection(
 					server_uri=server_uri,
 					user=self._metadata.searchinfo.username,
