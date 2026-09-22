@@ -1,8 +1,8 @@
-# 10x for Splunk
+# Log10x App
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-Search and visualize [compact](https://doc.log10x.com/run/transform/#compact) events in Splunk with zero data loss. This open-source [Log10x](https://www.log10x.com/?utm_source=github&utm_medium=readme&utm_campaign=splunk-app&utm_content=hero) app transparently expands compact events at search time, maintaining full querying, dashboard, and alerting capabilities while reducing ingested volume, and with it the license bill.
+Search and visualize [compact](https://doc.log10x.com/run/transform/#compact) events in Splunk with zero data loss. This open-source [Log10x](https://www.log10x.com/?utm_source=github&utm_medium=readme&utm_campaign=splunk-app&utm_content=hero) app expands compact events back to their original lines at search time, for use with Splunk Enterprise and Splunk Cloud Platform, while the ingested volume, and with it the license bill, stays reduced.
 
 > **Blog:** [Search compact logs in Splunk using the 10x app](https://www.log10x.com/blog/cutting-splunk-log-storage/?utm_source=github&utm_medium=readme&utm_campaign=splunk-app&utm_content=blog). How Splunk stores fewer bytes and still returns the original log lines.
 
@@ -10,7 +10,7 @@ To find optimization opportunities in your existing Splunk data, point the [Log1
 
 ## How It Works
 
-The app intercepts search requests and automatically expands [compact events](https://doc.log10x.com/run/transform/#compact) before displaying results. Users interact with Splunk exactly as before - searching, building dashboards, and configuring alerts on the original full-fidelity data.
+A [compact event](https://doc.log10x.com/run/transform/#compact) carries a template hash and its variable values; the constant words live in the KV Store, and the app puts them back at search time. Classic dashboards keep their panel SPL unchanged: `dashboard.js` routes each panel's search through the app's REST endpoint. Splunk's search page loads no app JavaScript, so a query in the search bar, a saved search or the REST API is wrapped in the `tenxsearch` command. Scheduled alerts compile once at save time into native saved searches.
 
 ### Ingestion Flow
 
@@ -23,13 +23,17 @@ Receiver  -->  Ingest (UF/HEC)  -->  KV Store (Templates)
 
 ### Search Flow
 
-Interactive searches are transparently transformed to [expand](https://doc.log10x.com/run/transform/#expand) compact events via a browser hook:
+Two paths reach the same rewrite, then [expand](https://doc.log10x.com/run/transform/#expand) the events:
 
 ```
-User Search  -->  Hook Intercept  -->  Transform (Add Macro)  -->  Inflate (Decode)  -->  Full Results
+Classic dashboard panel  -->  dashboard.js hook  --\
+                                                   +-->  Transform (prefilter + macro)  -->  Expand  -->  Full results
+Search bar | tenxsearch  --------------------------/
 ```
 
-Scheduled alerts run server-side, where the browser hook never fires. They are instead **compiled once at save time** into native SPL, a template hash prefilter plus the inflate macro, so the scheduler runs an ordinary saved search. This is handled by the `/tenx-alert` REST endpoint and the **10x Compile Alert** view (with a recompile pass that migrates legacy alerts and refreshes prefilters as templates appear). See [SAVE_TIME_ALERTS.md](SAVE_TIME_ALERTS.md).
+The dashboard path is the faster one: about 3 seconds for 20,000 expanded events, against about 21 seconds through the command, which writes every event out itself.
+
+Scheduled alerts run server-side, where the browser hook never fires. They are instead **compiled once at save time** into native SPL, a template hash prefilter plus the inflate macro, so the scheduler runs an ordinary saved search. This is handled by the `/tenx-alert` REST endpoint and the **Compile Alert** view (with a recompile pass that migrates legacy alerts and refreshes prefilters as templates appear). See [SAVE_TIME_ALERTS.md](SAVE_TIME_ALERTS.md).
 
 ## Receiver-side configuration
 
@@ -203,7 +207,7 @@ The app includes a built-in analytics dashboard providing real-time visibility i
 
 For complete documentation including troubleshooting, advanced configuration, and integration guides, see:
 
-- [10x for Splunk Documentation](https://doc.log10x.com/apps/receiver/compact/splunk/)
+- [Log10x App documentation](https://doc.log10x.com/apps/receiver/compact/splunk/)
 - [Save-time alert compilation](SAVE_TIME_ALERTS.md): how scheduled alerts on compact data are compiled and kept current
 - [Receiver Documentation](https://doc.log10x.com/apps/receiver/)
 - [Log10x Documentation](https://doc.log10x.com/)
@@ -233,7 +237,7 @@ This repository contains a Splunk app for expanding Log10x compact events. While
 
 ## Contributing
 
-Contributions are welcome! Please read our contributing guidelines and submit pull requests to the repository.
+Contributions are welcome as pull requests to this repository.
 
 ## Support
 

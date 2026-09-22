@@ -2,7 +2,7 @@
 
 Status: **built and verified end-to-end** on live Splunk 9.4 (Python 3.9) and Splunk 10.4.1
 (Python 3.13). The compiler, its REST handler (`/tenx-alert`), the recompile/migrate pass, and
-a UI control (the "10x Compile Alert" view) are all in place; the wiring is described at the end.
+a UI control (the Compile Alert view) are all in place; the wiring is described at the end.
 
 ## Why this exists
 
@@ -275,7 +275,7 @@ whether the *inflate macro* then reconstructs their text correctly.
    actually changed. It migrates legacy proxy alerts to native compiled searches and refreshes
    hash prefilters as new templates arrive, never auto-applying a `needs_review` result and
    never touching `RETRYABLE`/`REJECTED`.
-3. **UI control** (the "10x Compile Alert" nav view, `tenx_alert_compile.xml` +
+3. **UI control** (the Compile Alert nav view, `tenx_alert_compile.xml` +
    `tenx_alert_compile.js`): a form that calls `/tenx-alert`, surfaces
    `strategy` / `needs_review` / `reason` / `compiled_search`, offers "Confirm and schedule" for
    a flagged result, and has a "Recompile all managed alerts" button.

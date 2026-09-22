@@ -1,5 +1,5 @@
 <!--
-  10x Analytics Dashboard
+  Analytics dashboard
   =======================
 
   Monitor log optimization performance, storage savings, and ROI metrics.
@@ -11,10 +11,13 @@
      - Dashboard interprets earliest=0 differently than REST API
      - Leave <latest></latest> empty (not "now") for all-time searches
 
-  2. INDEX SPECIFICATION: Always use explicit index names
-     - CORRECT:     index=tenx_encoded
-     - PROBLEMATIC: index=* sourcetype=tenx_encoded
-     - Dashboard search context may not have access to all indexes with wildcards
+  2. WHERE THE COMPACT EVENTS ARE: every panel reads the `tenx-events` macro (macros.conf)
+     - Set it to the index and sourcetype your compact events use; naming the index is faster
+     - The default, index=* sourcetype=tenx_encoded, finds the app's sourcetype in every
+       index the searcher can read
+
+  5. NO SEARCH REWRITE ON THIS VIEW: dashboard.js leaves it out, because these panels read
+     the compact form on purpose (compact bytes, template hashes) and expand explicitly
 
   3. SUBSEARCHES: Avoid appendpipe/tstats subsearch patterns
      - appendpipe [| tstats ...] fails silently in dashboard context
@@ -28,7 +31,7 @@
   See README.md "Dashboard Troubleshooting" section for detailed diagnostics.
 -->
 <dashboard version="1.1" theme="light">
-  <label>10x Analytics Dashboard</label>
+  <label>Analytics</label>
   <description>Monitor log optimization performance, storage savings, and ROI metrics</description>
 
   <!--
@@ -41,7 +44,7 @@
       <title>Total Encoded Events</title>
       <single>
         <search>
-          <query>| tstats count where index=tenx_encoded | eval count=tostring(count, "commas")</query>
+          <query>| tstats count where `tenx-events` | eval count=tostring(count, "commas")</query>
           <earliest>1</earliest>
           <latest></latest>
         </search>
@@ -75,7 +78,7 @@
       <title>Compression Ratio</title>
       <single>
         <search>
-          <query>index=tenx_encoded
+          <query>`tenx-events`
 | head 5000
 | eval encoded_size=len(_raw)
 | `tenx-inflate`
@@ -98,7 +101,7 @@
       <title>Estimated Storage Savings</title>
       <single>
         <search>
-          <query>index=tenx_encoded
+          <query>`tenx-events`
 | head 10000
 | eval encoded_size=len(_raw)
 | `tenx-inflate`
@@ -130,7 +133,7 @@
       <title>Storage Comparison</title>
       <chart>
         <search>
-          <query>index=tenx_encoded
+          <query>`tenx-events`
 | head 10000
 | eval encoded_size=len(_raw)
 | `tenx-inflate`
@@ -151,13 +154,13 @@
       </chart>
     </panel>
     <panel>
-      <title>Event Volume Over Time</title>
+      <title>Event Volume, Last 7 Days</title>
       <chart>
         <search>
-          <query>index=tenx_encoded
+          <query>`tenx-events`
 | timechart span=1h count as "Encoded Events"</query>
-          <earliest>1</earliest>
-          <latest></latest>
+          <earliest>-7d@h</earliest>
+          <latest>now</latest>
         </search>
         <option name="charting.chart">area</option>
         <option name="charting.chart.nullValueMode">zero</option>
@@ -175,7 +178,7 @@
       <title>Top 10 Templates by Usage</title>
       <chart>
         <search>
-          <query>index=tenx_encoded
+          <query>`tenx-events`
 | rex field=_raw "^~?(?&lt;hash&gt;[^,]+)"
 | stats count by hash
 | sort -count
@@ -198,7 +201,7 @@
       <title>Template Usage Distribution</title>
       <chart>
         <search>
-          <query>index=tenx_encoded
+          <query>`tenx-events`
 | rex field=_raw "^~?(?&lt;hash&gt;[^,]+)"
 | stats count by hash
 | eval usage_bucket=case(
@@ -225,7 +228,7 @@
       <title>Inflation Success Rate (Sample)</title>
       <single>
         <search>
-          <query>index=tenx_encoded
+          <query>`tenx-events`
 | head 1000
 | rex field=_raw "^~?(?&lt;hash&gt;[^,]+)"
 | `tenx-inflate`
@@ -280,7 +283,7 @@
       <title>Avg Event Size Reduction</title>
       <single>
         <search>
-          <query>index=tenx_encoded
+          <query>`tenx-events`
 | head 5000
 | eval encoded_size=len(_raw)
 | `tenx-inflate`
@@ -307,7 +310,7 @@
       <title>Template Details (Top 20 by Usage)</title>
       <table>
         <search>
-          <query>index=tenx_encoded
+          <query>`tenx-events`
 | rex field=_raw "^~?(?&lt;hash&gt;[^,]+)"
 | stats count as "Event Count" by hash
 | sort -"Event Count"
@@ -333,7 +336,7 @@
       <title>ROI Summary</title>
       <table>
         <search>
-          <query>index=tenx_encoded
+          <query>`tenx-events`
 | head 10000
 | eval encoded_size=len(_raw)
 | `tenx-inflate`

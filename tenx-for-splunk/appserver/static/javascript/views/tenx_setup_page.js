@@ -79,7 +79,7 @@ define(function(require, exports, module) {
 
 		render() {
 			return e("div", null, [
-				e("h2", null,	"Welcome to the 10x for Splunk app"),
+				e("h2", null,	"Welcome to the Log10x App"),
 				e("div", null,	"In order to fully use the app, you need to configure which sourcetypes have tenx encoded data in them"),
 				e("div", null,	"This is done via a POST rest call to the /tenx-config/<sourcetype> and will mark the <sourcetype> as one with encoded data"),
 				e("div", null,	"The full path probably looks something like https://my-splunk-hostname:8089/services/tenx-config/my_source_type"),

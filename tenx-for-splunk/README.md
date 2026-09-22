@@ -1,6 +1,6 @@
-# 10x for Splunk - Log10x Log Optimization App
+# Log10x App
 
-A Splunk app that enables search-time expansion of 10x compact log events. 10x replaces repetitive patterns with compact template hashes, cutting stored volume while maintaining full searchability.
+Search-time expansion of 10x compact log events, for use with Splunk Enterprise and Splunk Cloud Platform. 10x replaces repetitive patterns with compact template hashes, cutting stored volume while maintaining full searchability.
 
 ## Table of Contents
 
@@ -24,14 +24,14 @@ A Splunk app that enables search-time expansion of 10x compact log events. 10x r
 1. **Templates**: The static pattern structure with placeholders for variable data
 2. **Encoded Events**: Compact representations containing only a hash reference and variable values
 
-### What does 10x for Splunk do?
+### What does the app do?
 
-The 10x for Splunk app provides the infrastructure to:
+The app provides the infrastructure to:
 
 1. **Receive** template definitions from the 10x pipeline
 2. **Store** parsed template data in a KV store for efficient lookup
 3. **Inflate** compact events back to their original form at search time
-4. **Search** compact data transparently using standard SPL queries
+4. **Search** compact data with standard SPL: classic dashboards unchanged, the search bar through the `tenxsearch` command
 
 ### Reduction Example
 
@@ -171,8 +171,8 @@ The `tenx_dml` collection stores parsed template data with fields:
 
 ### Prerequisites
 
-- Splunk Enterprise 8.x or later
-- Python 3.7+ (included with Splunk)
+- Splunk Enterprise 9.4 through 10.4, or Splunk Cloud Platform
+- Python 3.9 or later, as shipped with those versions of Splunk
 - Admin access to install apps
 
 ### Installation Steps
@@ -189,7 +189,7 @@ The `tenx_dml` collection stores parsed template data with fields:
 
 3. **Verify installation:**
    - Navigate to Settings > Apps in Splunk Web
-   - Confirm "10x for Splunk" appears in the app list
+   - Confirm "Log10x App" appears in the app list
 
 4. **Configure indexes (if needed):**
    - Create indexes for `tenx_dml_raw_json`, `tenx_dml_pure`, and `tenx_encoded` sourcetypes
@@ -252,7 +252,7 @@ variable_separator = $
 The "Consume KV" saved search runs every 2 minutes by default. To adjust:
 
 1. Navigate to Settings > Searches, reports, and alerts
-2. Find "Consume KV" in the 10x for Splunk app
+2. Find "Consume KV" in the Log10x App
 3. Edit the cron schedule as needed
 
 Or modify `savedsearches.conf`:
@@ -274,6 +274,19 @@ REPORT-tenx = tenx-hash-vars-extraction
 ```
 
 This applies the field extraction that parses compact events into `tenx_hash`, `tenx_var_0`, and `tenx_vars` fields.
+
+### Pointing the Dashboards at Your Compact Events
+
+The app's Analytics and Diagnostics dashboards read the `tenx-events` macro. Its default,
+`index=* sourcetype=tenx_encoded`, finds the app's sourcetype in every index you can search.
+Set it to your compact index, and add any custom sourcetype, under **Settings > Advanced
+search > Search macros**:
+
+```spl
+index=my_compact_index (sourcetype=tenx_encoded OR sourcetype=my_custom_sourcetype)
+```
+
+Naming the index makes every panel faster.
 
 ---
 
@@ -325,7 +338,7 @@ by piece, since the pipeline stores it in pieces.
 | `tenxsearch` | 21 s |
 
 A generating command writes every event out itself, which costs about a millisecond per
-event on top of a two-second floor. Alerts avoid it: the **10x Compile Alert** view stores
+event on top of a two-second floor. Alerts avoid it: the **Compile Alert** view stores
 native SPL that the scheduler runs directly, see [SAVE_TIME_ALERTS.md](../SAVE_TIME_ALERTS.md).
 
 ### Basic Expansion
@@ -562,18 +575,13 @@ This is a common issue when dashboard panels using the `search` command return e
    <latest>now</latest>
    ```
 
-#### Index Specification Issues
+#### Dashboards Show Zero Events
 
-**Problem**: `index=*` in dashboard context may not search all indexes.
+**Problem**: the 10x dashboards report no events although compact events are indexed.
 
-**Solution**: Always specify explicit index names:
-```spl
-<!-- CORRECT -->
-index=tenx_encoded
-
-<!-- PROBLEMATIC -->
-index=* sourcetype=tenx_encoded
-```
+**Solution**: the dashboards find events through the `tenx-events` macro. Set it to the index
+and sourcetype your compact events use; see [Pointing the Dashboards at Your Compact
+Events](#pointing-the-dashboards-at-your-compact-events).
 
 #### Subsearch Limitations
 
@@ -588,7 +596,7 @@ index=* sourcetype=tenx_encoded
 | untable _row metric MB
 
 <!-- PROBLEMATIC - appendpipe fails in dashboards -->
-| appendpipe [| tstats count where index=tenx_encoded | ...]
+| appendpipe [| tstats count where `tenx-events` | ...]
 ```
 
 #### tstats vs search Command
@@ -602,13 +610,13 @@ index=* sourcetype=tenx_encoded
 **Diagnostic approach**:
 ```spl
 <!-- Test 1: Does tstats find data? -->
-| tstats count where index=tenx_encoded
+| tstats count where `tenx-events`
 
 <!-- Test 2: What indexes have data? -->
 | eventcount summarize=false index=*
 
 <!-- Test 3: What's the time range of data? -->
-index=tenx_encoded | stats min(_time) as earliest, max(_time) as latest
+`tenx-events` | stats min(_time) as earliest, max(_time) as latest
 | eval earliest=strftime(earliest, "%Y-%m-%d"), latest=strftime(latest, "%Y-%m-%d")
 ```
 
@@ -707,4 +715,5 @@ this directory, which expands those events at search time, is not.
 
 ## Support
 
-For issues and feature requests, contact the Log10x team.
+- Issues and feature requests: [GitHub Issues](https://github.com/log-10x/splunk-app/issues)
+- Direct support: [support@log10x.com](mailto:support@log10x.com)
