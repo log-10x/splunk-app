@@ -316,9 +316,10 @@ class TenxAlertCompiler:
 			# entirely (a cut hash list can be relied on neither way), so the compiled search
 			# is correct and wider than it could be.
 			review_reasons.append(
-				"the template lookup for at least one keyword was cut short (more message types "
-				"matched than could be fetched); that keyword is left out of the prefilter, so "
-				"the compiled search is correct but scans wider")
+				"the template lookup for at least one keyword was cut short (it ran out of time, "
+				"or matched more message types than can be fetched); that keyword is left out of "
+				"the prefilter, so the compiled search is correct but scans wider. Compiling again "
+				"on a less busy instance may restore it")
 
 		if result.no_prefilter:
 			review_reasons.append(

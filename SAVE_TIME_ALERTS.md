@@ -73,7 +73,7 @@ compiled search returns the same events; the flag names its cost or dependency:
 | The search uses `NOT` | The exclusion does not narrow the prefilter, so the search scans wider |
 | No keyword terms, such as `status=500` alone | No prefilter; every run scans the whole compact sourcetype |
 | Every keyword is negated or its lookup was cut short | The same full scan |
-| A keyword's lookup matched more templates than can be fetched | That keyword is left out of the prefilter |
+| A keyword's lookup ran out of time or matched more templates than can be fetched | That keyword is left out of the prefilter |
 | No template matches a keyword | The alert fires only when the word appears as a variable value |
 | A field condition | It depends on the expanded text carrying space-separated `key=value` pairs |
 
