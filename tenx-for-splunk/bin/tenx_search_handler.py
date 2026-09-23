@@ -166,7 +166,8 @@ class TenxSearchHandler(PersistentServerConnectionApplication):
 
 			search_manager = tenx_search_manager.TenxSearchManager(
 				server_connection=server_connection,
-				tenx_config=tenx_config)
+				tenx_config=tenx_config,
+				app=in_string_json.get('ns', {}).get('app'))
 
 			# Get the original search params.
 			#

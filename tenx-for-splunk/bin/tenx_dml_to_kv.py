@@ -218,7 +218,7 @@ def update_kv_store(settings):
 
 		server_connection = tenx_util.ServerConnection(
 			server_uri=server_uri,
-			user="fill_this",
+			user=settings.get('owner') or 'nobody',
 			auth={'session_key': token})
 
 		dml_intf = tenx_dml_intf.TenxDmlInterface(

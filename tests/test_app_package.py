@@ -99,3 +99,22 @@ class TestSideNavigationIsLegible:
 				  for name in own]
 		assert len(own) >= 3
 		assert len(set(firsts)) == len(firsts), dict(zip(own, firsts))
+
+
+class TestPackageHygiene:
+	def test_license_and_notices_ship_in_the_package(self):
+		for name in ('LICENSE', 'THIRD_PARTY_NOTICES'):
+			assert os.path.getsize(os.path.join(APP, name)) > 0, name
+
+	def test_only_admins_and_power_users_write_the_template_store(self):
+		meta = open(os.path.join(APP, 'metadata', 'default.meta')).read()
+		for stanza in ('collections/tenx_dml', 'transforms/tenx-dml-lookup', 'props'):
+			block = meta.split('[' + stanza + ']', 1)[1].split('\n[', 1)[0]
+			assert 'write : [ * ]' not in block, stanza
+
+	def test_no_handler_logs_the_raw_request(self):
+		# The request payload carries the caller's session token.
+		for name in os.listdir(os.path.join(APP, 'bin')):
+			if name.endswith('.py'):
+				source = open(os.path.join(APP, 'bin', name)).read()
+				assert not re.search(r'logger\.\w+\(\s*in_string(_json)?\s*\)', source), name

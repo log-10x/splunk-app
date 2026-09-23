@@ -277,14 +277,14 @@ class TenxAlertCompiler:
 				AlertStrategy.REJECTED, None, original, state,
 				reason=("search is too complex to compile into a native saved search; "
 						"rewrite it, or schedule it manually via the `| tenxsearch` "
-						"generating command (correct but slower - proxies a nested job)"))
+						"generating command (correct, and slower: it proxies a nested job)"))
 
 		# A transient DML lookup failure is not a permanent problem with the search: the save
 		# layer should retry rather than drop or overwrite a live alert.
 		if state == ResolvedState.FAILURE and result.retryable:
 			return AlertCompileResult(
 				AlertStrategy.RETRYABLE, None, original, state,
-				reason="template lookup failed (transient); retry - do not drop the alert")
+				reason="template lookup failed (transient); retry, and keep the existing alert")
 
 		# FAILURE (unparseable), PENDING or anything unexpected: do not persist a broken search.
 		return AlertCompileResult(
@@ -316,10 +316,10 @@ class TenxAlertCompiler:
 			# entirely (a cut hash list can be relied on neither way), so the compiled search
 			# is correct and wider than it could be.
 			review_reasons.append(
-				"the template lookup for at least one keyword was cut short (more message types "
-				"matched than could be fetched); that keyword is left out of the prefilter, so "
-				"the compiled search is correct but scans wider - recompile once cardinality is "
-				"more assured, or verify on a live instance")
+				"the template lookup for at least one keyword was cut short (it ran out of time, "
+				"or matched more message types than can be fetched); that keyword is left out of "
+				"the prefilter, so the compiled search is correct but scans wider. Compiling again "
+				"on a less busy instance may restore it")
 
 		if result.no_prefilter:
 			review_reasons.append(
@@ -336,7 +336,7 @@ class TenxAlertCompiler:
 		elif result.no_dml_results:
 			review_reasons.append(
 				"no message type currently matches these terms; this alert will only fire "
-				"if a term appears as a variable value, not as template text - confirm "
+				"if a term appears as a variable value, not as template text. Confirm "
 				"that is the intent, or recompile once a matching template exists")
 
 		# Field conditions filter post-inflate via generic key=value extraction from the decoded
@@ -348,7 +348,7 @@ class TenxAlertCompiler:
 		if result.field_terms:
 			review_reasons.append(
 				"filters on field condition(s) {} via key=value extraction from the decoded event "
-				"text; confirm those decode as real fields (space-separated key=value) - other "
+				"text; confirm those decode as fields (space-separated key=value). Other "
 				"payload shapes may not extract, and the alert would then not fire".format(
 					", ".join(result.field_terms)))
 

@@ -11,11 +11,7 @@ define(function(require, exports, module) {
 	var execute = function(restartSearchManagers) {
 		const originalSearchType = "POST";
 		// Splunk 9 and later create search jobs at /search/v2/jobs; older Splunk Web used
-		// /search/jobs. The hook matched only the old path, so on every dashboard of every
-		// version this app supports it installed and never fired: jobs went to Splunk
-		// unrewritten and searches on compact events returned compact events. Found by
-		// reading the browser's POST list on 9.4.15 and 10.4.3, not by any test that
-		// runs without a browser.
+		// /search/jobs.
 		const originalSearchPaths = ["/search/v2/jobs", "/search/jobs"];
 
 		const newSearchPath = "/tenx-search";

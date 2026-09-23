@@ -125,10 +125,9 @@ PER_PIECE_HASH_LIMIT = 500
 
 # Total time one search may spend looking words up in the dictionary, and the most any
 # single lookup may take. The budget is shared: a term cut into seven pieces is seven
-# lookups, and before this was a budget it was 2 seconds EACH, which a freshly started
-# Splunk 9.4.15 exceeded on the first lookup of the first search and refused the whole
-# search over. Warm, a lookup takes about 0.3 seconds. A piece whose lookup does not fit
-# in what is left is not used to narrow, which is correct and wider.
+# lookups. A freshly started Splunk can spend seconds on its first lookup; warm, a lookup
+# takes about 0.3 seconds. A piece whose lookup does not fit in what is left is not used
+# to narrow, which is correct and wider.
 PROBE_BUDGET_MS = 30000
 PROBE_MAX_MS = 10000
 
@@ -653,8 +652,6 @@ class TenxSearchCommand(TenxSplCommand):
 
 		# The whole search body is an implicit AND of the root's children. Modifiers and
 		# field conditions compile to None here and are emitted by their own methods.
-		#
-		# TODO - allow configurable timeouts for the dml search
 		#
 		self._probe_deadline = tenx_util.current_time_ms() + PROBE_BUDGET_MS
 

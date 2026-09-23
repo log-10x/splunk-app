@@ -19,8 +19,8 @@ timestamp_placeholder = <string>
 variable_separator = <string>
 * Variable separator in the raw 10x pattern
 
-10x_extraction_name = <string>
-* Name of the search time field extraction for preping encoded events to be decoded
+tenx_extraction_name = <string>
+* props.conf key of the search-time extraction that splits a compact event into its hash and values
 
-10x_extraction = <string>
-* Regular expression for the search time field extraction for preping encoded events to be decoded
+tenx_extraction = <string>
+* transforms.conf stanza that extraction uses

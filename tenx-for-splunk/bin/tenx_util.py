@@ -147,7 +147,7 @@ def get_tenx_config(service=None, server_uri=None, token=None):
 					if stanza.name.startswith(SPLUNK_SOURCE_PREFIX):
 						sources.append(stanza.name[len(SPLUNK_SOURCE_PREFIX):])
 					else:
-						# TODO - check this is actually a sourcetype
+						# Any other stanza name is taken as a sourcetype.
 						#
 						source_types.append(stanza.name)
 

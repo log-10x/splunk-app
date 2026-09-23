@@ -127,7 +127,8 @@ class TenxSearchCommand(GeneratingCommand):
 
 			search_manager = tenx_search_manager.TenxSearchManager(
 				server_connection=server_connection,
-				tenx_config=tenx_config)
+				tenx_config=tenx_config,
+				app=self._metadata.searchinfo.app)
 
 			original_job_sid = self._metadata.searchinfo.sid
 

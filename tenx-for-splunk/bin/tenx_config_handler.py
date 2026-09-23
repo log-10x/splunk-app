@@ -189,7 +189,7 @@ class TenxConfigHandler(PersistentServerConnectionApplication):
 		try:
 			in_string_json = json.loads(in_string)
 
-			logger.warning(in_string_json)
+			logger.info("Config request {} {}.".format(in_string_json.get("method"), in_string_json.get("path_info")))
 
 			method = in_string_json.get("method")
 
