@@ -132,13 +132,14 @@ Repository name: `log-10x/splunk-app`. Repository URL: https://github.com/log-10
 | Field | Value |
 |---|---|
 | Version | 1.1.1, read from the package |
-| Splunk platform compatibility | Splunk Enterprise 9.4 and 10.4 |
+| Splunk platform compatibility | Splunk Enterprise 9.4, 10.0, 10.2, 10.4 |
 | CIM | None |
 
-These are the versions the app is tested on, 9.4.15 and 10.4.3. Add 10.0 through 10.3 after
-a run of the acceptance matrix on each; Splunkbase requires a release to run on every version
-it names, and may extend it to the next version without a test. Splunk Cloud Platform
-compatibility is set by cloud vetting after upload, not selected here.
+These are every Splunk Enterprise line Splunk supports today, and each is tested: 9.4.15,
+10.0.10, 10.2.7 and 10.4.3, each a fresh install of this package. Splunk ships on-premises
+releases every other minor, so 10.1 and 10.3 exist only on Splunk Cloud Platform, where
+compatibility is set by cloud vetting after upload rather than selected here. Splunkbase
+requires a release to run on every version it names.
 
 **Release notes**
 
@@ -151,8 +152,8 @@ compatibility is set by cloud vetting after upload, not selected here.
 > - A search that cannot be rewritten is refused with a message.
 > - The Analytics and Diagnostics dashboards find compact events through the `tenx-events`
 >   macro.
-> - Tested on Splunk Enterprise 9.4 and 10.4, and passes the Splunk Cloud Platform vetting
->   checks.
+> - Tested on Splunk Enterprise 9.4, 10.0, 10.2 and 10.4, and passes the Splunk Cloud Platform
+>   vetting checks.
 >
 > After upgrading, restart Splunk so Splunk Web serves the updated dashboard script.
 
@@ -162,7 +163,7 @@ compatibility is set by cloud vetting after upload, not selected here.
 |---|---|
 | AppInspect 4.3.1: default, cloud, future, private_victoria, private_classic | 0 errors, 0 failures, 0 future failures |
 | Splunkbase file standards: one root folder, no hidden or compiled files, no `local/` | met |
-| Acceptance matrix, Splunk 9.4.15 and 10.4.3 | 18 of 18 on both |
+| 30 checks per version on a fresh install of this package: search matrix, saved search, refusal, both dashboards, the hook, the search bar, navigation | 30 of 30 on 9.4.15, 10.0.10, 10.2.7 and 10.4.3 |
 | Unit tests, Python 3.9 and 3.13 | pass |
 
 Warnings AppInspect reports, none blocking: SplunkJS telemetry notice, Python 2/3 notice,
