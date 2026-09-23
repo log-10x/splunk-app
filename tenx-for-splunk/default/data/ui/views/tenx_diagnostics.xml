@@ -1,5 +1,5 @@
 <!--
-  10x Diagnostics Dashboard
+  Diagnostics dashboard
   =========================
 
   Use this dashboard to troubleshoot issues with 10x log optimization.
@@ -13,7 +13,7 @@
   See README.md "Troubleshooting" section for detailed explanations.
 -->
 <dashboard version="1.1" theme="light">
-  <label>10x Diagnostics</label>
+  <label>Diagnostics</label>
   <description>Troubleshoot 10x configuration, data flow, and search issues</description>
 
   <!-- Row 1: Index and Data Discovery -->
@@ -22,9 +22,7 @@
       <title>1. Index Event Counts</title>
       <table>
         <search>
-          <query>| eventcount summarize=false index=*
-| search index IN (tenx_encoded, tenx_dml, main)
-| sort -count</query>
+          <query>| tstats count where (`tenx-events`) OR (index=tenx_dml) by index, sourcetype | sort -count</query>
           <earliest>1</earliest>
           <latest></latest>
         </search>
@@ -36,7 +34,7 @@
       <title>2. tstats Event Count</title>
       <single>
         <search>
-          <query>| tstats count where index=tenx_encoded</query>
+          <query>| tstats count where `tenx-events`</query>
           <earliest>1</earliest>
           <latest></latest>
         </search>
@@ -48,7 +46,7 @@
       <title>3. search Event Count</title>
       <single>
         <search>
-          <query>index=tenx_encoded | stats count</query>
+          <query>`tenx-events` | stats count</query>
           <earliest>1</earliest>
           <latest></latest>
         </search>
@@ -64,7 +62,7 @@
       <title>4. Data Time Range</title>
       <table>
         <search>
-          <query>index=tenx_encoded
+          <query>`tenx-events`
 | stats min(_time) as earliest_epoch, max(_time) as latest_epoch, count
 | eval earliest=strftime(earliest_epoch, "%Y-%m-%d %H:%M:%S")
 | eval latest=strftime(latest_epoch, "%Y-%m-%d %H:%M:%S")
@@ -81,7 +79,7 @@
       <title>5. Sourcetype Breakdown</title>
       <table>
         <search>
-          <query>| tstats count where index=tenx_encoded by sourcetype
+          <query>| tstats count where `tenx-events` by sourcetype
 | sort -count</query>
           <earliest>1</earliest>
           <latest></latest>
@@ -143,7 +141,7 @@
       <title>9. Field Extraction Test</title>
       <table>
         <search>
-          <query>index=tenx_encoded
+          <query>`tenx-events`
 | head 5
 | table _raw, tenx_hash, tenx_var_0, tenx_vars</query>
           <earliest>1</earliest>
@@ -161,7 +159,7 @@
       <title>10. Inflation Test (Before)</title>
       <table>
         <search>
-          <query>index=tenx_encoded
+          <query>`tenx-events`
 | head 3
 | table _raw</query>
           <earliest>1</earliest>
@@ -175,7 +173,7 @@
       <title>11. Inflation Test (After)</title>
       <table>
         <search>
-          <query>index=tenx_encoded
+          <query>`tenx-events`
 | head 3
 | `tenx-inflate`
 | table _raw</query>
@@ -194,7 +192,7 @@
       <title>12. Inflation Debug (Intermediate Fields)</title>
       <table>
         <search>
-          <query>index=tenx_encoded
+          <query>`tenx-events`
 | head 3
 | `tenx-inflate-debug`
 | table tenx_hash, tenx_var_0, tenx_ts_sec, tenx_ts_f, tenx_log_term</query>
@@ -227,7 +225,7 @@
       <title>14. Template Lookup Match Test</title>
       <table>
         <search>
-          <query>index=tenx_encoded
+          <query>`tenx-events`
 | head 5
 | lookup tenx-dml-lookup _key as tenx_hash OUTPUT pattern
 | eval has_template=if(isnull(pattern), "NO", "YES")
@@ -280,7 +278,7 @@
       <title>17. Compression Ratio Test</title>
       <table>
         <search>
-          <query>index=tenx_encoded
+          <query>`tenx-events`
 | head 100
 | eval encoded_size=len(_raw)
 | `tenx-inflate`

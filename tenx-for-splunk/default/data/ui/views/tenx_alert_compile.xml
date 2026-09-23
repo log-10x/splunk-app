@@ -1,5 +1,5 @@
 <dashboard script="tenx_alert_compile.js" version="1.1">
-	<label>10x Compile Alert</label>
+	<label>Compile Alert</label>
 	<description>Compile a search once, at save time, into native SPL so a scheduled alert on 10x-compact data runs as an ordinary saved search - no browser hook.</description>
 	<row>
 		<panel>

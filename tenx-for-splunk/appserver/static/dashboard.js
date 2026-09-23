@@ -14,12 +14,11 @@ How it works:
 
 Alternatively, the code can be added independently to any dashboard it's required in.
 
-Note that if there are non-dashboard pages in an app which still require 10x search capabilities,
-they also need to have the 'tenx_search_hook.js' include and 'TenxSearchHook.execute' call to be done
-manually in their code.
-
-An example of this is the way the '10x Search' tab works in the 10x app, which is defined by the
-following files: search.xml, tenx_template_slim.html, and tenx_search.js
+The app's own Analytics and Diagnostics dashboards are left out on purpose: their
+panels read the compact form, counting events and templates and measuring compact bytes, and
+expand explicitly where they need the original line. Routed through the rewrite, every event
+would be expanded first, the compact sizes would be measured on expanded lines, and the
+template fields those panels group by would be dropped.
 */
 require([
 	"/static/app/tenx-for-splunk/javascript/search/tenx_search_hook.js",
@@ -33,5 +32,12 @@ require([
 	//
 	// See tenx_search_hook.js for more info.
 	//
+	var compactFormViews = ["tenx_dashboard", "tenx_diagnostics"];
+	var view = window.location.pathname.replace(/\/+$/, "").split("/").pop();
+
+	if (compactFormViews.indexOf(view) !== -1) {
+		return;
+	}
+
 	TenxSearchHook.execute(true);
 });

@@ -1,6 +1,6 @@
 //# sourceURL=tenx_alert_compile.js
 //
-// Dashboard behaviour for the "10x Compile Alert" view (tenx_alert_compile.xml).
+// Dashboard behaviour for the Compile Alert view (tenx_alert_compile.xml).
 // Compiles a search via the /tenx-alert REST handler and surfaces the classification
 // (strategy / needs_review / reason / compiled_search), so a human confirms a flagged or
 // rejected result before it is scheduled. Also triggers the bulk recompile/migrate pass.
