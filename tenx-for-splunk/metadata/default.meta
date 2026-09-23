@@ -53,15 +53,15 @@ access = read : [ * ], write : [ admin, sc_admin, power ]
 export = system
 
 [collections/tenx_dml]
-access = read : [ * ], write : [ * ]
+access = read : [ * ], write : [ admin, sc_admin, power ]
 export = system
 
 [transforms/tenx-dml-lookup]
-access = read : [ * ], write : [ * ]
+access = read : [ * ], write : [ admin, sc_admin, power ]
 export = system
 
 [props]
-access = read : [ * ], write : [ * ]
+access = read : [ * ], write : [ admin, sc_admin, power ]
 export = system
 
 

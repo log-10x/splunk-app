@@ -2,7 +2,7 @@
   Analytics dashboard
   =======================
 
-  Monitor log optimization performance, storage savings, and ROI metrics.
+  Compact event counts, active templates, compression ratio and storage saved.
 
   IMPORTANT: Dashboard Search Gotchas
   ===================================
@@ -32,7 +32,7 @@
 -->
 <dashboard version="1.1" theme="light">
   <label>Analytics</label>
-  <description>Monitor log optimization performance, storage savings, and ROI metrics</description>
+  <description>Compact event counts, active templates, compression ratio and storage saved</description>
 
   <!--
     Row 1: Key Metrics
@@ -183,8 +183,7 @@
 | stats count by hash
 | sort -count
 | head 10
-| lookup tenx-dml-lookup _key as hash OUTPUT pattern
-| eval template=substr(pattern, 1, 50)."..."
+| rename hash as template
 | table template, count</query>
           <earliest>1</earliest>
           <latest></latest>
@@ -317,9 +316,8 @@
 | head 20
 | lookup tenx-dml-lookup _key as hash OUTPUT pattern, timestamp_format
 | eval "Has Timestamp"=if(len(timestamp_format)>0, "Yes", "No")
-| eval "Pattern Preview"=substr(pattern, 1, 80)
-| rename hash as "Template Hash"
-| table "Template Hash", "Event Count", "Has Timestamp", "Pattern Preview"</query>
+| rename hash as "Template Hash", pattern as "Pattern"
+| table "Template Hash", "Event Count", "Has Timestamp", "Pattern"</query>
           <earliest>1</earliest>
           <latest></latest>
         </search>
@@ -330,10 +328,10 @@
     </panel>
   </row>
 
-  <!-- Row 6: ROI Calculator -->
+  <!-- Row 6: Compression sample -->
   <row>
     <panel>
-      <title>ROI Summary</title>
+      <title>Compression on a 10,000-Event Sample</title>
       <table>
         <search>
           <query>`tenx-events`
@@ -347,9 +345,8 @@
 | eval savings_mb=round(inf_mb-enc_mb, 2)
 | eval ratio=round(inf_bytes/enc_bytes, 2)
 | eval savings_pct=round((1-(enc_bytes/inf_bytes))*100, 1)
-| eval monthly_savings=round((savings_mb/1024)*15, 2)
-| rename sample_count as "Sample Events", inf_mb as "Original Size (MB)", enc_mb as "Encoded Size (MB)", savings_mb as "Storage Saved (MB)", ratio as "Compression Ratio", savings_pct as "Savings %", monthly_savings as "Monthly Savings ($)"
-| fields "Sample Events", "Original Size (MB)", "Encoded Size (MB)", "Storage Saved (MB)", "Compression Ratio", "Savings %", "Monthly Savings ($)"</query>
+| rename sample_count as "Sample Events", inf_mb as "Original Size (MB)", enc_mb as "Encoded Size (MB)", savings_mb as "Storage Saved (MB)", ratio as "Compression Ratio", savings_pct as "Savings %"
+| fields "Sample Events", "Original Size (MB)", "Encoded Size (MB)", "Storage Saved (MB)", "Compression Ratio", "Savings %"</query>
           <earliest>1</earliest>
           <latest></latest>
         </search>

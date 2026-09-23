@@ -32,7 +32,8 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 > ingests and meters. The app keeps the template text in the KV Store and puts it back at
 > search time, so the original lines return intact.
 >
-> Classic dashboards keep their SPL: the app rewrites their searches in the browser. From
+> Classic dashboards keep their SPL: the browser sends each panel's search to the app, which
+> rewrites it on the server. From
 > the search bar, saved searches, alerts and the REST API, a search is wrapped in the
 > `tenxsearch` command. Scheduled alerts compile once at save time into native saved
 > searches. NOT, OR, groups, phrases, field conditions, and values such as IP addresses and
@@ -63,7 +64,8 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 >
 > **Limits**
 >
-> - A search without the `tenxsearch` command returns zero events, not an error.
+> - Outside a classic dashboard, a search without the `tenxsearch` command returns zero
+>   events or unexpanded `~hash,...` rows, not an error.
 > - A search the app cannot rewrite is refused with a message. The unsupported shape is a
 >   sourcetype inside an OR with other terms, `sourcetype=x OR host=y`.
 > - Dashboard Studio loads no app JavaScript; its panels use the command.
@@ -82,9 +84,12 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 > 3. Create two HTTP Event Collector tokens: one with sourcetype `tenx_dml_raw_json` and
 >    index `tenx_dml` for templates, one with sourcetype `tenx_encoded` and your index for
 >    compact events.
-> 4. Point the 10x Receiver at both tokens.
+> 4. Point the 10x Receiver at both tokens, with `varMaxRecurIndexes: 0`,
+>    `timestampZone: UTC` and `maxPerObject: 1` in its configuration.
 > 5. Set the `tenx-events` macro to your compact index: Settings > Advanced search > Search
 >    macros, for example `index=my_compact_index sourcetype=tenx_encoded`.
+> 6. If templates were indexed before the app was installed, run the Backfill KV saved
+>    search once from Settings > Searches, reports, and alerts.
 >
 > After upgrading the app, restart Splunk so Splunk Web serves the updated dashboard script.
 >
@@ -100,6 +105,10 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 >   `$SPLUNK_HOME/var/log/splunk/tenx_search_command.log` or `tenx_search_handler.log`.
 > - **Events show as `~hash,value,...`.** The template has not reached the KV Store yet. The
 >   Consume KV saved search runs every five minutes; the Diagnostics dashboard shows its runs.
+>   Templates indexed before the app was installed need one run of Backfill KV.
+> - **An event stays compact and carries `tenx_expand_refused`.** Its template cannot be
+>   expanded exactly. `back-reference` means the Receiver needs `varMaxRecurIndexes: 0`;
+>   `multiple-timestamps` means it needs `maxPerObject: 1`.
 > - **Behaviour unchanged after an upgrade.** Restart Splunk so Splunk Web serves the new
 >   dashboard script.
 
@@ -131,7 +140,7 @@ Repository name: `log-10x/splunk-app`. Repository URL: https://github.com/log-10
 
 | Field | Value |
 |---|---|
-| Version | 1.1.1, read from the package |
+| Version | 1.1.2, read from the package |
 | Splunk platform compatibility | Splunk Enterprise 9.4, 10.0, 10.2, 10.4 |
 | CIM | None |
 
@@ -152,8 +161,8 @@ requires a release to run on every version it names.
 > - A search that cannot be rewritten is refused with a message.
 > - The Analytics and Diagnostics dashboards find compact events through the `tenx-events`
 >   macro.
-> - Tested on Splunk Enterprise 9.4, 10.0, 10.2 and 10.4, and passes the Splunk Cloud Platform
->   vetting checks.
+> - Tested on Splunk Enterprise 9.4, 10.0, 10.2 and 10.4. The package passes AppInspect's
+>   Splunk Cloud checks.
 >
 > After upgrading, restart Splunk so Splunk Web serves the updated dashboard script.
 
@@ -178,7 +187,7 @@ From the repository root:
 rm -rf /tmp/sbpkg && mkdir -p /tmp/sbpkg
 rsync -a --exclude 'local/' --exclude '__pycache__/' --exclude '*.pyc' --exclude '*.pyo' --exclude '.*' \
   tenx-for-splunk/ /tmp/sbpkg/tenx-for-splunk/
-cd /tmp/sbpkg && COPYFILE_DISABLE=1 tar --format ustar -czf tenx-for-splunk-1.1.1.tar.gz tenx-for-splunk
+cd /tmp/sbpkg && COPYFILE_DISABLE=1 tar --format ustar -czf tenx-for-splunk-1.1.2.tar.gz tenx-for-splunk
 ```
 
 ## Submitting

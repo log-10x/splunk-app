@@ -1,6 +1,6 @@
 # Log10x App
 
-Search-time expansion of 10x compact log events, for use with Splunk Enterprise and Splunk Cloud Platform. 10x replaces repetitive patterns with compact template hashes, cutting stored volume while maintaining full searchability.
+Search-time expansion of 10x compact log events, for Splunk Enterprise 9.4 through 10.4. The package passes AppInspect's Splunk Cloud checks. 10x replaces repetitive patterns with compact template hashes, cutting stored volume while maintaining full searchability.
 
 ## Table of Contents
 
@@ -76,7 +76,7 @@ At search time, the `tenx-inflate` macro reconstructs the original event by comb
         +------------------------+                                    |
         | Saved Search           |                                    |
         | "Consume KV"           |                                    |
-        | (runs every 2 min)     |                                    |
+        | (runs every 5 min)     |                                    |
         +------------------------+                                    |
                      |                                                |
                      v                                                |
@@ -89,8 +89,8 @@ At search time, the `tenx-inflate` macro reconstructs the original event by comb
           |                     |                                     |
           v                     v                                     |
 +------------------+  +------------------+                            |
-| KV Store (kvdml) |  | tenx_dml_pure     |                            |
-| Template parts   |  | (searchable)     |                            |
+| KV Store         |  | tenx_dml_pure    |                            |
+| (tenx_dml)       |  | (searchable)     |                            |
 +------------------+  +------------------+                            |
           |                                                           |
           +---------------------------+-------------------------------+
@@ -132,6 +132,7 @@ The `tenx_dml` collection stores parsed template data with fields:
 | `part_0` | string | First template segment (before first variable) |
 | `pattern_terminator` | string | Last template segment (after last variable) |
 | `timestamp_format` | string | Splunk strftime format for timestamp reconstruction |
+| `expand_unsafe` | string | Empty when the template can be expanded; otherwise the reason it cannot, and the inflate macro leaves its events compact |
 
 #### Macros
 
@@ -171,7 +172,7 @@ The `tenx_dml` collection stores parsed template data with fields:
 
 ### Prerequisites
 
-- Splunk Enterprise 9.4 through 10.4, or Splunk Cloud Platform
+- Splunk Enterprise 9.4 through 10.4
 - Python 3.9 or later, as shipped with those versions of Splunk
 - Admin access to install apps
 
@@ -191,34 +192,41 @@ The `tenx_dml` collection stores parsed template data with fields:
    - Navigate to Settings > Apps in Splunk Web
    - Confirm "Log10x App" appears in the app list
 
-4. **Configure indexes (if needed):**
-   - Create indexes for `tenx_dml_raw_json`, `tenx_dml_pure`, and `tenx_encoded` sourcetypes
-   - Or use existing indexes by updating `tenx_config.conf`
+4. **Create the template index:**
+   - Create an index named `tenx_dml`. Templates arrive there as `tenx_dml_raw_json` and are
+     stored back there as `tenx_dml_pure`. Compact events (`tenx_encoded`) go to any index.
+
+5. **Point the dashboards at your compact index:** set the `tenx-events` macro, see
+   [Pointing the Dashboards at Your Compact Events](#pointing-the-dashboards-at-your-compact-events).
+
+6. **Load templates already indexed:** run the **Backfill KV** saved search once, see
+   [Loading Templates Indexed Earlier](#loading-templates-indexed-earlier).
 
 ### Directory Structure
 
 ```
 tenx-for-splunk/
-├── bin/                          # Python scripts
-│   ├── tenx_consts.py            # Default configuration
-│   ├── tenx_dml_builder.py       # Template parsing logic
-│   ├── tenx_dml_intf.py          # DML sourcetype interface
-│   ├── tenx_dml_to_kv.py         # Alert action entry point
-│   ├── tenx_kv_intf.py           # KV store interface
-│   └── tenx_util.py              # Utility functions
+├── appserver/static/            # dashboard.js, the search hook, the Compile Alert script
+├── bin/                         # Python scripts, see Python Scripts above
 ├── default/
 │   ├── alert_actions.conf       # Alert action definition
 │   ├── app.conf                 # App metadata
 │   ├── collections.conf         # KV store schema
-│   ├── tenx_config.conf          # App configuration
-│   ├── tenx_config.conf.spec     # Configuration spec
+│   ├── commands.conf            # The tenxsearch command
 │   ├── macros.conf              # SPL macros
 │   ├── props.conf               # Sourcetype definitions
-│   ├── savedsearches.conf       # Scheduled searches
-│   └── transforms.conf          # Field extractions & lookups
-├── lib/                         # Python libraries
-└── metadata/
-    └── default.meta             # Permissions
+│   ├── restmap.conf, web.conf   # The /tenx-search and /tenx-alert endpoints
+│   ├── savedsearches.conf       # Consume KV and Backfill KV
+│   ├── tenx_config.conf         # App configuration
+│   ├── transforms.conf          # Field extractions and lookups
+│   └── data/ui/                 # Dashboards and navigation
+├── lib/                         # splunklib and parsimonious, see THIRD_PARTY_NOTICES
+├── metadata/
+│   └── default.meta             # Permissions
+├── README/
+│   └── tenx_config.conf.spec    # Configuration spec
+├── LICENSE
+└── THIRD_PARTY_NOTICES
 ```
 
 ---
@@ -232,13 +240,13 @@ Located at `$SPLUNK_HOME/etc/apps/tenx-for-splunk/default/tenx_config.conf`:
 ```ini
 [config]
 # Index for processed template data
-dest_dml_index = main
+dest_dml_index = tenx_dml
 
 # Sourcetype for processed templates
 dml_source_type = tenx_dml_pure
 
 # KV store collection name
-collection_name = kvdml
+collection_name = tenx_dml
 
 # Placeholder for timestamp in templates
 timestamp_placeholder = __TENX_TS__
@@ -249,7 +257,7 @@ variable_separator = $
 
 ### Modifying the Saved Search Schedule
 
-The "Consume KV" saved search runs every 2 minutes by default. To adjust:
+The "Consume KV" saved search runs every 5 minutes by default. To adjust:
 
 1. Navigate to Settings > Searches, reports, and alerts
 2. Find "Consume KV" in the Log10x App
@@ -259,10 +267,21 @@ Or modify `savedsearches.conf`:
 
 ```ini
 [Consume KV]
-cron_schedule = */2 * * * *      # Every 2 minutes
-dispatch.earliest_time = -3m     # Look back 3 minutes
+cron_schedule = */5 * * * *
+dispatch.earliest_time = -7m
 dispatch.latest_time = now
 ```
+
+Keep the window wider than the interval, or a template that arrives between two runs is
+never stored.
+
+### Loading Templates Indexed Earlier
+
+Consume KV stores templates as they arrive. Templates indexed before the app was installed,
+or while Consume KV was disabled or failing, are loaded by the **Backfill KV** saved search,
+which reads the last 30 days of `tenx_dml_raw_json`. Run it once from **Settings > Searches,
+reports, and alerts** after installing, and after any outage of Consume KV. Running it again
+is safe: templates already stored are skipped.
 
 ### Adding Custom Sourcetypes for Encoded Events
 
@@ -414,6 +433,10 @@ Configure your 10x pipeline to output:
    - Sourcetype: `tenx_encoded`
    - Format: `~<hash>,<var0>,<var1>,...`
 
+3. **Receiver settings** this app relies on: `varMaxRecurIndexes: 0`, `timestampZone: UTC`
+   and `maxPerObject: 1`. The [repository README](../README.md#receiver-side-configuration)
+   explains each one.
+
 ### Step 2: Verify Template Ingestion
 
 After sending some test data, verify templates are being received:
@@ -425,7 +448,7 @@ index=* sourcetype=tenx_dml_raw_json earliest=-15m
 
 ### Step 3: Check KV Store Population
 
-Wait 2-3 minutes for the "Consume KV" saved search to run, then verify:
+Wait five minutes for the "Consume KV" saved search to run, or run **Backfill KV**, then verify:
 
 ```spl
 | inputlookup tenx-dml-lookup
@@ -496,16 +519,12 @@ The `tenx-inflate` macro performs these operations:
 2. **Lookup template**: `lookup tenx-dml-lookup _key AS tenx_hash`
    - Retrieves template parts from KV store
 
-3. **Detect timestamp precision**:
-   ```
-   eval tenx_ts_sec = if(tenx_var_0 > 10000000000000,
-                        tenx_var_0 / 1000000000,    # nanoseconds
-                        tenx_var_0 / 1000)          # milliseconds
-   ```
+3. **Split the timestamp**: the first ten digits of `tenx_var_0` are epoch seconds; the rest
+   is the fraction, cut to the precision the template's format asks for.
 
 4. **Reconstruct event**: Combines template parts with variables using `mvzip` and `mvappend`
 
-5. **Format timestamp**: Replaces `__TENX_TS__` placeholder with formatted time using `strftime`
+5. **Format timestamp**: Replaces the `__TENX_TS__` placeholder with the time rendered in UTC by `strftime`
 
 6. **Cleanup**: Removes intermediate `tenx_*` fields
 
@@ -553,27 +572,10 @@ The `tenx_dml_builder.py` script converts Java SimpleDateFormat to Splunk strfti
 
 ### Dashboard Shows "No Results Found"
 
-This is a common issue when dashboard panels using the `search` command return empty while API queries work. The root causes and solutions are documented below.
+#### Time Range in Your Own Dashboards
 
-#### Time Range Issues
-
-**Problem**: Dashboard search time ranges behave differently than API searches.
-
-**Solutions**:
-1. **Use `<earliest>1</earliest>` instead of `<earliest>0</earliest>`**
-   - In dashboards, `earliest=0` may be interpreted as "no time constraint" rather than "epoch 0"
-   - Using `1` (epoch second 1, Jan 1 1970 00:00:01) works reliably
-
-2. **Leave `<latest>` empty rather than `now`**
-   ```xml
-   <!-- CORRECT -->
-   <earliest>1</earliest>
-   <latest></latest>
-
-   <!-- PROBLEMATIC -->
-   <earliest>0</earliest>
-   <latest>now</latest>
-   ```
+For an all-time panel, set `<earliest>1</earliest>` and leave `<latest>` empty. Splunk Web
+reads `<earliest>0</earliest>` as no time constraint, not as epoch 0.
 
 #### Dashboards Show Zero Events
 
@@ -587,16 +589,12 @@ Events](#pointing-the-dashboards-at-your-compact-events).
 
 **Problem**: `appendpipe [| tstats ...]` and similar subsearch patterns fail silently in dashboard context.
 
-**Solution**: Simplify queries to avoid subsearches. Use `untable` instead of complex append patterns:
+**Solution**: pivot with `untable` instead of appending a subsearch:
 ```spl
-<!-- CORRECT - Use untable for pivoting -->
 | stats sum(enc) as enc, sum(inf) as inf
 | eval Encoded=round(enc/1048576, 2), Original=round(inf/1048576, 2)
 | fields Encoded, Original
 | untable _row metric MB
-
-<!-- PROBLEMATIC - appendpipe fails in dashboards -->
-| appendpipe [| tstats count where `tenx-events` | ...]
 ```
 
 #### tstats vs search Command
@@ -607,21 +605,22 @@ Events](#pointing-the-dashboards-at-your-compact-events).
 - `tstats` searches tsidx (index metadata) - faster, always available
 - `search` searches raw events - requires correct index/time range permissions
 
-**Diagnostic approach**:
+**Diagnostic approach**, one search at a time:
 ```spl
-<!-- Test 1: Does tstats find data? -->
 | tstats count where `tenx-events`
-
-<!-- Test 2: What indexes have data? -->
+```
+```spl
 | eventcount summarize=false index=*
-
-<!-- Test 3: What's the time range of data? -->
+```
+```spl
 `tenx-events` | stats min(_time) as earliest, max(_time) as latest
 | eval earliest=strftime(earliest, "%Y-%m-%d"), latest=strftime(latest, "%Y-%m-%d")
 ```
 
 
 ### Templates Not Appearing in KV Store
+
+Templates indexed before the app was installed are loaded only by **Backfill KV**; run it once.
 
 1. **Check saved search execution:**
    ```spl
@@ -705,8 +704,8 @@ Events](#pointing-the-dashboards-at-your-compact-events).
 
 ## License
 
-This app is released under the [MIT License](../LICENSE). The bundled Splunk SDK
-for Python under `lib/splunklib` stays under its own Apache 2.0 license.
+This app is released under the MIT License, see [LICENSE](LICENSE). The bundled libraries
+keep their own licenses, see [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
 
 Compacting events requires the Log10x Receiver, which is commercial. The app in
 this directory, which expands those events at search time, is not.

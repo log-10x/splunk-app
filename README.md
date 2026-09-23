@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-Search and visualize [compact](https://doc.log10x.com/run/transform/#compact) events in Splunk with zero data loss. This open-source [Log10x](https://www.log10x.com/?utm_source=github&utm_medium=readme&utm_campaign=splunk-app&utm_content=hero) app expands compact events back to their original lines at search time, for use with Splunk Enterprise and Splunk Cloud Platform, while the ingested volume, and with it the license bill, stays reduced.
+Search and visualize [compact](https://doc.log10x.com/run/transform/#compact) events in Splunk with zero data loss. This open-source [Log10x](https://www.log10x.com/?utm_source=github&utm_medium=readme&utm_campaign=splunk-app&utm_content=hero) app expands compact events back to their original lines at search time, while the ingested volume, and with it the license bill, stays reduced. It runs on Splunk Enterprise 9.4 through 10.4, and the package passes AppInspect's Splunk Cloud checks.
 
 > **Blog:** [Search compact logs in Splunk using the 10x app](https://www.log10x.com/blog/cutting-splunk-log-storage/?utm_source=github&utm_medium=readme&utm_campaign=splunk-app&utm_content=blog). How Splunk stores fewer bytes and still returns the original log lines.
 
@@ -43,8 +43,7 @@ earlier variable value instead of re-encoding it). It has no value to put there.
 
 Such a template is detected when it is stored and marked `expand_unsafe`. The inflate macro then
 leaves the compact event as it is and sets `tenx_expand_refused` on the result, rather than
-printing text that is not the original line. Earlier versions expanded it anyway and returned the
-wrong text silently, since the search still returned a result.
+printing text that is not the original line.
 
 **Set `varMaxRecurIndexes: 0`** in the Receiver's pipeline configuration for any deployment that
 feeds this app. This is a whole-process setting, not a per-destination one: disabling it costs a
@@ -124,7 +123,7 @@ nanosecond precision, which one `TIME_FORMAT` cannot express.
 
 ### Step 1: Install Splunk App
 
-Clone the repository and install to your Splunk apps directory:
+Install from Splunkbase, or clone the repository into your Splunk apps directory:
 
 ```bash
 git clone https://github.com/log-10x/splunk-app.git
@@ -132,9 +131,9 @@ cp -r splunk-app/tenx-for-splunk $SPLUNK_HOME/etc/apps/
 $SPLUNK_HOME/bin/splunk restart
 ```
 
-### Step 2: Create HEC Tokens
+### Step 2: Create the Index and HEC Tokens
 
-Create two HTTP Event Collector tokens in Splunk - one for templates, one for compact events.
+Create an index named `tenx_dml` for templates, then two HTTP Event Collector tokens: one for templates, one for compact events.
 
 **Templates Token:**
 
@@ -149,14 +148,22 @@ Create two HTTP Event Collector tokens in Splunk - one for templates, one for co
 | Setting | Value |
 |---------|-------|
 | Name | `tenx-encoded` |
-| Source type | Select appropriate for your logs |
+| Source type | `tenx_encoded` |
 | Index | Your target index |
 
-### Step 3: Configure Forwarder
+### Step 3: Configure the Receiver and Forwarder
 
-Configure your log forwarder to send compact events and templates to Splunk. See the [full documentation](https://doc.log10x.com/apps/receiver/compact/splunk/) for Fluent Bit, Fluentd, and OTel Collector examples.
+Set `varMaxRecurIndexes: 0`, `timestampZone: UTC` and `maxPerObject: 1` in the Receiver's configuration (see [Receiver-side configuration](#receiver-side-configuration)), and point your forwarder at both tokens. See the [full documentation](https://doc.log10x.com/apps/receiver/compact/splunk/) for Fluent Bit, Fluentd, and OTel Collector examples.
 
-### Step 4: Verify End-to-End
+### Step 4: Point the Dashboards at Your Index
+
+Set the `tenx-events` macro to your compact index under **Settings > Advanced search > Search macros**, for example `index=my_compact_index sourcetype=tenx_encoded`.
+
+### Step 5: Load Existing Templates
+
+The **Consume KV** saved search stores new templates every five minutes. Templates indexed before the app was installed, or during an outage of that search, are loaded by running the **Backfill KV** saved search once from **Settings > Searches, reports, and alerts**. Running it again is safe: templates already stored are skipped.
+
+### Step 6: Verify End-to-End
 
 Run these SPL queries to confirm everything is working:
 
@@ -172,35 +179,37 @@ index=tenx_dml sourcetype=tenx_dml_raw_json | head 10
 
 **Check compact events expand:**
 ```spl
-index=your_logs_index | head 10
+| tenxsearch searchstring="index=your_logs_index sourcetype=tenx_encoded" | head 10
 ```
 
 ## Analytics Dashboard
 
-The app includes a built-in analytics dashboard providing real-time visibility into optimization performance, storage savings, and ROI metrics.
+The Analytics dashboard finds compact events through the `tenx-events` macro.
 
-| Metric | Description |
+| Panel | Description |
 |--------|-------------|
-| **Total Encoded Events** | Count of optimized events ingested |
-| **Active Templates** | Number of unique patterns in KV Store |
-| **Reduction Ratio** | Average reduction factor across all events |
-| **Storage Savings** | Estimated bytes saved and percentage reduction |
-| **Event Volume Over Time** | Trend comparison of compact vs original volume |
-| **Top Templates by Usage** | Most frequently matched patterns |
-| **Expansion Success Rate** | Percentage of events successfully expanded |
+| **Total Encoded Events** | Compact events indexed |
+| **Active Templates** | Templates in the KV Store |
+| **Compression Ratio** | Original size over compact size |
+| **Estimated Storage Savings** | Bytes saved and percentage reduction |
+| **Event Volume, Last 7 Days** | Compact events per hour |
+| **Top 10 Templates by Usage** | Template hashes with the most events |
+| **Inflation Success Rate** | Share of sampled events that expand |
 
 ## Components
 
 | Component | Description |
 |-----------|-------------|
-| **Search Hook** | JavaScript module intercepting all search requests |
-| **Search Handler** | REST endpoint transforming SPL queries |
+| **Search Hook** | `dashboard.js`, routing each classic dashboard panel's search to the Search Handler |
+| **Search Handler** | `/tenx-search` REST endpoint rewriting a search for compact events |
+| **tenxsearch Command** | Generating command for the search bar, saved searches and the REST API |
 | **Alert Compiler** | `/tenx-alert` REST endpoint compiling a search into a native scheduled alert at save time (with a recompile/migrate pass) |
 | **Compile Alert View** | UI to compile, review, and recompile save-time alerts |
 | **KV Store** | Template patterns for event reconstruction |
 | **Inflate Macro** | SPL macro joining events with templates |
-| **Consume KV Search** | Scheduled search populating KV store from templates |
-| **Analytics Dashboard** | Compression metrics and ROI visualization |
+| **Consume KV Search** | Scheduled search storing new templates in the KV Store |
+| **Backfill KV Search** | Unscheduled search loading templates indexed before the app was installed |
+| **Analytics Dashboard** | Compression and template metrics |
 | **Diagnostics Dashboard** | Troubleshooting and verification tools |
 
 ## Documentation

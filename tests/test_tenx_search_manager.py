@@ -118,3 +118,16 @@ def test_more_distinct_hashes_than_fetched_is_truncated():
 
 	assert hashes == ['h_a']
 	assert truncated is True
+
+
+def test_jobs_are_created_in_the_callers_app():
+	# A dashboard in another app may use that app's private macros, lookups or eventtypes,
+	# which resolve only in a job created in that app's namespace.
+	manager = TenxSearchManager(RecordingConnection(), dict(CONFIG), app='ops_app')
+	assert manager.create_search_job_url() == '/servicesNS/admin/ops_app/search/jobs/'
+	assert manager.parse_search_string_url() == '/servicesNS/admin/ops_app/search/parser'
+
+
+def test_jobs_default_to_the_search_app():
+	assert TenxSearchManager(RecordingConnection(), dict(CONFIG)).create_search_job_url() \
+		== '/servicesNS/admin/search/search/jobs/'

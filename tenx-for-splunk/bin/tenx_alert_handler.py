@@ -286,6 +286,11 @@ class TenxAlertHandler(PersistentServerConnectionApplication):
 
 			tenx_config = tenx_util.get_tenx_config(server_uri=server_uri, token=token)
 
+			if not tenx_config.get(tenx_util.CONFIG_LOADED, True):
+				return {'payload': "10x: the app's configuration could not be read, so this alert was not "
+					"compiled (built on the defaults it would look for templates in the wrong index). "
+					"See tenx_alert_handler.log.", 'status': 500}
+
 			server_connection = tenx_util.ServerConnection(
 				server_uri=server_uri,
 				user=user,
@@ -293,7 +298,8 @@ class TenxAlertHandler(PersistentServerConnectionApplication):
 
 			search_manager = tenx_search_manager.TenxSearchManager(
 				server_connection=server_connection,
-				tenx_config=tenx_config)
+				tenx_config=tenx_config,
+				app=in_string_json.get('ns', {}).get('app'))
 
 			search_builder = tenx_search_builder.TenxSearchBuilder(
 				server_connection=server_connection,

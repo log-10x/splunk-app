@@ -38,16 +38,18 @@ JobState
 
 API Endpoints Used
 ------------------
-POST /servicesNS/{user}/search/search/jobs/
+{app} is the app the search came from, `search` when it is not known.
+
+POST /servicesNS/{user}/{app}/search/jobs/
     Create new search job
 
-GET /servicesNS/{user}/search/search/jobs/{sid}
+GET /servicesNS/{user}/{app}/search/jobs/{sid}
     Get job details
 
-GET /servicesNS/{user}/search/search/jobs/{sid}/events
+GET /servicesNS/{user}/{app}/search/jobs/{sid}/events
     Get job results
 
-GET /services/search/parser
+GET /servicesNS/{user}/{app}/search/parser
     Parse search string
 
 See Also
@@ -85,16 +87,19 @@ class TenxSearchManager:
 	"""
 	Class for handling common search related operations with the Splunk cluster.
 	"""
-	def __init__(self, server_connection, tenx_config):
+	def __init__(self, server_connection, tenx_config, app=None):
 		self.server_connection = server_connection
 		self.tenx_config = tenx_config
 		self.dml_key = 'dml_hash'
+		# The app the search came from. Another app's namespace cannot see this app's private
+		# macros, lookups or eventtypes, so the search is parsed and run in its own app.
+		self.app = app or 'search'
 
 	def create_search_job_url(self):
 		"""
 		Returns the base url for creating a new search job.
 		"""
-		return '/servicesNS/' + self.server_connection.user + '/search/search/jobs/'
+		return '/servicesNS/' + self.server_connection.user + '/' + self.app + '/search/jobs/'
 
 	def create_search_job(self, search_data):
 		"""
@@ -334,7 +339,7 @@ class TenxSearchManager:
 		"""
 		Returns the base url for parsing a search string a new search job.
 		"""
-		return '/services/search/parser'
+		return '/servicesNS/' + self.server_connection.user + '/' + self.app + '/search/parser'
 
 	def parse_search_string(self, search, parse_only=False):
 		try:
