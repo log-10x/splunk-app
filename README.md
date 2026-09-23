@@ -181,11 +181,11 @@ The Analytics dashboard finds compact events through the `tenx-events` macro.
 |--------|-------------|
 | **Total Encoded Events** | Compact events indexed |
 | **Active Templates** | Templates in the KV Store |
-| **Compression Ratio** | Original size over compact size |
-| **Estimated Storage Savings** | Bytes saved and percentage reduction |
+| **Compression Ratio** | Original size over compact size, on the latest 5,000 events |
+| **Estimated Storage Savings** | Bytes saved and percentage reduction, on the latest 10,000 events |
 | **Event Volume, Last 7 Days** | Compact events per hour |
 | **Top 10 Templates by Usage** | Template hashes with the most events |
-| **Inflation Success Rate** | Share of sampled events that expand |
+| **Inflation Success Rate** | Share of the latest 1,000 events that expand |
 
 ## Components
 

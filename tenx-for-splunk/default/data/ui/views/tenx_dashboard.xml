@@ -95,6 +95,7 @@
         <option name="rangeValues">[1.5]</option>
         <option name="useColors">1</option>
         <option name="field">ratio</option>
+        <option name="underLabel">latest 5,000 events</option>
       </single>
     </panel>
     <panel>
@@ -120,6 +121,7 @@
         <option name="rangeValues">[0]</option>
         <option name="useColors">1</option>
         <option name="field">display</option>
+        <option name="underLabel">latest 10,000 events</option>
       </single>
     </panel>
   </row>
@@ -130,7 +132,7 @@
   -->
   <row>
     <panel>
-      <title>Storage Comparison</title>
+      <title>Storage Comparison, Latest 10,000 Events</title>
       <chart>
         <search>
           <query>`tenx-events`
@@ -224,7 +226,7 @@
   <!-- Row 4: Health Status -->
   <row>
     <panel>
-      <title>Inflation Success Rate (Sample)</title>
+      <title>Inflation Success Rate</title>
       <single>
         <search>
           <query>`tenx-events`
@@ -244,6 +246,7 @@
         <option name="rangeValues">[90,99]</option>
         <option name="useColors">1</option>
         <option name="field">rate</option>
+        <option name="underLabel">latest 1,000 events</option>
       </single>
     </panel>
     <panel>
@@ -299,6 +302,7 @@
         <option name="rangeValues">[0]</option>
         <option name="useColors">1</option>
         <option name="field">reduction</option>
+        <option name="underLabel">latest 5,000 events</option>
       </single>
     </panel>
   </row>
@@ -331,7 +335,7 @@
   <!-- Row 6: Compression sample -->
   <row>
     <panel>
-      <title>Compression on a 10,000-Event Sample</title>
+      <title>Compression, Latest 10,000 Events</title>
       <table>
         <search>
           <query>`tenx-events`
