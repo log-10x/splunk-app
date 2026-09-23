@@ -14,7 +14,7 @@ A [compact event](https://doc.log10x.com/run/transform/#compact) carries a templ
 
 ### Ingestion Flow
 
-Events are [compacted](https://doc.log10x.com/run/transform/#compact) at the edge by the [Receiver](https://doc.log10x.com/apps/receiver/) running in [Compact mode](https://doc.log10x.com/apps/receiver/compact/) and ingested into Splunk with reduced payload size:
+The [Receiver](https://doc.log10x.com/apps/receiver/) running in [Compact mode](https://doc.log10x.com/apps/receiver/compact/) [compacts](https://doc.log10x.com/run/transform/#compact) events at the edge, and Splunk ingests them at reduced size:
 
 ```
 Receiver  -->  Ingest (UF/HEC)  -->  KV Store (Templates)
@@ -33,26 +33,27 @@ Search bar | tenxsearch  --------------------------/
 
 The dashboard path is the faster one: about 3 seconds for 20,000 expanded events, against about 21 seconds through the command, which writes every event out itself.
 
-Scheduled alerts run server-side, where the browser hook never fires. They are instead **compiled once at save time** into native SPL, a template hash prefilter plus the inflate macro, so the scheduler runs an ordinary saved search. This is handled by the `/tenx-alert` REST endpoint and the **Compile Alert** view (with a recompile pass that migrates legacy alerts and refreshes prefilters as templates appear). See [SAVE_TIME_ALERTS.md](SAVE_TIME_ALERTS.md).
+Scheduled alerts run server-side, where the browser hook never fires. They are instead **compiled once at save time** into native SPL, a template hash prefilter plus the inflate macro, so the scheduler runs an ordinary saved search. This is handled by the `/tenx-alert` REST endpoint and the **Compile Alert** view (with a recompile pass that converts `| tenxsearch` alerts and refreshes prefilters as templates appear). See [SAVE_TIME_ALERTS.md](SAVE_TIME_ALERTS.md).
 
 ## Receiver-side configuration
 
-This app does not decode template **back-references** (`$N` syntax, produced when the Receiver's
-[`varMaxRecurIndexes`](https://doc.log10x.com/run/template/#varmaxrecurindexes) setting reuses an
-earlier variable value instead of re-encoding it). It has no value to put there.
+Set three options in the Receiver's configuration for any deployment that feeds this app.
 
-Such a template is detected when it is stored and marked `expand_unsafe`. The inflate macro then
-leaves the compact event as it is and sets `tenx_expand_refused` on the result, rather than
-printing text that is not the original line.
+### Back-references
 
-**Set `varMaxRecurIndexes: 0`** in the Receiver's pipeline configuration for any deployment that
-feeds this app. This is a whole-process setting, not a per-destination one: disabling it costs a
-small amount of the modeled compression (roughly half a percentage point, measured on a realistic
-Kubernetes/OTel corpus), in exchange for correct expansion of every event.
+**Set `varMaxRecurIndexes: 0`.** The app expands templates whose values all travel in the event.
+The Receiver's [`varMaxRecurIndexes`](https://doc.log10x.com/run/template/#varmaxrecurindexes)
+setting lets a template refer back to an earlier value (`$N`) instead. The setting applies to the
+whole Receiver process. At 0, modeled compression is about half a percentage point lower on a
+Kubernetes/OTel dataset, and every event expands exactly.
+
+A Receiver that also feeds Elasticsearch applies the setting there too. The
+[elasticsearch-plugin](https://github.com/log-10x/elasticsearch-plugin) decodes either form, and
+that traffic compresses about half a point less.
 
 ### Timestamps
 
-**Set `timestampZone: UTC`** in the Receiver's pipeline configuration as well.
+**Set `timestampZone: UTC`.**
 
 A timestamp that carries no zone marker of its own, `2025-10-02 06:35:34,498`,
 is only a time once something decides which zone it was written in. The Receiver
@@ -65,37 +66,23 @@ Pinning the Receiver to UTC makes that choice fixed and knowable, and this app's
 inflate macro renders in UTC to match. Without it, expansion returns a time
 shifted by the difference between the Receiver's host clock and UTC.
 
-Timestamps that do carry their own zone, anything ending in `Z` or an offset,
-are unaffected either way.
-
-**If the same Receiver also feeds Elasticsearch** in a fan-out topology, this setting applies to
-that traffic too. That is not a correctness problem for Elasticsearch, because the
-[elasticsearch-plugin](https://github.com/log-10x/elasticsearch-plugin) decoder handles
-back-references correctly. It means only that the Elasticsearch traffic forgoes the same small
-compression gain for as long as the Receiver instance it shares with Splunk has this setting
-disabled.
+Timestamps that carry their own zone, anything ending in `Z` or an offset, are unaffected.
 
 ### One timestamp per event
 
 **Set `maxPerObject: 1`** in the Receiver's timestamp configuration.
 
 The Receiver records every timestamp it finds in an event as its own slot. This app stores one
-timestamp format per template and reconstructs one, so a template carrying two slots can only
-render one of them, and the one it renders is not the one the format describes. At `1` the first
-timestamp keeps its slot and any later one becomes an ordinary variable whose literal text
-round-trips unchanged.
+timestamp format per template, so a template with two slots cannot render both. At `1` the first
+timestamp keeps its slot and any later one becomes an ordinary variable whose text round-trips
+unchanged.
 
-A template with more than one slot is detected when it is stored and refused in the same way as a
-back-reference, so the failure is visible rather than silent.
+### Store-time checks
 
-### What happens if these are not set
-
-Nothing is expanded wrongly. Both back-references and multi-timestamp templates are detected at
-store time, and the macro declines to expand the events that use them, leaving the compact text
-and a `tenx_expand_refused` field naming the reason. The cost of missing a setting is events that
-do not expand, not events that expand to the wrong text. The zone setting is the exception: a
-Receiver on a non-UTC clock cannot be detected from the data, which is why it is pinned rather
-than checked.
+Back-references and multi-timestamp templates are detected when stored. Their events stay compact
+and carry `tenx_expand_refused` naming the reason, `back-reference` or `multiple-timestamps`, so
+every expanded line is the original line. A Receiver's clock zone leaves no trace in the data, so
+`timestampZone: UTC` is required rather than checked.
 
 ### Event time on compact events
 
@@ -105,12 +92,10 @@ compact index.
 
 This matters when you search by time range. A search over the last hour selects events
 that arrived in the last hour, and the lines they expand to may carry any timestamp. The
-original time is still there, as an epoch in the event's first variable, and the expanded
-text shows it; it is simply not what Splunk sorts and filters on.
+original time is in the event's first variable, as an epoch, and the expanded text shows it.
 
-Making `_time` the original event time is possible but is not a setting, because not every
-template carries a timestamp slot and those that do vary between millisecond and
-nanosecond precision, which one `TIME_FORMAT` cannot express.
+`_time` stays at index time because templates vary in whether they carry a timestamp and in
+its precision, from milliseconds to nanoseconds, which one `TIME_FORMAT` cannot express.
 
 ## Quickstart
 
@@ -161,7 +146,13 @@ Set the `tenx-events` macro to your compact index under **Settings > Advanced se
 
 ### Step 5: Load Existing Templates
 
-The **Consume KV** saved search stores new templates every five minutes. Templates indexed before the app was installed, or during an outage of that search, are loaded by running the **Backfill KV** saved search once from **Settings > Searches, reports, and alerts**. Running it again is safe: templates already stored are skipped.
+The **Consume KV** saved search stores new templates every five minutes. To load templates indexed before the app was installed, or during an outage of that search, run this search once as an admin or power user:
+
+```spl
+index=tenx_dml sourcetype=tenx_dml_raw_json earliest=-30d | sendalert tenx_dml_to_kv
+```
+
+Widen `earliest` to reach older templates. Running it again is safe: templates already stored are skipped. The app's **Backfill KV** saved search holds the same search; its alert action fires only when the search runs on a schedule or with `sendalert`, not from the **Run** button.
 
 ### Step 6: Verify End-to-End
 
@@ -208,7 +199,7 @@ The Analytics dashboard finds compact events through the `tenx-events` macro.
 | **KV Store** | Template patterns for event reconstruction |
 | **Inflate Macro** | SPL macro joining events with templates |
 | **Consume KV Search** | Scheduled search storing new templates in the KV Store |
-| **Backfill KV Search** | Unscheduled search loading templates indexed before the app was installed |
+| **Backfill KV Search** | The same template load over 30 days, for templates indexed before the app was installed |
 | **Analytics Dashboard** | Compression and template metrics |
 | **Diagnostics Dashboard** | Troubleshooting and verification tools |
 

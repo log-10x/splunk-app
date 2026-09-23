@@ -65,8 +65,8 @@ alone and then excludes `declined` from the expanded events.
 
 ## Results flagged for review
 
-A NATIVE result is flagged, and saved only on confirmation, when it is correct but a person
-should check it:
+A NATIVE result is flagged, and saved only on confirmation, when one of these holds. The
+compiled search returns the same events; the flag names its cost or dependency:
 
 | Flag | Why |
 |---|---|
@@ -79,8 +79,8 @@ should check it:
 
 A PASSTHROUGH result is flagged when the search still names a configured compact
 sourcetype or source, by name or by a matching wildcard such as `sourcetype=tenx_*`.
-Compact data selected another way, by an eventtype, an index alone or a macro, is not
-detected.
+Detection reads the sourcetype and source named in the search. A search that selects
+compact data by eventtype, index alone or macro compiles as PASSTHROUGH without a flag.
 
 ## Time
 

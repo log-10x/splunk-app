@@ -199,8 +199,8 @@ def recompile_source(saved_search):
 
 	Two managed shapes, in priority order:
 	- A stored `tenx_original_search`: a search /tenx-alert already compiled. Recompiling it
-	  picks up template hashes that appeared since it was saved (a better hash prefilter), or a
-	  fixed compile after a builder change.
+	  picks up template hashes that appeared since it was saved (a better hash prefilter), or the
+	  output of an updated builder.
 	- A legacy `| tenxsearch searchstring="..."` alert: the searchstring is the human search;
 	  recompiling migrates it from the per-run generating-command proxy to a native compiled
 	  saved search.

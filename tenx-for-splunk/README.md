@@ -47,7 +47,7 @@ The app provides the infrastructure to:
 
 **Template stored in KV store:**
 ```
-$($epoch) INFO [main] com.example.Service - Processing request for user $ with transaction id $
+$(epoch) INFO [main] com.example.Service - Processing request for user $ with transaction id $
 ```
 
 At search time, the `tenx-inflate` macro reconstructs the original event by combining the template with the variable values.
@@ -138,7 +138,7 @@ The `tenx_dml` collection stores parsed template data with fields:
 
 | Macro | Purpose |
 |-------|---------|
-| `tenx-inflate` | Main inflation macro - reconstructs original events |
+| `tenx-inflate` | Main inflation macro: reconstructs original events |
 | `tenx-inflate-debug` | Same as above but keeps intermediate fields for debugging |
 | `tenx-message(1)` | Utility macro to display messages in search results |
 
@@ -199,7 +199,7 @@ The `tenx_dml` collection stores parsed template data with fields:
 5. **Point the dashboards at your compact index:** set the `tenx-events` macro, see
    [Pointing the Dashboards at Your Compact Events](#pointing-the-dashboards-at-your-compact-events).
 
-6. **Load templates already indexed:** run the **Backfill KV** saved search once, see
+6. **Load templates already indexed:** run the backfill search once, see
    [Loading Templates Indexed Earlier](#loading-templates-indexed-earlier).
 
 ### Directory Structure
@@ -278,10 +278,16 @@ never stored.
 ### Loading Templates Indexed Earlier
 
 Consume KV stores templates as they arrive. Templates indexed before the app was installed,
-or while Consume KV was disabled or failing, are loaded by the **Backfill KV** saved search,
-which reads the last 30 days of `tenx_dml_raw_json`. Run it once from **Settings > Searches,
-reports, and alerts** after installing, and after any outage of Consume KV. Running it again
-is safe: templates already stored are skipped.
+or while Consume KV was disabled or failing, are loaded by running this search once, as an
+admin or power user, after installing and after any outage of Consume KV:
+
+```spl
+index=tenx_dml sourcetype=tenx_dml_raw_json earliest=-30d | sendalert tenx_dml_to_kv
+```
+
+Widen `earliest` to reach older templates. Running it again is safe: templates already
+stored are skipped. The **Backfill KV** saved search holds the same search; the **Run**
+button does not fire its alert action, so run the search above.
 
 ### Adding Custom Sourcetypes for Encoded Events
 
@@ -320,7 +326,7 @@ live in the KV Store. Two paths put them back.
 carries it and routes the panel's search through the app's REST endpoint. Panels keep
 their SPL. To cover another app's dashboards, copy the file into that app's
 `appserver/static/` and restart. The search bar and Dashboard Studio load no app
-JavaScript and are not covered.
+JavaScript; use the `tenxsearch` command there.
 
 **Everywhere else.** Wrap the search in the `tenxsearch` command:
 
@@ -338,12 +344,13 @@ inline `earliest=`/`latest=` and a trailing pipeline behave as they do on the or
 data, with Splunk's precedence. An IP address, hostname or region name is matched piece
 by piece, since the pipeline stores it in pieces.
 
-**Limits.**
+**Search behavior.**
 
-- A search without the command returns zero events, not an error. Keep compact indexes out
-  of default index sets and name them so the omission is visible.
+- Outside a classic dashboard, a keyword search without the command returns no events, and a
+  search with no keywords returns compact `~hash,...` rows. Keep compact indexes out of
+  default index sets and name them in searches.
 - A search that cannot be rewritten is refused. The job fails with a message, and a
-  dashboard panel shows it in place of a number. The unsupported shape is a sourcetype
+  dashboard panel shows it in place of a number. The rewrite refuses one shape: a sourcetype
   inside an OR, `sourcetype=x OR host=y`.
 - A word matching more than 25,000 templates is dropped from the prefilter, so the search
   scans the sourcetype and checks that word after expansion. A word whose dictionary lookup
@@ -448,7 +455,8 @@ index=* sourcetype=tenx_dml_raw_json earliest=-15m
 
 ### Step 3: Check KV Store Population
 
-Wait five minutes for the "Consume KV" saved search to run, or run **Backfill KV**, then verify:
+Wait five minutes for the "Consume KV" saved search to run, or run the
+[backfill search](#loading-templates-indexed-earlier), then verify:
 
 ```spl
 | inputlookup tenx-dml-lookup
@@ -486,10 +494,10 @@ index=* sourcetype=tenx_encoded earliest=-15m
 ~<hash>,<var0>,<var1>,<var2>,...
 ```
 
-- `~` - Optional prefix (handled by extraction regex)
-- `<hash>` - Template hash identifier
-- `<var0>` - First variable (typically epoch timestamp in milliseconds or nanoseconds)
-- `<var1>...` - Additional variable values
+- `~`: Optional prefix (handled by extraction regex)
+- `<hash>`: Template hash identifier
+- `<var0>`: First variable (typically epoch timestamp in milliseconds or nanoseconds)
+- `<var1>...`: Additional variable values
 
 ### Template Format
 
@@ -501,13 +509,13 @@ $ INFO [main] MyService - User $ performed action $ at $
 
 Special timestamp format:
 ```
-$(<format>) - Timestamp placeholder with Java SimpleDateFormat pattern
-$(epoch) - Special case for milliseconds since epoch
+$(<format>): Timestamp placeholder with Java SimpleDateFormat pattern
+$(epoch): Special case for milliseconds since epoch
 ```
 
 Examples:
-- `$(yyyy-MM-dd'T'HH:mm:ss.SSS'Z')` - ISO 8601 format
-- `$(epoch)` - Unix epoch milliseconds
+- `$(yyyy-MM-dd'T'HH:mm:ss.SSS'Z')`: ISO 8601 format
+- `$(epoch)`: Unix epoch milliseconds
 
 ### Expansion Macro Logic
 
@@ -536,10 +544,10 @@ The `tenx-hash-vars-extraction` transform:
 ^~?(?<tenx_hash>[^,]+),(?<tenx_var_0>[^,]+)(?:,(?<tenx_vars>.*))?
 ```
 
-- `~?` - Optional tilde prefix
-- `(?<tenx_hash>[^,]+)` - Capture hash (everything up to first comma)
-- `(?<tenx_var_0>[^,]+)` - Capture first variable (timestamp)
-- `(?:,(?<tenx_vars>.*))?` - Optionally capture remaining variables
+- `~?`: Optional tilde prefix
+- `(?<tenx_hash>[^,]+)`: Capture hash (everything up to first comma)
+- `(?<tenx_var_0>[^,]+)`: Capture first variable (timestamp)
+- `(?:,(?<tenx_vars>.*))?`: Optionally capture remaining variables
 
 ### Timestamp Format Conversion
 
@@ -620,7 +628,8 @@ Events](#pointing-the-dashboards-at-your-compact-events).
 
 ### Templates Not Appearing in KV Store
 
-Templates indexed before the app was installed are loaded only by **Backfill KV**; run it once.
+Templates indexed before the app was installed are loaded only by the
+[backfill search](#loading-templates-indexed-earlier); run it once.
 
 1. **Check saved search execution:**
    ```spl
@@ -707,8 +716,8 @@ Templates indexed before the app was installed are loaded only by **Backfill KV*
 This app is released under the MIT License, see [LICENSE](LICENSE). The bundled libraries
 keep their own licenses, see [THIRD_PARTY_NOTICES](THIRD_PARTY_NOTICES).
 
-Compacting events requires the Log10x Receiver, which is commercial. The app in
-this directory, which expands those events at search time, is not.
+Compacting events requires the Log10x Receiver, which is commercial. The app in this
+directory is MIT-licensed open source.
 
 ---
 

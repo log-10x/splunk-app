@@ -192,8 +192,8 @@
         <option name="charting.chart.showDataLabels">all</option>
         <option name="charting.drilldown">none</option>
         <option name="charting.legend.placement">none</option>
-        <option name="charting.axisTitleX.text">Events</option>
-        <option name="charting.axisTitleY.text">Template</option>
+        <option name="charting.axisTitleX.text">Template hash</option>
+        <option name="charting.axisTitleY.text">Events</option>
       </chart>
     </panel>
     <panel>

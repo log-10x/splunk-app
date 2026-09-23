@@ -86,8 +86,7 @@ import tenx_util
 # Grammar for parsing a search command.
 #
 spl_grammar = Grammar(
-	# TODO - add support for tag-specifier
-	# TODO - allow STR_CHAR to also be #x5C (SPECIAL_CHAR | QOATATION_CHAR))
+	# Not supported: tag=... specifiers, and a backslash inside STR_CHAR.
 	"""
 	search					= "search" (WS+ logical_expression)?
 
@@ -516,9 +515,7 @@ class TenxSearchAstNodeFactory(TenxAstNodeFactory):
 	# list under the search root or a parenthesised group. Three nodes carry meaning that
 	# must not be flattened away:
 	#
-	# - not_logical_expression. Pruning it promoted the negated term as if it were positive, so
-	#   `NOT bootstrap` compiled into the same search as `bootstrap` and returned the exact
-	#   complement of what was asked (6 events against a truth of 19,992).
+	# - not_logical_expression. Pruned, `NOT x` would compile as `x`.
 	# - p_logical_expression. Pruning it spliced a group into its parent and lost the grouping.
 	# - or_expression, once it has two operands. With one it is just its operand.
 	KEPT_LOGICAL_NODES = ("not_logical_expression", "p_logical_expression")

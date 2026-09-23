@@ -33,10 +33,9 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 > search time, so the original lines return intact.
 >
 > Classic dashboards keep their SPL: the browser sends each panel's search to the app, which
-> rewrites it on the server. From
-> the search bar, saved searches, alerts and the REST API, a search is wrapped in the
-> `tenxsearch` command. Scheduled alerts compile once at save time into native saved
-> searches. NOT, OR, groups, phrases, field conditions, and values such as IP addresses and
+> rewrites it on the server. From the search bar, saved searches, alerts and the REST API, a
+> search is wrapped in the `tenxsearch` command. Scheduled alerts compile once at save time
+> into native saved searches. NOT, OR, groups, phrases, field conditions, and values such as IP addresses and
 > hostnames behave as they do on the original data.
 >
 > Producing compact events requires the 10x Receiver, which is licensed separately. The app
@@ -62,12 +61,12 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 > saved. Diagnostics checks each stage from template arrival to expansion. Both find compact
 > events through the `tenx-events` macro.
 >
-> **Limits**
+> **Search coverage**
 >
 > - Outside a classic dashboard, a search without the `tenxsearch` command returns zero
 >   events or unexpanded `~hash,...` rows, not an error.
-> - A search the app cannot rewrite is refused with a message. The unsupported shape is a
->   sourcetype inside an OR with other terms, `sourcetype=x OR host=y`.
+> - A search the app cannot rewrite is refused with a message. The rewrite refuses one
+>   shape: a sourcetype inside an OR with other terms, `sourcetype=x OR host=y`.
 > - Dashboard Studio loads no app JavaScript; its panels use the command.
 >
 > **Speed**, 20,000 expanded events on Splunk 10.4.3: about 3 seconds through a dashboard,
@@ -88,8 +87,8 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 >    `timestampZone: UTC` and `maxPerObject: 1` in its configuration.
 > 5. Set the `tenx-events` macro to your compact index: Settings > Advanced search > Search
 >    macros, for example `index=my_compact_index sourcetype=tenx_encoded`.
-> 6. If templates were indexed before the app was installed, run the Backfill KV saved
->    search once from Settings > Searches, reports, and alerts.
+> 6. If templates were indexed before the app was installed, run this search once:
+>    `index=tenx_dml sourcetype=tenx_dml_raw_json earliest=-30d | sendalert tenx_dml_to_kv`
 >
 > After upgrading the app, restart Splunk so Splunk Web serves the updated dashboard script.
 >
@@ -105,11 +104,12 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 >   `$SPLUNK_HOME/var/log/splunk/tenx_search_command.log` or `tenx_search_handler.log`.
 > - **Events show as `~hash,value,...`.** The template has not reached the KV Store yet. The
 >   Consume KV saved search runs every five minutes; the Diagnostics dashboard shows its runs.
->   Templates indexed before the app was installed need one run of Backfill KV.
+>   Templates indexed before the app was installed need one run of
+>   `index=tenx_dml sourcetype=tenx_dml_raw_json earliest=-30d | sendalert tenx_dml_to_kv`.
 > - **An event stays compact and carries `tenx_expand_refused`.** Its template cannot be
 >   expanded exactly. `back-reference` means the Receiver needs `varMaxRecurIndexes: 0`;
 >   `multiple-timestamps` means it needs `maxPerObject: 1`.
-> - **Behaviour unchanged after an upgrade.** Restart Splunk so Splunk Web serves the new
+> - **Behavior unchanged after an upgrade.** Restart Splunk so Splunk Web serves the new
 >   dashboard script.
 
 **Categories**: IT Operations, Utilities
@@ -122,10 +122,10 @@ Enterprise 10.4.3 against 20,000 compact events from the OpenTelemetry demo.
 | File | Caption |
 |---|---|
 | `1_search_bar_tenxsearch.png` | The search bar with `tenxsearch`: 438 matching events, expanded to their original lines |
-| `2_classic_dashboard_plain_spl.png` | A classic dashboard written in plain SPL returns expanded results with no changes |
+| `2_classic_dashboard_plain_spl.png` | Service errors, a user's own classic dashboard in plain SPL: counts and events come back expanded with no changes to the panels |
 | `3_analytics_dashboard.png` | Analytics: compact events, templates, compression ratio and storage saved |
 | `4_diagnostics.png` | Diagnostics: every stage from template arrival to expansion |
-| `5_compile_alert.png` | Compile Alert: a scheduled alert compiled once into native SPL |
+| `5_compile_alert.png` | Compile Alert: a search compiled once into native SPL for a scheduled alert, with the reason it is flagged for review |
 
 Repository name: `log-10x/splunk-app`. Repository URL: https://github.com/log-10x/splunk-app
 

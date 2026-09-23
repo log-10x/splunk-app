@@ -1,6 +1,6 @@
 <dashboard script="tenx_alert_compile.js" version="1.1">
 	<label>Compile Alert</label>
-	<description>Compile a search once, at save time, into native SPL so a scheduled alert on 10x-compact data runs as an ordinary saved search - no browser hook.</description>
+	<description>Compile a search once, at save time, into native SPL so a scheduled alert on 10x-compact data runs as an ordinary saved search, with no browser hook.</description>
 	<row>
 		<panel>
 			<html>
@@ -15,7 +15,7 @@
 					</div>
 					<div style="margin:8px 0;">
 						<button id="tenx-alert-compile" class="btn btn-primary">Compile</button>
-						<button id="tenx-alert-recompile" class="btn" title="Recompile every managed alert - migrate legacy | tenxsearch alerts and pick up new templates">Recompile all managed alerts</button>
+						<button id="tenx-alert-recompile" class="btn" title="Recompile every managed alert: convert | tenxsearch alerts to native SPL and pick up new templates">Recompile all managed alerts</button>
 					</div>
 					<div id="tenx-alert-result" style="margin-top:10px;"></div>
 				</div>
