@@ -61,7 +61,7 @@ See Also
 - tenx_alert_compiler.py:  the compile step.
 - tenx_alert_persist.py:   the (offline-tested) decision + payload logic.
 - tenx_search_handler.py:  the sibling interactive handler this mirrors.
-- SAVE_TIME_ALERTS.md:     the wiring plan.
+- SAVE_TIME_ALERTS.md in the app repository: how compiled alerts work.
 """
 
 

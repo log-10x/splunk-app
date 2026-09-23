@@ -4,8 +4,10 @@ A scheduled alert runs on the server, where the dashboard hook never fires. The 
 compiles the alert's search once, when it is saved, into native SPL, and stores that. The
 scheduler then runs an ordinary saved search with no Python between it and the data.
 
-`| tenxsearch` also works in a saved search, but every run then proxies a nested job and
-writes each event out through Python. Compiling avoids that cost.
+Only alerts created through the **Compile Alert** view or the `/tenx-alert` endpoint are
+compiled. An alert saved the usual way from the search page is not: on compact data it must
+wrap its search in `| tenxsearch`, and every run then proxies a nested job and writes each
+event out through Python. Compiling avoids that cost.
 
 ## Compiling an alert
 

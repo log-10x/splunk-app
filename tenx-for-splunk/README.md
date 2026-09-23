@@ -365,7 +365,7 @@ by piece, since the pipeline stores it in pieces.
 
 A generating command writes every event out itself, which costs about a millisecond per
 event on top of a two-second floor. Alerts avoid it: the **Compile Alert** view stores
-native SPL that the scheduler runs directly, see [SAVE_TIME_ALERTS.md](../SAVE_TIME_ALERTS.md).
+native SPL that the scheduler runs directly, see [SAVE_TIME_ALERTS.md](https://github.com/log-10x/splunk-app/blob/main/SAVE_TIME_ALERTS.md).
 
 ### Basic Expansion
 
@@ -441,7 +441,7 @@ Configure your 10x pipeline to output:
    - Format: `~<hash>,<var0>,<var1>,...`
 
 3. **Receiver settings** this app relies on: `varMaxRecurIndexes: 0`, `timestampZone: UTC`
-   and `maxPerObject: 1`. The [repository README](../README.md#receiver-side-configuration)
+   and `maxPerObject: 1`. The [repository README](https://github.com/log-10x/splunk-app/blob/main/README.md#receiver-side-configuration)
    explains each one.
 
 ### Step 2: Verify Template Ingestion

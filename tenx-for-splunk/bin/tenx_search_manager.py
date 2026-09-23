@@ -119,6 +119,16 @@ class TenxSearchManager:
 			logger.error("Error creating search job for search - {} - {}.".format(search_data['search'], e), exc_info=1)
 			return None
 
+	def cancel_search_job(self, sid):
+		"""
+		Cancels a search job and removes it. Errors are logged and otherwise ignored: the job
+		expires on its own either way.
+		"""
+		try:
+			self.server_connection.post(self.get_search_job_url(sid) + '/control', {'action': 'cancel'})
+		except Exception as e:
+			logger.warning("Failed cancelling search job {} - {}.".format(sid, e))
+
 	def get_search_job_url(self, sid):
 		"""
 		Returns the base url for the specific search job SID provided.

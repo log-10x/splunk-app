@@ -106,13 +106,20 @@ class TenxSearchCommand(GeneratingCommand):
 	searchstring = Option(require=True)
 
 	def generate(self):
+		# The expanded search runs as a job of its own. If this command stops before reading it
+		# to the end (the outer search is cancelled, or fails), that job is cancelled too.
+		#
+		search_manager = None
+		search_sid = None
+		finished = False
+
 		try:
 			server_uri = self._metadata.searchinfo.splunkd_uri
 			token = self._metadata.searchinfo.session_key
 
 			tenx_config = tenx_util.get_tenx_config(server_uri=server_uri, token=token)
 
-			self.logger.info("Loaded config - {}".format(json.dumps(tenx_config)))
+			self.logger.debug("Loaded config - {}".format(json.dumps(tenx_config)))
 
 			if not tenx_config.get(tenx_util.CONFIG_LOADED, True):
 				self.write_error("10x: the app's configuration could not be read, so this search was not run "
@@ -285,8 +292,15 @@ class TenxSearchCommand(GeneratingCommand):
 
 					yield result
 
+			finished = True
+
 		except Exception as e:
 			self.logger.error("Unexpected error running tenxsearch - {}.".format(e), exc_info=1)
+
+		finally:
+			if search_sid is not None and not finished:
+				self.logger.info("Cancelling nested search {}.".format(search_sid))
+				search_manager.cancel_search_job(search_sid)
 
 
 dispatch(TenxSearchCommand, sys.argv, sys.stdin, sys.stdout, __name__)

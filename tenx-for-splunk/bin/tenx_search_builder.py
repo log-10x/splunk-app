@@ -848,7 +848,7 @@ class TenxSearchCommand(TenxSplCommand):
 		This is needed to filter out stuff that doesn't actually match and may be here by accident.
 
 		This can happen for complex queries as we interlace data from variables (encoded events) and
-		templates (coming from the decoding against kvdml)
+		templates (coming from the decoding against tenx_dml)
 		"""
 		return " | search " + " ".join([item.text for item in self.user_search_terms])
 

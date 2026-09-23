@@ -34,12 +34,6 @@ export = system
 export = system
 
 
-### VIEWSTATES: even normal users should be able to create shared viewstates
-
-[viewstates]
-access = read : [ * ], write : [ * ]
-export = system
-
 [macros/tenx-inflate]
 access = read : [ * ], write : [ admin, sc_admin, power ]
 export = system

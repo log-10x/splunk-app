@@ -37,14 +37,14 @@ This handler is faster than the tenxsearch command because:
 
 Usage Example
 -------------
-    curl -k -u admin:password \\
+    curl -k -u <user>:<password> \\
         -d "search=error&earliest_time=-1h&latest_time=now" \\
         https://localhost:8089/servicesNS/admin/tenx-for-splunk/tenx-search
 
     # Response: {"sid": "1234567890.12345"}
 
     # Then poll for results:
-    curl -k -u admin:password \\
+    curl -k -u <user>:<password> \\
         https://localhost:8089/services/search/jobs/1234567890.12345/results
 
 Logging
@@ -152,7 +152,7 @@ class TenxSearchHandler(PersistentServerConnectionApplication):
 
 			tenx_config = tenx_util.get_tenx_config(server_uri=server_uri, token=token)
 
-			logger.info("Loaded config - {}".format(json.dumps(tenx_config)))
+			logger.debug("Loaded config - {}".format(json.dumps(tenx_config)))
 
 			if not tenx_config.get(tenx_util.CONFIG_LOADED, True):
 				return refusal("10x: the app's configuration could not be read, so this search was not "

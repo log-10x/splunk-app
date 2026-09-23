@@ -24,9 +24,9 @@ TENX_EXTRACTION : str
 DEFAULT_CONFIG : dict
     Default values for all configurable settings:
 
-    - dest_dml_index: Index for processed template events (default: 'main')
+    - dest_dml_index: Index for processed template events (default: 'tenx_dml')
     - dml_source_type: Sourcetype for processed templates (default: 'tenx_dml_pure')
-    - collection_name: KV store collection name (default: 'kvdml')
+    - collection_name: KV store collection name (default: 'tenx_dml')
     - timestamp_placeholder: Placeholder text for timestamps (default: '__TENX_TS__')
     - variable_separator: Character separating variables in templates (default: '$')
     - tenx_extraction_name: props.conf key for extraction (default: 'REPORT-tenx')
@@ -58,13 +58,13 @@ TENX_EXTRACTION = 'tenx_extraction'
 
 DEFAULT_CONFIG = {
 	# Index where processed template events (tenx_dml_pure) are stored
-	'dest_dml_index':			'main',
+	'dest_dml_index':			'tenx_dml',
 
 	# Sourcetype for processed/searchable template patterns
 	'dml_source_type':			'tenx_dml_pure',
 
 	# KV store collection name for template lookup data
-	'collection_name':			'kvdml',
+	'collection_name':			'tenx_dml',
 
 	# Placeholder string in patterns where timestamp should be rendered
 	# The tenx-inflate macro replaces this with strftime output
