@@ -24,8 +24,9 @@ so a new template reaches an alert within about 15 minutes of reaching the KV St
 **Recompile all managed alerts** in the view runs the same pass at once for the current
 user. Both recompile from the search as originally written, rewrite an alert only when its
 compiled form changed, leave an alert a person edited by hand alone, and never apply a
-result that needs review. The pass also converts an existing
-`| tenxsearch searchstring="..."` alert into a compiled one.
+result that needs review. The button also converts an existing
+`| tenxsearch searchstring="..."` alert into a compiled one; the scheduled pass leaves those
+as they are.
 
 The same actions are available at the `/tenx-alert` REST endpoint:
 

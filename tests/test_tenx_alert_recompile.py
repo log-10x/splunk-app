@@ -104,3 +104,23 @@ def test_a_hand_edited_alert_is_not_overwritten():
 		compiler_for(TEMPLATES + [('h_cart2', 'cartstore quota exceeded for $')]))
 
 	assert summary['drifted'] == 1 and conn.posts == []
+
+
+def test_the_scheduled_pass_leaves_tenxsearch_saved_searches_alone():
+	legacy = '| tenxsearch searchstring="sourcetype=tenx_encoded cartstore" | stats count'
+	conn = Conn([{'name': 'Report', 'owner': 'alice', 'search': legacy}])
+
+	summary = tenx_alert_recompile.recompile_all(conn, tenx_alert_recompile.ALL_OWNERS,
+		compiler_for(TEMPLATES), migrate_legacy=False)
+
+	assert summary['examined'] == 0 and conn.posts == []
+	assert conn.stanzas[0]['search'] == legacy
+
+
+def test_the_button_still_converts_them():
+	legacy = '| tenxsearch searchstring="sourcetype=tenx_encoded cartstore"'
+	conn = Conn([{'name': 'Report', 'owner': 'alice', 'search': legacy}])
+
+	summary = tenx_alert_recompile.recompile_all(conn, 'alice', compiler_for(TEMPLATES))
+
+	assert summary['migrated'] == 1

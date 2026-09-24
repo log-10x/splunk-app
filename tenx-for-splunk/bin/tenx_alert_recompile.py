@@ -100,12 +100,16 @@ def list_managed_savedsearches(server_connection, owner):
 	return stanzas
 
 
-def recompile_all(server_connection, owner, compiler):
+def recompile_all(server_connection, owner, compiler, migrate_legacy=True):
 	"""
 	Recompiles every managed saved search visible to `owner` from its search as written,
 	applying only clean results whose compiled form changed. Never auto-applies a result that
 	needs review, never touches one that failed or was rejected, and never overwrites an alert
 	a person has edited by hand (counted as `drifted`).
+
+	migrate_legacy=False leaves `| tenxsearch` saved searches alone: the scheduled pass only
+	refreshes alerts already compiled through the app, and converting a saved search is left
+	to a person pressing "Recompile all managed alerts".
 	"""
 	summary = {'examined': 0, 'recompiled': 0, 'migrated': 0, 'unchanged': 0,
 		'needs_review': 0, 'skipped': 0, 'drifted': 0, 'errors': 0, 'updated': []}
@@ -116,10 +120,14 @@ def recompile_all(server_connection, owner, compiler):
 		if source is None:
 			continue
 
+		is_legacy = tenx_alert_persist.is_legacy_tenxsearch(stanza)
+
+		if is_legacy and not migrate_legacy:
+			continue
+
 		summary['examined'] += 1
 		name = stanza['name']
 		stanza_owner = stanza['owner']
-		is_legacy = tenx_alert_persist.is_legacy_tenxsearch(stanza)
 
 		if tenx_alert_persist.is_drifted(stanza):
 			summary['drifted'] += 1
