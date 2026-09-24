@@ -32,7 +32,7 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 > that change, so a stream of repeated patterns takes less of the license. On the OpenTelemetry
 > demo the bytes sent to Splunk shrank by 63.7%, encoded events and template dictionary counted
 > together, and every line expanded back byte-identical with the Receiver settings in the
-> installation steps (measurement: https://www.log10x.com/blog/cutting-splunk-log-storage/?utm_source=splunkbase&utm_medium=listing).
+> installation steps (measurement: https://www.log10x.com/blog/cutting-splunk-log-storage/).
 > The same license then holds more: sources that were sampled, filtered or kept out of Splunk
 > to stay under the limit can come back, or the license can be smaller.
 >
@@ -44,10 +44,10 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 > they do on the original data.
 >
 > The 10x Receiver produces compact events, and it is free on up to 10 nodes
-> (https://www.log10x.com/pricing?utm_source=splunkbase&utm_medium=listing). No sign-up is
+> (https://www.log10x.com/pricing). No sign-up is
 > required to evaluate it: with no license token it runs the full product for 30 days on up to
 > 10 nodes, air-gapped, and a free license removes the time limit
-> (https://doc.log10x.com/manage/license/?utm_source=splunkbase&utm_medium=listing). The app
+> (https://doc.log10x.com/manage/license/). The app
 > itself is open source under the MIT license.
 
 **Short description**
@@ -87,9 +87,9 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 >
 > **Network**: the app makes no outbound calls. It talks only to the local splunkd.
 >
-> Full documentation: https://doc.log10x.com/apps/receiver/compact/splunk/?utm_source=splunkbase&utm_medium=listing
+> Full documentation: https://doc.log10x.com/apps/receiver/compact/splunk/
 >
-> How it works, with the measurement: https://www.log10x.com/blog/cutting-splunk-log-storage/?utm_source=splunkbase&utm_medium=listing
+> How it works, with the measurement: https://www.log10x.com/blog/cutting-splunk-log-storage/
 
 **Installation**
 
@@ -99,7 +99,7 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 > 3. Create two HTTP Event Collector tokens: one with sourcetype `tenx_dml_raw_json` and
 >    index `tenx_dml` for templates, one with sourcetype `tenx_encoded` and your index for
 >    compact events.
-> 4. Deploy the 10x Receiver (https://doc.log10x.com/apps/receiver/deploy/?utm_source=splunkbase&utm_medium=listing) and point it at
+> 4. Deploy the 10x Receiver (https://doc.log10x.com/apps/receiver/deploy/) and point it at
 >    both tokens, with `varMaxRecurIndexes: 0`, `timestampZone: UTC` and `maxPerObject: 1` in
 >    its configuration.
 > 5. Set the `tenx-events` macro to your compact index: Settings > Advanced search > Search
@@ -109,7 +109,7 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 >
 > After upgrading the app, restart Splunk so Splunk Web serves the updated dashboard script.
 >
-> Step-by-step guide: https://doc.log10x.com/apps/receiver/compact/splunk/?utm_source=splunkbase&utm_medium=listing
+> Step-by-step guide: https://doc.log10x.com/apps/receiver/compact/splunk/
 
 **Troubleshooting**
 
