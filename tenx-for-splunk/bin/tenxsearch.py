@@ -84,6 +84,12 @@ tenx_util.setup_logger('tenx_search_command', logging.INFO)
 # nothing. The nested job is bounded by Splunk's own search limits either way.
 MAX_WAIT_MS = 30 * 60 * 1000
 
+# The expanded search runs as a job of its own, which this command polls every 100 ms while it
+# waits and reads while it streams. Splunk cancels a job nobody has touched for this many
+# seconds, so if this process is ended without running any cleanup, the expanded search stops
+# with it.
+NESTED_AUTO_CANCEL_S = 30
+
 
 @Configuration()
 class TenxSearchCommand(GeneratingCommand):
@@ -107,7 +113,8 @@ class TenxSearchCommand(GeneratingCommand):
 
 	def generate(self):
 		# The expanded search runs as a job of its own. If this command stops before reading it
-		# to the end (the outer search is cancelled, or fails), that job is cancelled too.
+		# to the end (the outer search ended, or an error), that job is cancelled here; if the
+		# process is ended outright, the job's auto_cancel stops it (see NESTED_AUTO_CANCEL_S).
 		#
 		search_manager = None
 		search_sid = None
@@ -201,7 +208,8 @@ class TenxSearchCommand(GeneratingCommand):
 				"earliest_time": job_details['request'].get('earliest_time', ''),
 				"latest_time": job_details['request'].get('latest_time', ''),
 				'rf': job_details['request'].get('rf', '*'),
-				"search": actual_search
+				"search": actual_search,
+				"auto_cancel": NESTED_AUTO_CANCEL_S
 			}
 
 			# Creating a search job for the new search.
@@ -216,7 +224,16 @@ class TenxSearchCommand(GeneratingCommand):
 
 			# Waiting for the job to finish.
 			#
-			search_job_state = search_manager.poll_for_job_end(search_sid, MAX_WAIT_MS, 100)
+			# Splunk does not stop this command when the outer search is cancelled; it keeps
+			# waiting. So the outer search is checked while waiting, and the expanded search is
+			# cancelled (in the finally below) once the outer one has ended.
+			#
+			search_job_state = search_manager.poll_for_job_end(search_sid, MAX_WAIT_MS, 100,
+				keep_going=lambda: search_manager.is_job_live(original_job_sid))
+
+			if search_job_state == tenx_search_manager.JobState.ABORTED:
+				self.logger.info("Outer search {} ended; stopping {}.".format(original_job_sid, search_sid))
+				return
 
 			if search_job_state != tenx_search_manager.JobState.SUCCESS:
 				self.logger.warning("Job {} didn't finish, state is {} ({}).".format(search_sid, search_job_state, original_job_sid))
@@ -231,11 +248,18 @@ class TenxSearchCommand(GeneratingCommand):
 
 			search_job_details = search_manager.get_search_job_details(search_sid)
 
-			if 'eventCount' not in search_job_details:
-				self.logger.warning("Missing eventCount in job details {} ({}).".format(search_sid, original_job_sid))
+			# A search that ends in a transforming command (stats and the like) has its output
+			# under /results, counted by resultCount; an event search has its events under
+			# /events, counted by eventCount.
+			#
+			transformed = bool(search_job_details.get('reportSearch'))
+			count_key = 'resultCount' if transformed else 'eventCount'
+
+			if count_key not in search_job_details:
+				self.logger.warning("Missing {} in job details {} ({}).".format(count_key, search_sid, original_job_sid))
 				return
 
-			event_count = int(search_job_details['eventCount'])
+			event_count = int(search_job_details[count_key])
 
 			if event_count <= 0:
 				self.logger.info("No events returned for search {} ({}).".format(search_sid, original_job_sid))
@@ -263,7 +287,7 @@ class TenxSearchCommand(GeneratingCommand):
 
 				params = {"offset": start_offset, "count": event_count_to_request}
 
-				search_results = search_manager.get_search_results(search_sid, params)
+				search_results = search_manager.get_search_results(search_sid, params, transformed=transformed)
 
 				if search_results is None:
 					self.logger.warning("Failed getting results {}->{} for {} ({}).".format(
