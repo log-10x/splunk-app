@@ -191,14 +191,20 @@ class LocalSearchManager(LocalSplParser):
 	non-subsearch path: parse_search_string (from LocalSplParser) and run_dml_search.
 	"""
 
-	def __init__(self, template_store, fail_dml=False, truncate_dml=False):
+	def __init__(self, template_store, fail_dml=False, truncate_dml=False, timestamp_formats=()):
 		self.store = template_store
+		# What get_timestamp_formats answers: the strftime formats of the stored templates, or
+		# None to exercise the path where they could not be read.
+		self.timestamp_formats = timestamp_formats
 		# When True, run_dml_search returns (None, False) to exercise the compile-time DML
 		# failure path (which the builder surfaces as ResolvedState.FAILURE, retryable).
 		self.fail_dml = fail_dml
 		# When True, run_dml_search reports truncated=True alongside real matches, to
 		# exercise the "hash set may be incomplete" needs_review path.
 		self.truncate_dml = truncate_dml
+
+	def get_timestamp_formats(self, max_time_ms=2000, poll_interval_ms=50):
+		return None if self.timestamp_formats is None else list(self.timestamp_formats)
 
 	def run_dml_search(self, dml_search, max_time_ms=2000, poll_interval_ms=50):
 		if self.fail_dml:

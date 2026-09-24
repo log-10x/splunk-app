@@ -323,7 +323,7 @@ class TenxAlertCompiler:
 		if result.no_prefilter:
 			review_reasons.append(
 				"none of this alert's keywords restricts the compact events (each is negated, "
-				"or its template lookup was cut short), so the compiled search scans the entire "
+				"could be text printed from a timestamp, or its template lookup was cut short), so the compiled search scans the entire "
 				"compact sourcetype on every run and applies the keywords after expansion")
 		elif not result.has_search_terms:
 			# No keyword search terms at all (a field-only search like 'status=500', or no

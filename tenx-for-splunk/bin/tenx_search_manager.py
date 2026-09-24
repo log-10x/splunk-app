@@ -328,6 +328,30 @@ class TenxSearchManager:
 
 		return hashes, truncated
 
+	def get_timestamp_formats(self, max_time_ms=2000, poll_interval_ms=50):
+		"""
+		The distinct timestamp formats of the stored templates, as Splunk strftime strings, or
+		None when they could not be read in time.
+		"""
+		sid = self.create_search_job({
+			'earliest_time': '0',
+			'latest_time': 'now',
+			'search': '| inputlookup tenx-dml-lookup | stats count by timestamp_format'})
+
+		if sid is None:
+			return None
+
+		if self.poll_for_job_end(sid, max_time_ms, poll_interval_ms) != JobState.SUCCESS:
+			logger.warning("Timestamp formats not read in {}ms ({}).".format(max_time_ms, sid))
+			return None
+
+		results = self.get_search_results(sid, {'count': 0}, transformed=True)
+
+		if results is None or 'results' not in results:
+			return None
+
+		return [row.get('timestamp_format') for row in results['results'] if row.get('timestamp_format')]
+
 	def run_dml_search(self, dml_search, max_time_ms=2000, poll_interval_ms=50):
 		"""
 		Runs a search on the 10x DML, waits for the search job to finish, and returns the results.
