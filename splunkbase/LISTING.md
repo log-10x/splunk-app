@@ -138,10 +138,10 @@ Enterprise 10.4.3 against 20,000 compact events from the OpenTelemetry demo.
 
 | File | Caption |
 |---|---|
-| `1_search_bar_tenxsearch.png` | The search bar with `tenxsearch`: 438 matching events, expanded to their original lines |
-| `2_classic_dashboard_plain_spl.png` | Service errors, a user's own classic dashboard in plain SPL: counts and events come back expanded with no changes to the panels |
-| `3_analytics_dashboard.png` | Analytics: compact events, templates, compression ratio and storage saved |
-| `4_diagnostics.png` | Diagnostics: every stage from template arrival to expansion |
+| `1_before_after.png` | One event as Splunk stores it, 354 bytes, and as the app shows it: the original 1,065-byte line, byte-identical |
+| `2_search_bar.png` | The search bar with `tenxsearch`: 438 matching events, expanded to their original lines |
+| `3_dashboard.png` | A user's own classic dashboard in plain SPL: counts and events come back expanded with no changes to the panels |
+| `4_analytics.png` | Analytics: compact events, templates, compression ratio and storage saved |
 | `5_compile_alert.png` | Compile Alert: a search compiled once into native SPL for a scheduled alert, with the reason it is flagged for review |
 
 Repository name: `log-10x/splunk-app`. Repository URL: https://github.com/log-10x/splunk-app
