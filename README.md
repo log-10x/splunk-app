@@ -194,12 +194,14 @@ The Analytics dashboard finds compact events through the `tenx-events` macro.
 | **Search Hook** | `dashboard.js`, routing each classic dashboard panel's search to the Search Handler |
 | **Search Handler** | `/tenx-search` REST endpoint rewriting a search for compact events |
 | **tenxsearch Command** | Generating command for the search bar, saved searches and the REST API |
+| **tenxrecompile Command** | Recompiles every compiled alert so it picks up new templates |
 | **Alert Compiler** | `/tenx-alert` REST endpoint compiling a search into a native scheduled alert at save time (with a recompile/migrate pass) |
 | **Compile Alert View** | UI to compile, review, and recompile save-time alerts |
 | **KV Store** | Template patterns for event reconstruction |
 | **Inflate Macro** | SPL macro joining events with templates |
 | **Consume KV Search** | Scheduled search storing new templates in the KV Store |
 | **Backfill KV Search** | The same template load over 30 days, for templates indexed before the app was installed |
+| **Recompile Compiled Alerts Search** | Runs `tenxrecompile` every 15 minutes |
 | **Analytics Dashboard** | Compression and template metrics |
 | **Diagnostics Dashboard** | Troubleshooting and verification tools |
 

@@ -16,10 +16,16 @@ and select **Compile**. The view shows the compiled search, its strategy, and an
 to review it. A clean result is saved at once. A result flagged for review is saved only
 after **Confirm and schedule**.
 
-**Recompile all managed alerts** recompiles every alert the view created, from the search
-as originally written. Run it after new templates arrive, so their hashes join the
-prefilter. It also converts an existing `| tenxsearch searchstring="..."` alert into a
-compiled one. It applies only clean results whose compiled form changed.
+A compiled alert selects events by the templates that matched its words when it was
+compiled. A template that appears later, such as a new log statement after a deploy, joins
+the alert when the alert is compiled again. The **Recompile Compiled Alerts** saved search
+does that every 15 minutes for every user's alerts, through the `| tenxrecompile` command,
+so a new template reaches an alert within about 15 minutes of reaching the KV Store.
+**Recompile all managed alerts** in the view runs the same pass at once for the current
+user. Both recompile from the search as originally written, rewrite an alert only when its
+compiled form changed, leave an alert a person edited by hand alone, and never apply a
+result that needs review. The pass also converts an existing
+`| tenxsearch searchstring="..."` alert into a compiled one.
 
 The same actions are available at the `/tenx-alert` REST endpoint:
 
