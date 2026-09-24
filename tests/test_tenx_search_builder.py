@@ -514,3 +514,75 @@ class TestProbeOutcomes:
 
 		assert result.resolved == ' | search index=main error'
 		assert manager.probes == []
+
+
+# ---------------------------------------------------------------------------
+# Timestamp text: the printed date and time are in neither the compact raw nor the template
+# ---------------------------------------------------------------------------
+
+from tenx_search_builder import TimestampPattern, timestamp_text_pieces
+
+ISO_MS = '%Y-%m-%dT%H:%M:%S.%3QZ'
+SLASHED = '%Y/%m/%d %H:%M:%S'
+TIME_MS = '%H:%M:%S.%3Q'
+
+
+def printed(word, *formats):
+	return sorted(timestamp_text_pieces(word, [TimestampPattern(fmt) for fmt in formats]))
+
+
+class TestTimestampText:
+	def test_time_of_day_is_printed_text(self):
+		assert printed('21:18:51', SLASHED) == ['18', '21', '51']
+
+	def test_part_of_a_time_is_printed_text(self):
+		assert printed('21:18', SLASHED) == ['18', '21']
+
+	def test_a_year_is_printed_text(self):
+		assert printed('2025', SLASHED) == ['2025']
+
+	def test_iso_pieces_keep_their_letters(self):
+		assert printed('2025-10-01T21:18:51.498Z', ISO_MS) == ['01T21', '10', '18', '2025', '498Z', '51']
+
+	def test_month_name(self):
+		assert printed('Oct', '%d %b %Y') == ['Oct']
+
+	def test_an_ip_keeps_every_piece_the_formats_cannot_print(self):
+		# 192 could be the milliseconds after "ss."; the rest cannot follow it in any format.
+		assert printed('192.168.45.200', ISO_MS, SLASHED, TIME_MS) == ['192']
+
+	def test_ids_hostnames_and_words_are_not_printed_text(self):
+		for word in ('a05b2981', 'ip-192-168-42-205.ec2.internal', 'us-west-2', 'error', '1759353531000'):
+			assert printed(word, ISO_MS, SLASHED, TIME_MS) == [], word
+
+	def test_separators_must_agree(self):
+		# '21' can be the seconds at the end of a timestamp followed by other text, but with
+		# dots in place of colons the word is not a printed time.
+		assert printed('21.18.51', SLASHED) == ['21']
+
+	def test_unknown_formats_widen_on_the_generic_shape(self):
+		assert sorted(timestamp_text_pieces('21:18:51', None)) == ['18', '21', '51']
+		assert timestamp_text_pieces('error', None) == set()
+
+
+class TestTimestampTextPrefilter:
+	def test_time_text_does_not_narrow(self):
+		result, manager = compile_search('sourcetype=tenx_encoded "21:18:51"', timestamp_formats=[SLASHED])
+		assert '"21"' not in prefilter(result.resolved) and '"51"' not in prefilter(result.resolved)
+		assert manager.probes == []
+		assert result.resolved.endswith('| search "21:18:51"')
+
+	def test_other_words_still_narrow(self):
+		result, manager = compile_search('sourcetype=tenx_encoded payment "21:18:51"', timestamp_formats=[SLASHED])
+		assert '"payment"' in prefilter(result.resolved)
+		assert manager.probes == ['"payment"']
+
+	def test_an_ip_still_narrows_on_the_pieces_no_format_prints(self):
+		result, manager = compile_search('sourcetype=tenx_encoded 192.168.45.200', timestamp_formats=[TIME_MS])
+		pre = prefilter(result.resolved)
+		assert '"168"' in pre and '"45"' in pre and '"200"' in pre and '"192"' not in pre
+
+	def test_unreadable_formats_widen_generically(self):
+		result, manager = compile_search('sourcetype=tenx_encoded "21:18:51"', timestamp_formats=None)
+		assert manager.probes == []
+		assert result.resolved.endswith('| search "21:18:51"')

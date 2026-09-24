@@ -92,6 +92,7 @@ See Also
 """
 
 import logging
+import re
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +136,217 @@ PROBE_MAX_MS = 10000
 # even inside quotes. The text before the first '*' is matched instead, when it is long
 # enough to be a filter: "~-" matched 12,648 of 20,000 events and "~" matched 16,746.
 HASH_PREFIX_MIN = 2
+
+
+# Text a rendered timestamp can contain. A compact event stores its timestamp as epoch
+# digits and the inflate macro renders it through the template's format, so the printed
+# date and time are in neither the compact raw nor the template text. A search word that
+# could be part of that printed text therefore cannot be used to narrow, only checked after
+# expansion. Each strftime directive maps to the text it can print, as a regex for one piece
+# (the text between segment breakers) and the characters it can use. Lengths and character
+# classes, not value ranges: a superset is all the prefilter needs.
+_MONTHS = ('january', 'february', 'march', 'april', 'may', 'june', 'july', 'august',
+	'september', 'october', 'november', 'december')
+_DAYS = ('monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday', 'sunday')
+_DIGITS = frozenset('0123456789')
+
+
+def _names(names, abbreviated):
+	names = sorted(set(name[:3] if abbreviated else name for name in names))
+	return '(?:' + '|'.join(names) + ')', frozenset(''.join(names)), max(len(name) for name in names)
+
+
+_TS_DIRECTIVES = {
+	'Y': (r'\d{4}', _DIGITS, 4), 'y': (r'\d{2}', _DIGITS, 2), 'm': (r'\d{2}', _DIGITS, 2),
+	'd': (r'\d{2}', _DIGITS, 2), 'H': (r'\d{2}', _DIGITS, 2), 'I': (r'\d{2}', _DIGITS, 2),
+	'M': (r'\d{2}', _DIGITS, 2), 'S': (r'\d{2}', _DIGITS, 2), 'j': (r'\d{3}', _DIGITS, 3),
+	'V': (r'\d{2}', _DIGITS, 2), 's': (r'\d{1,11}', _DIGITS, 11), 'Q': (r'\d{3}', _DIGITS, 3),
+	'b': _names(_MONTHS, True), 'B': _names(_MONTHS, False),
+	'a': _names(_DAYS, True), 'A': _names(_DAYS, False),
+	'p': ('(?:am|pm)', frozenset('ampm'), 2), 'Z': ('[a-z]{1,5}', frozenset('abcdefghijklmnopqrstuvwxyz'), 5),
+}
+
+# Used when the template formats could not be read: any piece made of digits, the T and Z
+# of ISO 8601, a month or day name, AM/PM or a zone abbreviation may be timestamp text.
+_GENERIC_TIMESTAMP_PIECE = re.compile(
+	r'(?:[0-9tz]*[0-9][0-9tz]*|' + _names(_MONTHS, False)[0] + '|' + _names(_MONTHS, True)[0] + '|'
+	+ _names(_DAYS, False)[0] + '|' + _names(_DAYS, True)[0] + r'|am|pm|utc|gmt)', re.I)
+_GENERIC_TIMESTAMP_CHARS = frozenset('0123456789tz' + ''.join(_MONTHS + _DAYS) + 'amputcg')
+
+
+class TimestampPattern(object):
+	"""
+	What one strftime format can print, as pieces between segment breakers: for each piece a
+	regex, the characters it can use and its longest length, and between pieces a regex for
+	the breaker characters.
+	"""
+
+	def __init__(self, fmt):
+		units = []
+		i = 0
+
+		while i < len(fmt):
+			ch = fmt[i]
+
+			if ch == '%' and i + 1 < len(fmt):
+				j = i + 1
+				digits = ''
+
+				while j < len(fmt) and fmt[j].isdigit():
+					digits += fmt[j]
+					j += 1
+
+				colons = 0
+
+				while j < len(fmt) and fmt[j] == ':':
+					colons += 1
+					j += 1
+
+				directive = fmt[j] if j < len(fmt) else ''
+
+				if directive == '%':
+					units.append(('sep', re.escape('%'), None, 0))
+				elif directive == 'Q' and digits:
+					units.append(('piece', r'\d{%d}' % int(digits), _DIGITS, int(digits)))
+				elif directive == 'z':
+					units.append(('sep', '[+-]', None, 0))
+					units.append(('piece', r'\d{2}' if colons else r'\d{4}', _DIGITS, 2 if colons else 4))
+
+					if colons == 1:
+						units.append(('sep', ':', None, 0))
+						units.append(('piece', r'\d{2}', _DIGITS, 2))
+				elif directive in _TS_DIRECTIVES:
+					regex, chars, longest = _TS_DIRECTIVES[directive]
+					units.append(('piece', regex, chars, longest))
+				else:
+					# An unknown directive: anything non-breaking.
+					units.append(('piece', '[^' + re.escape(''.join(sorted(SEGMENT_BREAKERS))) + ']*', None, 0))
+
+				i = j + 1
+				continue
+
+			if ch in SEGMENT_BREAKERS:
+				units.append(('sep', re.escape(ch), None, 0))
+			else:
+				units.append(('piece', re.escape(ch.lower()), frozenset(ch.lower()), 1))
+
+			i += 1
+
+		self.pieces = []
+		self.seps = []
+		pending_sep = None
+		current = None
+
+		for kind, regex, chars, longest in units:
+			if kind == 'sep':
+				if current is not None:
+					self.pieces.append(current)
+					current = None
+					pending_sep = ''
+
+				if pending_sep is not None:
+					pending_sep += regex
+
+				continue
+
+			if current is None:
+				if self.pieces:
+					self.seps.append(pending_sep or '')
+
+				pending_sep = None
+				current = ['', set(), 0, False]
+
+			current[0] += regex
+			current[3] = current[3] or chars is None
+
+			if chars is not None:
+				current[1] |= chars
+
+			current[2] += longest
+
+		if current is not None:
+			self.pieces.append(current)
+
+		self._full = [re.compile(piece[0], re.I) for piece in self.pieces]
+		self._seps = [re.compile(sep) for sep in self.seps]
+
+	def _piece_matches(self, word_piece, index):
+		if '*' in word_piece:
+			fixed = word_piece.replace('*', '').lower()
+			_regex, chars, longest, anything = self.pieces[index]
+			# The '*' can also stand for the text before or after the timestamp.
+			return anything or (set(fixed) <= chars and len(fixed) <= longest) or index in (0, len(self.pieces) - 1)
+
+		return self._full[index].fullmatch(word_piece) is not None
+
+	def printed_pieces(self, word_pieces, word_seps):
+		"""
+		The pieces of a word that could be printed by this format, over every way the word can
+		overlap the printed timestamp: inside it, or running over its start or its end.
+		"""
+		found = set()
+		n = len(word_pieces)
+		m = len(self.pieces)
+
+		for offset in range(-(n - 1), m):
+			first = max(0, -offset)
+			last = min(n, m - offset)
+
+			if first >= last:
+				continue
+
+			if all(self._piece_matches(word_pieces[i], i + offset) for i in range(first, last)) and \
+					all(self._seps[i + offset].fullmatch(word_seps[i]) for i in range(first, last - 1)):
+				found.update(word_pieces[first:last])
+
+		return found
+
+
+def split_with_breakers(word):
+	"""A word's pieces (as split_pieces, wildcard-only pieces kept) and the breaker text between them."""
+	pieces, seps = [], []
+	buf, sep = [], ''
+
+	for ch in word:
+		if ch in SEGMENT_BREAKERS:
+			if buf:
+				pieces.append(''.join(buf))
+				buf = []
+				sep = ''
+			sep += ch
+		else:
+			if not buf and pieces:
+				seps.append(sep)
+			buf.append(ch)
+
+	if buf:
+		pieces.append(''.join(buf))
+
+	return pieces, seps
+
+
+def timestamp_text_pieces(word, patterns):
+	"""
+	The pieces of one search word that could be text printed from a timestamp, given the
+	TimestampPatterns of the templates' formats, or None when the formats are unknown.
+	"""
+	pieces, seps = split_with_breakers(word)
+
+	if not pieces:
+		return set()
+
+	if patterns is None:
+		return set(piece for piece in pieces
+			if _GENERIC_TIMESTAMP_PIECE.fullmatch(piece.replace('*', '')) or (
+				'*' in piece and set(piece.replace('*', '').lower()) <= _GENERIC_TIMESTAMP_CHARS))
+
+	found = set()
+
+	for pattern in patterns:
+		if pattern.pieces:
+			found |= pattern.printed_pieces(pieces, seps)
+
+	return found
 
 
 class DmlProbeFailed(Exception):
@@ -393,6 +605,11 @@ class TenxSearchCommand(TenxSplCommand):
 		self._probe_cache = {}
 		self._template_hits = 0
 		self._probe_deadline = None
+		# The TimestampPatterns of the templates' formats, read once per search; None when
+		# they could not be read, which widens on the generic shape of timestamp text.
+		self._timestamp_patterns = None
+		self._timestamp_patterns_read = False
+		self.timestamp_text = False
 
 		parsed_command = self._get_parsed_command()
 
@@ -453,6 +670,23 @@ class TenxSearchCommand(TenxSplCommand):
 
 		return self._probe_cache[piece]
 
+	def _timestamp_text_patterns(self):
+		if not self._timestamp_patterns_read:
+			self._timestamp_patterns_read = True
+			remaining = PROBE_BUDGET_MS if self._probe_deadline is None else (
+				self._probe_deadline - tenx_util.current_time_ms())
+			formats = None
+
+			if remaining > 0 and hasattr(self.search_manager, 'get_timestamp_formats'):
+				formats = self.search_manager.get_timestamp_formats(min(remaining, PROBE_MAX_MS))
+
+			if formats is not None:
+				self._timestamp_patterns = [TimestampPattern(fmt) for fmt in formats if fmt]
+			else:
+				logger.warning("Template timestamp formats not read; widening on the generic timestamp shape.")
+
+		return self._timestamp_patterns
+
 	def _term_prefilter(self, term_text):
 		"""
 		The prefilter for one keyword term (a bare word or a quoted phrase).
@@ -468,10 +702,17 @@ class TenxSearchCommand(TenxSplCommand):
 		the group: if all of them are template text the hash clause selects it, otherwise at
 		least one is in the raw and the OR of pieces selects it. A piece whose probe was
 		truncated is left unrestricted, because a cut hash list cannot be relied on either way.
+
+		A piece that could be text printed from a timestamp is left unrestricted too: the
+		compact event holds the timestamp as epoch digits and the template holds only its
+		format, so the printed date and time are in neither, and are found after expansion.
 		"""
 		pieces = []
+		printed = set()
 
 		for word in tenx_util.strip_string(term_text).split():
+			printed |= timestamp_text_pieces(word, self._timestamp_text_patterns())
+
 			for piece in split_pieces(word):
 				if piece not in pieces:
 					pieces.append(piece)
@@ -484,6 +725,10 @@ class TenxSearchCommand(TenxSplCommand):
 		shared_hashes = None
 
 		for piece in pieces:
+			if piece in printed:
+				self.timestamp_text = True
+				continue
+
 			hashes, truncated = self._probe(piece)
 
 			if truncated:
@@ -673,7 +918,7 @@ class TenxSearchCommand(TenxSplCommand):
 		# variable values, and the compiled search says so by carrying no hash clause. A
 		# truncated probe is not evidence either way, so it does not count as "none".
 		#
-		self.no_dml_results = (self._template_hits == 0 and not self.dml_truncated)
+		self.no_dml_results = (self._template_hits == 0 and not self.dml_truncated and not self.timestamp_text)
 
 	def check_needs_tenx(self):
 		"""
