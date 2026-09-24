@@ -17,9 +17,8 @@ The clean answer is to compile the search once, when the alert is created or upd
 store the compiled SPL in savedsearches.conf. The scheduler then runs a plain, supported
 saved search.
 
-This module is the compile step. Wiring it into the actual save/update flow (a REST handler
-plus a small UI control, and a bulk-migrate pass over existing alerts) is layered on top of
-it - see SAVE_TIME_ALERTS.md.
+This module is the compile step. The /tenx-alert REST handler (tenx_alert_handler.py), the
+Compile Alert view and the recompile pass over existing alerts are built on it.
 
 What it produces
 ----------------
@@ -59,7 +58,7 @@ See Also
 --------
 - tenx_search_builder.py: TenxSearchBuilder.build() - the reused compile core.
 - tenxsearch.py:          the generating command used for the escape hatch.
-- SAVE_TIME_ALERTS.md:    the save/REST surface map and the wiring plan on top of this.
+- SAVE_TIME_ALERTS.md in the app repository: how compiled alerts work.
 """
 
 import logging

@@ -118,3 +118,33 @@ class TestPackageHygiene:
 			if name.endswith('.py'):
 				source = open(os.path.join(APP, 'bin', name)).read()
 				assert not re.search(r'logger\.\w+\(\s*in_string(_json)?\s*\)', source), name
+
+
+class TestRestSurface:
+	def test_every_handler_requires_authentication_and_gets_no_cookies(self):
+		restmap = conf('restmap.conf')
+		scripts = [s for s in restmap.sections() if s.startswith('script:')]
+		assert scripts
+		for stanza in scripts:
+			assert restmap.get(stanza, 'requireAuthentication') == 'true', stanza
+			assert not restmap.has_option(stanza, 'passHttpCookies'), stanza
+			assert not restmap.has_option(stanza, 'passHttpHeaders'), stanza
+			assert os.path.exists(os.path.join(APP, 'bin', restmap.get(stanza, 'script'))), stanza
+
+	def test_the_only_endpoints_are_search_and_alert(self):
+		restmap = conf('restmap.conf')
+		assert sorted(s for s in restmap.sections() if s.startswith('script:')) == \
+			['script:tenx-alert', 'script:tenx-search']
+		web = conf('web.conf')
+		assert sorted(web.sections()) == ['expose:tenx-alert', 'expose:tenx-search']
+
+	def test_keys_written_into_saved_searches_are_declared(self):
+		import tenx_alert_persist
+		spec = open(os.path.join(APP, 'README', 'savedsearches.conf.spec')).read()
+		for key in (tenx_alert_persist.ORIGINAL_SEARCH_KEY, tenx_alert_persist.COMPILED_SEARCH_KEY):
+			assert re.search(r'^' + key + r' = ', spec, re.M), key
+
+	def test_template_records_are_not_cut_below_the_stored_limit(self):
+		props = conf('props.conf')
+		for stanza in ('tenx_dml_raw_json', 'tenx_dml_pure'):
+			assert int(props.get(stanza, 'TRUNCATE')) >= 4 * 65536, stanza

@@ -59,6 +59,7 @@ See Also
 """
 
 import logging
+import urllib.error
 
 logger = logging.getLogger(__name__)
 
@@ -71,6 +72,7 @@ class JobState(Enum):
 	SUCCESS = auto()
 	FAILURE = auto()
 	TIMEOUT = auto()
+	ABORTED = auto()
 
 
 # Cap on distinct template hashes fetched per probe. If a probe matched more templates than
@@ -119,6 +121,16 @@ class TenxSearchManager:
 			logger.error("Error creating search job for search - {} - {}.".format(search_data['search'], e), exc_info=1)
 			return None
 
+	def cancel_search_job(self, sid):
+		"""
+		Cancels a search job and removes it. Errors are logged and otherwise ignored: the job
+		expires on its own either way.
+		"""
+		try:
+			self.server_connection.post(self.get_search_job_url(sid) + '/control', {'action': 'cancel'})
+		except Exception as e:
+			logger.warning("Failed cancelling search job {} - {}.".format(sid, e))
+
 	def get_search_job_url(self, sid):
 		"""
 		Returns the base url for the specific search job SID provided.
@@ -156,7 +168,25 @@ class TenxSearchManager:
 			logger.error("Failed getting search {} state - {}.".format(sid, e), exc_info=1)
 			return None
 
-	def poll_for_job_end(self, sid, max_time_ms, poll_interval_ms):
+	def is_job_live(self, sid):
+		"""
+		False when the job is gone or has ended (cancelled, failed or done); True otherwise,
+		including when the check itself fails, so a transient error never stops a search.
+		"""
+		try:
+			content = tenx_util.get_internal(self.server_connection.get(self.get_search_job_url(sid)),
+				'entry', 0, 'content')
+		except urllib.error.HTTPError as e:
+			return e.code != 404
+		except Exception:
+			return True
+
+		if not content:
+			return True
+
+		return content.get('dispatchState') not in ('DONE', 'FAILED') and not content.get('isFinalized')
+
+	def poll_for_job_end(self, sid, max_time_ms, poll_interval_ms, keep_going=None, check_every_ms=1000):
 		"""
 		Polls a given search job until it either reach a terminal state (successful or not), or times out.
 		Will poll for roughly a max time of max_time_ms (as the time it takes to actually poll is added),
@@ -166,10 +196,20 @@ class TenxSearchManager:
 		If at any point the job state will be 'FAILED', returns JobState.FAILURE
 
 		If max_time_ms has been reached, returns JobState.TIMEOUT
+
+		keep_going, when given, is called about every check_every_ms; once it returns False the
+		poll stops and returns JobState.ABORTED.
 		"""
 		start_time = tenx_util.current_time_ms()
+		last_check = start_time
 
 		while True:
+			if keep_going is not None and tenx_util.current_time_ms() - last_check >= check_every_ms:
+				last_check = tenx_util.current_time_ms()
+
+				if not keep_going():
+					return JobState.ABORTED
+
 			state = self.get_search_job_state(sid)
 
 			if state == 'DONE':
@@ -191,17 +231,19 @@ class TenxSearchManager:
 		"""
 		return self.get_search_job_url(sid) + '/events'
 
-	def get_search_results(self, sid, params=None):
+	def get_search_results(self, sid, params=None, transformed=False):
 		"""
 		Returns the current search results for the search job matching the SID provided.
 
-		Params may be used to affect different aspects of the returned results.
+		Params may be used to affect different aspects of the returned results. A search that
+		ends in a transforming command (stats, chart, top and so on) has its output under
+		/results, not /events; pass transformed=True for one.
 		"""
 		if params is None:
 			params = {}
 
 		try:
-			url = self.get_search_results_url(sid)
+			url = self.get_search_job_results_url(sid) if transformed else self.get_search_results_url(sid)
 			return self.server_connection.get(url, params)
 
 		except Exception as e:

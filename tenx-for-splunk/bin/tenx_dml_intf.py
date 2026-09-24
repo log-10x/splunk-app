@@ -29,7 +29,7 @@ Usage
     from tenx_dml_intf import TenxDmlInterface
 
     conn = ServerConnection(server_uri, user, {'session_key': token})
-    dml = TenxDmlInterface(conn, 'hostname', 'main', 'tenx_dml_pure')
+    dml = TenxDmlInterface(conn, 'hostname', 'tenx_dml', 'tenx_dml_pure')
 
     # Submit a searchable template entry
     dml.submit('abc123hash', 'abc123hash INFO User logged in', 'consume_kv_alert')

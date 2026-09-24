@@ -3,8 +3,8 @@ Tenx DML to KV Store Alert Action
 ================================
 
 This module implements the alert action that populates the KV store with parsed
-template data. It is triggered by the "Consume KV" saved search which runs every
-2 minutes to process new template definitions.
+template data. It is triggered by the "Consume KV" saved search, which runs every
+5 minutes to process new template definitions.
 
 Data Flow
 ---------
@@ -15,7 +15,7 @@ Data Flow
    a. Check if it already exists in KV store (skip if yes)
    b. Parse template into structured format using TenxDMLBuilder
    c. Submit searchable version to `tenx_dml_pure` sourcetype
-   d. Create entry in `kvdml` KV store collection
+   d. Create entry in `tenx_dml` KV store collection
 
 Input Format
 ------------
@@ -27,7 +27,7 @@ The saved search results contain JSON objects with:
 
 Output Format
 -------------
-KV Store Entry (kvdml collection):
+KV Store Entry (tenx_dml collection):
     {
         "_key": "<hash>",
         "pattern_hash": "<hash>",
@@ -57,7 +57,7 @@ Configuration
 Settings are loaded from tenx_config.conf via tenx_util.get_tenx_config():
     - variable_separator: Character separating variables in templates (default: $)
     - timestamp_placeholder: Placeholder for timestamp in patterns (default: __TENX_TS__)
-    - collection_name: KV store collection name (default: kvdml)
+    - collection_name: KV store collection name (default: tenx_dml)
     - dest_dml_index: Index for DML pure events (default: main)
     - dml_source_type: Sourcetype for DML pure events (default: tenx_dml_pure)
 
@@ -191,8 +191,8 @@ def update_kv_store(settings):
 
 	This script is configured via a periodic cron based alert which fires with all new events inserted into the "raw" DML.
 
-	Default config is to run this every 2 minutes, with the last 10 minutes of new events, to avoid missing stuff
-	due to possible hiccups in the process.
+	Default config is to run this every 5 minutes over the last 7 minutes of new events, so a template that
+	arrives between two runs is not missed.
 
 	This config can be changed by modifying the savedsearches.conf file, either manually, via API, or Splunk's UI.
 
@@ -212,6 +212,12 @@ def update_kv_store(settings):
 		tenx_config = tenx_util.get_tenx_config(server_uri=server_uri, token=token)
 
 		logger.info("Loaded config - {}".format(json.dumps(tenx_config)))
+
+		# On the defaults the templates would be written to the wrong index and collection.
+		#
+		if not tenx_config.get(tenx_util.CONFIG_LOADED, True):
+			logger.error("The app's configuration could not be read; no templates were stored.")
+			return -1
 
 		variable_separator = tenx_config['variable_separator']
 		timestamp_placeholder = tenx_config['timestamp_placeholder']

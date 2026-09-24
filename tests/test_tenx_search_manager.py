@@ -131,3 +131,62 @@ def test_jobs_are_created_in_the_callers_app():
 def test_jobs_default_to_the_search_app():
 	assert TenxSearchManager(RecordingConnection(), dict(CONFIG)).create_search_job_url() \
 		== '/servicesNS/admin/search/search/jobs/'
+
+
+class StateConnection(RecordingConnection):
+	"""Answers job-state requests from a script."""
+
+	def __init__(self, states):
+		RecordingConnection.__init__(self)
+		self.states = list(states)
+
+	def get(self, url, params=None, output_mode="json"):
+		state = self.states.pop(0) if len(self.states) > 1 else self.states[0]
+		return {'entry': [{'content': {'dispatchState': state}}]}
+
+
+def test_polling_stops_when_the_outer_search_has_ended(monkeypatch):
+	import tenx_search_manager
+	manager = TenxSearchManager(StateConnection(['RUNNING']), dict(CONFIG))
+	monkeypatch.setattr(tenx_search_manager.tenx_util, 'sleep_ms', lambda ms: None)
+	checks = []
+
+	def keep_going():
+		checks.append(1)
+		return len(checks) < 3
+
+	state = manager.poll_for_job_end('nested', 60 * 1000, 1, keep_going=keep_going, check_every_ms=0)
+
+	assert state == tenx_search_manager.JobState.ABORTED
+	assert len(checks) == 3
+
+
+def test_a_cancelled_outer_search_is_not_live():
+	import urllib.error
+
+	class Gone(RecordingConnection):
+		def get(self, url, params=None, output_mode="json"):
+			raise urllib.error.HTTPError(url, 404, 'Not Found', {}, None)
+
+	class Flaky(RecordingConnection):
+		def get(self, url, params=None, output_mode="json"):
+			raise urllib.error.HTTPError(url, 503, 'Busy', {}, None)
+
+	assert TenxSearchManager(Gone(), dict(CONFIG)).is_job_live('x') is False
+	assert TenxSearchManager(Flaky(), dict(CONFIG)).is_job_live('x') is True
+	assert TenxSearchManager(StateConnection(['FAILED']), dict(CONFIG)).is_job_live('x') is False
+	assert TenxSearchManager(StateConnection(['RUNNING']), dict(CONFIG)).is_job_live('x') is True
+
+
+def test_transformed_output_is_read_from_results():
+	class UrlRecorder(RecordingConnection):
+		def get(self, url, params=None, output_mode="json"):
+			self.posted.append((url, params))
+			return {'results': []}
+
+	connection = UrlRecorder()
+	manager = TenxSearchManager(connection, dict(CONFIG), app='ops_app')
+	manager.get_search_results('s1', {'offset': 0})
+	manager.get_search_results('s2', {'offset': 0}, transformed=True)
+	assert connection.posted[0][0].endswith('/s1/events')
+	assert connection.posted[1][0].endswith('/s2/results')

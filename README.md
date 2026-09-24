@@ -10,7 +10,7 @@ To find optimization opportunities in your existing Splunk data, point the [Log1
 
 ## How It Works
 
-A [compact event](https://doc.log10x.com/run/transform/#compact) carries a template hash and its variable values; the constant words live in the KV Store, and the app puts them back at search time. Classic dashboards keep their panel SPL unchanged: `dashboard.js` routes each panel's search through the app's REST endpoint. Splunk's search page loads no app JavaScript, so a query in the search bar, a saved search or the REST API is wrapped in the `tenxsearch` command. Scheduled alerts compile once at save time into native saved searches.
+A [compact event](https://doc.log10x.com/run/transform/#compact) carries a template hash and its variable values; the constant words live in the KV Store, and the app puts them back at search time. Classic dashboards keep their panel SPL unchanged: `dashboard.js` routes each panel's search through the app's REST endpoint. Splunk's search page loads no app JavaScript, so a query in the search bar, a saved search or the REST API is wrapped in the `tenxsearch` command. An alert created in the app's **Compile Alert** view compiles once into a native saved search.
 
 ### Ingestion Flow
 
@@ -33,7 +33,7 @@ Search bar | tenxsearch  --------------------------/
 
 The dashboard path is the faster one: about 3 seconds for 20,000 expanded events, against about 21 seconds through the command, which writes every event out itself.
 
-Scheduled alerts run server-side, where the browser hook never fires. They are instead **compiled once at save time** into native SPL, a template hash prefilter plus the inflate macro, so the scheduler runs an ordinary saved search. This is handled by the `/tenx-alert` REST endpoint and the **Compile Alert** view (with a recompile pass that converts `| tenxsearch` alerts and refreshes prefilters as templates appear). See [SAVE_TIME_ALERTS.md](SAVE_TIME_ALERTS.md).
+Scheduled alerts run server-side, where the browser hook never fires. An alert created in the **Compile Alert** view, or through the `/tenx-alert` endpoint, is **compiled once at save time** into native SPL, a template hash prefilter plus the inflate macro, so the scheduler runs an ordinary saved search. This is handled by the `/tenx-alert` REST endpoint and the **Compile Alert** view (with a recompile pass that converts `| tenxsearch` alerts and refreshes prefilters as templates appear). See [SAVE_TIME_ALERTS.md](SAVE_TIME_ALERTS.md).
 
 ## Receiver-side configuration
 

@@ -34,9 +34,10 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 >
 > Classic dashboards keep their SPL: the browser sends each panel's search to the app, which
 > rewrites it on the server. From the search bar, saved searches, alerts and the REST API, a
-> search is wrapped in the `tenxsearch` command. Scheduled alerts compile once at save time
-> into native saved searches. NOT, OR, groups, phrases, field conditions, and values such as IP addresses and
-> hostnames behave as they do on the original data.
+> search is wrapped in the `tenxsearch` command. An alert created in the app's Compile Alert
+> view is compiled once into a native saved search, so the scheduler runs no Python. NOT, OR,
+> groups, phrases, field conditions, and values such as IP addresses and hostnames behave as
+> they do on the original data.
 >
 > Producing compact events requires the 10x Receiver, which is licensed separately. The app
 > is open source under the MIT license.
@@ -79,7 +80,8 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 **Installation**
 
 > 1. Install the app and restart Splunk.
-> 2. Create an index named `tenx_dml` for templates.
+> 2. Create an index named `tenx_dml` for templates. The app stores each template there a
+>    second time, as `tenx_dml_pure`, for search.
 > 3. Create two HTTP Event Collector tokens: one with sourcetype `tenx_dml_raw_json` and
 >    index `tenx_dml` for templates, one with sourcetype `tenx_encoded` and your index for
 >    compact events.
@@ -159,6 +161,7 @@ requires a release to run on every version it names.
 > - NOT, OR, groups, phrases, inline `earliest=`, field conditions, and values such as IP
 >   addresses and hostnames match as on the original data.
 > - A search that cannot be rewritten is refused with a message.
+> - The Compile Alert view compiles an alert once into a native saved search.
 > - The Analytics and Diagnostics dashboards find compact events through the `tenx-events`
 >   macro.
 > - Tested on Splunk Enterprise 9.4, 10.0, 10.2 and 10.4. The package passes AppInspect's

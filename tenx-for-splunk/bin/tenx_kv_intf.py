@@ -6,9 +6,9 @@ This module provides an interface to Splunk's KV store for managing 10x
 template data. The KV store is used at search time by the tenx-inflate macro
 to look up template parts for reconstructing original log events.
 
-KV Store Collection: kvdml
+KV Store Collection: tenx_dml
 --------------------------
-The kvdml collection stores parsed template data with the following schema:
+The tenx_dml collection stores parsed template data with the following schema:
 
     {
         "_key": "<template_hash>",           # Primary key (same as pattern_hash)
@@ -34,7 +34,7 @@ Usage
     from tenx_kv_intf import TenxKVInterface
 
     conn = ServerConnection(server_uri, user, {'session_key': token})
-    kv = TenxKVInterface('kvdml', conn, 'nobody', 'tenx-for-splunk')
+    kv = TenxKVInterface('tenx_dml', conn, 'nobody', 'tenx-for-splunk')
 
     # Check if template exists
     existing = kv.get_entry('abc123hash')

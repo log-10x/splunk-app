@@ -26,7 +26,7 @@ See Also
 --------
 - tenx_alert_compiler.py: produces the AlertCompileResult this module dispatches on.
 - tenx_alert_handler.py:  the REST handler that performs the actual saved/searches write.
-- SAVE_TIME_ALERTS.md:    the wiring plan this implements (item 1).
+- SAVE_TIME_ALERTS.md in the app repository: how compiled alerts work.
 """
 
 import re
