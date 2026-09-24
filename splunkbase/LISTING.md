@@ -27,10 +27,14 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 
 **Summary**
 
-> The Log10x App searches and expands 10x compact events in Splunk. The 10x Receiver stores
-> each event as a template hash plus the values that change, which cuts the volume Splunk
-> ingests and meters. The app keeps the template text in the KV Store and puts it back at
-> search time, so the original lines return intact.
+> With the Log10x App, Splunk can index compact log events and still search, chart and alert
+> on the original lines. The 10x Receiver stores each event as a template hash plus the values
+> that change, so a stream of repeated patterns takes less of the license. On the OpenTelemetry
+> demo the bytes sent to Splunk shrank by 63.7%, encoded events and template dictionary counted
+> together, and every line expanded back byte-identical with the Receiver settings in the
+> installation steps (measurement: https://www.log10x.com/blog/cutting-splunk-log-storage/).
+> The same license then holds more: sources that were sampled, filtered or kept out of Splunk
+> to stay under the limit can come back, or the license can be smaller.
 >
 > Classic dashboards keep their SPL: the browser sends each panel's search to the app, which
 > rewrites it on the server. From the search bar, saved searches, alerts and the REST API, a
@@ -44,7 +48,9 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 
 **Short description**
 
-> Search and expand 10x compact log events at search time.
+> Keep more logs in Splunk on the same license. Compact events index at a fraction of their
+> original volume and expand back byte-identical at search time: classic dashboards keep their
+> SPL, and one command covers the search bar, saved searches and alerts.
 
 **Details**
 
@@ -69,6 +75,7 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 > - A search the app cannot rewrite is refused with a message. The rewrite refuses one
 >   shape: a sourcetype inside an OR with other terms, `sourcetype=x OR host=y`.
 > - Dashboard Studio loads no app JavaScript; its panels use the command.
+> - A compact event's `_time` is its index time; the original timestamp is in the expanded line.
 >
 > **Speed**, 20,000 expanded events on Splunk 10.4.3: about 3 seconds through a dashboard,
 > about 21 seconds through the command, which writes every event out itself.
@@ -76,6 +83,8 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 > **Network**: the app makes no outbound calls. It talks only to the local splunkd.
 >
 > Full documentation: https://doc.log10x.com/apps/receiver/compact/splunk/
+>
+> How it works, with the measurement: https://www.log10x.com/blog/cutting-splunk-log-storage/
 
 **Installation**
 
