@@ -148,3 +148,12 @@ class TestRestSurface:
 		props = conf('props.conf')
 		for stanza in ('tenx_dml_raw_json', 'tenx_dml_pure'):
 			assert int(props.get(stanza, 'TRUNCATE')) >= 4 * 65536, stanza
+
+
+class TestScheduledRecompile:
+	def test_compiled_alerts_are_recompiled_on_a_schedule(self):
+		saved = conf('savedsearches.conf')
+		assert saved.get('Recompile Compiled Alerts', 'search').strip() == '| tenxrecompile'
+		assert saved.get('Recompile Compiled Alerts', 'enableSched') == '1'
+		assert conf('commands.conf').get('tenxrecompile', 'filename') == 'tenxrecompile.py'
+		assert os.path.exists(os.path.join(APP, 'bin', 'tenxrecompile.py'))

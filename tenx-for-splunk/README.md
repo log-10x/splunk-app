@@ -155,6 +155,8 @@ The `tenx_dml` collection stores parsed template data with fields:
 | Script | Purpose |
 |--------|---------|
 | `tenxsearch.py` | The `tenxsearch` generating command |
+| `tenxrecompile.py` | The `tenxrecompile` command, run every 15 minutes by the Recompile Compiled Alerts saved search |
+| `tenx_alert_recompile.py` | Recompiles managed alerts, each written back to its owner |
 | `tenx_search_builder.py` | Compiles a user search into a search over compact events |
 | `tenx_spl_parser.py` | Grammar and AST for the search terms the builder rewrites |
 | `tenx_search_manager.py` | Search jobs and the template dictionary lookups |
@@ -212,11 +214,11 @@ tenx-for-splunk/
 │   ├── alert_actions.conf       # Alert action definition
 │   ├── app.conf                 # App metadata
 │   ├── collections.conf         # KV store schema
-│   ├── commands.conf            # The tenxsearch command
+│   ├── commands.conf            # The tenxsearch and tenxrecompile commands
 │   ├── macros.conf              # SPL macros
 │   ├── props.conf               # Sourcetype definitions
 │   ├── restmap.conf, web.conf   # The /tenx-search and /tenx-alert endpoints
-│   ├── savedsearches.conf       # Consume KV and Backfill KV
+│   ├── savedsearches.conf       # Consume KV, Backfill KV, Recompile Compiled Alerts
 │   ├── tenx_config.conf         # App configuration
 │   ├── transforms.conf          # Field extractions and lookups
 │   └── data/ui/                 # Dashboards and navigation

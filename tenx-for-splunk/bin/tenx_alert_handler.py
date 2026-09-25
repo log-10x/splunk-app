@@ -90,6 +90,7 @@ import tenx_search_manager
 import tenx_search_builder
 import tenx_alert_compiler
 import tenx_alert_persist
+import tenx_alert_recompile
 
 tenx_util.setup_logger('tenx_alert_handler', logging.INFO)
 logger = logging.getLogger(__name__)
@@ -118,21 +119,6 @@ class TenxAlertHandler(PersistentServerConnectionApplication):
 
 		return form
 
-	def saved_searches_base_url(self, user):
-		"""
-		Base URL for the saved/searches collection in this app's namespace for the given owner.
-		"""
-		return '/servicesNS/' + user + '/' + APP_NAME + '/saved/searches'
-
-	def conf_savedsearches_url(self, user, name):
-		"""
-		URL for the raw conf-editing endpoint for a single savedsearches stanza. Unlike the
-		saved/searches EAI endpoint, this accepts arbitrary stanza keys, which is how the
-		human-original search is stored (the EAI endpoint rejects unknown arguments).
-		"""
-		return ('/servicesNS/' + user + '/' + APP_NAME +
-			'/configs/conf-savedsearches/' + urllib.parse.quote(name, safe=''))
-
 	def _read_error_body(self, http_error):
 		"""
 		Best-effort extraction of Splunk's error message from an HTTPError, so the caller sees
@@ -144,123 +130,14 @@ class TenxAlertHandler(PersistentServerConnectionApplication):
 			return str(http_error)
 
 	def write_tenx_metadata(self, server_connection, user, name, original_search, compiled_search):
-		"""
-		Stashes the alert's 10x metadata (human original + compiled fingerprint) on the stanza via
-		configs/conf-savedsearches. The stanza must already exist (a create writes the search
-		first). The original is the source of truth for recompilation; the fingerprint lets the
-		recompile pass tell its own output from a manual edit.
-		"""
-		server_connection.post(
-			self.conf_savedsearches_url(user, name),
-			tenx_alert_persist.build_tenx_metadata(original_search, compiled_search))
+		tenx_alert_recompile.write_tenx_metadata(server_connection, user, name, original_search, compiled_search)
 
 	def write_saved_search(self, server_connection, user, name, data):
-		"""
-		Creates the saved search if the stanza is new, or updates it if it already exists.
-
-		`data` must NOT contain 'name' (name identifies the stanza: it goes in the URL for an
-		update and is added to the body for a create). Returns 'created' or 'updated'.
-		"""
-		base_url = self.saved_searches_base_url(user)
-		update_url = base_url + '/' + urllib.parse.quote(name, safe='')
-
-		try:
-			# Try update first - POST to the specific stanza. Name lives in the URL here.
-			server_connection.post(update_url, data)
-			return 'updated'
-		except urllib.error.HTTPError as e:
-			if e.code != 404:
-				raise
-
-			# Stanza does not exist yet - create it. Name goes in the body for a create.
-			create_data = dict(data)
-			create_data['name'] = name
-			server_connection.post(base_url, create_data)
-			return 'created'
-
-	def list_managed_savedsearches(self, server_connection, user):
-		"""
-		Returns a stanza dict {name, search, tenx_original_search} for every savedsearches stanza
-		in this app namespace, read via configs/conf-savedsearches (which exposes the custom
-		tenx_original_search key that saved/searches hides). The caller filters to the ones the
-		compiler actually manages.
-		"""
-		url = '/servicesNS/' + user + '/' + APP_NAME + '/configs/conf-savedsearches'
-		res = server_connection.get(url, {'count': 0})
-
-		stanzas = []
-
-		for entry in res.get('entry', []) or []:
-			content = entry.get('content', {}) or {}
-			stanzas.append({
-				'name': entry.get('name'),
-				'search': content.get('search', ''),
-				tenx_alert_persist.ORIGINAL_SEARCH_KEY: content.get(tenx_alert_persist.ORIGINAL_SEARCH_KEY, ''),
-				tenx_alert_persist.COMPILED_SEARCH_KEY: content.get(tenx_alert_persist.COMPILED_SEARCH_KEY, ''),
-			})
-
-		return stanzas
+		return tenx_alert_recompile.write_saved_search(server_connection, user, name, data)
 
 	def recompile_all(self, server_connection, user, compiler):
-		"""
-		Recompiles every managed saved search from its human original, applying only clean,
-		storable results whose compiled form actually changed. This migrates legacy
-		`| tenxsearch` alerts to native compiled searches, and refreshes existing compiles to
-		pick up template hashes that appeared after the alert was first saved.
-
-		A recompile is conservative: it never auto-applies a needs_review result (a human must
-		confirm those via /tenx-alert), never touches a RETRYABLE/REJECTED result, skips unchanged
-		compiles so it does not churn live alerts, and - via the compiled fingerprint - refuses to
-		overwrite an alert an operator has manually edited (counted as `drifted`).
-		"""
-		summary = {'examined': 0, 'recompiled': 0, 'migrated': 0, 'unchanged': 0,
-			'needs_review': 0, 'skipped': 0, 'drifted': 0, 'errors': 0, 'updated': []}
-
-		for stanza in self.list_managed_savedsearches(server_connection, user):
-			source = tenx_alert_persist.recompile_source(stanza)
-
-			if source is None:
-				continue
-
-			summary['examined'] += 1
-			name = stanza['name']
-			is_legacy = tenx_alert_persist.is_legacy_tenxsearch(stanza)
-
-			# A search we compiled that a human has since hand-edited: never clobber it.
-			if tenx_alert_persist.is_drifted(stanza):
-				summary['drifted'] += 1
-				continue
-
-			try:
-				result = compiler.compile(source)
-				decision = tenx_alert_persist.decide(result, confirm=False)
-
-				if decision.action != tenx_alert_persist.APPLY:
-					summary['needs_review' if decision.action == tenx_alert_persist.REVIEW else 'skipped'] += 1
-					continue
-
-				# Only rewrite when the compiled search actually changed. With hashes sorted
-				# deterministically (tenx_search_manager), an unchanged template set yields the
-				# identical compiled string, so this is a real no-op rather than churn.
-				if result.compiled_search == stanza['search']:
-					summary['unchanged'] += 1
-					continue
-
-				# Stash the human original + the new fingerprint FIRST, then overwrite the search.
-				# For a legacy alert the original lives only in the `| tenxsearch` body we are about
-				# to replace; writing metadata first means a failure of the search write cannot lose
-				# it. If the search write then fails, the alert simply stays as it was (still
-				# functional) and is safely re-examined on a later pass.
-				self.write_tenx_metadata(server_connection, user, name, result.original_search, result.compiled_search)
-				self.write_saved_search(server_connection, user, name, {'search': result.compiled_search})
-
-				summary['migrated' if is_legacy else 'recompiled'] += 1
-				summary['updated'].append(name)
-			except Exception as e:
-				logger.warning("Recompile failed for {} - {}".format(name, e))
-				summary['errors'] += 1
-
-		return summary
+		"""Recompiles the managed alerts visible to `user`; see tenx_alert_recompile."""
+		return tenx_alert_recompile.recompile_all(server_connection, user, compiler)
 
 	def handle(self, in_string):
 		"""
