@@ -174,15 +174,13 @@ requires a release to run on every version it names.
 > - Search compact events from the search bar, saved searches, alerts and the REST API with
 >   the `tenxsearch` command; classic dashboards keep their SPL.
 > - NOT, OR, groups, phrases, inline `earliest=`, field conditions, and values such as IP
->   addresses and hostnames match as on the original data.
+>   addresses, hostnames, dates and times match as on the original data.
 > - A search that cannot be rewritten is refused with a message.
-> - The Compile Alert view compiles an alert once into a native saved search.
+> - The Compile Alert view compiles an alert once into a native saved search, and a scheduled
+>   pass keeps compiled alerts current as new log statements appear.
 > - The Analytics and Diagnostics dashboards find compact events through the `tenx-events`
 >   macro.
-> - Tested on Splunk Enterprise 9.4, 10.0, 10.2 and 10.4. The package passes AppInspect's
->   Splunk Cloud checks.
->
-> After upgrading, restart Splunk so Splunk Web serves the updated dashboard script.
+> - Tested on Splunk Enterprise 9.4, 10.0, 10.2 and 10.4.
 
 ## Checks run on this package
 
