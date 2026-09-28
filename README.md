@@ -39,6 +39,24 @@ Scheduled alerts run server-side, where the browser hook never fires. An alert c
 
 Set three options in the Receiver's configuration for any deployment that feeds this app.
 
+They live in two files of the Receiver's config folder (`$TENX_CONFIG`, mounted at
+`/etc/tenx/config` in the container image):
+
+```yaml
+# pipelines/run/template/config.yaml
+var:
+  maxRecurIndexes: 0
+
+# pipelines/run/transform/timestamp/config.yaml
+timestamp:
+  maxPerObject: 1
+  zone: UTC
+```
+
+Edit the values in place. Passing the same options on the command line, as
+`varMaxRecurIndexes 0`, stops the engine with `should be specified only once`, because
+these files already set them.
+
 ### Back-references
 
 **Set `varMaxRecurIndexes: 0`.** The app expands templates whose values all travel in the event.
@@ -70,7 +88,7 @@ Timestamps that carry their own zone, anything ending in `Z` or an offset, are u
 
 ### One timestamp per event
 
-**Set `maxPerObject: 1`** in the Receiver's timestamp configuration.
+**Set `maxPerObject: 1`** in the Receiver's timestamp configuration (`timestamp.maxPerObject`).
 
 The Receiver records every timestamp it finds in an event as its own slot. This app stores one
 timestamp format per template, so a template with two slots cannot render both. At `1` the first
