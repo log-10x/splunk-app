@@ -59,9 +59,9 @@ timestamp:
   zone: UTC
 ```
 
-Edit the values in place. Passing the same options on the command line, as
-`varMaxRecurIndexes 0`, stops the engine with `should be specified only once`, because
-these files already set them.
+Edit the values in place. On engines before 1.1.88, passing the same options on the
+command line, as `varMaxRecurIndexes 0`, stops the engine with
+`should be specified only once`, because these files already set them.
 
 ### Back-references
 
