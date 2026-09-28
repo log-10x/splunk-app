@@ -149,6 +149,10 @@ class TestRestSurface:
 		for stanza in ('tenx_dml_raw_json', 'tenx_dml_pure'):
 			assert int(props.get(stanza, 'TRUNCATE')) >= 4 * 65536, stanza
 
+	def test_compact_events_are_not_cut_at_the_splunk_default(self):
+		props = conf('props.conf')
+		assert int(props.get('tenx_encoded', 'TRUNCATE')) >= 4 * 65536
+
 
 class TestScheduledRecompile:
 	def test_compiled_alerts_are_recompiled_on_a_schedule(self):
