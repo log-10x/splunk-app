@@ -38,6 +38,12 @@ Scheduled alerts run server-side, where the browser hook never fires. An alert c
 ## Receiver-side configuration
 
 Set three options in the Receiver's configuration for any deployment that feeds this app.
+From engine 1.1.88 they can also follow the app on the command line, which replaces the
+values the app's configuration sets:
+
+```
+tenx run @apps/receiver varMaxRecurIndexes 0 timestampZone UTC timestampMaxPerObject 1
+```
 
 They live in two files of the Receiver's config folder (`$TENX_CONFIG`, mounted at
 `/etc/tenx/config` in the container image):
