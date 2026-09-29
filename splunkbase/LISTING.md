@@ -157,17 +157,26 @@ Repository name: `log-10x/splunk-app`. Repository URL: https://github.com/log-10
 
 | Field | Value |
 |---|---|
-| Version | 1.1.2, read from the package |
+| Version | 1.1.3, read from the package |
 | Splunk platform compatibility | Splunk Enterprise 9.4, 10.0, 10.2, 10.4 |
 | CIM | None |
 
 These are every Splunk Enterprise line Splunk supports today, and each is tested: 9.4.15,
-10.0.10, 10.2.7 and 10.4.3, each a fresh install of this package. Splunk ships on-premises
-releases every other minor, so 10.1 and 10.3 exist only on Splunk Cloud Platform, where
-compatibility is set by cloud vetting after upload rather than selected here. Splunkbase
-requires a release to run on every version it names.
+10.0.10, 10.2.7 and 10.4.3, each a fresh install of 1.1.2. 1.1.3 changes one `props.conf`
+key and the version; it is checked on 10.4.3, and the same key was measured on 9.4. Splunk
+ships on-premises releases every other minor, so 10.1 and 10.3 exist only on Splunk Cloud
+Platform, where compatibility is set by cloud vetting after upload rather than selected here.
+Splunkbase requires a release to run on every version it names.
 
 **Release notes**
+
+Paste the block for the version being uploaded. Splunkbase keeps notes per release.
+
+1.1.3:
+
+> Compact events up to 256 KB expand whole; 1.1.2 cut events over Splunk's 10,000-byte default.
+
+1.1.2:
 
 > First Splunkbase release.
 >
@@ -188,8 +197,9 @@ requires a release to run on every version it names.
 |---|---|
 | AppInspect 4.3.1: default, cloud, future, private_victoria, private_classic | 0 errors, 0 failures, 0 future failures |
 | Splunkbase file standards: one root folder, no hidden or compiled files, no `local/` | met |
-| 30 checks per version on a fresh install of this package: search matrix, saved search, refusal, both dashboards, the hook, the search bar, navigation | 30 of 30 on 9.4.15, 10.0.10, 10.2.7 and 10.4.3 |
-| Unit tests, Python 3.9 and 3.13 | pass |
+| 46 checks per version on a fresh install of 1.1.2: search matrix, saved search, refusal, both dashboards, the hook, the search bar, navigation, scheduled recompile | 46 of 46 on 9.4.15, 10.0.10, 10.2.7 and 10.4.3 |
+| Long compact events on Splunk 10.4.3, 1.1.3 upgraded in place over 1.1.2: the OpenTelemetry demo sample, 3,723 compact events, 11 over 10,000 bytes, the longest 25,472, sent through the HEC event endpoint, the HEC raw endpoint and a file input | every event stored whole; 5,000 of 5,000 lines expand byte-identical on each path (1.1.2 on the raw endpoint and file input: 11 events cut at 10,000 bytes, 4,710 lines back) |
+| Unit tests, Python 3.9 and 3.13 | 297 pass |
 
 Warnings AppInspect reports, none blocking: SplunkJS telemetry notice, Python 2/3 notice,
 `collections.conf` present, `check_for_updates` set for a published app, Splunk SDK 2.1.1.
@@ -203,7 +213,7 @@ From the repository root:
 rm -rf /tmp/sbpkg && mkdir -p /tmp/sbpkg
 rsync -a --exclude 'local/' --exclude '__pycache__/' --exclude '*.pyc' --exclude '*.pyo' --exclude '.*' \
   tenx-for-splunk/ /tmp/sbpkg/tenx-for-splunk/
-cd /tmp/sbpkg && COPYFILE_DISABLE=1 tar --format ustar -czf tenx-for-splunk-1.1.2.tar.gz tenx-for-splunk
+cd /tmp/sbpkg && COPYFILE_DISABLE=1 tar --format ustar -czf tenx-for-splunk-1.1.3.tar.gz tenx-for-splunk
 ```
 
 ## Submitting
