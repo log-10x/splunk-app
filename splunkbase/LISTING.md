@@ -174,7 +174,7 @@ Paste the block for the version being uploaded. Splunkbase keeps notes per relea
 
 1.1.3:
 
-> Compact events up to 256 KB expand whole; 1.1.2 cut events over Splunk's 10,000-byte default.
+> Compact events up to 256 KB now expand whole. In 1.1.2, events over Splunk's 10,000-byte default were cut when they arrived through a forwarder, a file input or the HEC raw endpoint; the HEC event endpoint was not affected.
 
 1.1.2:
 
