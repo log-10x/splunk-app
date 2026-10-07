@@ -116,7 +116,7 @@ At search time, the `tenx-inflate` macro reconstructs the original event by comb
 | Sourcetype | Purpose |
 |------------|---------|
 | `tenx_dml_raw_json` | Receives template definitions as JSON: `{"templateHash":"...", "template":"..."}` |
-| `tenx_dml_pure` | Searchable template patterns (hash + stripped pattern text) |
+| `tenx_dml_pure` | Searchable copy of each template (hash + stripped pattern text). Written with `collect` as sourcetype `stash` and source `tenx_dml_pure`, which Splunk does not count against the licence; copies an install already holds keep sourcetype `tenx_dml_pure` |
 | `tenx_encoded` | Encoded log events in format: `~<hash>,<var0>,<var1>,...` |
 
 #### KV Store Collection
@@ -132,7 +132,9 @@ The `tenx_dml` collection stores parsed template data with fields:
 | `part_0` | string | First template segment (before first variable) |
 | `pattern_terminator` | string | Last template segment (after last variable) |
 | `timestamp_format` | string | Splunk strftime format for timestamp reconstruction |
-| `expand_unsafe` | string | Empty when the template can be expanded; otherwise the reason it cannot, and the inflate macro leaves its events compact |
+| `expand_unsafe` | string | Empty when the template can be expanded; otherwise the reason it cannot (`back-reference`, `multiple-timestamps`, `hash-conflict`), and the inflate macro leaves its events compact |
+| `pattern_search` | string | Searchable text of the template: separators removed, line breaks as spaces |
+| `search_copy` | string | `pending` until the searchable copy is written, then `written` |
 
 #### Macros
 
@@ -195,8 +197,9 @@ The `tenx_dml` collection stores parsed template data with fields:
    - Confirm "Log10x App" appears in the app list
 
 4. **Create the template index:**
-   - Create an index named `tenx_dml`. Templates arrive there as `tenx_dml_raw_json` and are
-     stored back there as `tenx_dml_pure`. Compact events (`tenx_encoded`) go to any index.
+   - Create an index named `tenx_dml`. Templates arrive there as `tenx_dml_raw_json`, and their
+     searchable copy is written there with `collect` (sourcetype `stash`, source `tenx_dml_pure`),
+     which is not licence-metered. Compact events (`tenx_encoded`) go to any index.
 
 5. **Point the dashboards at your compact index:** set the `tenx-events` macro, see
    [Pointing the Dashboards at Your Compact Events](#pointing-the-dashboards-at-your-compact-events).
@@ -574,7 +577,8 @@ The `tenx_dml_builder.py` script converts Java SimpleDateFormat to Splunk strfti
 | Endpoint | Purpose |
 |----------|---------|
 | `/servicesNS/{owner}/{app}/storage/collections/data/{collection}/` | KV store operations |
-| `/services/receivers/simple` | Submit events to index |
+| `/servicesNS/{owner}/{app}/storage/collections/data/{collection}/batch_save` | Mark templates whose searchable copy is written |
+| `/servicesNS/nobody/{app}/search/jobs` | Run the `collect` search that writes the searchable copy |
 
 ---
 

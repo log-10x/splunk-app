@@ -269,9 +269,11 @@ class TenxSearchManager:
 			'earliest_time': '0',
 			'latest_time': 'now',
 			'rf': self.dml_key,
-			'search': 'search index=%s sourcetype=%s %s | stats count by %s' % (
+			# The searchable copy exists in two forms on an upgraded install: sourcetype
+			# tenx_dml_pure, and sourcetype stash with that name as its source.
+			'search': 'search index=%s (sourcetype=%s OR source=%s) %s | stats count by %s' % (
 				self.tenx_config['dest_dml_index'], self.tenx_config['dml_source_type'],
-				dml_search, self.dml_key)
+				self.tenx_config['dml_source_type'], dml_search, self.dml_key)
 		}
 
 		return self.create_search_job(search_data)

@@ -79,3 +79,13 @@ class TestKeyTrimming:
 	def test_special_characters_are_still_url_quoted(self, kv, conn):
 		kv.get_entry('$+[?l?!!f ')
 		assert conn.gets[0].endswith('/%24%2B%5B%3Fl%3F%21%21f')
+
+
+class TestUpdateEntry:
+
+	def test_replaces_the_record_under_its_trimmed_key(self, kv, conn):
+		assert kv.update_entry('abc ', {'pattern_hash': 'abc ', 'pattern': 'x', 'expand_unsafe': 'hash-conflict'})
+		url, record = conn.posts[0]
+		assert unquote(url.rsplit('/', 1)[1]) == 'abc'
+		assert record['_key'] == 'abc'
+		assert record['expand_unsafe'] == 'hash-conflict'

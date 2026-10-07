@@ -103,10 +103,11 @@ unchanged.
 
 ### Store-time checks
 
-Back-references and multi-timestamp templates are detected when stored. Their events stay compact
-and carry `tenx_expand_refused` naming the reason, `back-reference` or `multiple-timestamps`, so
-every expanded line is the original line. A Receiver's clock zone leaves no trace in the data, so
-`timestampZone: UTC` is required rather than checked.
+Back-references, multi-timestamp templates and two different templates under one template hash
+are detected when stored. Their events stay compact and carry `tenx_expand_refused` naming the
+reason, `back-reference`, `multiple-timestamps` or `hash-conflict`, so every expanded line is the
+original line. The Diagnostics dashboard lists every refused template. A Receiver's clock zone
+leaves no trace in the data, so `timestampZone: UTC` is required rather than checked.
 
 ### Event time on compact events
 

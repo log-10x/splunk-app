@@ -12,10 +12,11 @@ Data Flow
 2. "Consume KV" saved search finds new templates and triggers this alert action
 3. This script reads the search results (JSON template definitions)
 4. For each template:
-   a. Check if it already exists in KV store (skip if yes)
+   a. Check whether the KV store already holds it (see reconcile_existing for a different
+      template under the same key)
    b. Parse template into structured format using TenxDMLBuilder
-   c. Submit searchable version to `tenx_dml_pure` sourcetype
-   d. Create entry in `tenx_dml` KV store collection
+   c. Create entry in `tenx_dml` KV store collection, its searchable copy pending
+5. Write the searchable copy of every pending template with `collect` (tenx_dml_intf.py)
 
 Input Format
 ------------
@@ -35,11 +36,14 @@ KV Store Entry (tenx_dml collection):
         "pattern_parts": ["<part1>", "<part2>", ...],
         "part_0": "<first_part>",
         "pattern_terminator": "<last_part>",
-        "timestamp_format": "<splunk_strftime_format>"
+        "timestamp_format": "<splunk_strftime_format>",
+        "expand_unsafe": "<empty, or why the template cannot be expanded>",
+        "pattern_search": "<template_with_separators_removed>",
+        "search_copy": "pending | written"
     }
 
-DML Pure Event:
-    "<hash> <template_with_separators_removed>"
+Searchable copy, sourcetype stash, source tenx_dml_pure:
+    "<hash>\t<template_with_separators_removed>"
 
 Execution
 ---------
@@ -58,8 +62,8 @@ Settings are loaded from tenx_config.conf via tenx_util.get_tenx_config():
     - variable_separator: Character separating variables in templates (default: $)
     - timestamp_placeholder: Placeholder for timestamp in patterns (default: __TENX_TS__)
     - collection_name: KV store collection name (default: tenx_dml)
-    - dest_dml_index: Index for DML pure events (default: main)
-    - dml_source_type: Sourcetype for DML pure events (default: tenx_dml_pure)
+    - dest_dml_index: Index for the searchable copy (default: tenx_dml)
+    - dml_source_type: Source of the searchable copy (default: tenx_dml_pure)
 
 Logging
 -------
@@ -185,9 +189,73 @@ def get_result_parts(result):
 	return record_key, pattern
 
 
+LOOKUP_NAME = 'tenx-dml-lookup'
+
+RECONCILE_SAME = "same"
+RECONCILE_REPLACED = "replaced"
+RECONCILE_CONFLICT = "conflict"
+
+
+def reconcile_existing(kv_intf, dml_builder, existing, record_key, pattern):
+	"""
+	Decides what an incoming template means for the record already stored under its key.
+
+	The key is the template hash, trimmed. The same key with the same text is a template sent
+	again, which is normal: every Receiver sends each template once per start. The same key
+	with different text is two templates under one hash, or two hashes that differ only by
+	surrounding whitespace. Expanding their events with either text prints a line that was
+	never written, so the record is marked hash-conflict and the inflate macro leaves those
+	events compact.
+
+	One different-text case is not a conflict: a stored text that is a strict prefix of the
+	incoming one under the same hash was cut by a TRUNCATE limit on the way in. The whole
+	template replaces it.
+
+	Returns RECONCILE_SAME, RECONCILE_REPLACED or RECONCILE_CONFLICT.
+	"""
+	if not isinstance(existing, dict):
+		return RECONCILE_SAME
+
+	stored_hash = existing.get(tenx_dml_builder.RECORD_PATTERN_HASH)
+	stored_pattern = existing.get(tenx_dml_builder.RECORD_PATTERN)
+
+	same_hash = stored_hash is None or stored_hash == record_key
+	same_pattern = stored_pattern is None or stored_pattern == pattern
+
+	if same_hash and same_pattern:
+		logger.debug("Already has entry for {}, skipping.".format(record_key))
+		return RECONCILE_SAME
+
+	if same_hash and pattern.startswith(stored_pattern):
+		whole = dml_builder.build_kv_record_data(record_key, pattern)
+		whole[tenx_dml_intf.SEARCH_COPY] = tenx_dml_intf.SEARCH_COPY_PENDING
+
+		if kv_intf.update_entry(record_key, whole):
+			logger.info("Replaced the cut template stored for {} ({} of {} characters) with the whole one.".format(
+				record_key, len(stored_pattern), len(pattern)))
+			return RECONCILE_REPLACED
+
+		return RECONCILE_SAME
+
+	if existing.get(tenx_dml_builder.RECORD_EXPAND_UNSAFE) == tenx_dml_builder.UNSAFE_HASH_CONFLICT:
+		return RECONCILE_SAME
+
+	flagged = {k: v for k, v in existing.items() if not k.startswith('_')}
+	flagged[tenx_dml_builder.RECORD_EXPAND_UNSAFE] = tenx_dml_builder.UNSAFE_HASH_CONFLICT
+
+	if not kv_intf.update_entry(record_key, flagged):
+		return RECONCILE_SAME
+
+	logger.warning("Template hash conflict on key {!r}: stored hash {!r} with {} characters of text, incoming hash {!r} with {} characters of different text. "
+		"Events under this key now stay compact, marked hash-conflict.".format(
+			kv_intf.kv_key(record_key), stored_hash, len(stored_pattern or ''), record_key, len(pattern)))
+
+	return RECONCILE_CONFLICT
+
+
 def update_kv_store(settings):
 	"""
-	Updateds the KV store and "pure" DML sourcetype from the "raw" DML data which is forwarded into splunk.
+	Updates the KV store and the searchable copy from the "raw" DML data which is forwarded into splunk.
 
 	This script is configured via a periodic cron based alert which fires with all new events inserted into the "raw" DML.
 
@@ -196,8 +264,8 @@ def update_kv_store(settings):
 
 	This config can be changed by modifying the savedsearches.conf file, either manually, via API, or Splunk's UI.
 
-	The process runs over all the given results of the search, checks for their existence in the KV store, and if
-	missing adds them to both the "pure" DML, and the KV store.
+	The process runs over all the given results of the search, checks for their existence in the KV store, adds
+	the missing ones, and then writes the searchable copy of every template still pending.
 
 	Because the process checks existance before placing new items, duplicate items should be reduced to a minimum.
 	They can still happen due to certain race conditions, as we don't actually "lock" or CAS data, but this is a
@@ -227,17 +295,19 @@ def update_kv_store(settings):
 			user=settings.get('owner') or 'nobody',
 			auth={'session_key': token})
 
-		dml_intf = tenx_dml_intf.TenxDmlInterface(
-			server_connection=server_connection,
-			host=settings.get('server_host'),
-			index_name=tenx_config['dest_dml_index'],
-			dml_sourcetype=tenx_config['dml_source_type'])
-
 		kv_intf = tenx_kv_intf.TenxKVInterface(
 			collection_name=tenx_config['collection_name'],
 			server_connection=server_connection,
 			app_name=APP_NAME,
 			owner='nobody')
+
+		dml_intf = tenx_dml_intf.TenxDmlInterface(
+			server_connection=server_connection,
+			kv_intf=kv_intf,
+			app_name=APP_NAME,
+			lookup_name=LOOKUP_NAME,
+			index_name=tenx_config['dest_dml_index'],
+			source=tenx_config['dml_source_type'])
 
 		dml_builder = tenx_dml_builder.TenxDMLBuilder(
 			timestamp_placeholder=timestamp_placeholder,
@@ -249,13 +319,12 @@ def update_kv_store(settings):
 			# Logging already happens inside get_results_reader
 			return -1
 
-		events_source = "consume_kv_alert"
-
 		# Counters for observability
 		updates_performed = 0
 		skipped_invalid = 0
 		skipped_existing = 0
 		skipped_dml_error = 0
+		conflicts_marked = 0
 
 		for result in reader:
 			record_key, pattern = get_result_parts(result)
@@ -267,33 +336,31 @@ def update_kv_store(settings):
 
 			existing = kv_intf.get_entry(record_key)
 			if existing:
-				# Two hashes that differ only by surrounding whitespace share a KV key,
-				# because search-time extraction cannot tell them apart either. The
-				# first one stored wins; say so, since the second one's events would
-				# then expand with the first one's template.
-				stored = existing.get(tenx_dml_builder.RECORD_PATTERN_HASH) if isinstance(existing, dict) else None
-				if stored is not None and stored != record_key:
-					logger.warning("KV key collision: {!r} is already stored and {!r} trims to the same key; the second is not stored.".format(stored, record_key))
-				logger.debug("Already has entry for {}, skipping.".format(record_key))
-				skipped_existing += 1
-				continue
+				outcome = reconcile_existing(kv_intf, dml_builder, existing, record_key, pattern)
 
-			pure_dml_event = dml_builder.build_pure_dml_line(record_key, pattern)
+				if outcome == RECONCILE_CONFLICT:
+					conflicts_marked += 1
+				elif outcome == RECONCILE_REPLACED:
+					updates_performed += 1
+				else:
+					skipped_existing += 1
 
-			if not dml_intf.submit(record_key, pure_dml_event, events_source):
-				logger.warning("Failed submitting {} to dml, won't update kv store.".format(record_key))
-				skipped_dml_error += 1
 				continue
 
 			record_data = dml_builder.build_kv_record_data(record_key, pattern)
+			record_data[tenx_dml_intf.SEARCH_COPY] = tenx_dml_intf.SEARCH_COPY_PENDING
 
 			if kv_intf.create_entry(record_key, record_data):
 				updates_performed += 1
 
+		if dml_intf.write_pending() < 0:
+			logger.warning("The searchable copy of new templates was not written; they stay pending for the next run.")
+			skipped_dml_error += 1
+
 		# Log summary stats
-		if skipped_invalid > 0 or skipped_dml_error > 0:
-			logger.info("Processing summary: added={}, existing={}, invalid={}, errors={}".format(
-				updates_performed, skipped_existing, skipped_invalid, skipped_dml_error))
+		if skipped_invalid > 0 or skipped_dml_error > 0 or conflicts_marked > 0:
+			logger.info("Processing summary: added={}, existing={}, invalid={}, errors={}, conflicts={}".format(
+				updates_performed, skipped_existing, skipped_invalid, skipped_dml_error, conflicts_marked))
 
 		return updates_performed
 	except Exception as e:
