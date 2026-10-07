@@ -106,8 +106,10 @@ unchanged.
 Back-references, multi-timestamp templates and two different templates under one template hash
 are detected when stored. Their events stay compact and carry `tenx_expand_refused` naming the
 reason, `back-reference`, `multiple-timestamps` or `hash-conflict`, so every expanded line is the
-original line. The Diagnostics dashboard lists every refused template. A Receiver's clock zone
-leaves no trace in the data, so `timestampZone: UTC` is required rather than checked.
+original line. The Diagnostics dashboard lists every refused template. To clear a `hash-conflict`
+after deciding which template is right, delete that key from the `tenx_dml` collection and run the
+backfill search in Step 5. A Receiver's clock zone leaves no trace in the data, so
+`timestampZone: UTC` is required rather than checked.
 
 ### Event time on compact events
 

@@ -152,3 +152,13 @@ def test_a_whole_template_replacing_a_cut_one_gets_a_new_searchable_copy(monkeyp
 	fill(monkeypatch, tmp_path, [('-Abc123xyz', whole)], kv=kv)
 
 	assert kv.records['-Abc123xyz']['search_copy'] == 'pending'
+
+
+def test_a_cut_re_send_of_a_stored_whole_template_is_not_a_conflict(monkeypatch, tmp_path):
+	whole = TEMPLATE_A + ' for order $ after $ retries'
+	fill(monkeypatch, tmp_path, [('-Abc123xyz', whole), ('-Abc123xyz', whole[:40])])
+	record = StoreKV.last.records['-Abc123xyz']
+
+	assert record['pattern'] == whole
+	assert record['expand_unsafe'] == ''
+	assert StoreKV.last.updates == []

@@ -207,9 +207,9 @@ def reconcile_existing(kv_intf, dml_builder, existing, record_key, pattern):
 	never written, so the record is marked hash-conflict and the inflate macro leaves those
 	events compact.
 
-	One different-text case is not a conflict: a stored text that is a strict prefix of the
-	incoming one under the same hash was cut by a TRUNCATE limit on the way in. The whole
-	template replaces it.
+	One different-text case is not a conflict: under the same hash, a text that is a strict
+	prefix of the other was cut by a TRUNCATE limit on the way in. The longer one is kept; an
+	incoming whole template replaces a stored cut one.
 
 	Returns RECONCILE_SAME, RECONCILE_REPLACED or RECONCILE_CONFLICT.
 	"""
@@ -224,6 +224,11 @@ def reconcile_existing(kv_intf, dml_builder, existing, record_key, pattern):
 
 	if same_hash and same_pattern:
 		logger.debug("Already has entry for {}, skipping.".format(record_key))
+		return RECONCILE_SAME
+
+	if same_hash and stored_pattern.startswith(pattern):
+		logger.info("Template {} arrived cut ({} of {} characters); the stored whole one is kept.".format(
+			record_key, len(pattern), len(stored_pattern)))
 		return RECONCILE_SAME
 
 	if same_hash and pattern.startswith(stored_pattern):
