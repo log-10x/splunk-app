@@ -29,10 +29,11 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 
 > With the Log10x App, Splunk can index compact log events and still search, chart and alert
 > on the original lines. The 10x Receiver stores each event as a template hash plus the values
-> that change, so a stream of repeated patterns takes less of the license. On the OpenTelemetry
-> demo the bytes sent to Splunk shrank by 63.7%, encoded events and template dictionary counted
-> together, and every line expanded back byte-identical with the Receiver settings in the
-> installation steps (measurement: https://www.log10x.com/blog/cutting-splunk-log-storage/).
+> that change, so a stream of repeated patterns takes less of the license, and the record's
+> metadata travels as indexed fields. On 20,000 Kubernetes records of the OpenTelemetry demo,
+> Splunk's licence meter recorded 59% fewer bytes, compact events and templates counted
+> together, than for the same records sent the way the OpenTelemetry Collector sends them by
+> default.
 > The same license then holds more: sources that were sampled, filtered or kept out of Splunk
 > to stay under the limit can come back, or the license can be smaller.
 >
@@ -178,6 +179,7 @@ Paste the block for the version being uploaded. Splunkbase keeps notes per relea
 > - The app's searchable copy of each template is now written with Splunk's `collect` as sourcetype `stash`, which Splunk does not count against the licence. Template records sent by the Receiver are counted as before.
 > - Two different templates under one template hash are detected when stored. Their events stay compact and carry `tenx_expand_refused=hash-conflict` instead of expanding with the wrong text, and the Diagnostics dashboard lists them.
 > - A stored template that is a cut-short copy of the one the Receiver sends is replaced by the whole template.
+> - A compact event from a template with no values now expands.
 
 1.1.3:
 
@@ -211,7 +213,8 @@ Paste the block for the version being uploaded. Splunkbase keeps notes per relea
 | 1.1.4 hash conflict: a second, different template sent under a hash 3,916 events use | key marked `hash-conflict`, all 3,916 events left compact with `tenx_expand_refused`, the other 16,084 expand; the same template sent again marks nothing (0 of 2,991) |
 | 1.1.4 on Splunk 9.4.15: 1.1.3 from Splunkbase (sha256 fe0e2ba2...) installed and filled, then upgraded in place to 1.1.4 | re-sending all 2,991 templates marks none; the same template hashes for 6 of 6 terms; `tenxsearch` equals the expanded truth on 3 of 3 (error 438, cartstore 1,974, NOT bootstrap 19,992) |
 | 1.1.4 on Splunk 9.4.15, fresh install | 2,991 of 2,991 copies written as `stash`, byte-identical to the 1.1.3 copy, one template per event, longest 43,004 characters; 0 bytes metered for them while a control with an ordinary sourcetype is metered; a conflicting template leaves its 3,916 events compact with `hash-conflict` |
-| Unit tests, Python 3.9 and 3.13 | 310 pass |
+| 1.1.4 on Splunk 10.4.3 through the Receiver, 20,000 Kubernetes records of the OpenTelemetry demo, Fluent Bit and Fluentd configured as in the setup guide | every compact event carries the Kubernetes metadata as indexed fields; with Fluentd, 2,581 templates for 2,581 event hashes; all 12,868 compact events expand, 19,974 of 20,000 lines byte-identical, the other 26 being empty messages the Receiver does not return; licence meter 1,427,624 bytes against 3,479,139 for the same records sent message-as-event with the metadata as fields |
+| Unit tests, Python 3.9 and 3.13 | 315 pass |
 
 Warnings AppInspect reports, none blocking: SplunkJS telemetry notice, Python 2/3 notice,
 `collections.conf` present, `check_for_updates` set for a published app, Splunk SDK 2.1.1.

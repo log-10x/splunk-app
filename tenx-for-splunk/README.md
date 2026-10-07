@@ -117,7 +117,7 @@ At search time, the `tenx-inflate` macro reconstructs the original event by comb
 |------------|---------|
 | `tenx_dml_raw_json` | Receives template definitions as JSON: `{"templateHash":"...", "template":"..."}` |
 | `tenx_dml_pure` | Searchable copy of each template (hash + stripped pattern text). Written with `collect` as sourcetype `stash` and source `tenx_dml_pure`, which Splunk does not count against the licence; copies an install already holds keep sourcetype `tenx_dml_pure` |
-| `tenx_encoded` | Encoded log events in format: `~<hash>,<var0>,<var1>,...` |
+| `tenx_encoded` | Encoded log events in format: `~<hash>,<var0>,<var1>,...`, or `~<hash>` for a template with no values |
 
 #### KV Store Collection
 

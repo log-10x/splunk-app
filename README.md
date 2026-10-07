@@ -17,8 +17,8 @@ A [compact event](https://doc.log10x.com/run/transform/#compact) carries a templ
 The [Receiver](https://doc.log10x.com/apps/receiver/) running in [Compact mode](https://doc.log10x.com/apps/receiver/compact/) [compacts](https://doc.log10x.com/run/transform/#compact) events at the edge, and Splunk ingests them at reduced size:
 
 ```
-Receiver  -->  Ingest (UF/HEC)  -->  KV Store (Templates)
-                                -->  Index (Encoded Events)
+Receiver  -->  Ingest (HEC)  -->  KV Store (Templates)
+                             -->  Index (compact events, metadata as indexed fields)
 ```
 
 ### Search Flow
@@ -165,7 +165,7 @@ Create an index named `tenx_dml` for templates, then two HTTP Event Collector to
 
 ### Step 3: Configure the Receiver and Forwarder
 
-Set `varMaxRecurIndexes: 0`, `timestampZone: UTC` and `maxPerObject: 1` in the Receiver's configuration (see [Receiver-side configuration](#receiver-side-configuration)), and point your forwarder at both tokens. See the [full documentation](https://doc.log10x.com/apps/receiver/compact/splunk/) for Fluent Bit, Fluentd, and OTel Collector examples.
+Set `varMaxRecurIndexes: 0`, `timestampZone: UTC` and `maxPerObject: 1` in the Receiver's configuration (see [Receiver-side configuration](#receiver-side-configuration)), and point your forwarder at both tokens: templates to `tenx_dml`, and each compact event as the message with the record's metadata as indexed fields. The [setup guide](https://doc.log10x.com/apps/receiver/compact/splunk/) has the Fluent Bit and Fluentd configuration.
 
 ### Step 4: Point the Dashboards at Your Index
 
