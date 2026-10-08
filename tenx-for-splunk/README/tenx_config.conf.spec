@@ -8,7 +8,8 @@ dest_dml_index = <string>
 * Name of the index for indexing processed (pure) 10x pattern data
 
 dml_source_type = <string>
-* Name of the sourcetype for indexing processed (pure) 10x pattern data
+* Name of the searchable copy of 10x pattern data: the source of copies written with
+  collect as sourcetype stash, and the sourcetype of copies an install already holds
 
 collection_name = <string>
 * Name of the KV collection for storing 10x pattern structure

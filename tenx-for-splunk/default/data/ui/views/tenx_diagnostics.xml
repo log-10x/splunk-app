@@ -239,6 +239,26 @@
     </panel>
   </row>
 
+  <!-- Row 7b: Templates refused at store time -->
+  <row>
+    <panel>
+      <title>18. Templates Refused at Store Time</title>
+      <table>
+        <search>
+          <query>| inputlookup tenx-dml-lookup
+| where isnotnull(expand_unsafe) AND expand_unsafe!=""
+| eval chars=len(pattern)
+| table _key, expand_unsafe, chars, pattern</query>
+          <earliest>1</earliest>
+          <latest></latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="wrap">true</option>
+        <option name="count">20</option>
+      </table>
+    </panel>
+  </row>
+
   <!-- Row 8: Template Pipeline Status -->
   <row>
     <panel>

@@ -34,12 +34,35 @@ import re
 from tenx_alert_compiler import AlertStrategy
 
 
-# A legacy alert that decodes at runtime via the generating command:
-#   | tenxsearch searchstring="<human search>"
-# The searchstring is the human search; recompiling it migrates the alert from the per-run
-# proxy to a native compiled saved search.
+# A saved search that decodes at runtime through one of the app's generating commands:
+#   | tenxsearch searchstring="<search>" [| <rest of the pipeline>]
+#   | tx <search> [| <rest of the pipeline>]
+# The search with the rest of its pipeline is the human search; recompiling it migrates the
+# saved search from the per-run command to a native compiled saved search.
 _TENXSEARCH_RE = re.compile(
-	r'\|\s*tenxsearch\s+searchstring\s*=\s*"((?:[^"\\]|\\.)*)"', re.IGNORECASE)
+	r'\A\s*\|\s*tenxsearch\s+searchstring\s*=\s*"((?:[^"\\]|\\.)*)"\s*(\|.*)?\Z',
+	re.IGNORECASE | re.DOTALL)
+_TX_RE = re.compile(r'\A\s*\|\s*tx\s+(.*\S)\s*\Z', re.IGNORECASE | re.DOTALL)
+
+
+def _command_search(search):
+	"""
+	The human search of a saved search written with `| tenxsearch` or `| tx`, or None.
+	"""
+	search = search or ''
+
+	match = _TENXSEARCH_RE.match(search)
+
+	if match:
+		# unescape the SPL string literal: \" -> " and \\ -> \
+		human = match.group(1).replace('\\"', '"').replace('\\\\', '\\')
+		rest = (match.group(2) or '').strip()
+
+		return human + ' ' + rest if rest else human
+
+	match = _TX_RE.match(search)
+
+	return match.group(1) if match else None
 
 
 # Handler-control form keys that must NOT be forwarded as saved-search attributes.
@@ -201,9 +224,9 @@ def recompile_source(saved_search):
 	- A stored `tenx_original_search`: a search /tenx-alert already compiled. Recompiling it
 	  picks up template hashes that appeared since it was saved (a better hash prefilter), or the
 	  output of an updated builder.
-	- A legacy `| tenxsearch searchstring="..."` alert: the searchstring is the human search;
-	  recompiling migrates it from the per-run generating-command proxy to a native compiled
-	  saved search.
+	- A `| tenxsearch searchstring="..."` or `| tx ...` saved search: the search with the rest
+	  of its pipeline is the human search; recompiling migrates it from the per-run generating
+	  command to a native compiled saved search.
 
 	A stored original wins over a tenxsearch match (an already-migrated alert keeps its original
 	as the source of truth even if its compiled body still mentions tenxsearch for some reason).
@@ -213,19 +236,13 @@ def recompile_source(saved_search):
 	if original:
 		return original
 
-	match = _TENXSEARCH_RE.search(saved_search.get('search') or '')
-
-	if match:
-		# unescape the SPL string literal: \" -> " and \\ -> \
-		return match.group(1).replace('\\"', '"').replace('\\\\', '\\')
-
-	return None
+	return _command_search(saved_search.get('search'))
 
 
 def is_legacy_tenxsearch(saved_search):
 	"""
-	Whether a saved search is a legacy `| tenxsearch ...` alert with no stored original yet -
+	Whether a saved search is a `| tenxsearch` or `| tx` alert with no stored original yet -
 	i.e. recompiling it is a migration (proxy -> native), not a refresh of an existing compile.
 	"""
 	return (not (saved_search.get(ORIGINAL_SEARCH_KEY) or '').strip()
-		and _TENXSEARCH_RE.search(saved_search.get('search') or '') is not None)
+		and _command_search(saved_search.get('search')) is not None)

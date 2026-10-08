@@ -124,3 +124,34 @@ def test_the_button_still_converts_them():
 	summary = tenx_alert_recompile.recompile_all(conn, 'alice', compiler_for(TEMPLATES))
 
 	assert summary['migrated'] == 1
+
+
+def test_the_button_keeps_the_pipeline_after_tenxsearch():
+	legacy = '| tenxsearch searchstring="sourcetype=tenx_encoded cartstore" | stats count'
+	conn = Conn([{'name': 'Report', 'owner': 'alice', 'search': legacy}])
+
+	summary = tenx_alert_recompile.recompile_all(conn, 'alice', compiler_for(TEMPLATES))
+
+	assert summary['migrated'] == 1
+	assert conn.stanzas[0]['search'] == compiled(TEMPLATES, 'sourcetype=tenx_encoded cartstore | stats count')
+	assert conn.stanzas[0]['search'].endswith('| stats count')
+
+
+def test_the_button_converts_a_tx_alert():
+	conn = Conn([{'name': 'Report', 'owner': 'alice',
+		'search': '| tx sourcetype=tenx_encoded cartstore | stats count'}])
+
+	summary = tenx_alert_recompile.recompile_all(conn, 'alice', compiler_for(TEMPLATES))
+
+	assert summary['migrated'] == 1
+	assert conn.stanzas[0]['search'] == compiled(TEMPLATES, 'sourcetype=tenx_encoded cartstore | stats count')
+
+
+def test_the_scheduled_pass_leaves_tx_saved_searches_alone():
+	search = '| tx sourcetype=tenx_encoded cartstore | stats count'
+	conn = Conn([{'name': 'Report', 'owner': 'alice', 'search': search}])
+
+	summary = tenx_alert_recompile.recompile_all(conn, tenx_alert_recompile.ALL_OWNERS,
+		compiler_for(TEMPLATES), migrate_legacy=False)
+
+	assert summary['examined'] == 0 and conn.stanzas[0]['search'] == search

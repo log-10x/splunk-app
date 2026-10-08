@@ -267,15 +267,15 @@ class TenxAlertCompiler:
 			return self._compile_passthrough(original, result)
 
 		if state == ResolvedState.COMPLEX:
-			# Do not auto-fall-back to `| tenxsearch`: it re-runs the same builder logic on
+			# Do not auto-fall-back to `| tx`: it re-runs the same builder logic on
 			# the same search, so a shape too complex for this compiler is generally too
 			# complex for that command too, and it carries its own cost (a nested proxied
 			# job, no streaming). Surface the reason; a human can still choose to schedule
-			# `| tenxsearch searchstring="..."` manually, understanding that trade-off.
+			# `| tx <search>` manually, understanding that trade-off.
 			return AlertCompileResult(
 				AlertStrategy.REJECTED, None, original, state,
 				reason=("search is too complex to compile into a native saved search; "
-						"rewrite it, or schedule it manually via the `| tenxsearch` "
+						"rewrite it, or schedule it manually via the `| tx` "
 						"generating command (correct, and slower: it proxies a nested job)"))
 
 		# A transient DML lookup failure is not a permanent problem with the search: the save

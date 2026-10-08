@@ -152,3 +152,39 @@ class TenxKVInterface:
 			logger.error("Failed updating record for {} - {}".format(record_key, e), exc_info=1)
 
 		return False
+
+	def update_entry(self, record_key, record_data):
+		"""
+		Replaces the entry stored under record_key with record_data.
+		"""
+		try:
+			key = self.kv_key(record_key)
+			record = {self.KV_KEY: key}
+			record.update(record_data)
+
+			self.server_connection.post(self.build_record_url(key), json.dumps(record))
+
+			logger.info("Updated KV entry for {}.".format(record_key))
+
+			return True
+		except urllib.error.HTTPError as e:
+			logger.warning("HTTPError while replacing record for {} - {}".format(record_key, e), exc_info=1)
+		except Exception as e:
+			logger.error("Failed replacing record for {} - {}".format(record_key, e), exc_info=1)
+
+		return False
+
+	def save_batch(self, records):
+		"""
+		Writes whole records, each carrying its _key, in one call. A record whose key exists
+		is replaced.
+		"""
+		try:
+			url = self.build_record_url("batch_save")
+			self.server_connection.post(url, json.dumps(records))
+
+			return True
+		except Exception as e:
+			logger.error("Failed saving {} records in a batch - {}".format(len(records), e), exc_info=1)
+
+		return False

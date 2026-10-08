@@ -255,10 +255,11 @@ RECORD_PART_0 = "part_0"
 RECORD_PATTERN_TERMINATOR = "pattern_terminator"
 RECORD_TIMESTAMP_FORMAT = "timestamp_format"
 RECORD_EXPAND_UNSAFE = "expand_unsafe"
+RECORD_PATTERN_SEARCH = "pattern_search"
 
 RECORD_HEADERS = [
 	RECORD_PATTERN_HASH, RECORD_PATTERN, RECORD_PATTERN_PARTS, RECORD_PART_0, RECORD_PATTERN_TERMINATOR, RECORD_TIMESTAMP_FORMAT,
-	RECORD_EXPAND_UNSAFE
+	RECORD_EXPAND_UNSAFE, RECORD_PATTERN_SEARCH
 ]
 
 # Reasons this app cannot reconstruct a pattern's original text. Stored on the record and
@@ -266,6 +267,9 @@ RECORD_HEADERS = [
 # text that is wrong.
 UNSAFE_BACK_REFERENCE = "back-reference"
 UNSAFE_MULTIPLE_TIMESTAMPS = "multiple-timestamps"
+# Two different templates reached the store under one key, so neither text can be trusted for
+# that key's events.
+UNSAFE_HASH_CONFLICT = "hash-conflict"
 
 
 class TenxDMLBuilder:
@@ -299,9 +303,17 @@ class TenxDMLBuilder:
 		collapsed this way - an escaped literal "$0(" occurring in the raw source text is left
 		alone, matching how build_kv_record_data decides what counts as escaped.
 		"""
+		return key + "\t" + self.build_search_text(pattern)
+
+	def build_search_text(self, pattern):
+		"""
+		Returns the pattern's searchable text: the pattern with its variable separators and
+		the "$0(" escape digit removed and its line breaks turned into spaces. This is the text
+		a search term is matched against to find the templates that carry it.
+		"""
 		normalized = self._collapse_dollar_zero_escape(pattern)
 
-		return key + "\t" + normalized.replace(self.variable_separator, "").replace("\r\n", " ").replace("\n", " ")
+		return normalized.replace(self.variable_separator, "").replace("\r\n", " ").replace("\n", " ")
 
 	def _collapse_dollar_zero_escape(self, pattern):
 		"""
@@ -512,5 +524,6 @@ class TenxDMLBuilder:
 			RECORD_PART_0: part_0,
 			RECORD_PATTERN_TERMINATOR: pattern_terminator,
 			RECORD_TIMESTAMP_FORMAT: timestamp_format,
-			RECORD_EXPAND_UNSAFE: self.scan_expand_unsafe(base_pattern)
+			RECORD_EXPAND_UNSAFE: self.scan_expand_unsafe(base_pattern),
+			RECORD_PATTERN_SEARCH: self.build_search_text(base_pattern)
 		}

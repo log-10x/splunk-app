@@ -5,9 +5,9 @@ compiles the alert's search once, when it is saved, into native SPL, and stores 
 scheduler then runs an ordinary saved search with no Python between it and the data.
 
 Only alerts created through the **Compile Alert** view or the `/tenx-alert` endpoint are
-compiled. An alert saved the usual way from the search page is not: on compact data it must
-wrap its search in `| tenxsearch`, and every run then proxies a nested job and writes each
-event out through Python. Compiling avoids that cost.
+compiled. An alert saved the usual way from the search page is not: on compact data its
+search starts with `| tx`, and every run then proxies a nested job and writes each event out
+through Python. Compiling avoids that cost.
 
 ## Compiling an alert
 
@@ -24,9 +24,9 @@ so a new template reaches an alert within about 15 minutes of reaching the KV St
 **Recompile all managed alerts** in the view runs the same pass at once for the current
 user. Both recompile from the search as originally written, rewrite an alert only when its
 compiled form changed, leave an alert a person edited by hand alone, and never apply a
-result that needs review. The button also converts an existing
-`| tenxsearch searchstring="..."` alert into a compiled one; the scheduled pass leaves those
-as they are.
+result that needs review. The button also converts an existing `| tx ...` or
+`| tenxsearch searchstring="..."` alert into a compiled one, with the rest of its pipeline;
+the scheduled pass leaves those as they are.
 
 The same actions are available at the `/tenx-alert` REST endpoint:
 

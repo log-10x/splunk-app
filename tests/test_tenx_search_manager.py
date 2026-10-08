@@ -53,7 +53,7 @@ def test_resolution_search_names_the_index(manager, monkeypatch):
 	manager.create_dml_search('ProducerStateManager')
 
 	assert captured['search'] == (
-		'search index=tenx_dml sourcetype=tenx_dml_pure ProducerStateManager | stats count by dml_hash')
+		'search index=tenx_dml (sourcetype=tenx_dml_pure OR source=tenx_dml_pure) ProducerStateManager | stats count by dml_hash')
 
 
 def test_resolution_search_follows_a_relocated_index(manager, monkeypatch):
@@ -63,7 +63,7 @@ def test_resolution_search_follows_a_relocated_index(manager, monkeypatch):
 
 	manager.create_dml_search('error')
 
-	assert captured['search'].startswith('search index=somewhere_else sourcetype=tenx_dml_pure ')
+	assert captured['search'].startswith('search index=somewhere_else (sourcetype=tenx_dml_pure OR source=tenx_dml_pure) ')
 
 
 def test_resolution_search_covers_all_time(manager, monkeypatch):

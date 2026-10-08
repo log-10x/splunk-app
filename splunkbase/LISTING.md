@@ -29,16 +29,17 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 
 > With the Log10x App, Splunk can index compact log events and still search, chart and alert
 > on the original lines. The 10x Receiver stores each event as a template hash plus the values
-> that change, so a stream of repeated patterns takes less of the license. On the OpenTelemetry
-> demo the bytes sent to Splunk shrank by 63.7%, encoded events and template dictionary counted
-> together, and every line expanded back byte-identical with the Receiver settings in the
-> installation steps (measurement: https://www.log10x.com/blog/cutting-splunk-log-storage/).
+> that change, so a stream of repeated patterns takes less of the license, and the record's
+> metadata travels as indexed fields. On 20,000 Kubernetes records of the OpenTelemetry demo,
+> Splunk's licence meter recorded 59% fewer bytes, compact events and templates counted
+> together, than for the same records sent the way the OpenTelemetry Collector sends them by
+> default.
 > The same license then holds more: sources that were sampled, filtered or kept out of Splunk
 > to stay under the limit can come back, or the license can be smaller.
 >
 > Classic dashboards keep their SPL: the browser sends each panel's search to the app, which
 > rewrites it on the server. From the search bar, saved searches, alerts and the REST API, a
-> search is wrapped in the `tenxsearch` command. An alert created in the app's Compile Alert
+> search starts with the app's `tx` command: `| tx index=app_logs "payment failed"`. An alert created in the app's Compile Alert
 > view is compiled once into a native saved search, so the scheduler runs no Python. NOT, OR,
 > groups, phrases, field conditions, and values such as IP addresses and hostnames behave as
 > they do on the original data.
@@ -64,8 +65,9 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 > - Classic dashboards: `dashboard.js` routes each panel's search through the app's REST
 >   endpoint, which rewrites it. Panels keep their SPL. Copy the file into another app's
 >   `appserver/static/` to cover that app's dashboards.
-> - Everywhere else: `| tenxsearch searchstring="index=my_index sourcetype=tenx_encoded error"`.
->   Escape a quoted phrase inside the wrapper: `searchstring="index=my_index \"payment failed\""`.
+> - Everywhere else: start the search with `| tx`, as in
+>   `| tx index=my_index sourcetype=tenx_encoded "payment failed" NOT retry`. Everything after
+>   `tx` is the search, written as it would be on the original data.
 >
 > **Dashboards**
 >
@@ -75,10 +77,11 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 >
 > **Search coverage**
 >
-> - Outside a classic dashboard, a search without the `tenxsearch` command returns zero
->   events or unexpanded `~hash,...` rows, not an error.
-> - A search the app cannot rewrite is refused with a message. The rewrite refuses one
->   shape: a sourcetype inside an OR with other terms, `sourcetype=x OR host=y`.
+> - Outside a classic dashboard, a search without the `tx` command returns zero events or
+>   unexpanded `~hash,...` rows, not an error.
+> - A search the app cannot rewrite is refused with a message. The rewrite refuses two
+>   shapes: a sourcetype inside an OR with other terms, `sourcetype=x OR host=y`, and a quoted
+>   phrase that contains an escaped quote.
 > - Dashboard Studio loads no app JavaScript; its panels use the command.
 > - A compact event's `_time` is its index time; the original timestamp is in the expanded line.
 >
@@ -115,8 +118,8 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 
 > - **Dashboards show zero events.** Set the `tenx-events` macro to the index and sourcetype
 >   your compact events use.
-> - **A search returns zero events.** Wrap it in `| tenxsearch searchstring="..."`, or run it
->   from a classic dashboard in an app that carries `dashboard.js`.
+> - **A search returns zero events.** Start it with `| tx`, or run it from a classic dashboard
+>   in an app that carries `dashboard.js`.
 > - **A search is refused.** The message names the cause; the detail is in
 >   `$SPLUNK_HOME/var/log/splunk/tenx_search_command.log` or `tenx_search_handler.log`.
 > - **Events show as `~hash,value,...`.** The template has not reached the KV Store yet. The
@@ -157,13 +160,14 @@ Repository name: `log-10x/splunk-app`. Repository URL: https://github.com/log-10
 
 | Field | Value |
 |---|---|
-| Version | 1.1.3, read from the package |
+| Version | 1.1.4, read from the package |
 | Splunk platform compatibility | Splunk Enterprise 9.4, 10.0, 10.2, 10.4 |
 | CIM | None |
 
 These are every Splunk Enterprise line Splunk supports today, and each is tested: 9.4.15,
-10.0.10, 10.2.7 and 10.4.3, each a fresh install of 1.1.2. 1.1.3 changes one `props.conf`
-key and the version; it is checked on 10.4.3, and the same key was measured on 9.4. Splunk
+10.0.10, 10.2.7 and 10.4.3, each a fresh install of 1.1.2. 1.1.3 changed one `props.conf`
+key, checked on 10.4.3 and measured on 9.4. 1.1.4 changes how templates are stored; it is
+checked on 10.4.3 and 9.4.15, the oldest and newest lines, on a fresh install and an upgrade. Splunk
 ships on-premises releases every other minor, so 10.1 and 10.3 exist only on Splunk Cloud
 Platform, where compatibility is set by cloud vetting after upload rather than selected here.
 Splunkbase requires a release to run on every version it names.
@@ -171,6 +175,18 @@ Splunkbase requires a release to run on every version it names.
 **Release notes**
 
 Paste the block for the version being uploaded. Splunkbase keeps notes per release.
+
+1.1.4:
+
+> - The app's searchable copy of each template is now written with Splunk's `collect` as sourcetype `stash`, which Splunk does not count against the licence. Template records sent by the Receiver are counted as before.
+> - Two different templates under one template hash are detected when stored. Their events stay compact and carry `tenx_expand_refused=hash-conflict` instead of expanding with the wrong text, and the Diagnostics dashboard lists them.
+> - A stored template that is a cut-short copy of the one the Receiver sends is replaced by the whole template.
+> - A compact event from a template with no values now expands.
+> - The new `tx` command takes the search as written, with no `searchstring=` option and no
+>   escaped quotes: `| tx index=app_logs "payment failed" NOT retry`. `tenxsearch` works as
+>   before.
+> - Recompile all managed alerts keeps the rest of an alert's pipeline, such as
+>   `| stats count`, when it converts a `tenxsearch` alert, and converts `tx` alerts too.
 
 1.1.3:
 
@@ -199,7 +215,15 @@ Paste the block for the version being uploaded. Splunkbase keeps notes per relea
 | Splunkbase file standards: one root folder, no hidden or compiled files, no `local/` | met |
 | 46 checks per version on a fresh install of 1.1.2: search matrix, saved search, refusal, both dashboards, the hook, the search bar, navigation, scheduled recompile | 46 of 46 on 9.4.15, 10.0.10, 10.2.7 and 10.4.3 |
 | Long compact events on Splunk 10.4.3, 1.1.3 upgraded in place over 1.1.2: the OpenTelemetry demo sample, 3,723 compact events, 11 over 10,000 bytes, the longest 25,472, sent through the HEC event endpoint, the HEC raw endpoint and a file input | every event stored whole; 5,000 of 5,000 lines expand byte-identical on each path (1.1.2 on the raw endpoint and file input: 11 events cut at 10,000 bytes, 4,710 lines back) |
-| Unit tests, Python 3.9 and 3.13 | 297 pass |
+| 1.1.4 on Splunk 10.4.3, the E21 template set (2,991 templates) and 20,000 compact events: searchable copy written with `collect` as `stash` | 2,991 of 2,991 copies byte-identical to the 1.1.3 copy, one template per event, the longest 43,004 characters whole; `license_usage.log` shows 0 bytes for them while a control written the same way with an ordinary sourcetype is metered |
+| 1.1.4 search through the new copy, fresh install and upgrade over 1.1.3 copies | the same template hashes for 10 of 10 terms; `tenxsearch` equals the expanded truth on 6 of 6 searches (error 438, cartstore 1,974, accounting 75, "connection refused" 217, kafka 3,728, NOT bootstrap 19,992) |
+| 1.1.4 hash conflict: a second, different template sent under a hash 3,916 events use | key marked `hash-conflict`, all 3,916 events left compact with `tenx_expand_refused`, the other 16,084 expand; the same template sent again marks nothing (0 of 2,991) |
+| 1.1.4 on Splunk 9.4.15: 1.1.3 from Splunkbase (sha256 fe0e2ba2...) installed and filled, then upgraded in place to 1.1.4 | re-sending all 2,991 templates marks none; the same template hashes for 6 of 6 terms; `tenxsearch` equals the expanded truth on 3 of 3 (error 438, cartstore 1,974, NOT bootstrap 19,992) |
+| 1.1.4 on Splunk 9.4.15, fresh install | 2,991 of 2,991 copies written as `stash`, byte-identical to the 1.1.3 copy, one template per event, longest 43,004 characters; 0 bytes metered for them while a control with an ordinary sourcetype is metered; a conflicting template leaves its 3,916 events compact with `hash-conflict` |
+| 1.1.4 on Splunk 10.4.3 through the Receiver, 20,000 Kubernetes records of the OpenTelemetry demo, Fluent Bit and Fluentd configured as in the setup guide | every compact event carries the Kubernetes metadata as indexed fields; with Fluentd, 2,581 templates for 2,581 event hashes; all 12,868 compact events expand, 19,974 of 20,000 lines byte-identical, the other 26 being empty messages the Receiver does not return; licence meter 1,427,624 bytes against 3,479,139 for the same records sent message-as-event with the metadata as fields |
+| 1.1.4 `tx` on Splunk 10.4.3, the same 20,000 events | equals the expanded truth on 17 of 17 searches, among them a quoted phrase with `NOT` and a parenthesised group, quoted field values, a subsearch and a time modifier, and equals `tenxsearch` on the 9 run through both; a phrase containing an escaped quote is refused by both commands; `\| tx` with no search fails with a message |
+| 1.1.4 Recompile all managed alerts on Splunk 10.4.3: one alert saved as `\| tx ... \| stats count`, one as `\| tenxsearch ... \| stats count` | both converted to native SPL that ends in `\| stats count`, each returning 217, the expanded truth |
+| Unit tests, Python 3.9 and 3.13 | 327 pass |
 
 Warnings AppInspect reports, none blocking: SplunkJS telemetry notice, Python 2/3 notice,
 `collections.conf` present, `check_for_updates` set for a published app, Splunk SDK 2.1.1.
@@ -213,7 +237,7 @@ From the repository root:
 rm -rf /tmp/sbpkg && mkdir -p /tmp/sbpkg
 rsync -a --exclude 'local/' --exclude '__pycache__/' --exclude '*.pyc' --exclude '*.pyo' --exclude '.*' \
   tenx-for-splunk/ /tmp/sbpkg/tenx-for-splunk/
-cd /tmp/sbpkg && COPYFILE_DISABLE=1 tar --format ustar -czf tenx-for-splunk-1.1.3.tar.gz tenx-for-splunk
+cd /tmp/sbpkg && COPYFILE_DISABLE=1 tar --format ustar -czf tenx-for-splunk-1.1.4.tar.gz tenx-for-splunk
 ```
 
 ## Submitting

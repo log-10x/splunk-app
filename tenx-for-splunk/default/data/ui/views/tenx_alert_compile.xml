@@ -15,7 +15,7 @@
 					</div>
 					<div style="margin:8px 0;">
 						<button id="tenx-alert-compile" class="btn btn-primary">Compile</button>
-						<button id="tenx-alert-recompile" class="btn" title="Recompile every managed alert: convert | tenxsearch alerts to native SPL and pick up new templates">Recompile all managed alerts</button>
+						<button id="tenx-alert-recompile" class="btn" title="Recompile every managed alert: convert | tx and | tenxsearch alerts to native SPL and pick up new templates">Recompile all managed alerts</button>
 					</div>
 					<div id="tenx-alert-result" style="margin-top:10px;"></div>
 				</div>

@@ -10,15 +10,15 @@ To find optimization opportunities in your existing Splunk data, point the [Log1
 
 ## How It Works
 
-A [compact event](https://doc.log10x.com/run/transform/#compact) carries a template hash and its variable values; the constant words live in the KV Store, and the app puts them back at search time. Classic dashboards keep their panel SPL unchanged: `dashboard.js` routes each panel's search through the app's REST endpoint. Splunk's search page loads no app JavaScript, so a query in the search bar, a saved search or the REST API is wrapped in the `tenxsearch` command. An alert created in the app's **Compile Alert** view compiles once into a native saved search.
+A [compact event](https://doc.log10x.com/run/transform/#compact) carries a template hash and its variable values; the constant words live in the KV Store, and the app puts them back at search time. Classic dashboards keep their panel SPL unchanged: `dashboard.js` routes each panel's search through the app's REST endpoint. Splunk's search page loads no app JavaScript, so a query in the search bar, a saved search or the REST API starts with the app's `tx` command: `| tx index=app_logs error`. An alert created in the app's **Compile Alert** view compiles once into a native saved search.
 
 ### Ingestion Flow
 
 The [Receiver](https://doc.log10x.com/apps/receiver/) running in [Compact mode](https://doc.log10x.com/apps/receiver/compact/) [compacts](https://doc.log10x.com/run/transform/#compact) events at the edge, and Splunk ingests them at reduced size:
 
 ```
-Receiver  -->  Ingest (UF/HEC)  -->  KV Store (Templates)
-                                -->  Index (Encoded Events)
+Receiver  -->  Ingest (HEC)  -->  KV Store (Templates)
+                             -->  Index (compact events, metadata as indexed fields)
 ```
 
 ### Search Flow
@@ -28,12 +28,12 @@ Two paths reach the same rewrite, then [expand](https://doc.log10x.com/run/trans
 ```
 Classic dashboard panel  -->  dashboard.js hook  --\
                                                    +-->  Transform (prefilter + macro)  -->  Expand  -->  Full results
-Search bar | tenxsearch  --------------------------/
+Search bar | tx  ----------------------------------/
 ```
 
 The dashboard path is the faster one: about 3 seconds for 20,000 expanded events, against about 21 seconds through the command, which writes every event out itself.
 
-Scheduled alerts run server-side, where the browser hook never fires. An alert created in the **Compile Alert** view, or through the `/tenx-alert` endpoint, is **compiled once at save time** into native SPL, a template hash prefilter plus the inflate macro, so the scheduler runs an ordinary saved search. This is handled by the `/tenx-alert` REST endpoint and the **Compile Alert** view (with a recompile pass that converts `| tenxsearch` alerts and refreshes prefilters as templates appear). See [SAVE_TIME_ALERTS.md](SAVE_TIME_ALERTS.md).
+Scheduled alerts run server-side, where the browser hook never fires. An alert created in the **Compile Alert** view, or through the `/tenx-alert` endpoint, is **compiled once at save time** into native SPL, a template hash prefilter plus the inflate macro, so the scheduler runs an ordinary saved search. This is handled by the `/tenx-alert` REST endpoint and the **Compile Alert** view (with a recompile pass that converts `| tx` and `| tenxsearch` alerts and refreshes prefilters as templates appear). See [SAVE_TIME_ALERTS.md](SAVE_TIME_ALERTS.md).
 
 ## Receiver-side configuration
 
@@ -103,9 +103,12 @@ unchanged.
 
 ### Store-time checks
 
-Back-references and multi-timestamp templates are detected when stored. Their events stay compact
-and carry `tenx_expand_refused` naming the reason, `back-reference` or `multiple-timestamps`, so
-every expanded line is the original line. A Receiver's clock zone leaves no trace in the data, so
+Back-references, multi-timestamp templates and two different templates under one template hash
+are detected when stored. Their events stay compact and carry `tenx_expand_refused` naming the
+reason, `back-reference`, `multiple-timestamps` or `hash-conflict`, so every expanded line is the
+original line. The Diagnostics dashboard lists every refused template. To clear a `hash-conflict`
+after deciding which template is right, delete that key from the `tenx_dml` collection and run the
+backfill search in Step 5. A Receiver's clock zone leaves no trace in the data, so
 `timestampZone: UTC` is required rather than checked.
 
 ### Event time on compact events
@@ -162,7 +165,7 @@ Create an index named `tenx_dml` for templates, then two HTTP Event Collector to
 
 ### Step 3: Configure the Receiver and Forwarder
 
-Set `varMaxRecurIndexes: 0`, `timestampZone: UTC` and `maxPerObject: 1` in the Receiver's configuration (see [Receiver-side configuration](#receiver-side-configuration)), and point your forwarder at both tokens. See the [full documentation](https://doc.log10x.com/apps/receiver/compact/splunk/) for Fluent Bit, Fluentd, and OTel Collector examples.
+Set `varMaxRecurIndexes: 0`, `timestampZone: UTC` and `maxPerObject: 1` in the Receiver's configuration (see [Receiver-side configuration](#receiver-side-configuration)), and point your forwarder at both tokens: templates to `tenx_dml`, and each compact event as the message with the record's metadata as indexed fields. The [setup guide](https://doc.log10x.com/apps/receiver/compact/splunk/) has the Fluent Bit and Fluentd configuration.
 
 ### Step 4: Point the Dashboards at Your Index
 
@@ -194,7 +197,7 @@ index=tenx_dml sourcetype=tenx_dml_raw_json | head 10
 
 **Check compact events expand:**
 ```spl
-| tenxsearch searchstring="index=your_logs_index sourcetype=tenx_encoded" | head 10
+| tx index=your_logs_index sourcetype=tenx_encoded | head 10
 ```
 
 ## Analytics Dashboard
@@ -217,7 +220,7 @@ The Analytics dashboard finds compact events through the `tenx-events` macro.
 |-----------|-------------|
 | **Search Hook** | `dashboard.js`, routing each classic dashboard panel's search to the Search Handler |
 | **Search Handler** | `/tenx-search` REST endpoint rewriting a search for compact events |
-| **tenxsearch Command** | Generating command for the search bar, saved searches and the REST API |
+| **tx Command** | Generating command for the search bar, saved searches and the REST API; `tenxsearch` is the same command with the search in one quoted option |
 | **tenxrecompile Command** | Recompiles every compiled alert so it picks up new templates |
 | **Alert Compiler** | `/tenx-alert` REST endpoint compiling a search into a native scheduled alert at save time (with a recompile/migrate pass) |
 | **Compile Alert View** | UI to compile, review, and recompile save-time alerts |
