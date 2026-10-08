@@ -39,7 +39,7 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 >
 > Classic dashboards keep their SPL: the browser sends each panel's search to the app, which
 > rewrites it on the server. From the search bar, saved searches, alerts and the REST API, a
-> search starts with the app's `tx` command: `| tx index=app_logs "payment failed"`. An alert created in the app's Compile Alert
+> search starts with the app's `tx` command, naming the compact sourcetype: `| tx index=app_logs sourcetype=tenx_encoded "payment failed"`. An alert created in the app's Compile Alert
 > view is compiled once into a native saved search, so the scheduler runs no Python. NOT, OR,
 > groups, phrases, field conditions, and values such as IP addresses and hostnames behave as
 > they do on the original data.
@@ -161,13 +161,13 @@ Repository name: `log-10x/splunk-app`. Repository URL: https://github.com/log-10
 | Field | Value |
 |---|---|
 | Version | 1.1.4, read from the package |
-| Splunk platform compatibility | Splunk Enterprise 9.4, 10.0, 10.2, 10.4 |
+| Splunk platform compatibility | Splunk Enterprise 9.4, 10.0, 10.2, 10.4, 10.6 |
 | CIM | None |
 
-These are every Splunk Enterprise line Splunk supports today, and each is tested: 9.4.15,
-10.0.10, 10.2.7 and 10.4.3, each a fresh install of 1.1.2. 1.1.3 changed one `props.conf`
-key, checked on 10.4.3 and measured on 9.4. 1.1.4 changes how templates are stored; it is
-checked on 10.4.3 and 9.4.15, the oldest and newest lines, on a fresh install and an upgrade. Splunk
+Each line is tested: 9.4.15, 10.0.10, 10.2.7 and 10.4.3, each a fresh install of 1.1.2. 1.1.3
+changed one `props.conf` key, checked on 10.4.3 and measured on 9.4. 1.1.4 changes how
+templates are stored; it is checked on 9.4.15, 10.4.3 and 10.6.0.5, on a fresh install and an
+upgrade over 1.1.3. Splunk
 ships on-premises releases every other minor, so 10.1 and 10.3 exist only on Splunk Cloud
 Platform, where compatibility is set by cloud vetting after upload rather than selected here.
 Splunkbase requires a release to run on every version it names.
@@ -183,7 +183,7 @@ Paste the block for the version being uploaded. Splunkbase keeps notes per relea
 > - A stored template that is a cut-short copy of the one the Receiver sends is replaced by the whole template.
 > - A compact event from a template with no values now expands.
 > - The new `tx` command takes the search as written, with no `searchstring=` option and no
->   escaped quotes: `| tx index=app_logs "payment failed" NOT retry`. `tenxsearch` works as
+>   escaped quotes: `| tx index=app_logs sourcetype=tenx_encoded "payment failed" NOT retry`. `tenxsearch` works as
 >   before.
 > - Recompile all managed alerts keeps the rest of an alert's pipeline, such as
 >   `| stats count`, when it converts a `tenxsearch` alert, and converts `tx` alerts too.
@@ -223,6 +223,9 @@ Paste the block for the version being uploaded. Splunkbase keeps notes per relea
 | 1.1.4 on Splunk 10.4.3 through the Receiver, 20,000 Kubernetes records of the OpenTelemetry demo, Fluent Bit and Fluentd configured as in the setup guide | every compact event carries the Kubernetes metadata as indexed fields; with Fluentd, 2,581 templates for 2,581 event hashes; all 12,868 compact events expand, 19,974 of 20,000 lines byte-identical, the other 26 being empty messages the Receiver does not return; licence meter 1,427,624 bytes against 3,479,139 for the same records sent message-as-event with the metadata as fields |
 | 1.1.4 `tx` on Splunk 10.4.3, the same 20,000 events | equals the expanded truth on 17 of 17 searches, among them a quoted phrase with `NOT` and a parenthesised group, quoted field values, a subsearch and a time modifier, and equals `tenxsearch` on the 9 run through both; a phrase containing an escaped quote is refused by both commands; `\| tx` with no search fails with a message |
 | 1.1.4 Recompile all managed alerts on Splunk 10.4.3: one alert saved as `\| tx ... \| stats count`, one as `\| tenxsearch ... \| stats count` | both converted to native SPL that ends in `\| stats count`, each returning 217, the expanded truth |
+| 1.1.4 on Splunk 10.6.0.5, fresh install: the E21 template set and 20,000 compact events through the HEC event endpoint, truth from the same events decoded by the engine | 2,991 of 2,991 copies written as `stash`, one template per event, longest 43,004 characters; 0 bytes metered for them while a control written the same way with an ordinary sourcetype is metered (445,251 bytes); `tx`, `tenxsearch` and the truth agree on 12 of 12 searches, among them a phrase with `NOT`, a parenthesised group, a field value, a time modifier and a subsearch; `\| tx` with no search and an escaped quote are refused with a message; a conflicting template leaves its 3,916 events compact with `hash-conflict`, the other 16,084 expand; `tests/live_endpoints.py` 3 of 3; Recompile all managed alerts converts a `\| tx` and a `\| tenxsearch` alert to native SPL ending in `\| stats count`, each returning 217, the truth |
+| 1.1.4 on Splunk 10.6.0.5: 1.1.3 from Splunkbase (sha256 fe0e2ba2...) installed and filled, then upgraded in place to 1.1.4 | re-sending all 2,991 templates marks none; 6 of 6 terms give the same count through `tenxsearch` on 1.1.3 and through `tx` and `tenxsearch` on 1.1.4, equal to the truth |
+| 1.1.4 as packaged, with the `tx` examples naming the compact sourcetype, on Splunk 10.6.0.5, fresh install | the search assistant shows `\| tx index=app_logs sourcetype=tenx_encoded "connection refused" NOT retry`, and `\| tx` with no search names the same form; 2,991 templates in the KV, 2,991 `stash` copies; `tx`, `tenxsearch` and the truth agree on 6 of 6 searches; AppInspect 4.3.1: 0 failures and 0 errors on the default, cloud, future, private_app, private_classic and private_victoria tag sets, the same results as the package before the change |
 | Unit tests, Python 3.9 and 3.13 | 327 pass |
 
 Warnings AppInspect reports, none blocking: SplunkJS telemetry notice, Python 2/3 notice,

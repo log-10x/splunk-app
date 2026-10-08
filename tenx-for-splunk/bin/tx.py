@@ -1,7 +1,7 @@
 """
 tx: search compact events, written the way any search is written.
 
-    | tx index=app_logs "connection refused" NOT bootstrap
+    | tx index=app_logs sourcetype=tenx_encoded "connection refused" NOT bootstrap
 
 Everything after `tx` is the search, with no searchstring= wrapper and no outer quotes. It is
 rewritten and expanded exactly as `| tenxsearch searchstring="..."` is.

@@ -313,7 +313,7 @@ class TestComplexIsRejected:
 		assert result.strategy == AlertStrategy.REJECTED
 		assert not result.storable
 		assert result.compiled_search is None
-		assert 'tenxsearch' in result.reason  # still named as a manual, human-chosen option
+		assert '| tx' in result.reason  # still named as a manual, human-chosen option
 
 	def test_ambiguous_mixed_sourcetype_via_real_builder_is_passthrough_not_complex(self):
 		# The real builder does NOT emit ResolvedState.COMPLEX for this shape; it passes the

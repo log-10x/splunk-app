@@ -131,7 +131,7 @@ class TenxSearchCommandBase(GeneratingCommand):
 
 			if not searchstring or not searchstring.strip():
 				self.write_error("10x: no search was given. Write the search after the command, "
-					"for example: | tx index=app_logs error")
+					"for example: | tx index=app_logs sourcetype=tenx_encoded error")
 				return
 
 			tenx_config = tenx_util.get_tenx_config(server_uri=server_uri, token=token)
