@@ -5,8 +5,8 @@ Tenx Recompile Command
     | tenxrecompile
 
 Recompiles every alert compiled through the app, for every user, so each picks up templates
-that appeared after it was compiled. Saved searches written with `| tenxsearch` are left as
-they are. The "Recompile Compiled Alerts" saved search runs it on a
+that appeared after it was compiled. Saved searches written with `| tx` or `| tenxsearch` are
+left as they are. The "Recompile Compiled Alerts" saved search runs it on a
 schedule; it can also be run by hand. Returns one row summarising the pass. See
 tenx_alert_recompile.py.
 

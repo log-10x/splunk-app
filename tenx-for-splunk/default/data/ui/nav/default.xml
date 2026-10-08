@@ -3,7 +3,7 @@
   <view name="tenx_diagnostics" label="Diagnostics" />
   <view name="tenx_alert_compile" label="Compile Alert" />
   <!-- Splunk's own search view. Its search bar loads no app JavaScript, so compact data is
-       searched there with the tenxsearch command; see the README. -->
+       searched there with the tx command; see the README. -->
   <view name="search" />
   <view name="alerts" />
   <view name="dashboards" />

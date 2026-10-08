@@ -91,8 +91,7 @@ MAX_WAIT_MS = 30 * 60 * 1000
 NESTED_AUTO_CANCEL_S = 30
 
 
-@Configuration()
-class TenxSearchCommand(GeneratingCommand):
+class TenxSearchCommandBase(GeneratingCommand):
 	"""
 	Generating command which effectively returns the result of doing the given searchstring
 	on 10x encoded data.
@@ -109,7 +108,11 @@ class TenxSearchCommand(GeneratingCommand):
 	See tenx_search_handler.py for more details
 	"""
 
-	searchstring = Option(require=True)
+	def search_text(self):
+		"""
+		The search to rewrite for compact data, as the user wrote it.
+		"""
+		raise NotImplementedError
 
 	def generate(self):
 		# The expanded search runs as a job of its own. If this command stops before reading it
@@ -123,6 +126,13 @@ class TenxSearchCommand(GeneratingCommand):
 		try:
 			server_uri = self._metadata.searchinfo.splunkd_uri
 			token = self._metadata.searchinfo.session_key
+
+			searchstring = self.search_text()
+
+			if not searchstring or not searchstring.strip():
+				self.write_error("10x: no search was given. Write the search after the command, "
+					"for example: | tx index=app_logs error")
+				return
 
 			tenx_config = tenx_util.get_tenx_config(server_uri=server_uri, token=token)
 
@@ -161,11 +171,11 @@ class TenxSearchCommand(GeneratingCommand):
 
 			# Converting the input search into a matching 10x encoded search.
 			#
-			build_result = search_builder.build(self.searchstring)
+			build_result = search_builder.build(searchstring)
 			new_search = build_result.resolved
 
 			self.logger.info("Original search {} - {} ..xxx.. New search - {} ({})".format(
-				original_job_sid, self.searchstring, new_search, build_result.state))
+				original_job_sid, searchstring, new_search, build_result.state))
 
 			# A search that could not be rewritten must not run as typed: on compact data the
 			# words are not in the events, so the bare search returns nothing, or the wrong
@@ -192,7 +202,7 @@ class TenxSearchCommand(GeneratingCommand):
 			# that is the silent wrong answer again, so it is refused the same way.
 			#
 			if not build_result.engaged:
-				compact_sources = tenx_alert_compiler._referenced_tenx_sources(self.searchstring, tenx_config)
+				compact_sources = tenx_alert_compiler._referenced_tenx_sources(searchstring, tenx_config)
 
 				if compact_sources:
 					self.write_error("10x: this search names the compact source(s) {} but could not be rewritten "
@@ -202,7 +212,7 @@ class TenxSearchCommand(GeneratingCommand):
 						"tenx_search_command.log.".format(", ".join(sorted(compact_sources))))
 					return
 
-			actual_search = self.searchstring if new_search is None else new_search
+			actual_search = searchstring if new_search is None else new_search
 
 			search_data = {
 				"earliest_time": job_details['request'].get('earliest_time', ''),
@@ -325,6 +335,18 @@ class TenxSearchCommand(GeneratingCommand):
 			if search_sid is not None and not finished:
 				self.logger.info("Cancelling nested search {}.".format(search_sid))
 				search_manager.cancel_search_job(search_sid)
+
+
+@Configuration()
+class TenxSearchCommand(TenxSearchCommandBase):
+	"""
+	| tenxsearch searchstring="<search>"
+	"""
+
+	searchstring = Option(require=True)
+
+	def search_text(self):
+		return self.searchstring
 
 
 dispatch(TenxSearchCommand, sys.argv, sys.stdin, sys.stdout, __name__)

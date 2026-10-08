@@ -179,6 +179,25 @@ class TestRecompileSource:
 
 		assert tenx_alert_persist.recompile_source(stanza) == r'host="web1" AND path=\x'
 
+	def test_the_pipeline_after_tenxsearch_is_part_of_the_source(self):
+		stanza = {'name': 'a', 'search': '| tenxsearch searchstring="sourcetype=tenx_encoded error" | stats count by host', self.K: ''}
+
+		assert tenx_alert_persist.recompile_source(stanza) == 'sourcetype=tenx_encoded error | stats count by host'
+
+	def test_tx_search_and_pipeline_are_the_source(self):
+		stanza = {'name': 'a', 'search': '| tx sourcetype=tenx_encoded "connection refused" | stats count', self.K: ''}
+
+		assert tenx_alert_persist.recompile_source(stanza) == 'sourcetype=tenx_encoded "connection refused" | stats count'
+
+	def test_a_command_inside_a_subsearch_is_not_managed(self):
+		for search in ('index=main | append [| tenxsearch searchstring="x"]', 'index=main | append [| tx x]'):
+			assert tenx_alert_persist.recompile_source({'name': 'a', 'search': search, self.K: ''}) is None
+
+	def test_tenxsearch_followed_by_more_than_a_pipeline_is_not_managed(self):
+		stanza = {'name': 'a', 'search': '| tenxsearch searchstring="x" extra=1', self.K: ''}
+
+		assert tenx_alert_persist.recompile_source(stanza) is None
+
 	def test_stored_original_wins_over_a_tenxsearch_body(self):
 		stanza = {'name': 'a', 'search': '| tenxsearch searchstring="something else"', self.K: 'sourcetype=tenx_encoded payment'}
 
@@ -195,5 +214,6 @@ class TestRecompileSource:
 		plain = {'name': 'a', 'search': 'index=main error', self.K: ''}
 
 		assert tenx_alert_persist.is_legacy_tenxsearch(legacy) is True
+		assert tenx_alert_persist.is_legacy_tenxsearch(dict(legacy, search='| tx x | stats count')) is True
 		assert tenx_alert_persist.is_legacy_tenxsearch(migrated) is False
 		assert tenx_alert_persist.is_legacy_tenxsearch(plain) is False

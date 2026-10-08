@@ -39,7 +39,7 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 >
 > Classic dashboards keep their SPL: the browser sends each panel's search to the app, which
 > rewrites it on the server. From the search bar, saved searches, alerts and the REST API, a
-> search is wrapped in the `tenxsearch` command. An alert created in the app's Compile Alert
+> search starts with the app's `tx` command: `| tx index=app_logs "payment failed"`. An alert created in the app's Compile Alert
 > view is compiled once into a native saved search, so the scheduler runs no Python. NOT, OR,
 > groups, phrases, field conditions, and values such as IP addresses and hostnames behave as
 > they do on the original data.
@@ -65,8 +65,9 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 > - Classic dashboards: `dashboard.js` routes each panel's search through the app's REST
 >   endpoint, which rewrites it. Panels keep their SPL. Copy the file into another app's
 >   `appserver/static/` to cover that app's dashboards.
-> - Everywhere else: `| tenxsearch searchstring="index=my_index sourcetype=tenx_encoded error"`.
->   Escape a quoted phrase inside the wrapper: `searchstring="index=my_index \"payment failed\""`.
+> - Everywhere else: start the search with `| tx`, as in
+>   `| tx index=my_index sourcetype=tenx_encoded "payment failed" NOT retry`. Everything after
+>   `tx` is the search, written as it would be on the original data.
 >
 > **Dashboards**
 >
@@ -76,10 +77,11 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 >
 > **Search coverage**
 >
-> - Outside a classic dashboard, a search without the `tenxsearch` command returns zero
->   events or unexpanded `~hash,...` rows, not an error.
-> - A search the app cannot rewrite is refused with a message. The rewrite refuses one
->   shape: a sourcetype inside an OR with other terms, `sourcetype=x OR host=y`.
+> - Outside a classic dashboard, a search without the `tx` command returns zero events or
+>   unexpanded `~hash,...` rows, not an error.
+> - A search the app cannot rewrite is refused with a message. The rewrite refuses two
+>   shapes: a sourcetype inside an OR with other terms, `sourcetype=x OR host=y`, and a quoted
+>   phrase that contains an escaped quote.
 > - Dashboard Studio loads no app JavaScript; its panels use the command.
 > - A compact event's `_time` is its index time; the original timestamp is in the expanded line.
 >
@@ -116,8 +118,8 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 
 > - **Dashboards show zero events.** Set the `tenx-events` macro to the index and sourcetype
 >   your compact events use.
-> - **A search returns zero events.** Wrap it in `| tenxsearch searchstring="..."`, or run it
->   from a classic dashboard in an app that carries `dashboard.js`.
+> - **A search returns zero events.** Start it with `| tx`, or run it from a classic dashboard
+>   in an app that carries `dashboard.js`.
 > - **A search is refused.** The message names the cause; the detail is in
 >   `$SPLUNK_HOME/var/log/splunk/tenx_search_command.log` or `tenx_search_handler.log`.
 > - **Events show as `~hash,value,...`.** The template has not reached the KV Store yet. The
@@ -180,6 +182,11 @@ Paste the block for the version being uploaded. Splunkbase keeps notes per relea
 > - Two different templates under one template hash are detected when stored. Their events stay compact and carry `tenx_expand_refused=hash-conflict` instead of expanding with the wrong text, and the Diagnostics dashboard lists them.
 > - A stored template that is a cut-short copy of the one the Receiver sends is replaced by the whole template.
 > - A compact event from a template with no values now expands.
+> - The new `tx` command takes the search as written, with no `searchstring=` option and no
+>   escaped quotes: `| tx index=app_logs "payment failed" NOT retry`. `tenxsearch` works as
+>   before.
+> - Recompile all managed alerts keeps the rest of an alert's pipeline, such as
+>   `| stats count`, when it converts a `tenxsearch` alert, and converts `tx` alerts too.
 
 1.1.3:
 
@@ -214,7 +221,9 @@ Paste the block for the version being uploaded. Splunkbase keeps notes per relea
 | 1.1.4 on Splunk 9.4.15: 1.1.3 from Splunkbase (sha256 fe0e2ba2...) installed and filled, then upgraded in place to 1.1.4 | re-sending all 2,991 templates marks none; the same template hashes for 6 of 6 terms; `tenxsearch` equals the expanded truth on 3 of 3 (error 438, cartstore 1,974, NOT bootstrap 19,992) |
 | 1.1.4 on Splunk 9.4.15, fresh install | 2,991 of 2,991 copies written as `stash`, byte-identical to the 1.1.3 copy, one template per event, longest 43,004 characters; 0 bytes metered for them while a control with an ordinary sourcetype is metered; a conflicting template leaves its 3,916 events compact with `hash-conflict` |
 | 1.1.4 on Splunk 10.4.3 through the Receiver, 20,000 Kubernetes records of the OpenTelemetry demo, Fluent Bit and Fluentd configured as in the setup guide | every compact event carries the Kubernetes metadata as indexed fields; with Fluentd, 2,581 templates for 2,581 event hashes; all 12,868 compact events expand, 19,974 of 20,000 lines byte-identical, the other 26 being empty messages the Receiver does not return; licence meter 1,427,624 bytes against 3,479,139 for the same records sent message-as-event with the metadata as fields |
-| Unit tests, Python 3.9 and 3.13 | 315 pass |
+| 1.1.4 `tx` on Splunk 10.4.3, the same 20,000 events | equals the expanded truth on 17 of 17 searches, among them a quoted phrase with `NOT` and a parenthesised group, quoted field values, a subsearch and a time modifier, and equals `tenxsearch` on the 9 run through both; a phrase containing an escaped quote is refused by both commands; `\| tx` with no search fails with a message |
+| 1.1.4 Recompile all managed alerts on Splunk 10.4.3: one alert saved as `\| tx ... \| stats count`, one as `\| tenxsearch ... \| stats count` | both converted to native SPL that ends in `\| stats count`, each returning 217, the expanded truth |
+| Unit tests, Python 3.9 and 3.13 | 327 pass |
 
 Warnings AppInspect reports, none blocking: SplunkJS telemetry notice, Python 2/3 notice,
 `collections.conf` present, `check_for_updates` set for a published app, Splunk SDK 2.1.1.

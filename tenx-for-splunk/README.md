@@ -31,7 +31,7 @@ The app provides the infrastructure to:
 1. **Receive** template definitions from the 10x pipeline
 2. **Store** parsed template data in a KV store for efficient lookup
 3. **Inflate** compact events back to their original form at search time
-4. **Search** compact data with standard SPL: classic dashboards unchanged, the search bar through the `tenxsearch` command
+4. **Search** compact data with standard SPL: classic dashboards unchanged, the search bar through the `tx` command
 
 ### Reduction Example
 
@@ -148,7 +148,8 @@ The `tenx_dml` collection stores parsed template data with fields:
 
 | Surface | Purpose |
 |---------|---------|
-| `tenxsearch searchstring="..."` | Generating command: runs a search over compact events as if on the original lines (see Usage) |
+| `tx <search>` | Generating command: runs a search over compact events as if on the original lines (see Usage) |
+| `tenxsearch searchstring="..."` | The same command, with the search in one quoted option |
 | `appserver/static/dashboard.js` + `javascript/search/tenx_search_hook.js` | Loaded on every classic dashboard in an app that carries `dashboard.js`; routes panel searches through `/tenx-search` |
 | `/tenx-search` REST endpoint | Rewrites a search and returns an ordinary job id; what the dashboard hook calls |
 
@@ -156,7 +157,8 @@ The `tenx_dml` collection stores parsed template data with fields:
 
 | Script | Purpose |
 |--------|---------|
-| `tenxsearch.py` | The `tenxsearch` generating command |
+| `tenxsearch.py` | The `tenxsearch` generating command, and the search rewrite `tx` shares |
+| `tx.py` | The `tx` generating command |
 | `tenxrecompile.py` | The `tenxrecompile` command, run every 15 minutes by the Recompile Compiled Alerts saved search |
 | `tenx_alert_recompile.py` | Recompiles managed alerts, each written back to its owner |
 | `tenx_search_builder.py` | Compiles a user search into a search over compact events |
@@ -217,7 +219,7 @@ tenx-for-splunk/
 │   ├── alert_actions.conf       # Alert action definition
 │   ├── app.conf                 # App metadata
 │   ├── collections.conf         # KV store schema
-│   ├── commands.conf            # The tenxsearch and tenxrecompile commands
+│   ├── commands.conf            # The tx, tenxsearch and tenxrecompile commands
 │   ├── macros.conf              # SPL macros
 │   ├── props.conf               # Sourcetype definitions
 │   ├── restmap.conf, web.conf   # The /tenx-search and /tenx-alert endpoints
@@ -331,16 +333,18 @@ live in the KV Store. Two paths put them back.
 carries it and routes the panel's search through the app's REST endpoint. Panels keep
 their SPL. To cover another app's dashboards, copy the file into that app's
 `appserver/static/` and restart. The search bar and Dashboard Studio load no app
-JavaScript; use the `tenxsearch` command there.
+JavaScript; use the `tx` command there.
 
-**Everywhere else.** Wrap the search in the `tenxsearch` command:
+**Everywhere else.** Start the search with `| tx`:
 
 ```spl
-| tenxsearch searchstring="index=myindex sourcetype=tenx_encoded error"
+| tx index=myindex sourcetype=tenx_encoded "payment failed" NOT retry
 ```
 
-Escape a quoted phrase inside the wrapper: `searchstring="index=myindex \"payment failed\""`.
-The command runs in the search bar, saved searches, alerts and the REST API.
+Everything after `tx` is the search, written as it would be on the original data. The
+command runs in the search bar, saved searches, alerts and the REST API.
+`| tenxsearch searchstring="..."` is the same command with the search in one quoted option,
+and saved searches written that way keep working.
 
 Both paths resolve each word against the templates, select the compact events whose
 template text or variable values carry it, expand them, and re-apply the search. `NOT`,
@@ -355,8 +359,8 @@ by piece, since the pipeline stores it in pieces.
   search with no keywords returns compact `~hash,...` rows. Keep compact indexes out of
   default index sets and name them in searches.
 - A search that cannot be rewritten is refused. The job fails with a message, and a
-  dashboard panel shows it in place of a number. The rewrite refuses one shape: a sourcetype
-  inside an OR, `sourcetype=x OR host=y`.
+  dashboard panel shows it in place of a number. The rewrite refuses two shapes: a sourcetype
+  inside an OR, `sourcetype=x OR host=y`, and a quoted phrase that contains an escaped quote.
 - A word matching more than 25,000 templates is dropped from the prefilter, so the search
   scans the sourcetype and checks that word after expansion. A word whose dictionary lookup
   does not finish inside the search's 30-second lookup budget is dropped the same way.
@@ -366,7 +370,7 @@ by piece, since the pipeline stores it in pieces.
 | path | time |
 |------|------|
 | Dashboard panel, REST endpoint | 1 to 3.5 s |
-| `tenxsearch` | 21 s |
+| `tx` or `tenxsearch` | 21 s |
 
 A generating command writes every event out itself, which costs about a millisecond per
 event on top of a two-second floor. Alerts avoid it: the **Compile Alert** view stores
