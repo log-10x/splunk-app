@@ -82,11 +82,10 @@ class TestEventTime:
 		expr = ingest_eval()
 		assert 'time() - 2000*86400' in expr and 'time() + 2*86400' in expr
 
-	def test_the_working_fields_are_removed(self):
-		expr = ingest_eval()
-		for field in set(re.findall(r'\b(tenx_t_\w+)=', expr)):
-			assert field + ':=null()' in expr
-
+	def test_only_time_is_assigned(self):
+		# A working field assigned in INGEST_EVAL is licence-metered even when removed.
+		assigned = re.findall(r'(?:^|,\s*)([A-Za-z_]\w*)\s*:?=(?!=)', ingest_eval())
+		assert assigned == ['_time']
 
 MACROS = ('tenx-inflate', 'tenx-inflate-debug')
 HOUR_DIRECTIVES = ('%H', '%I', '%M', '%S', '%p')
