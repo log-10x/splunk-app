@@ -20,7 +20,8 @@ mkdir -p "$OUT"
 dx(){ timeout 900 docker exec "$@"; }
 sp(){ dx -u splunk $C /opt/splunk/bin/splunk "$@"; }
 q(){ sp search "$1" -app tenx-for-splunk -auth "admin:$PASS" -maxout 0 -preview false "${@:2}" 2>/dev/null; }
-count(){ q "| tstats count where index=$1" | tr -dc '0-9'; }
+# tenx_dml by sourcetype: the app's scheduled Consume KV search writes its stash copies there too.
+count(){ if [ "$1" = tenx_dml ]; then q "| tstats count where index=tenx_dml sourcetype=tenx_dml_raw_json" | tr -dc '0-9'; else q "| tstats count where index=$1" | tr -dc '0-9'; fi; }
 say(){ printf '\n=== %s\n' "$*"; }
 up(){ until dx -u splunk $C /opt/splunk/bin/splunk status 2>/dev/null | grep -q "splunkd is running"; do sleep 10; done; }
 

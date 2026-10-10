@@ -121,7 +121,8 @@ parsed. Searches and alerts over a time range select late and replayed logs by t
 the line. A timestamp more than 2,000 days old or more than 2 days ahead, Splunk's own
 defaults for `MAX_DAYS_AGO` and `MAX_DAYS_HENCE`, keeps the index time.
 
-Measured on Splunk 10.4.3 with the OpenTelemetry demo sample, 157,228 compact events: of the
+Measured on Splunk 9.4.15, 10.4.3 and 10.6.0.5, the same on each, with the OpenTelemetry demo
+sample, 157,228 compact events: of the
 134,668 whose original line carries a timestamp Splunk recognizes, 134,340 get that time as
 `_time` to the second and 133,658 to the millisecond. The other 328 are lines without a full
 date, which the Receiver and Splunk complete differently (glog lines carry no year, and three
@@ -133,7 +134,7 @@ The transform is a parsing setting, so it runs where compact events are parsed (
 ### Timestamps in expanded lines
 
 Every timestamp renders in UTC for every viewer, at every hour of the year. Checked on Splunk
-10.4.3 with 10,708 events at 2,677 instants, among them every ten minutes for 14 hours either
+9.4.15, 10.4.3 and 10.6.0.5 with 10,708 events at 2,677 instants, among them every ten minutes for 14 hours either
 side of the 2026 daylight-saving transitions, expanded by viewers in eight zones (UTC,
 America/New_York, Europe/London, Australia/Sydney, Pacific/Chatham, America/Adak,
 Asia/Kolkata, Etc/GMT-4): every line is the UTC text. A zone in the timestamp format prints
