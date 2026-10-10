@@ -2,7 +2,7 @@
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-Search and visualize [compact](https://doc.log10x.com/run/transform/#compact) events in Splunk with zero data loss. This open-source [Log10x](https://www.log10x.com/?utm_source=github&utm_medium=readme&utm_campaign=splunk-app&utm_content=hero) app expands compact events back to their original lines at search time, while the ingested volume, and with it the license bill, stays reduced. It runs on Splunk Enterprise 9.4 through 10.4, and the package passes AppInspect's Splunk Cloud checks.
+Search and visualize [compact](https://doc.log10x.com/run/transform/#compact) events in Splunk with zero data loss. This open-source [Log10x](https://www.log10x.com/?utm_source=github&utm_medium=readme&utm_campaign=splunk-app&utm_content=hero) app expands compact events back to their original lines at search time, while the ingested volume, and with it the license bill, stays reduced. It runs on Splunk Enterprise 9.4 through 10.6, and the package passes AppInspect's Splunk Cloud checks.
 
 > **Blog:** [Search compact logs in Splunk using the 10x app](https://www.log10x.com/blog/cutting-splunk-log-storage/?utm_source=github&utm_medium=readme&utm_campaign=splunk-app&utm_content=blog). How Splunk stores fewer bytes and still returns the original log lines.
 
@@ -130,7 +130,7 @@ its precision, from milliseconds to nanoseconds, which one `TIME_FORMAT` cannot 
 
 | Requirement | Description |
 |-------------|-------------|
-| Splunk Enterprise | 9.4 through 10.4 |
+| Splunk Enterprise | 9.4 through 10.6 |
 | Admin Access | Required for app installation and KV Store setup |
 
 ### Step 1: Install Splunk App
