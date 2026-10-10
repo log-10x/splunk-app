@@ -113,16 +113,31 @@ backfill search in Step 5. A Receiver's clock zone leaves no trace in the data, 
 
 ### Event time on compact events
 
-A compact event's `_time` is the time Splunk indexed it, not the time in the original log
-line. Measured on Splunk 10.4.3: `_time` equals `_indextime` for every event in the
-compact index.
+A compact event's `_time` is the time in its original log line wherever the template has a
+timestamp slot, and the time Splunk indexed it where there is none. The Receiver writes the
+timestamp as an epoch in the event's first variable, 13 digits for milliseconds or 19 for
+nanoseconds, and the `tenx-event-time` transform sets `_time` from it while the event is
+parsed. Searches and alerts over a time range select late and replayed logs by the time in
+the line. A timestamp more than 2,000 days old or more than 2 days ahead, Splunk's own
+defaults for `MAX_DAYS_AGO` and `MAX_DAYS_HENCE`, keeps the index time.
 
-This matters when you search by time range. A search over the last hour selects events
-that arrived in the last hour, and the lines they expand to may carry any timestamp. The
-original time is in the event's first variable, as an epoch, and the expanded text shows it.
+Measured on Splunk 10.4.3 with the OpenTelemetry demo sample, 157,228 compact events: of the
+134,668 whose original line carries a timestamp Splunk recognizes, 134,340 get that time as
+`_time` to the second and 133,658 to the millisecond. The other 328 are lines without a full
+date, which the Receiver and Splunk complete differently (glog lines carry no year, and three
+lines carry only a time of day), and three lines where Splunk reads a number as a time. Where
+a template's timestamp stops at whole seconds, `_time` does too.
 
-`_time` stays at index time because templates vary in whether they carry a timestamp and in
-its precision, from milliseconds to nanoseconds, which one `TIME_FORMAT` cannot express.
+The transform is a parsing setting, so it runs where compact events are parsed (see Step 1).
+
+### Timestamps in expanded lines
+
+Every timestamp renders in UTC for every viewer, at every hour of the year. Checked on Splunk
+10.4.3 with 10,708 events at 2,677 instants, among them every ten minutes for 14 hours either
+side of the 2026 daylight-saving transitions, expanded by viewers in eight zones (UTC,
+America/New_York, Europe/London, Australia/Sydney, Pacific/Chatham, America/Adak,
+Asia/Kolkata, Etc/GMT-4): every line is the UTC text. A zone in the timestamp format prints
+`+0000` or `UTC`.
 
 ## Quickstart
 
@@ -142,6 +157,10 @@ git clone https://github.com/log-10x/splunk-app.git
 cp -r splunk-app/tenx-for-splunk $SPLUNK_HOME/etc/apps/
 $SPLUNK_HOME/bin/splunk restart
 ```
+
+In a distributed deployment, install the app on the search heads and on the indexers or heavy
+forwarders that parse compact events. The compact sourcetype's parsing settings, `TRUNCATE` and
+the event time, apply on the instance that parses the data.
 
 ### Step 2: Create the Index and HEC Tokens
 

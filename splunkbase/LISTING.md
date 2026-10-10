@@ -83,7 +83,9 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 >   shapes: a sourcetype inside an OR with other terms, `sourcetype=x OR host=y`, and a quoted
 >   phrase that contains an escaped quote.
 > - Dashboard Studio loads no app JavaScript; its panels use the command.
-> - A compact event's `_time` is its index time; the original timestamp is in the expanded line.
+> - A compact event's `_time` is the time in its original line where the template has a
+>   timestamp, and its index time where it has none. The setting applies where events are
+>   parsed, so the app is installed on indexers or heavy forwarders as well as search heads.
 >
 > **Speed**, 20,000 expanded events on Splunk 10.4.3: about 3 seconds through a dashboard,
 > about 21 seconds through the command, which writes every event out itself.
@@ -160,7 +162,7 @@ Repository name: `log-10x/splunk-app`. Repository URL: https://github.com/log-10
 
 | Field | Value |
 |---|---|
-| Version | 1.1.4, read from the package |
+| Version | 1.1.5, read from the package |
 | Splunk platform compatibility | Splunk Enterprise 9.4, 10.0, 10.2, 10.4, 10.6 |
 | CIM | None |
 
@@ -175,6 +177,11 @@ Splunkbase requires a release to run on every version it names.
 **Release notes**
 
 Paste the block for the version being uploaded. Splunkbase keeps notes per release.
+
+1.1.5:
+
+> - A compact event's `_time` is now the time in its original log line wherever the template has a timestamp, so searches and alerts over a time range select late and replayed logs by their own time. Events from templates without a timestamp keep their index time. The setting applies where events are parsed: install the app on the indexers or heavy forwarders as well as on the search heads.
+> - Expanded timestamps render in UTC for every viewer at every hour of the year. Around a daylight-saving transition they could render an hour off for a viewer in a zone that observes one, and a zone in the timestamp format printed the viewer's offset; it now prints `+0000` or `UTC`.
 
 1.1.4:
 
@@ -224,6 +231,8 @@ Paste the block for the version being uploaded. Splunkbase keeps notes per relea
 | 1.1.4 `tx` on Splunk 10.4.3, the same 20,000 events | equals the expanded truth on 17 of 17 searches, among them a quoted phrase with `NOT` and a parenthesised group, quoted field values, a subsearch and a time modifier, and equals `tenxsearch` on the 9 run through both; a phrase containing an escaped quote is refused by both commands; `\| tx` with no search fails with a message |
 | 1.1.4 Recompile all managed alerts on Splunk 10.4.3: one alert saved as `\| tx ... \| stats count`, one as `\| tenxsearch ... \| stats count` | both converted to native SPL that ends in `\| stats count`, each returning 217, the expanded truth |
 | 1.1.4 on Splunk 10.6.0.5, fresh install: the E21 template set and 20,000 compact events through the HEC event endpoint, truth from the same events decoded by the engine | 2,991 of 2,991 copies written as `stash`, one template per event, longest 43,004 characters; 0 bytes metered for them while a control written the same way with an ordinary sourcetype is metered (445,251 bytes); `tx`, `tenxsearch` and the truth agree on 12 of 12 searches, among them a phrase with `NOT`, a parenthesised group, a field value, a time modifier and a subsearch; `\| tx` with no search and an escaped quote are refused with a message; a conflicting template leaves its 3,916 events compact with `hash-conflict`, the other 16,084 expand; `tests/live_endpoints.py` 3 of 3; Recompile all managed alerts converts a `\| tx` and a `\| tenxsearch` alert to native SPL ending in `\| stats count`, each returning 217, the truth |
+| 1.1.5 event time on Splunk 10.4.3: the OpenTelemetry demo sample, 157,228 compact events from engine 1.1.139, truth from Splunk's own timestamp extraction on the same lines indexed raw | of the 134,668 events whose original line carries a timestamp Splunk recognizes, 134,340 get that time as `_time` to the second and 133,658 to the millisecond (1.1.4: 0); the other 328 are lines without a full date (glog carries no year, three lines only a time of day) and three lines where Splunk reads a number as a time; events without a timestamp keep their index time; no field added to the index |
+| 1.1.5 timestamp rendering on Splunk 10.4.3: 10,708 events at 2,677 instants, every ten minutes for 14 hours either side of the 2026 daylight-saving transitions plus every six hours through 2026, four timestamp formats, viewers in UTC, America/New_York, Europe/London, Australia/Sydney, Pacific/Chatham, America/Adak, Asia/Kolkata and Etc/GMT-4 | every line the UTC text in every zone (1.1.4: an hour off at 54 instants for New York, 126 for Sydney, 160 for Chatham, 114 for Adak and 6 for London, and the viewer's offset printed for a zone in the format) |
 | 1.1.4 on Splunk 10.6.0.5: 1.1.3 from Splunkbase (sha256 fe0e2ba2...) installed and filled, then upgraded in place to 1.1.4 | re-sending all 2,991 templates marks none; 6 of 6 terms give the same count through `tenxsearch` on 1.1.3 and through `tx` and `tenxsearch` on 1.1.4, equal to the truth |
 | 1.1.4 as packaged, with the `tx` examples naming the compact sourcetype, on Splunk 10.6.0.5, fresh install | the search assistant shows `\| tx index=app_logs sourcetype=tenx_encoded "connection refused" NOT retry`, and `\| tx` with no search names the same form; 2,991 templates in the KV, 2,991 `stash` copies; `tx`, `tenxsearch` and the truth agree on 6 of 6 searches; AppInspect 4.3.1: 0 failures and 0 errors on the default, cloud, future, private_app, private_classic and private_victoria tag sets, the same results as the package before the change |
 | Unit tests, Python 3.9 and 3.13 | 327 pass |
