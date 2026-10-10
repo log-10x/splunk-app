@@ -113,13 +113,14 @@ backfill search in Step 5. A Receiver's clock zone leaves no trace in the data, 
 
 ### Event time on compact events
 
-A compact event's `_time` is the time in its original log line wherever the template has a
-timestamp slot, and the time Splunk indexed it where there is none. The Receiver writes the
-timestamp as an epoch in the event's first variable, 13 digits for milliseconds or 19 for
-nanoseconds, and the `tenx-event-time` transform sets `_time` from it while the event is
-parsed. Searches and alerts over a time range select late and replayed logs by the time in
-the line. A timestamp more than 2,000 days old or more than 2 days ahead, Splunk's own
-defaults for `MAX_DAYS_AGO` and `MAX_DAYS_HENCE`, keeps the index time.
+A compact event's `_time` is the time in its original log line wherever the Receiver wrote
+one, and the time Splunk indexed it otherwise. The Receiver writes a template's timestamp as
+an epoch in the event's first variable, 13 digits for milliseconds or 19 for nanoseconds.
+The `tenx-event-time` transform sets `_time` from a first variable of that shape while the
+event is parsed, when it falls inside Splunk's own timestamp window: 2,000 days back and 2
+days ahead, the defaults for `MAX_DAYS_AGO` and `MAX_DAYS_HENCE`. Any other first variable
+keeps the index time. Searches and alerts over a time range select late and replayed logs by
+the time in the line.
 
 Measured on Splunk 9.4.15, 10.4.3 and 10.6.0.5, the same on each, with the OpenTelemetry demo
 sample, 157,228 compact events: of the
