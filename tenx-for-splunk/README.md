@@ -1,6 +1,6 @@
 # Log10x App
 
-Search-time expansion of 10x compact log events, for Splunk Enterprise 9.4 through 10.4. The package passes AppInspect's Splunk Cloud checks. 10x replaces repetitive patterns with compact template hashes, cutting stored volume while maintaining full searchability.
+Search-time expansion of 10x compact log events, for Splunk Enterprise 9.4 through 10.6. The package passes AppInspect's Splunk Cloud checks. 10x replaces repetitive patterns with compact template hashes, cutting stored volume while maintaining full searchability.
 
 ## Table of Contents
 
@@ -178,7 +178,7 @@ The `tenx_dml` collection stores parsed template data with fields:
 
 ### Prerequisites
 
-- Splunk Enterprise 9.4 through 10.4
+- Splunk Enterprise 9.4 through 10.6
 - Python 3.9 or later, as shipped with those versions of Splunk
 - Admin access to install apps
 
