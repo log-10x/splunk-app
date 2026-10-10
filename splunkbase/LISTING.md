@@ -27,29 +27,11 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 
 **Summary**
 
-> With the Log10x App, Splunk can index compact log events and still search, chart and alert
-> on the original lines. The 10x Receiver stores each event as a template hash plus the values
-> that change, so a stream of repeated patterns takes less of the license, and the record's
-> metadata travels as indexed fields. On 20,000 Kubernetes records of the OpenTelemetry demo,
-> Splunk's licence meter recorded 59% fewer bytes, compact events and templates counted
-> together, than for the same records sent the way the OpenTelemetry Collector sends them by
-> default.
-> The same license then holds more: sources that were sampled, filtered or kept out of Splunk
-> to stay under the limit can come back, or the license can be smaller.
+> With the Log10x App, Splunk can index compact log events and still search, chart and alert on the original lines. The 10x Receiver stores each event as a template hash plus the values that change, so a stream of repeated patterns takes less of the license. On the OpenTelemetry demo, Splunk's license meter counted 63.91% fewer bytes, encoded events and templates included, and every line expanded back byte-identical with the Receiver settings in the installation steps (measurement: https://github.com/log-10x/benchmarks/tree/main/splunk-license). The same license then holds more: sources that were sampled, filtered or kept out of Splunk to stay under the limit can come back, or the license can be smaller.
 >
-> Classic dashboards keep their SPL: the browser sends each panel's search to the app, which
-> rewrites it on the server. From the search bar, saved searches, alerts and the REST API, a
-> search starts with the app's `tx` command, naming the compact sourcetype: `| tx index=app_logs sourcetype=tenx_encoded "payment failed"`. An alert created in the app's Compile Alert
-> view is compiled once into a native saved search, so the scheduler runs no Python. NOT, OR,
-> groups, phrases, field conditions, and values such as IP addresses and hostnames behave as
-> they do on the original data.
+> Classic dashboards keep their SPL: the browser sends each panel's search to the app, which rewrites it on the server. From the search bar, saved searches, alerts and the REST API, a search is wrapped in the tx command (tenxsearch also works). An alert created in the app's Compile Alert view is compiled once into a native saved search, so the scheduler runs no Python. NOT, OR, groups, phrases, field conditions, and values such as IP addresses and hostnames behave as they do on the original data.
 >
-> The 10x Receiver produces compact events, and it is free on up to 10 nodes
-> (https://www.log10x.com/pricing). No sign-up is
-> required to evaluate it: with no license token it runs the full product for 30 days on up to
-> 10 nodes, air-gapped, and a free license removes the time limit
-> (https://doc.log10x.com/manage/license/). The app
-> itself is open source under the MIT license.
+> The 10x Receiver produces compact events, and it is free on up to 10 nodes (https://www.log10x.com/pricing). No sign-up is required to evaluate it: with no license token it runs the full product for 30 days on up to 10 nodes, air-gapped, and a free license removes the time limit (https://doc.log10x.com/manage/license/). The app itself is open source under the MIT license.
 
 **Short description**
 
