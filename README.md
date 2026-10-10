@@ -129,7 +129,9 @@ date, which the Receiver and Splunk complete differently (glog lines carry no ye
 lines carry only a time of day), and three lines where Splunk reads a number as a time. Where
 a template's timestamp stops at whole seconds, `_time` does too.
 
-The transform is a parsing setting, so it runs where compact events are parsed (see Step 1).
+The transform adds no licence-metered bytes: in the E21 licence run on Splunk 10.4.3 the
+compact events metered exactly their raw text, 74,338,244 bytes, with it on. It is a parsing
+setting, so it runs where compact events are parsed (see Step 1).
 
 ### Timestamps in expanded lines
 
