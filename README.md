@@ -31,7 +31,11 @@ Classic dashboard panel  -->  dashboard.js hook  --\
 Search bar | tx  ----------------------------------/
 ```
 
-The dashboard path is the faster one: on Splunk 10.4.3, 20,000 expanded events return in about 5 seconds through a dashboard and about 10 seconds through the command, which writes every event out itself. The macro runs natively: a keyword search returns in under a second, and all 20,000 events in under 3 seconds.
+The dashboard path is the faster one: on Splunk 10.4.3, 20,000 expanded events return in about 5 seconds through a dashboard and about 10 seconds through the command, which writes every event out itself. The macro runs natively: a keyword search returns in about a second, and all 20,000 events in under 3 seconds.
+
+The macros split the words into pieces at anything that is not a letter or a digit and look each piece up in the templates, so a word that lives in a template's constant text is found as well as a word that is a value. Pieces a rendered timestamp could print (one or two digits, a year, an epoch, month and day names) and a word after `NOT` are skipped, and a search made only of such pieces expands every event in range before filtering. `tenx-lines` takes words only; a `field=value` term needs `tenx-search`, in the named form `` `tenx-search(terms="status=500 timeout")` ``, since Splunk reads a bare `=` in a macro call as a named argument.
+
+Three things to set up around them. Every role that searches compact data needs read access to the templates index (`index=tenx_dml` by default): without it a template word returns nothing and no message. The `tenx-templates` macro and `dest_dml_index` in `tenx_config.conf` must name the same index. Sources read by an Enterprise Security add-on, and Cisco sourcetypes, stay raw: the add-ons extract from the raw event before anything can expand a compact one, and Splunk's Cisco rate needs the Cisco sourcetype.
 
 Scheduled alerts run server-side, where the browser hook never fires. An alert created in the **Compile Alert** view, or through the `/tenx-alert` endpoint, is **compiled once at save time** into native SPL, a template hash prefilter plus the inflate macro, so the scheduler runs an ordinary saved search. This is handled by the `/tenx-alert` REST endpoint and the **Compile Alert** view (with a recompile pass that converts `| tx` and `| tenxsearch` alerts and refreshes prefilters as templates appear). See [SAVE_TIME_ALERTS.md](SAVE_TIME_ALERTS.md).
 
