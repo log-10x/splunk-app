@@ -10,7 +10,7 @@ To find optimization opportunities in your existing Splunk data, point the [Log1
 
 ## How It Works
 
-A [compact event](https://doc.log10x.com/run/transform/#compact) carries a template hash and its variable values; the constant words live in the KV Store, and the app puts them back at search time. Classic dashboards keep their panel SPL unchanged: `dashboard.js` routes each panel's search through the app's REST endpoint. Splunk's search page loads no app JavaScript, so a query in the search bar, a saved search or the REST API starts with the app's `tx` command: `| tx index=app_logs error`. An alert created in the app's **Compile Alert** view compiles once into a native saved search.
+A [compact event](https://doc.log10x.com/run/transform/#compact) carries a template hash and its variable values; the constant words live in the KV Store, and the app puts them back at search time. Classic dashboards keep their panel SPL unchanged: `dashboard.js` routes each panel's search through the app's REST endpoint. Splunk's search page loads no app JavaScript, so a query in the search bar, a saved search or the REST API starts with the app's `tx` command, `| tx index=app_logs error`, or wraps its words in the `tenx-search` macro, which runs the same search natively with no custom command: ``index=app_logs `tenx-search(error)` ``. `tenx-lines` is the same macro without the fields inside the expanded line, for searches that only list events. An alert created in the app's **Compile Alert** view compiles once into a native saved search.
 
 ### Ingestion Flow
 
@@ -31,7 +31,7 @@ Classic dashboard panel  -->  dashboard.js hook  --\
 Search bar | tx  ----------------------------------/
 ```
 
-The dashboard path is the faster one: about 3 seconds for 20,000 expanded events, against about 21 seconds through the command, which writes every event out itself.
+The dashboard path is the faster one: on Splunk 10.4.3, 20,000 expanded events return in about 5 seconds through a dashboard and about 10 seconds through the command, which writes every event out itself. The macro runs natively: a keyword search returns in under a second, and all 20,000 events in under 3 seconds.
 
 Scheduled alerts run server-side, where the browser hook never fires. An alert created in the **Compile Alert** view, or through the `/tenx-alert` endpoint, is **compiled once at save time** into native SPL, a template hash prefilter plus the inflate macro, so the scheduler runs an ordinary saved search. This is handled by the `/tenx-alert` REST endpoint and the **Compile Alert** view (with a recompile pass that converts `| tx` and `| tenxsearch` alerts and refreshes prefilters as templates appear). See [SAVE_TIME_ALERTS.md](SAVE_TIME_ALERTS.md).
 
