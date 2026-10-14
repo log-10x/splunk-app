@@ -31,7 +31,7 @@ Classic dashboard panel  -->  dashboard.js hook  --\
 Search bar | tx  ----------------------------------/
 ```
 
-The dashboard path is the faster one: about 3 seconds for 20,000 expanded events, against about 21 seconds through the command, which writes every event out itself.
+The dashboard path is the faster one. On Splunk 10.4.3, 20,000 expanded events return in about 5 seconds through a dashboard and about 10 seconds through the command, which writes every event out itself; a keyword search returns in about 2 and 3 seconds.
 
 Scheduled alerts run server-side, where the browser hook never fires. An alert created in the **Compile Alert** view, or through the `/tenx-alert` endpoint, is **compiled once at save time** into native SPL, a template hash prefilter plus the inflate macro, so the scheduler runs an ordinary saved search. This is handled by the `/tenx-alert` REST endpoint and the **Compile Alert** view (with a recompile pass that converts `| tx` and `| tenxsearch` alerts and refreshes prefilters as templates appear). See [SAVE_TIME_ALERTS.md](SAVE_TIME_ALERTS.md).
 

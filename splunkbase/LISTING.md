@@ -69,8 +69,9 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 >   timestamp, and its index time where it has none. The setting applies where events are
 >   parsed, so the app is installed on indexers or heavy forwarders as well as search heads.
 >
-> **Speed**, 20,000 expanded events on Splunk 10.4.3: about 3 seconds through a dashboard,
-> about 21 seconds through the command, which writes every event out itself.
+> **Speed**, 20,000 expanded events on Splunk 10.4.3: about 5 seconds through a dashboard,
+> about 10 seconds through the command, which writes every event out itself; a keyword
+> search returns in about 2 and 3 seconds.
 >
 > **Network**: the app makes no outbound calls. It talks only to the local splunkd.
 >
