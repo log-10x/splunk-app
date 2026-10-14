@@ -31,7 +31,7 @@ The app provides the infrastructure to:
 1. **Receive** template definitions from the 10x pipeline
 2. **Store** parsed template data in a KV store for efficient lookup
 3. **Inflate** compact events back to their original form at search time
-4. **Search** compact data with standard SPL: classic dashboards unchanged, the search bar through the `tx` command
+4. **Search** compact data by what the lines say: the `tx` macro in front of an ordinary search, and classic dashboards unchanged
 
 ### Reduction Example
 
@@ -143,13 +143,17 @@ The `tenx_dml` collection stores parsed template data with fields:
 | `tenx-inflate` | Main inflation macro: reconstructs original events |
 | `tenx-inflate-debug` | Same as above but keeps intermediate fields for debugging |
 | `tenx-message(1)` | Utility macro to display messages in search results |
+| `tx` | Written in front of a search: searches compact events by what the original lines say (see Usage) |
+| `tenx-events` | Where the compact events are: the index and sourcetype `tx` and the dashboards read |
+| `tenx-templates` | Where the searchable copies of the templates are, for `tx` |
 
 #### Search Surfaces
 
 | Surface | Purpose |
 |---------|---------|
-| `tx <search>` | Generating command: runs a search over compact events as if on the original lines (see Usage) |
-| `tenxsearch searchstring="..."` | The same command, with the search in one quoted option |
+| `` `tx` <search> `` | Macro: searches compact events by what the original lines say, from the search bar, Dashboard Studio, saved searches and alerts (see Usage) |
+| `tenxprefilter` | Generating command the `tx` macro runs once per search, in its subsearch, to select the compact events to expand; not typed |
+| `\| tx <search>`, `\| tenxsearch searchstring="..."` | Generating commands that run a rewritten search and write every event out through Python; kept so saved searches written with them keep working |
 | `appserver/static/dashboard.js` + `javascript/search/tenx_search_hook.js` | Loaded on every classic dashboard in an app that carries `dashboard.js`; routes panel searches through `/tenx-search` |
 | `/tenx-search` REST endpoint | Rewrites a search and returns an ordinary job id; what the dashboard hook calls |
 
@@ -157,7 +161,9 @@ The `tenx_dml` collection stores parsed template data with fields:
 
 | Script | Purpose |
 |--------|---------|
-| `tenxsearch.py` | The `tenxsearch` generating command, and the search rewrite `tx` shares |
+| `tenx_prefilter.py` | The `tenxprefilter` command the `tx` macro runs |
+| `tenx_prefilter_parser.py` | Reads the words after `tx` as a search and builds the prefilter from them |
+| `tenxsearch.py` | The `tenxsearch` generating command, and the search rewrite the `tx` command shares |
 | `tx.py` | The `tx` generating command |
 | `tenxrecompile.py` | The `tenxrecompile` command, run every 15 minutes by the Recompile Compiled Alerts saved search |
 | `tenx_alert_recompile.py` | Recompiles managed alerts, each written back to its owner |
@@ -219,8 +225,8 @@ tenx-for-splunk/
 │   ├── alert_actions.conf       # Alert action definition
 │   ├── app.conf                 # App metadata
 │   ├── collections.conf         # KV store schema
-│   ├── commands.conf            # The tx, tenxsearch and tenxrecompile commands
-│   ├── macros.conf              # SPL macros
+│   ├── commands.conf            # The tenxprefilter, tx, tenxsearch and tenxrecompile commands
+│   ├── macros.conf              # SPL macros, including tx
 │   ├── props.conf               # Sourcetype definitions
 │   ├── restmap.conf, web.conf   # The /tenx-search and /tenx-alert endpoints
 │   ├── savedsearches.conf       # Consume KV, Backfill KV, Recompile Compiled Alerts
@@ -327,54 +333,73 @@ Naming the index makes every panel faster.
 ### Searching Compact Events
 
 A compact event holds a template hash and the event's variable values; the constant words
-live in the KV Store. Two paths put them back.
+live in the KV Store. A word that exists only in a template is not in the index, so a plain
+keyword search over compact data finds the events where the word is a value and misses the
+others. Search compact data with the `tx` macro.
+
+**The `tx` macro**, in the search bar, Dashboard Studio panels, saved searches and alerts.
+Write it in front of the search terms, after the index and any metadata or time terms:
+
+```spl
+index=myindex earliest=-4h `tx` "payment failed" NOT retry status=500 | stats count by host
+```
+
+The words after `tx` are ordinary SPL, applied to the expanded lines. Phrases,
+`field=value`, `field IN (...)`, wildcards, `TERM()`, `CASE()`, `NOT`, `OR`, `AND` and
+parentheses behave as on the original data, with Splunk's precedence, and the fields inside
+an expanded JSON line are extracted. Searching an IP address, a hostname or an ID works the
+same way: the words go after `tx`, whether they are values or template text.
 
 **Classic dashboards.** `dashboard.js` loads on every classic dashboard in the app that
 carries it and routes the panel's search through the app's REST endpoint. Panels keep
 their SPL. To cover another app's dashboards, copy the file into that app's
-`appserver/static/` and restart. The search bar and Dashboard Studio load no app
-JavaScript; use the `tx` command there.
+`appserver/static/` and restart.
 
-**Everywhere else.** Start the search with `| tx`:
+**Rules.**
 
-```spl
-| tx index=myindex sourcetype=tenx_encoded "payment failed" NOT retry
-```
+- Time modifiers (`earliest=`, `latest=`) go before `tx`. After it they would match no
+  event, so the search stops with a message saying so.
+- A comma outside quotes after `tx` is matched literally by Splunk, so the search stops with
+  a message. Remove the comma, or put the text in quotes.
+- The index, sourcetype, host and the forwarder's indexed fields narrow what is read when
+  they come before `tx`. After it they filter the expanded events, which gives the same
+  result more slowly.
+- `tx` inside another subsearch (`append`, `join`) or wrapped in another macro cannot read
+  its own words. It then expands every compact event in range and applies the words after,
+  with a warning: the same result, more slowly.
+- A compact event is the event the 10x engine formed. Lines without a timestamp of their
+  own, such as the lines of a stack trace, join the line before them, so a stack trace is
+  one event, a count counts events, and words joined with AND can match on different lines
+  of one event.
 
-Everything after `tx` is the search, written as it would be on the original data. The
-command runs in the search bar, saved searches, alerts and the REST API.
-`| tenxsearch searchstring="..."` is the same command with the search in one quoted option,
-and saved searches written that way keep working.
+**How `tx` chooses the events to expand.** Its subsearch runs `tenxprefilter` once per
+search. The command reads the search's own text, takes the words after `tx`, finds which
+templates carry each word, and selects the compact events that carry each word as a value
+or through their template. A word a rendered timestamp could print, a word with a character
+outside a-z and 0-9, and a word carried by more than 5,000 templates select nothing on their
+own, and a `NOT`, a field comparison, or an `OR` with any of these selects every event in
+range. The search after `tx` then applies the full terms, so the selection may be wider than
+the result, never narrower.
 
-Both paths resolve each word against the templates, select the compact events whose
-template text or variable values carry it, expand them, and re-apply the search. `NOT`,
-`OR`, `AND`, parenthesised groups, wildcards, field conditions including `IN (...)`,
-inline `earliest=`/`latest=` and a trailing pipeline behave as they do on the original
-data, with Splunk's precedence. An IP address, hostname or region name is matched piece
-by piece, since the pipeline stores it in pieces.
+**The `tx` and `tenxsearch` commands.** `| tx index=myindex sourcetype=tenx_encoded error`
+and `| tenxsearch searchstring="..."` run a rewritten search and write every event out
+through Python, which is several times slower than the macro. They are kept so saved
+searches written with them keep working.
 
 **Search behavior.**
 
-- Outside a classic dashboard, a keyword search without the command returns no events, and a
-  search with no keywords returns compact `~hash,...` rows. Keep compact indexes out of
-  default index sets and name them in searches.
-- A search that cannot be rewritten is refused. The job fails with a message, and a
-  dashboard panel shows it in place of a number. The rewrite refuses two shapes: a sourcetype
-  inside an OR, `sourcetype=x OR host=y`, and a quoted phrase that contains an escaped quote.
-- A word matching more than 25,000 templates is dropped from the prefilter, so the search
-  scans the sourcetype and checks that word after expansion. A word whose dictionary lookup
-  does not finish inside the search's 30-second lookup budget is dropped the same way.
+- Without `tx`, a keyword search over compact data returns only the events where the
+  word is a value, and a search with no keywords returns compact `~hash,...` rows. Keep
+  compact indexes out of default index sets and name them in searches.
+- A template appears in the dictionary when the Consume KV search stores it, every five
+  minutes. Until then its events stay compact, and a search for a word of that template does
+  not select them.
 
-**Speed**, 20,000 expanded events:
-
-| path | time |
-|------|------|
-| Dashboard panel, REST endpoint | 1 to 3.5 s |
-| `tx` or `tenxsearch` | 21 s |
-
-A generating command writes every event out itself, which costs about a millisecond per
-event on top of a two-second floor. Alerts avoid it: the **Compile Alert** view stores
-native SPL that the scheduler runs directly, see [SAVE_TIME_ALERTS.md](https://github.com/log-10x/splunk-app/blob/main/SAVE_TIME_ALERTS.md).
+**Speed.** On one laptop running Splunk 10.4.3, a `tx` search over 157,228 compact events
+returned in about 1.5 to 4 seconds, where the same search over the raw lines took under a
+second. About 0.3 seconds of each is the `tenxprefilter` command and about 0.4 seconds is
+Splunk starting it. The `| tx` command, which writes every event out itself, took two to five
+times as long as the macro.
 
 ### Basic Expansion
 
@@ -659,6 +684,16 @@ Templates indexed before the app was installed are loaded only by the
    | spath
    | table templateHash, template
    ```
+
+### A `tx` Search Returns No Results
+
+- **The time range comes after `tx`.** Move `earliest=` and `latest=` before it; in the
+  search bar the job stops with a message that says so.
+- **The search goes through the REST export endpoint.** `/services/search/jobs/export`
+  drops the message of a command that fails inside a subsearch and returns no rows. Run the
+  search through `/services/search/jobs` to read the message.
+- **The words belong to a template stored in the last few minutes.** Wait for the next
+  Consume KV run, or run it by hand (Settings > Searches, reports, and alerts).
 
 ### Expansion Returns Empty or Wrong Results
 
