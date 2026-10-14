@@ -51,7 +51,21 @@ class TestDashboardsFindCompactEvents:
 	def test_the_macro_the_dashboards_read_is_defined(self):
 		macros = conf('macros.conf')
 		assert macros.has_section('tenx-events')
-		assert 'sourcetype=tenx_encoded' in macros.get('tenx-events', 'definition')
+		assert 'sourcetype::tenx_encoded' in macros.get('tenx-events', 'definition')
+
+	def test_tx_and_what_it_calls_are_shared_with_every_app(self):
+		macros = conf('macros.conf')
+		assert macros.has_section('tx') and macros.has_section('tenx-templates')
+		meta = open(os.path.join(APP, 'metadata', 'default.meta'), encoding='utf-8').read()
+		for name in ('tx', 'tenx-events', 'tenx-templates', 'tenx-inflate'):
+			assert re.search(r'\[macros/%s\]\naccess = [^\n]*\nexport = system' % re.escape(name), meta), name
+
+	def test_the_command_tx_calls_is_declared_and_kept_out_of_the_assistant(self):
+		commands = conf('commands.conf')
+		assert commands.get('tenxprefilter', 'filename') == 'tenx_prefilter.py'
+		bnf = conf('searchbnf.conf')
+		assert bnf.get('tenxprefilter-command', 'usage') == 'private'
+		assert bnf.get('tx-command', 'usage') == 'private' and bnf.get('tenxsearch-command', 'usage') == 'private'
 
 	def test_every_compact_panel_reads_the_macro(self):
 		for f in ('tenx_dashboard.xml', 'tenx_diagnostics.xml'):

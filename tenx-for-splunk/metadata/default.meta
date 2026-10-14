@@ -46,6 +46,18 @@ export = system
 access = read : [ * ], write : [ admin, sc_admin, power ]
 export = system
 
+[macros/tx]
+access = read : [ * ], write : [ admin, sc_admin, power ]
+export = system
+
+[macros/tenx-events]
+access = read : [ * ], write : [ admin, sc_admin, power ]
+export = system
+
+[macros/tenx-templates]
+access = read : [ * ], write : [ admin, sc_admin, power ]
+export = system
+
 [collections/tenx_dml]
 access = read : [ * ], write : [ admin, sc_admin, power ]
 export = system
