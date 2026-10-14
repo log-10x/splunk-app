@@ -59,19 +59,24 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 >
 > **Search coverage**
 >
-> - Outside a classic dashboard, a search without the `tx` command returns zero events or
->   unexpanded `~hash,...` rows, not an error.
-> - A search the app cannot rewrite is refused with a message. The rewrite refuses two
->   shapes: a sourcetype inside an OR with other terms, `sourcetype=x OR host=y`, and a quoted
+> - Outside a classic dashboard, a keyword search without `tx` returns only the events where
+>   the word is a value, and a search with no keywords returns compact `~hash,...` rows.
+> - `tx` stops a search with a message when `earliest=` or `latest=` comes after it, or when a
+>   comma after it is outside quotes: Splunk would match the first against no event and the
+>   second literally.
+> - Classic dashboards and the `| tx` command rewrite the search, and refuse two shapes with a
+>   message: a sourcetype inside an OR with other terms, `sourcetype=x OR host=y`, and a quoted
 >   phrase that contains an escaped quote.
-> - Dashboard Studio loads no app JavaScript; its panels use the command.
+> - Dashboard Studio loads no app JavaScript; its panels use the `tx` macro, which passes
+>   Splunk's risky-command check.
 > - A compact event's `_time` is the time in its original line where the template has a
 >   timestamp, and its index time where it has none. The setting applies where events are
 >   parsed, so the app is installed on indexers or heavy forwarders as well as search heads.
 >
-> **Speed**, 20,000 expanded events on Splunk 10.4.3: about 5 seconds through a dashboard,
-> about 10 seconds through the command, which writes every event out itself; a keyword
-> search returns in about 2 and 3 seconds.
+> **Speed**, on one laptop running Splunk 10.4.3: a `tx` search over 157,228 compact events
+> returns in about 1.5 to 4 seconds, where the same search over the raw lines takes under a
+> second; the `| tx` command, which writes every event out itself, takes two to five times as
+> long. A classic dashboard expands 20,000 events in about 5 seconds.
 >
 > **Network**: the app makes no outbound calls. It talks only to the local splunkd.
 >
@@ -106,6 +111,8 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 > - **A search returns zero events.** Write `tx` in front of the search terms, with `earliest=`
 >   and `latest=` before it, or run it from a classic dashboard in an app that carries
 >   `dashboard.js`.
+> - **A `tx` search stops with a message.** Move `earliest=` and `latest=` before `tx`; remove
+>   a comma after it or put the text in quotes.
 > - **A search is refused.** The message names the cause; the detail is in
 >   `$SPLUNK_HOME/var/log/splunk/tenx_search_command.log` or `tenx_search_handler.log`.
 > - **Events show as `~hash,value,...`.** The template has not reached the KV Store yet. The
