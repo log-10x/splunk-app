@@ -163,7 +163,7 @@ templates are stored; it is checked on 9.4.15, 10.4.3 and 10.6.0.5, on a fresh i
 upgrade over 1.1.3. 1.1.5 changes the compact sourcetype's event time and the expansion macro; it is
 checked on 9.4.15, 10.4.3 and 10.6.0.5, each a fresh install. 1.1.6 adds the `tx` macro and
 its command and replicates the template collection; it is checked on 10.4.3 as an upgrade over
-1.1.5. Splunk
+1.1.5, and on 9.4.15 and 10.6.0.5 as a fresh install. Splunk
 ships on-premises releases every other minor, so 10.1 and 10.3 exist only on Splunk Cloud
 Platform, where compatibility is set by cloud vetting after upload rather than selected here.
 Splunkbase requires a release to run on every version it names.
@@ -222,6 +222,7 @@ Paste the block for the version being uploaded. Splunkbase keeps notes per relea
 | 1.1.6 unit tests | 386 passed, among them the parser of the words after `tx`: Splunk's precedence, `IN`, `TERM()`, `CASE()`, escaped quotes, and the cases that select every event in range |
 | 1.1.6 as packaged, upgraded in place over 1.1.5's configuration on Splunk 10.4.3; the OpenTelemetry demo sample, 20,120 compact events, truth from the same lines indexed raw | 41 searches typed as `` `tx` <search> ``: 31 return the raw lines exactly, 8 differ only where lines are grouped into one event (a stack trace is one event), and an unquoted comma stops with its message; a time window after `tx` stops with its message and before it returns the window's 60 events of 60 |
 | 1.1.6 `tx` contexts on Splunk 10.4.3 | passes Splunk's risky-command check (the one Dashboard Studio and search links apply); runs from the Search app; inside `append` and wrapped in another macro it expands every event in range with a warning and returns the same counts; a role with only the `search` capability, a scheduled search, and searches of 1, 10, 60 and 200 KB return the same counts |
+| 1.1.6 as packaged, fresh install on Splunk 9.4.15 and on 10.6.0.5; the same 20,000 compact events and their 2,988 templates | the app loads as 1.1.6; `tx` returns 1,974, 688 and 468 for a word, a phrase and an OR, as on 10.4.3, with each event expanded to its original line; passes the risky-command check and runs from the Search app; a comma or a time modifier after `tx` stops with its message (9.4 shows it as an error with no events, 10.6 fails the search) |
 | 1.1.6 AppInspect 4.3.1: default, cloud, future, private_victoria, private_classic | 0 errors, 0 failures |
 | AppInspect 4.3.1: default, cloud, future, private_victoria, private_classic | 0 errors, 0 failures, 0 future failures |
 | Splunkbase file standards: one root folder, no hidden or compiled files, no `local/` | met |
