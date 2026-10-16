@@ -10,7 +10,7 @@ To find optimization opportunities in your existing Splunk data, point the [Log1
 
 ## How It Works
 
-A [compact event](https://doc.log10x.com/run/transform/#compact) carries a template hash and its variable values; the constant words live in the KV Store, and the app puts them back at search time. Classic dashboards keep their panel SPL unchanged: `dashboard.js` routes each panel's search through the app's REST endpoint. Splunk's search page loads no app JavaScript, so a query in the search bar, a saved search or the REST API starts with the app's `tx` command: `| tx index=app_logs error`. An alert created in the app's **Compile Alert** view compiles once into a native saved search.
+A [compact event](https://doc.log10x.com/run/transform/#compact) carries a template hash and its variable values; the constant words live in the KV Store, and the app puts them back at search time. A word that exists only in a template is not in the index, so a plain keyword search over compact data finds the events where the word is a value and misses the others. To search by what the lines say, write the `tx` macro in front of the search terms, after the index and any metadata or time terms: ``index=app_logs `tx` error "payment failed"``. The words after it are ordinary SPL, applied to the expanded lines. Classic dashboards keep their panel SPL unchanged: `dashboard.js` routes each panel's search through the app's REST endpoint. An alert created in the app's **Compile Alert** view compiles once into a native saved search.
 
 ### Ingestion Flow
 
@@ -23,15 +23,15 @@ Receiver  -->  Ingest (HEC)  -->  KV Store (Templates)
 
 ### Search Flow
 
-Two paths reach the same rewrite, then [expand](https://doc.log10x.com/run/transform/#expand) the events:
+Each path selects the compact events that can match, then [expands](https://doc.log10x.com/run/transform/#expand) them and applies the search to the original lines:
 
 ```
-Classic dashboard panel  -->  dashboard.js hook  --\
-                                                   +-->  Transform (prefilter + macro)  -->  Expand  -->  Full results
-Search bar | tx  ----------------------------------/
+Search bar, Dashboard Studio, saved search:  `tx` macro  -->  prefilter (tenxprefilter)  --\
+                                                                                           +-->  Expand  -->  Full results
+Classic dashboard panel:  dashboard.js hook  -->  /tenx-search rewrite  -------------------/
 ```
 
-The dashboard path is the faster one: about 3 seconds for 20,000 expanded events, against about 21 seconds through the command, which writes every event out itself.
+On one laptop running Splunk 10.4.3, a `tx` search over 157,228 compact events returned in about 1.5 to 4 seconds, where the same search over the raw lines took under a second; the `| tx` command, which writes every event out itself, took two to five times as long as the macro.
 
 Scheduled alerts run server-side, where the browser hook never fires. An alert created in the **Compile Alert** view, or through the `/tenx-alert` endpoint, is **compiled once at save time** into native SPL, a template hash prefilter plus the inflate macro, so the scheduler runs an ordinary saved search. This is handled by the `/tenx-alert` REST endpoint and the **Compile Alert** view (with a recompile pass that converts `| tx` and `| tenxsearch` alerts and refreshes prefilters as templates appear). See [SAVE_TIME_ALERTS.md](SAVE_TIME_ALERTS.md).
 
@@ -220,7 +220,7 @@ index=tenx_dml sourcetype=tenx_dml_raw_json | head 10
 
 **Check compact events expand:**
 ```spl
-| tx index=your_logs_index sourcetype=tenx_encoded | head 10
+index=your_logs_index `tx` | head 10
 ```
 
 ## Analytics Dashboard
@@ -243,7 +243,9 @@ The Analytics dashboard finds compact events through the `tenx-events` macro.
 |-----------|-------------|
 | **Search Hook** | `dashboard.js`, routing each classic dashboard panel's search to the Search Handler |
 | **Search Handler** | `/tenx-search` REST endpoint rewriting a search for compact events |
-| **tx Command** | Generating command for the search bar, saved searches and the REST API; `tenxsearch` is the same command with the search in one quoted option |
+| **tx Macro** | Written in front of a search to search compact events by what the lines say, from the search bar, Dashboard Studio, saved searches and alerts |
+| **tenxprefilter Command** | Run once per search by the `tx` macro; reads the search, looks up the templates that carry its words, and selects the compact events to expand |
+| **tx and tenxsearch Commands** | `\| tx <search>` and `\| tenxsearch searchstring="..."`: generating commands that write every event out through Python, kept so saved searches written with them keep working |
 | **tenxrecompile Command** | Recompiles every compiled alert so it picks up new templates |
 | **Alert Compiler** | `/tenx-alert` REST endpoint compiling a search into a native scheduled alert at save time (with a recompile/migrate pass) |
 | **Compile Alert View** | UI to compile, review, and recompile save-time alerts |

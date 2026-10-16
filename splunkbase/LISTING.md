@@ -29,7 +29,7 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 
 > With the Log10x App, Splunk can index compact log events and still search, chart and alert on the original lines. The 10x Receiver stores each event as a template hash plus the values that change, so a stream of repeated patterns takes less of the license. On the OpenTelemetry demo, Splunk's license meter counted 63.91% fewer bytes, encoded events and templates included, and every line expanded back byte-identical with the Receiver settings in the installation steps (measurement: https://github.com/log-10x/benchmarks/tree/main/splunk-license). The same license then holds more: sources that were sampled, filtered or kept out of Splunk to stay under the limit can come back, or the license can be smaller.
 >
-> Classic dashboards keep their SPL: the browser sends each panel's search to the app, which rewrites it on the server. From the search bar, saved searches, alerts and the REST API, a search is wrapped in the tx command (tenxsearch also works). An alert created in the app's Compile Alert view is compiled once into a native saved search, so the scheduler runs no Python. NOT, OR, groups, phrases, field conditions, and values such as IP addresses and hostnames behave as they do on the original data.
+> To search by what the lines say, write the tx macro in front of an ordinary search: index=my_index `tx` "payment failed" NOT retry. It runs as native SPL in the search bar, Dashboard Studio, saved searches and alerts, and NOT, OR, groups, phrases, field conditions, and values such as IP addresses and hostnames behave as they do on the original data. Classic dashboards keep their SPL: the browser sends each panel's search to the app, which rewrites it on the server. An alert created in the app's Compile Alert view is compiled once into a native saved search.
 >
 > The 10x Receiver produces compact events, and it is free on up to 10 nodes (https://www.log10x.com/pricing). No sign-up is required to evaluate it: with no license token it runs the full product for 30 days on up to 10 nodes, air-gapped, and a free license removes the time limit (https://doc.log10x.com/manage/license/). The app itself is open source under the MIT license.
 
@@ -37,8 +37,8 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 
 > Send Splunk the logs that sampling and filters keep out to fit the license, on that same
 > license. Compact events take a fraction of the volume and expand back byte-identical at
-> search time; classic dashboards keep their SPL, and one command covers the search bar, saved
-> searches, alerts and the REST API.
+> search time; classic dashboards keep their SPL, and one macro in front of a search covers the
+> search bar, Dashboard Studio, saved searches and alerts.
 
 **Details**
 
@@ -47,9 +47,9 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 > - Classic dashboards: `dashboard.js` routes each panel's search through the app's REST
 >   endpoint, which rewrites it. Panels keep their SPL. Copy the file into another app's
 >   `appserver/static/` to cover that app's dashboards.
-> - Everywhere else: start the search with `| tx`, as in
->   `| tx index=my_index sourcetype=tenx_encoded "payment failed" NOT retry`. Everything after
->   `tx` is the search, written as it would be on the original data.
+> - Everywhere else: write the `tx` macro in front of the search terms, after the index and any
+>   time terms, as in ``index=my_index earliest=-4h `tx` "payment failed" NOT retry``. The words
+>   after `tx` are the search, written as it would be on the original data.
 >
 > **Dashboards**
 >
@@ -59,18 +59,24 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 >
 > **Search coverage**
 >
-> - Outside a classic dashboard, a search without the `tx` command returns zero events or
->   unexpanded `~hash,...` rows, not an error.
-> - A search the app cannot rewrite is refused with a message. The rewrite refuses two
->   shapes: a sourcetype inside an OR with other terms, `sourcetype=x OR host=y`, and a quoted
+> - Outside a classic dashboard, a keyword search without `tx` returns only the events where
+>   the word is a value, and a search with no keywords returns compact `~hash,...` rows.
+> - `tx` stops a search with a message when `earliest=` or `latest=` comes after it, or when a
+>   comma after it is outside quotes: Splunk would match the first against no event and the
+>   second literally.
+> - Classic dashboards and the `| tx` command rewrite the search, and refuse two shapes with a
+>   message: a sourcetype inside an OR with other terms, `sourcetype=x OR host=y`, and a quoted
 >   phrase that contains an escaped quote.
-> - Dashboard Studio loads no app JavaScript; its panels use the command.
+> - Dashboard Studio loads no app JavaScript; its panels use the `tx` macro, which passes
+>   Splunk's risky-command check.
 > - A compact event's `_time` is the time in its original line where the template has a
 >   timestamp, and its index time where it has none. The setting applies where events are
 >   parsed, so the app is installed on indexers or heavy forwarders as well as search heads.
 >
-> **Speed**, 20,000 expanded events on Splunk 10.4.3: about 3 seconds through a dashboard,
-> about 21 seconds through the command, which writes every event out itself.
+> **Speed**, on one laptop running Splunk 10.4.3: a `tx` search over 157,228 compact events
+> returns in about 1.5 to 4 seconds, where the same search over the raw lines takes under a
+> second; the `| tx` command, which writes every event out itself, takes two to five times as
+> long. A classic dashboard expands 20,000 events in about 5 seconds.
 >
 > **Network**: the app makes no outbound calls. It talks only to the local splunkd.
 >
@@ -102,8 +108,11 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 
 > - **Dashboards show zero events.** Set the `tenx-events` macro to the index and sourcetype
 >   your compact events use.
-> - **A search returns zero events.** Start it with `| tx`, or run it from a classic dashboard
->   in an app that carries `dashboard.js`.
+> - **A search returns zero events.** Write `tx` in front of the search terms, with `earliest=`
+>   and `latest=` before it, or run it from a classic dashboard in an app that carries
+>   `dashboard.js`.
+> - **A `tx` search stops with a message.** Move `earliest=` and `latest=` before `tx`; remove
+>   a comma after it or put the text in quotes.
 > - **A search is refused.** The message names the cause; the detail is in
 >   `$SPLUNK_HOME/var/log/splunk/tenx_search_command.log` or `tenx_search_handler.log`.
 > - **Events show as `~hash,value,...`.** The template has not reached the KV Store yet. The
@@ -144,7 +153,7 @@ Repository name: `log-10x/splunk-app`. Repository URL: https://github.com/log-10
 
 | Field | Value |
 |---|---|
-| Version | 1.1.5, read from the package |
+| Version | 1.1.6, read from the package |
 | Splunk platform compatibility | Splunk Enterprise 9.4, 10.0, 10.2, 10.4, 10.6 |
 | CIM | None |
 
@@ -152,7 +161,9 @@ Each line is tested: 9.4.15, 10.0.10, 10.2.7 and 10.4.3, each a fresh install of
 changed one `props.conf` key, checked on 10.4.3 and measured on 9.4. 1.1.4 changes how
 templates are stored; it is checked on 9.4.15, 10.4.3 and 10.6.0.5, on a fresh install and an
 upgrade over 1.1.3. 1.1.5 changes the compact sourcetype's event time and the expansion macro; it is
-checked on 9.4.15, 10.4.3 and 10.6.0.5, each a fresh install. Splunk
+checked on 9.4.15, 10.4.3 and 10.6.0.5, each a fresh install. 1.1.6 adds the `tx` macro and
+its command and replicates the template collection; it is checked on 10.4.3 as an upgrade over
+1.1.5, and on 9.4.15 and 10.6.0.5 as a fresh install. Splunk
 ships on-premises releases every other minor, so 10.1 and 10.3 exist only on Splunk Cloud
 Platform, where compatibility is set by cloud vetting after upload rather than selected here.
 Splunkbase requires a release to run on every version it names.
@@ -160,6 +171,13 @@ Splunkbase requires a release to run on every version it names.
 **Release notes**
 
 Paste the block for the version being uploaded. Splunkbase keeps notes per release.
+
+1.1.6:
+
+> - Search compact events by writing the `tx` macro in front of an ordinary search: ``index=app_logs `tx` "payment failed" NOT retry status=500``. It runs as native SPL in the search bar, Dashboard Studio panels, saved searches and alerts, and passes Splunk's risky-command check. The words after it behave as on the original lines; `earliest=` and `latest=` go before it, and a time modifier or an unquoted comma after it stops the search with a message. The `tx` and `tenxsearch` commands keep working for saved searches written with them.
+> - The template collection is replicated to the indexers with the knowledge bundle, so expansion runs on the indexers instead of the search head.
+> - Template records are read at search time instead of being stored in the index files a second time.
+> - The `tx`, `tenx-events` and `tenx-templates` macros are shared with every app.
 
 1.1.5:
 
@@ -201,6 +219,11 @@ Paste the block for the version being uploaded. Splunkbase keeps notes per relea
 
 | Check | Result |
 |---|---|
+| 1.1.6 unit tests | 386 passed, among them the parser of the words after `tx`: Splunk's precedence, `IN`, `TERM()`, `CASE()`, escaped quotes, and the cases that select every event in range |
+| 1.1.6 as packaged, upgraded in place over 1.1.5's configuration on Splunk 10.4.3; the OpenTelemetry demo sample, 20,120 compact events, truth from the same lines indexed raw | 41 searches typed as `` `tx` <search> ``: 31 return the raw lines exactly, 8 differ only where lines are grouped into one event (a stack trace is one event), and an unquoted comma stops with its message; a time window after `tx` stops with its message and before it returns the window's 60 events of 60 |
+| 1.1.6 `tx` contexts on Splunk 10.4.3 | passes Splunk's risky-command check (the one Dashboard Studio and search links apply); runs from the Search app; inside `append` and wrapped in another macro it expands every event in range with a warning and returns the same counts; a role with only the `search` capability, a scheduled search, and searches of 1, 10, 60 and 200 KB return the same counts |
+| 1.1.6 as packaged, fresh install on Splunk 9.4.15 and on 10.6.0.5; the same 20,000 compact events and their 2,988 templates | the app loads as 1.1.6; `tx` returns 1,974, 688 and 468 for a word, a phrase and an OR, as on 10.4.3, with each event expanded to its original line; passes the risky-command check and runs from the Search app; a comma or a time modifier after `tx` stops with its message (9.4 shows it as an error with no events, 10.6 fails the search) |
+| 1.1.6 AppInspect 4.3.1: default, cloud, future, private_victoria, private_classic | 0 errors, 0 failures |
 | AppInspect 4.3.1: default, cloud, future, private_victoria, private_classic | 0 errors, 0 failures, 0 future failures |
 | Splunkbase file standards: one root folder, no hidden or compiled files, no `local/` | met |
 | 46 checks per version on a fresh install of 1.1.2: search matrix, saved search, refusal, both dashboards, the hook, the search bar, navigation, scheduled recompile | 46 of 46 on 9.4.15, 10.0.10, 10.2.7 and 10.4.3 |
@@ -233,7 +256,7 @@ From the repository root:
 rm -rf /tmp/sbpkg && mkdir -p /tmp/sbpkg
 rsync -a --exclude 'local/' --exclude '__pycache__/' --exclude '*.pyc' --exclude '*.pyo' --exclude '.*' \
   tenx-for-splunk/ /tmp/sbpkg/tenx-for-splunk/
-cd /tmp/sbpkg && COPYFILE_DISABLE=1 tar --format ustar -czf tenx-for-splunk-1.1.4.tar.gz tenx-for-splunk
+cd /tmp/sbpkg && COPYFILE_DISABLE=1 tar --format ustar -czf tenx-for-splunk-1.1.6.tar.gz tenx-for-splunk
 ```
 
 ## Submitting
