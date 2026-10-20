@@ -10,7 +10,7 @@ Template Format
 10x templates use `$` as the variable separator. Variables appear as:
 - `$` - Simple variable placeholder (replaced by var1, var2, etc.)
 - `$(format)` - Timestamp variable with Java SimpleDateFormat pattern
-- `$(epoch)` - Special case for milliseconds since Unix epoch
+- `$(epoch)`, `$(epochNano)`, `$(+%s)`, `$(+%s.%N)` - the source text was already an epoch; the value is written back as it is
 
 Example template:
     `$INFO [main] MyService - User $ performed $ at $(yyyy-MM-dd'T'HH:mm:ss.SSS'Z')`
@@ -61,6 +61,12 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+# Timestamp formats whose value is the source text itself (format spec S4.4), and the
+# timestamp_format the KV record carries for them. The inflate macro checks for it.
+EPOCH_FORMATS = frozenset(('epoch', 'epochNano', '+%s', '+%s.%N'))
+EPOCH_PASSTHROUGH = '__TENX_EPOCH__'
+
+
 def convert_timestamp_segment(char, count):
 	"""
 	Convert a single Java SimpleDateFormat pattern character to Splunk strftime format.
@@ -92,11 +98,11 @@ def convert_timestamp_segment(char, count):
 		- No non-zero-padded variants for day/month/hour/minute/second
 		- Limited timezone format options
 	"""
-	# Year: yyyy -> %Y (4-digit), yy -> %y (2-digit)
+	# Year: yy -> %y (2-digit); y, yyy and yyyy print the full year in Java
 	if char == 'y':
-		if count >= 4:
-			return '%Y'
-		return '%y'
+		if count == 2:
+			return '%y'
+		return '%Y'
 
 	# Month: MMMM -> %B (full name), MMM -> %b (abbrev), MM/M -> %m (numeric)
 	if char == 'M':
@@ -104,7 +110,8 @@ def convert_timestamp_segment(char, count):
 			return '%B'
 		if count == 3:
 			return '%b'
-		return '%m'  # Note: Splunk always zero-pads, no single-digit variant
+		# A single letter prints no leading zero; Splunk's %-m does the same.
+		return '%m' if count == 2 else '%-m'
 
 	# Week in year
 	if char == 'w':
@@ -112,11 +119,11 @@ def convert_timestamp_segment(char, count):
 
 	# Day in year
 	if char == 'D':
-		return '%j'  # Note: Splunk always zero-pads
+		return '%j' if count >= 3 else '%-j'
 
 	# Day in month
 	if char == 'd':
-		return '%d'  # Note: Splunk always zero-pads
+		return '%d' if count >= 2 else '%-d'
 
 	# Day name: EEEE -> %A (full), E/EE/EEE -> %a (abbreviated)
 	if char == 'E':
@@ -130,19 +137,19 @@ def convert_timestamp_segment(char, count):
 
 	# Hour in day (0-23): H or k
 	if char == 'H' or char == 'k':
-		return '%H'  # Note: Splunk always zero-pads
+		return '%H' if count >= 2 else '%-H'
 
 	# Hour in am/pm (0-11): K or h
 	if char == 'K' or char == 'h':
-		return '%I'  # Note: Splunk always zero-pads
+		return '%I' if count >= 2 else '%-I'
 
 	# Minute in hour
 	if char == 'm':
-		return '%M'  # Note: Splunk always zero-pads
+		return '%M' if count >= 2 else '%-M'
 
 	# Second in minute
 	if char == 's':
-		return '%S'  # Note: Splunk always zero-pads
+		return '%S' if count >= 2 else '%-S'
 
 	# Subsecond (milliseconds/microseconds): SSS -> %3Q, SSSSSS -> %6Q
 	if char == 'S':
@@ -185,11 +192,10 @@ def to_splunk_time_format(s):
 	if not s:
 		return ""
 
-	if s == 'epoch':
-		# 'epoch' is a special case for timestamp format, which just means "ms since epoch".
-		# %s is the seconds since epoch, and %Q is the ms leftover.
-		#
-		return '%s%Q'
+	if s in EPOCH_FORMATS:
+		# The source text was already an epoch, and the compact value is that text (format
+		# spec S4.4). The inflate macro writes the value back as it is.
+		return EPOCH_PASSTHROUGH
 
 	result = ''
 	current_alpha = ''

@@ -541,6 +541,15 @@ class TestTimestampText:
 	def test_a_year_is_printed_text(self):
 		assert printed('2025', SLASHED) == ['2025']
 
+	def test_an_unpadded_day_is_printed_text(self):
+		# BSD syslog: Sep  5 is %b  %-d, which prints one digit or two.
+		assert printed('5', '%b  %-d %H:%M:%S') == ['5']
+		assert printed('Sep', '%b  %-d %H:%M:%S') == ['Sep']
+
+	def test_an_epoch_passed_through_prints_no_timestamp_text(self):
+		# Its digits are a value in the compact event, found like any other value.
+		assert printed('1318554959877', '__TENX_EPOCH__') == []
+
 	def test_iso_pieces_keep_their_letters(self):
 		assert printed('2025-10-01T21:18:51.498Z', ISO_MS) == ['01T21', '10', '18', '2025', '498Z', '51']
 
