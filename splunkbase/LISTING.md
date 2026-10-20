@@ -153,7 +153,7 @@ Repository name: `log-10x/splunk-app`. Repository URL: https://github.com/log-10
 
 | Field | Value |
 |---|---|
-| Version | 1.1.6, read from the package |
+| Version | 1.1.7, read from the package |
 | Splunk platform compatibility | Splunk Enterprise 9.4, 10.0, 10.2, 10.4, 10.6 |
 | CIM | None |
 
@@ -171,6 +171,14 @@ Splunkbase requires a release to run on every version it names.
 **Release notes**
 
 Paste the block for the version being uploaded. Splunkbase keeps notes per release.
+
+1.1.7:
+
+> - Field conditions after `tx` match key=value text, such as `status=600`, syslog's `uid=0` or `EventCode=4624`: the fields of an expanded event are the ones Splunk extracts from the original line, key=value pairs and JSON alike, and no others.
+> - Dates expand as written when a day, hour, minute or second has no leading zero, such as syslog's `Sep  5 00:14:52`.
+> - A timestamp that was already an epoch number expands as that number.
+> - A `tx` search with nothing to narrow on no longer highlights the whole of every event.
+> - After upgrading, run `index=tenx_dml sourcetype=tenx_dml_raw_json earliest=0 | sendalert tenx_dml_to_kv` once, so that templates stored by an earlier version take the date changes.
 
 1.1.6:
 

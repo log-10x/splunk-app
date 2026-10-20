@@ -202,7 +202,7 @@ The **Consume KV** saved search stores new templates every five minutes. To load
 index=tenx_dml sourcetype=tenx_dml_raw_json earliest=-30d | sendalert tenx_dml_to_kv
 ```
 
-Widen `earliest` to reach older templates. Running it again is safe: templates already stored are skipped. The app's **Backfill KV** saved search holds the same search; its alert action fires only when the search runs on a schedule or with `sendalert`, not from the **Run** button.
+Widen `earliest` to reach older templates. Running it again is safe: templates already stored are kept, and their records are brought up to date when this version of the app derives them differently. The app's **Backfill KV** saved search holds the same search; its alert action fires only when the search runs on a schedule or with `sendalert`, not from the **Run** button.
 
 ### Step 6: Verify End-to-End
 
