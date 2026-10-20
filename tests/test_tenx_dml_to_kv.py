@@ -162,3 +162,35 @@ def test_a_cut_re_send_of_a_stored_whole_template_is_not_a_conflict(monkeypatch,
 	assert record['pattern'] == whole
 	assert record['expand_unsafe'] == ''
 	assert StoreKV.last.updates == []
+
+def test_an_upgrade_refreshes_a_record_whose_derived_fields_changed(monkeypatch, tmp_path):
+	# A record stored by an older build: the unpadded day was zero-padded (%d for d).
+	template = '$(MMM  d HH:mm:ss) web01 sshd[$]: Failed password for $'
+	kv = StoreKV()
+	import tenx_dml_builder
+	record = tenx_dml_builder.TenxDMLBuilder(timestamp_placeholder='__TENX_TS__', variable_separator='$').build_kv_record_data('-Sys1', template)
+	record['timestamp_format'] = '%b  %d %H:%M:%S'
+	record['search_copy'] = 'written'
+	kv.records['-Sys1'] = dict(record, _key='-Sys1')
+
+	fill(monkeypatch, tmp_path, [('-Sys1', template)], kv=kv)
+	stored = kv.records['-Sys1']
+
+	assert stored['timestamp_format'] == '%b  %-d %H:%M:%S'
+	assert stored['search_copy'] == 'written'
+	assert kv.updates == ['-Sys1']
+
+
+def test_a_refresh_keeps_a_hash_conflict_mark(monkeypatch, tmp_path):
+	kv = StoreKV()
+	import tenx_dml_builder
+	record = tenx_dml_builder.TenxDMLBuilder(timestamp_placeholder='__TENX_TS__', variable_separator='$').build_kv_record_data('-Abc123xyz', TEMPLATE_A)
+	record['expand_unsafe'] = 'hash-conflict'
+	record['timestamp_format'] = 'stale'
+	kv.records['-Abc123xyz'] = dict(record, _key='-Abc123xyz')
+
+	fill(monkeypatch, tmp_path, [('-Abc123xyz', TEMPLATE_A)], kv=kv)
+
+	assert kv.records['-Abc123xyz']['expand_unsafe'] == 'hash-conflict'
+	assert kv.records['-Abc123xyz']['timestamp_format'] == '%Y-%m-%d %H:%M:%S'
+

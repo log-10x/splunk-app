@@ -182,6 +182,11 @@ class TimestampPattern(object):
 	"""
 
 	def __init__(self, fmt):
+		# An epoch passed through as it is (EPOCH_PASSTHROUGH in tenx_dml_builder) is a value in
+		# the compact event, not printed text, so it adds no timestamp pieces.
+		if fmt == '__TENX_EPOCH__':
+			fmt = ''
+
 		units = []
 		i = 0
 
@@ -202,6 +207,12 @@ class TimestampPattern(object):
 					colons += 1
 					j += 1
 
+				# Splunk's %-d, %-H and the like print without the leading zero.
+				unpadded = j < len(fmt) and fmt[j] == '-'
+
+				if unpadded:
+					j += 1
+
 				directive = fmt[j] if j < len(fmt) else ''
 
 				if directive == '%':
@@ -217,6 +228,10 @@ class TimestampPattern(object):
 						units.append(('piece', r'\d{2}', _DIGITS, 2))
 				elif directive in _TS_DIRECTIVES:
 					regex, chars, longest = _TS_DIRECTIVES[directive]
+
+					if unpadded and chars is _DIGITS:
+						regex = r'\d{1,%d}' % longest
+
 					units.append(('piece', regex, chars, longest))
 				else:
 					# An unknown directive: anything non-breaking.

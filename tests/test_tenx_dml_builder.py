@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'tenx-for-splun
 
 import pytest
 from tenx_dml_builder import (
+	EPOCH_PASSTHROUGH,
 	convert_timestamp_segment,
 	to_splunk_time_format,
 	TenxDMLBuilder,
@@ -41,11 +42,21 @@ class TestConvertTimestampSegment:
 
 	def test_month_numeric(self):
 		assert convert_timestamp_segment('M', 2) == '%m'
-		assert convert_timestamp_segment('M', 1) == '%m'
+		assert convert_timestamp_segment('M', 1) == '%-m'
 
 	def test_day_of_month(self):
 		assert convert_timestamp_segment('d', 2) == '%d'
-		assert convert_timestamp_segment('d', 1) == '%d'
+		assert convert_timestamp_segment('d', 1) == '%-d'
+
+	def test_a_single_letter_prints_no_leading_zero(self):
+		# Java prints d, H, h, m, s and M without padding; Splunk's %- forms do the same.
+		assert [convert_timestamp_segment(c, 1) for c in 'dHkhKmsMD'] == \
+			['%-d', '%-H', '%-H', '%-I', '%-I', '%-M', '%-S', '%-m', '%-j']
+		assert [convert_timestamp_segment(c, 2) for c in 'dHhmsM'] == ['%d', '%H', '%I', '%M', '%S', '%m']
+
+	def test_year_letters(self):
+		# Only yy is the two-digit year; y, yyy and yyyy print it in full.
+		assert [convert_timestamp_segment('y', n) for n in (1, 2, 3, 4)] == ['%Y', '%y', '%Y', '%Y']
 
 	def test_day_name_full(self):
 		assert convert_timestamp_segment('E', 4) == '%A'
@@ -110,8 +121,15 @@ class TestToSplunkTimeFormat:
 	def test_none_returns_empty(self):
 		assert to_splunk_time_format(None) == ''
 
-	def test_epoch_special_case(self):
-		assert to_splunk_time_format('epoch') == '%s%Q'
+	def test_epoch_formats_pass_the_value_through(self):
+		# Format spec S4.4: the source text was already an epoch and the value is that text.
+		for fmt in ('epoch', 'epochNano', '+%s', '+%s.%N'):
+			assert to_splunk_time_format(fmt) == EPOCH_PASSTHROUGH
+
+	def test_bsd_syslog_day_keeps_its_space_padding(self):
+		# Sep  5: the engine writes MMM  d (two spaces) for one-digit days.
+		assert to_splunk_time_format('MMM  d HH:mm:ss') == '%b  %-d %H:%M:%S'
+		assert to_splunk_time_format('MMM dd HH:mm:ss') == '%b %d %H:%M:%S'
 
 	def test_simple_date(self):
 		result = to_splunk_time_format('yyyy/MM/dd')
@@ -174,7 +192,7 @@ class TestTwelveHourPatterns:
 
 	def test_us_style_12_hour_with_meridiem(self):
 		# "MMM dd, yyyy h:mm:ss a" is in the engine's shipped pattern list.
-		assert to_splunk_time_format('MMM dd, yyyy h:mm:ss a') == '%b %d, %Y %I:%M:%S %p'
+		assert to_splunk_time_format('MMM dd, yyyy h:mm:ss a') == '%b %d, %Y %-I:%M:%S %p'
 
 
 class TestTenxDMLBuilder:
@@ -258,7 +276,7 @@ class TestTenxDMLBuilder:
 	def test_build_kv_record_epoch_timestamp(self, builder):
 		result = builder.build_kv_record_data('hash6', '$(epoch) Event occurred')
 
-		assert result[RECORD_TIMESTAMP_FORMAT] == '%s%Q'
+		assert result[RECORD_TIMESTAMP_FORMAT] == EPOCH_PASSTHROUGH
 
 	def test_escaped_variable_separator(self, builder):
 		# Test that /$ is treated as literal $
@@ -311,7 +329,7 @@ class TestDollarZeroEscape:
 		# bare "$(" must still be read as a timestamp specifier, unaffected by the $0 fix
 		result = builder.build_kv_record_data('h3', '$(epoch) Event occurred')
 
-		assert result[RECORD_TIMESTAMP_FORMAT] == '%s%Q'
+		assert result[RECORD_TIMESTAMP_FORMAT] == EPOCH_PASSTHROUGH
 
 	def test_dollar_followed_by_literal_digit_zero_then_other_text_is_still_a_variable(self, builder):
 		# "$0x" ('(' does not follow) is just a plain variable; the literal "0x" is ordinary text

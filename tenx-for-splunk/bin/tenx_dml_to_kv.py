@@ -194,6 +194,30 @@ LOOKUP_NAME = 'tenx-dml-lookup'
 RECONCILE_SAME = "same"
 RECONCILE_REPLACED = "replaced"
 RECONCILE_CONFLICT = "conflict"
+RECONCILE_REFRESHED = "refreshed"
+
+
+def refresh_existing(kv_intf, dml_builder, existing, record_key, pattern):
+	"""Rewrites a stored record whose derived fields differ from what its text builds today."""
+	rebuilt = dml_builder.build_kv_record_data(record_key, pattern)
+
+	if existing.get(tenx_dml_builder.RECORD_EXPAND_UNSAFE) == tenx_dml_builder.UNSAFE_HASH_CONFLICT:
+		rebuilt[tenx_dml_builder.RECORD_EXPAND_UNSAFE] = tenx_dml_builder.UNSAFE_HASH_CONFLICT
+
+	stale = [k for k, v in rebuilt.items() if existing.get(k) != v]
+
+	if not stale:
+		logger.debug("Already has entry for {}, skipping.".format(record_key))
+		return RECONCILE_SAME
+
+	if tenx_dml_intf.SEARCH_COPY in existing:
+		rebuilt[tenx_dml_intf.SEARCH_COPY] = existing[tenx_dml_intf.SEARCH_COPY]
+
+	if kv_intf.update_entry(record_key, rebuilt):
+		logger.info("Refreshed the stored record for {}: {}.".format(record_key, ", ".join(sorted(stale))))
+		return RECONCILE_REFRESHED
+
+	return RECONCILE_SAME
 
 
 def reconcile_existing(kv_intf, dml_builder, existing, record_key, pattern):
@@ -211,7 +235,11 @@ def reconcile_existing(kv_intf, dml_builder, existing, record_key, pattern):
 	prefix of the other was cut by a TRUNCATE limit on the way in. The longer one is kept; an
 	incoming whole template replaces a stored cut one.
 
-	Returns RECONCILE_SAME, RECONCILE_REPLACED or RECONCILE_CONFLICT.
+	The same text sent again is rebuilt, and the record is rewritten when a field derived from
+	the text differs, as it does after an upgrade that changes how a field is derived (a
+	timestamp format, say). The searchable copy and a hash-conflict mark are kept.
+
+	Returns RECONCILE_SAME, RECONCILE_REFRESHED, RECONCILE_REPLACED or RECONCILE_CONFLICT.
 	"""
 	if not isinstance(existing, dict):
 		return RECONCILE_SAME
@@ -223,8 +251,7 @@ def reconcile_existing(kv_intf, dml_builder, existing, record_key, pattern):
 	same_pattern = stored_pattern is None or stored_pattern == pattern
 
 	if same_hash and same_pattern:
-		logger.debug("Already has entry for {}, skipping.".format(record_key))
-		return RECONCILE_SAME
+		return refresh_existing(kv_intf, dml_builder, existing, record_key, pattern)
 
 	if same_hash and stored_pattern.startswith(pattern):
 		logger.info("Template {} arrived cut ({} of {} characters); the stored whole one is kept.".format(
@@ -345,7 +372,7 @@ def update_kv_store(settings):
 
 				if outcome == RECONCILE_CONFLICT:
 					conflicts_marked += 1
-				elif outcome == RECONCILE_REPLACED:
+				elif outcome in (RECONCILE_REPLACED, RECONCILE_REFRESHED):
 					updates_performed += 1
 				else:
 					skipped_existing += 1

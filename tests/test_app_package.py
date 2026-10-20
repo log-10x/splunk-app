@@ -53,6 +53,20 @@ class TestDashboardsFindCompactEvents:
 		assert macros.has_section('tenx-events')
 		assert 'sourcetype::tenx_encoded' in macros.get('tenx-events', 'definition')
 
+	def test_tx_reruns_splunks_field_extraction_on_the_expanded_text(self):
+		# A compact event is marked extracted (_kv) before expansion; without dropping the
+		# mark, extract does nothing and every field=value term on key=value text returns 0.
+		tx = conf('macros.conf').get('tx', 'definition')
+		assert '| `tenx-inflate` | fields - _kv | extract |' in tx
+		# spath on non-JSON text invents fields, and on JSON doubles what extract finds.
+		assert 'spath' not in tx
+
+	def test_the_prefilter_never_returns_a_bare_star(self):
+		# A bare * becomes the highlight keyword *** and lights every event in Splunk Web.
+		src = open(os.path.join(APP, 'bin', 'tenx_prefilter.py'), encoding='utf-8').read()
+		assert 'EVERY_EVENT = "(*)"' in src
+		assert '{"search": "*"}' not in src and 'or "*"' not in src
+
 	def test_tx_and_what_it_calls_are_shared_with_every_app(self):
 		macros = conf('macros.conf')
 		assert macros.has_section('tx') and macros.has_section('tenx-templates')

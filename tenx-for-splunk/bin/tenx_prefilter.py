@@ -8,7 +8,7 @@ after `tx` (tenx_prefilter_parser), asks the template dictionary which templates
 word, and returns one row whose `search` field is the prefilter.
 
 When it cannot read the search (tx inside another subsearch, or wrapped in another macro) or
-cannot parse the words, it returns `*`, so every compact event in range is expanded and the
+cannot parse the words, it returns `(*)`, so every compact event in range is expanded and the
 words are applied to the expanded text: slower, never fewer results. Two things it stops with
 an error instead, because the search after `tx` would silently match nothing: a time modifier
 after `tx`, and an unquoted comma after `tx`.
@@ -33,6 +33,9 @@ from splunklib.searchcommands import dispatch, Configuration, GeneratingCommand
 import tenx_prefilter_parser as parser
 
 # Splunk names a subsearch's job subsearch_<parent sid>_<epoch>.<n>.
+# Matches every event like *, and gives Splunk Web no keyword to highlight (* lit every event).
+EVERY_EVENT = "(*)"
+
 SUBSEARCH_SID = re.compile(r"^subsearch_(.+)_\d+\.\d+$")
 
 
@@ -67,14 +70,14 @@ class TenxPrefilterCommand(GeneratingCommand):
 			text = None
 		if text is None:
 			self.write_warning("tx: could not read the search it is part of; every compact event in range is expanded.")
-			yield {"search": "*"}
+			yield {"search": EVERY_EVENT}
 			return
 		reader = parser.Parser(parser.tokenize(text))
 		try:
 			tree = reader.parse()
 		except parser.Unparsed as e:
 			self.write_warning("tx: could not read the words after tx as a search (%s); every compact event in range is expanded." % e)
-			yield {"search": "*"}
+			yield {"search": EVERY_EVENT}
 			return
 		if reader.time_modifier:
 			self.error_exit(RuntimeError("time modifier after tx"),
@@ -94,9 +97,9 @@ class TenxPrefilterCommand(GeneratingCommand):
 			except Exception as e:
 				self.logger.warning("tx: the template lookup failed: %s", e)
 				self.write_warning("tx: the template lookup did not complete; every compact event in range is expanded.")
-				yield {"search": "*"}
+				yield {"search": EVERY_EVENT}
 				return
-		yield {"search": parser.prefilter(tree, dictionary) or "*"}
+		yield {"search": parser.prefilter(tree, dictionary) or EVERY_EVENT}
 
 
 dispatch(TenxPrefilterCommand, sys.argv, sys.stdin, sys.stdout, __name__)

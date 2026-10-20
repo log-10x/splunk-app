@@ -299,7 +299,8 @@ index=tenx_dml sourcetype=tenx_dml_raw_json earliest=-30d | sendalert tenx_dml_t
 ```
 
 Widen `earliest` to reach older templates. Running it again is safe: templates already
-stored are skipped. The **Backfill KV** saved search holds the same search; the **Run**
+stored are kept, and their records are brought up to date when this version of the app
+derives them differently. The **Backfill KV** saved search holds the same search; the **Run**
 button does not fire its alert action, so run the search above.
 
 ### Adding Custom Sourcetypes for Encoded Events
@@ -346,8 +347,8 @@ index=myindex earliest=-4h `tx` "payment failed" NOT retry status=500 | stats co
 
 The words after `tx` are ordinary SPL, applied to the expanded lines. Phrases,
 `field=value`, `field IN (...)`, wildcards, `TERM()`, `CASE()`, `NOT`, `OR`, `AND` and
-parentheses behave as on the original data, with Splunk's precedence, and the fields inside
-an expanded JSON line are extracted. Searching an IP address, a hostname or an ID works the
+parentheses behave as on the original data, with Splunk's precedence. The fields are the ones
+Splunk extracts from the original lines, key=value pairs and JSON alike. Searching an IP address, a hostname or an ID works the
 same way: the words go after `tx`, whether they are values or template text.
 
 **Classic dashboards.** `dashboard.js` loads on every classic dashboard in the app that

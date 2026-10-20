@@ -153,7 +153,7 @@ Repository name: `log-10x/splunk-app`. Repository URL: https://github.com/log-10
 
 | Field | Value |
 |---|---|
-| Version | 1.1.6, read from the package |
+| Version | 1.1.7, read from the package |
 | Splunk platform compatibility | Splunk Enterprise 9.4, 10.0, 10.2, 10.4, 10.6 |
 | CIM | None |
 
@@ -163,7 +163,7 @@ templates are stored; it is checked on 9.4.15, 10.4.3 and 10.6.0.5, on a fresh i
 upgrade over 1.1.3. 1.1.5 changes the compact sourcetype's event time and the expansion macro; it is
 checked on 9.4.15, 10.4.3 and 10.6.0.5, each a fresh install. 1.1.6 adds the `tx` macro and
 its command and replicates the template collection; it is checked on 10.4.3 as an upgrade over
-1.1.5, and on 9.4.15 and 10.6.0.5 as a fresh install. Splunk
+1.1.5, and on 9.4.15 and 10.6.0.5 as a fresh install. 1.1.7 changes how fields and dates come out of an expanded event; it is checked on 10.4.3 as an upgrade over 1.1.6, and on 9.4.15 and 10.6.0.5 as a fresh install. Splunk
 ships on-premises releases every other minor, so 10.1 and 10.3 exist only on Splunk Cloud
 Platform, where compatibility is set by cloud vetting after upload rather than selected here.
 Splunkbase requires a release to run on every version it names.
@@ -171,6 +171,14 @@ Splunkbase requires a release to run on every version it names.
 **Release notes**
 
 Paste the block for the version being uploaded. Splunkbase keeps notes per release.
+
+1.1.7:
+
+> - Field conditions after `tx` match key=value text, such as `status=600`, syslog's `uid=0` or `EventCode=4624`: the fields of an expanded event are the ones Splunk extracts from the original line, key=value pairs and JSON alike, and no others.
+> - Dates expand as written when a day, hour, minute or second has no leading zero, such as syslog's `Sep  5 00:14:52`.
+> - A timestamp that was already an epoch number expands as that number.
+> - A `tx` search with nothing to narrow on no longer highlights the whole of every event.
+> - After upgrading, run `index=tenx_dml sourcetype=tenx_dml_raw_json earliest=0 | sendalert tenx_dml_to_kv` once, so that templates stored by an earlier version take the date changes.
 
 1.1.6:
 
@@ -219,6 +227,10 @@ Paste the block for the version being uploaded. Splunkbase keeps notes per relea
 
 | Check | Result |
 |---|---|
+| 1.1.7 unit tests | 397 passed, among them each of the 1.1.7 changes: the field extraction and the highlight in `tx`, unpadded date letters, epoch timestamps, and refreshing a stored template whose derived fields changed |
+| 1.1.7 as packaged on Splunk 10.4.3, upgraded in place over 1.1.6; nine log shapes (Apache, Proxifier, Kubernetes JSON, Java with stack traces, key=value application logs, BSD syslog, CSV, Windows event text, and lines with `$`, `/`, `~`, quotes, Unicode, tabs, leading zeros, UUIDs and 8 KB values), each encoded by edge-10x 1.1.142 and indexed raw beside its compact form | every line expands back as it was; the fields of every single-line event equal Splunk's own on the raw line (21,804 events); 25 of 25 key=value field searches and 155 of 162 word, value, phrase, OR, NOT and wildcard searches return the raw lines exactly, the other 7 differing only where lines are grouped into one event or a number sits inside a timestamp; one run of the template load after the upgrade rewrites the records stored by 1.1.6 |
+| 1.1.7 as packaged, fresh install on Splunk 9.4.15 and on 10.6.0.5; eight of the same log shapes | every line expands back as it was; fields equal Splunk's on 10,825 events; 11 of 11 field searches as raw; `status=600` on key=value text found; no search highlights every event; the risky-command check, the Search app, both stops, an unpadded syslog day and an epoch timestamp as on 10.4.3 |
+| 1.1.7 AppInspect 4.3.1: default, cloud, future, private_victoria, private_classic | 0 errors, 0 failures |
 | 1.1.6 unit tests | 386 passed, among them the parser of the words after `tx`: Splunk's precedence, `IN`, `TERM()`, `CASE()`, escaped quotes, and the cases that select every event in range |
 | 1.1.6 as packaged, upgraded in place over 1.1.5's configuration on Splunk 10.4.3; the OpenTelemetry demo sample, 20,120 compact events, truth from the same lines indexed raw | 41 searches typed as `` `tx` <search> ``: 31 return the raw lines exactly, 8 differ only where lines are grouped into one event (a stack trace is one event), and an unquoted comma stops with its message; a time window after `tx` stops with its message and before it returns the window's 60 events of 60 |
 | 1.1.6 `tx` contexts on Splunk 10.4.3 | passes Splunk's risky-command check (the one Dashboard Studio and search links apply); runs from the Search app; inside `append` and wrapped in another macro it expands every event in range with a warning and returns the same counts; a role with only the `search` capability, a scheduled search, and searches of 1, 10, 60 and 200 KB return the same counts |
@@ -256,7 +268,7 @@ From the repository root:
 rm -rf /tmp/sbpkg && mkdir -p /tmp/sbpkg
 rsync -a --exclude 'local/' --exclude '__pycache__/' --exclude '*.pyc' --exclude '*.pyo' --exclude '.*' \
   tenx-for-splunk/ /tmp/sbpkg/tenx-for-splunk/
-cd /tmp/sbpkg && COPYFILE_DISABLE=1 tar --format ustar -czf tenx-for-splunk-1.1.6.tar.gz tenx-for-splunk
+cd /tmp/sbpkg && COPYFILE_DISABLE=1 tar --format ustar -czf tenx-for-splunk-1.1.7.tar.gz tenx-for-splunk
 ```
 
 ## Submitting

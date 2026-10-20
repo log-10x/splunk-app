@@ -88,7 +88,7 @@ class TestEventTime:
 		assert assigned == ['_time']
 
 MACROS = ('tenx-inflate', 'tenx-inflate-debug')
-HOUR_DIRECTIVES = ('%H', '%I', '%M', '%S', '%p')
+HOUR_DIRECTIVES = ('%H', '%I', '%M', '%S', '%p', '%-H', '%-I', '%-M', '%-S')
 ZONE_DIRECTIVES = {'%:::z': '+00', '%:z': '+00:00', '%z': '+0000', '%Z': 'UTC'}
 
 
@@ -120,6 +120,10 @@ class TestUtcRendering:
 		assert 'tenx_ts_noon=tenx_ts_sec-tenx_ts_sod+43200' in definition
 		assert 'tenx_tz=strftime(tenx_ts_noon,"%z")' in definition
 
+	@pytest.mark.parametrize('name', MACROS)
+	def test_an_epoch_timestamp_is_written_back_as_it_is(self, name):
+		assert 'if(tenx_ts_f=="__TENX_EPOCH__", tenx_var_0, strftime(tenx_ts_utc, tenx_ts_fmt))' in macro(name)
+
 	def test_the_debug_macro_is_the_same_chain(self):
 		inflate = macro('tenx-inflate')
 		assert inflate[:inflate.index('| fields')].strip() == macro('tenx-inflate-debug').strip()
@@ -128,6 +132,6 @@ class TestUtcRendering:
 		from tenx_dml_builder import convert_timestamp_segment
 		emitted = {convert_timestamp_segment(c, n) for c in 'yMwDdEaHkKhmsSzZX' for n in (1, 2, 3, 4)}
 		emitted.discard(None)
-		date = {'%Y', '%y', '%B', '%b', '%m', '%V', '%j', '%d', '%A', '%a'}
+		date = {'%Y', '%y', '%B', '%b', '%m', '%V', '%j', '%d', '%A', '%a', '%-m', '%-j', '%-d'}
 		fraction = {d for d in emitted if re.fullmatch(r'%\d+Q', d)}
 		assert emitted - date - fraction <= set(HOUR_DIRECTIVES) | set(ZONE_DIRECTIVES)
