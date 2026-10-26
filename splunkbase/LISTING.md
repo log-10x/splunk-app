@@ -31,7 +31,7 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 >
 > To search by what the lines say, write the tx macro in front of an ordinary search: index=my_index `tx` "payment failed" NOT retry. It runs as native SPL in the search bar, Dashboard Studio, saved searches and alerts, and NOT, OR, groups, phrases, field conditions, and values such as IP addresses and hostnames behave as they do on the original data. Classic dashboards keep their SPL: the browser sends each panel's search to the app, which rewrites it on the server. An alert created in the app's Compile Alert view is compiled once into a native saved search.
 >
-> The 10x Receiver produces compact events, and it is free on up to 10 nodes (https://www.log10x.com/pricing). No sign-up is required to evaluate it: with no license token it runs the full product for 30 days on up to 10 nodes, air-gapped, and a free license removes the time limit (https://doc.log10x.com/manage/license/). The app itself is open source under the MIT license.
+> The 10x Receiver produces compact events, and it is free on up to 10 nodes (https://www.log10x.com/pricing). No sign-up is required: with no license token it runs the full product on up to 10 nodes, air-gapped, with no expiry (https://doc.log10x.com/manage/license/). The app itself is open source under the MIT license.
 
 **Short description**
 

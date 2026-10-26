@@ -270,19 +270,19 @@ For complete documentation including troubleshooting, advanced configuration, an
 
 This repository is licensed under the [MIT License](LICENSE).
 
-### Important: Log10x Product License Required
+### Log10x Receiver license
 
-This repository contains a Splunk app for expanding Log10x compact events. While the Splunk app itself is open source, **using the Log10x Receiver to compact events requires a commercial license**.
+This repository contains a Splunk app for expanding Log10x compact events. The app is open source. The Log10x Receiver that produces compact events runs on the built-in Free tier with no license token on up to 10 nodes, with no expiry; above 10 nodes it takes a paid license.
 
 | Component | License |
 |-----------|---------|
 | This repository (Splunk app) | MIT (open source) |
-| Log10x Receiver | Commercial license required |
+| Log10x Receiver | Free tier on up to 10 nodes; paid license above 10 |
 
 **What this means:**
 - You can freely use, modify, and distribute this Splunk app
-- The Log10x Receiver that generates compact events requires a paid subscription
-- A valid Log10x license is required to run the Receiver
+- The Log10x Receiver runs with no license token on up to 10 nodes
+- Above 10 nodes, the Receiver takes a paid license
 
 **Get Started:**
 - [Log10x Pricing](https://www.log10x.com/pricing?utm_source=github&utm_medium=readme&utm_campaign=splunk-app&utm_content=footer)
