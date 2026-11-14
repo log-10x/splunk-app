@@ -82,9 +82,16 @@ def compile_search(search, **manager_kwargs):
 	return result, manager
 
 
+# What follows the prefilter: expand, replay the original sourcetype's fields, then the
+# rewrite's own extraction with replayed events hidden from it, and give them back.
+EXPAND_HEAD = '| eval tenx_compact_raw=_raw | `tenx-inflate` | eval tenx_hide_others=1 | `tenx-replay` | fields - tenx_hide_others | eval tenx_h_raw=if(isnotnull(tenx_rst), _raw, null()), tenx_h_st=if(isnotnull(tenx_rst), sourcetype, null()), tenx_h_src=if(isnotnull(tenx_rst), source, null()), tenx_h_host=if(isnotnull(tenx_rst), host, null()) | eval _raw=if(isnotnull(tenx_rst), "", _raw), sourcetype=if(isnotnull(tenx_rst), "tenx_replayed", sourcetype), source=if(isnotnull(tenx_rst), "tenx_replayed", source), host=if(isnotnull(tenx_rst), "tenx_replayed", host) | extract | spath | fields - tenx_hash, tenx_var_0, tenx_vars'
+RESTORE = ' | eval _raw=coalesce(tenx_h_raw, _raw), sourcetype=coalesce(tenx_h_st, sourcetype), source=coalesce(tenx_h_src, source), host=coalesce(tenx_h_host, host) | fields - tenx_h_raw, tenx_h_st, tenx_h_src, tenx_h_host, tenx_compact_raw, tenx_rst'
+EXPAND = EXPAND_HEAD + RESTORE + ' '
+
+
 def prefilter(compiled):
 	"""The text between the modifiers and the inflate macro: the compact-event prefilter."""
-	head = compiled.split('| `tenx-inflate`')[0]
+	head = compiled.split('| eval tenx_compact_raw=_raw | `tenx-inflate`')[0]
 	return head.replace('| search sourcetype=tenx_encoded', '', 1).strip()
 
 
@@ -185,7 +192,7 @@ class TestCompiledPrefilter:
 
 		assert result.state == ResolvedState.SUCCESS
 		assert prefilter(result.resolved) == '("error" OR ("~h_err" OR "~h_err2"))'
-		assert result.resolved.endswith('| `tenx-inflate` | extract | spath | fields - tenx_hash, tenx_var_0, tenx_vars | search error')
+		assert result.resolved.endswith(EXPAND + '| search error')
 		assert manager.probes == ['"error"']
 
 	def test_space_and_star_hashes_are_selectable(self):
@@ -267,7 +274,9 @@ class TestCompiledPrefilter:
 
 		assert prefilter(result.resolved) == ''
 		assert manager.probes == []
-		assert result.resolved.endswith('| extract kvdelim="=" pairdelim=" " | search status=500')
+		# The generic key=value pass runs while a replayed event is hidden from it (it would give
+		# each of the event's fields a second copy); the condition is applied once it is back.
+		assert result.resolved.endswith('| extract kvdelim="=" pairdelim=" "' + RESTORE + ' | search status=500')
 		assert not result.no_prefilter   # no keywords at all is has_search_terms=False, not this
 
 	def test_downstream_pipeline_is_preserved(self):
@@ -354,7 +363,7 @@ class TestNegation:
 
 		assert result.state == ResolvedState.SUCCESS
 		assert prefilter(result.resolved) == ''
-		assert result.resolved.endswith('| `tenx-inflate` | extract | spath | fields - tenx_hash, tenx_var_0, tenx_vars | search NOT bootstrap')
+		assert result.resolved.endswith(EXPAND + '| search NOT bootstrap')
 		assert result.no_prefilter
 		assert result.has_search_terms
 		# the negated word is never sent to the dictionary
@@ -402,7 +411,9 @@ class TestSubTokenValues:
 
 		assert prefilter(result.resolved) == '("192") AND ("168") AND ("45") AND ("200")'
 		assert result.resolved.endswith('| search 192.168.45.200')
-		assert manager.probes == ['"192"', '"168"', '"45"', '"200"']
+		# Address parts are required without a dictionary lookup: digits only, never template
+		# text.
+		assert manager.probes == []
 
 	def test_hostname_mixes_required_and_template_pieces(self):
 		# live row 14: `ip-192-168-42-205.ec2.internal` returned 0 against 20,000. "ip",
@@ -427,7 +438,11 @@ class TestSubTokenValues:
 		result, manager = compile_search('sourcetype=tenx_encoded 10.0.0.1')
 
 		assert prefilter(result.resolved) == '("10") AND ("0") AND ("1")'
-		assert manager.probes == ['"10"', '"0"', '"1"']
+		assert manager.probes == []   # an address: its parts need no lookup
+		result, manager = compile_search('sourcetype=tenx_encoded zq9.zq8.zq9')
+
+		assert prefilter(result.resolved) == '("zq9") AND ("zq8")'
+		assert manager.probes == ['"zq9"', '"zq8"']
 
 	def test_pieces_matching_many_templates_share_one_clause(self):
 		# a piece present in more templates than PER_PIECE_HASH_LIMIT does not repeat the

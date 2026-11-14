@@ -127,6 +127,16 @@ class TestNativeCompile:
 		assert '| extract kvdelim="=" pairdelim=" "' in result.compiled_search
 		assert '| search status=500' in result.compiled_search
 
+	def test_a_compiled_alert_replays_the_original_sourcetypes_fields(self):
+		# The macro is expanded when the alert runs, so an alert compiled before `tenxreplay`
+		# wrote it picks the replay up without being recompiled. It runs right after expansion;
+		# the generic key=value pass comes later, with replayed events hidden from it, and the
+		# field condition last, so status=500 can match a field that a calculated field or a
+		# lookup of the original sourcetype produces.
+		search = make_compiler().compile('sourcetype=tenx_encoded status=500 payment').compiled_search
+		assert search.index('`tenx-inflate`') < search.index('`tenx-replay`') \
+			< search.index('extract kvdelim') < search.index('| search status=500')
+
 	def test_trailing_pipeline_is_preserved(self):
 		result = make_compiler().compile('sourcetype=tenx_encoded payment | stats count')
 
