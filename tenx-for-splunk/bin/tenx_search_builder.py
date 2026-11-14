@@ -118,6 +118,9 @@ class ResolvedState(Enum):
 # breakers together, as single characters. '*' is a major breaker for the indexer but a live
 # wildcard in a search term, so it stays attached to its piece. The multi-character majors
 # ('--' and the %XX escapes) are covered by their single characters.
+# A search term written as TERM(<x>) or CASE(<x>).
+TERM_CALL = re.compile(r'^(TERM|CASE)\((.*)\)$', re.S)
+
 SEGMENT_BREAKERS = frozenset("[]<>(){}|!;,'\"\n\r\t &?+/:=@.-$#%\\_")
 
 # A piece that matches more templates than this does not get its own ("piece" OR <hashes>)
@@ -808,7 +811,11 @@ class TenxSearchCommand(TenxSplCommand):
 		rule_type = node.rule_type
 
 		if rule_type == 'index_expression':
-			return self._term_prefilter(node.text)
+			# TERM(x) and CASE(x) match x as written (a whole indexed term, or with its case);
+			# the prefilter requires x's pieces, which every event matching either holds. The
+			# search after expansion applies TERM() or CASE() itself (original_search_terms).
+			call = TERM_CALL.match(node.text)
+			return self._term_prefilter(call.group(2) if call else node.text)
 
 		if rule_type in ('not_logical_expression', 'field_modifier', 'search_modifier'):
 			return None
