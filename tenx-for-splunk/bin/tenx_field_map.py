@@ -109,19 +109,31 @@ Usage
     tenx_field_map.py gen --records <kv_rows.json | templates.json> [--records ...]
         --target windows-security | <target.json> [--sourcetype ...] [--rename ...] --out <app dir>
     tenx_field_map.py verify --records ... --target ... --encoded <encoded.log> --raw <raw.log>
+    tenx_field_map.py gen ... --cap-file <compact cap file> [--splunkd <management URL>]
+    tenx_field_map.py activate --app <app dir> --cap-file <compact cap file> --splunkd <management URL>
+
+`--cap-file` keeps the Receiver's compact cap file to the templates whose transform is active where
+the data is parsed, so an event goes compact only once its fields can be written (see "The engine's
+compact cap file" below).
 
 Standard library only.
 """
 
 import argparse
+import base64
 import collections
 import configparser
+import csv
 import datetime
 import hashlib
 import json
 import os
 import re
+import ssl
 import sys
+import tempfile
+import urllib.parse
+import urllib.request
 
 # The app's own modules sit beside this file; `python3 -I` leaves the script's folder off the path.
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -241,8 +253,13 @@ def _as_list(value):
 
 
 def _from_kv_row(row):
+	# pattern_hash keeps the hash as the engine wrote it, outer spaces included (78 of 6,647 rows
+	# of one KV store); _key holds it trimmed.
+	written = row.get('pattern_hash')
+	if not written or written.strip() != row['_key']:
+		written = row['_key']
 	return Template(
-		key=row['_key'], written_hash=row['_key'], parts=_as_list(row.get('pattern_parts')),
+		key=row['_key'], written_hash=written, parts=_as_list(row.get('pattern_parts')),
 		part_0=row.get('part_0') or '', terminator=row.get('pattern_terminator') or '',
 		timestamp_format=row.get('timestamp_format') or '', expand_unsafe=row.get('expand_unsafe') or '',
 		pattern=row.get('pattern'))
@@ -1125,19 +1142,21 @@ def write_app(out_dir, target, field_map, settings, search_hash=True, sourcetype
 	for sub in ('default', 'metadata'):
 		os.makedirs(os.path.join(out_dir, sub), exist_ok=True)
 
-	files = {
-		os.path.join('default', 'props.conf'): props_text(target, field_map, settings, search_hash, sourcetype_field),
-		os.path.join('default', 'transforms.conf'): transforms_text(field_map, search_hash, target, sourcetype_field),
-		os.path.join('default', 'app.conf'): app_conf_text(target),
-		os.path.join('metadata', 'default.meta'): '[]\nexport = system\n',
-	}
+	# transforms.conf before props.conf: an instance that reads the folder between the two writes
+	# finds every transform the old props.conf names. Each file is written through a temporary file
+	# and a rename, and a file whose content would not change is left as it is.
+	files = collections.OrderedDict([
+		(os.path.join('default', 'transforms.conf'), transforms_text(field_map, search_hash, target, sourcetype_field)),
+		(os.path.join('default', 'props.conf'), props_text(target, field_map, settings, search_hash, sourcetype_field)),
+		(os.path.join('default', 'app.conf'), app_conf_text(target)),
+		(os.path.join('metadata', 'default.meta'), '[]\nexport = system\n'),
+	])
 	if target['indexed_value_false']:
 		files[os.path.join('default', 'fields.conf')] = fields_text(target)
 
 	sizes = {}
 	for rel, text in files.items():
-		with open(os.path.join(out_dir, rel), 'w', encoding='utf-8', newline='\n') as f:
-			f.write(text)
+		write_if_changed(os.path.join(out_dir, rel), text)
 		sizes[rel] = len(text.encode('utf-8'))
 	return sizes
 
@@ -1307,6 +1326,207 @@ def verify(templates, field_map, encoded_path, raw_path, raw_split=None, out=sys
 
 
 # ---------------------------------------------------------------------------------------------
+# The engine's compact cap file
+#
+# With `compactReceiverFieldNames: [templateHash]` and `compactReceiverDefault: false`, the Receiver
+# sends compact only the events whose template is listed `true` in its cap file
+# (compactReceiverLookupFile, pipelines/run/receive/compact in the config repository) and every other
+# event whole. An event sent compact before its template's transform is active where the data is
+# parsed is indexed without its fields and cannot be repaired, so a hash joins the list only after
+# its transform is active there:
+#
+# * gen --cap-file first rewrites the file without the listed hashes that no longer have a transform,
+#   then writes the app, then writes <cap file>.pending, the list as it should be once the app is
+#   active. gen never adds a hash to the cap file itself.
+# * activate has the instance that parses the data reload its index-time configuration, reads the
+#   app's transforms and props back from that instance over REST, and only when every stanza equals
+#   the generated one renames the pending list over the cap file. gen --splunkd runs it right after
+#   writing the app, for an app written in place on that instance.
+#
+# Rows: `"<hash>",true`, the hash as the engine writes it (outer spaces kept), always quoted (a hash
+# can start with "#", the CSV comment character, or hold a space), sorted. A row whose value does not
+# start with `true` (a template kept whole on purpose) is carried over as written and wins over a
+# transform. Every write goes to a temporary file in the same folder that is then renamed over the
+# target, so the engine, which reloads the file when it changes, never reads half a list. A file whose
+# content would not change is not written, so a GitOps checkout holding it changes only when the list
+# changes.
+
+CAP_HEADER = 'pattern_hash,value\n'
+CAP_PENDING_SUFFIX = '.pending'
+# app.conf in $SPLUNK_HOME/etc/system/default: reload.props and reload.transforms =
+# access_endpoints /admin/transforms-reload, /admin/metrics-reload, /admin/metric-schema-reload.
+RELOAD_ENDPOINT = '/services/admin/transforms-reload/_reload'
+
+
+def cap_hashes(field_map, templates):
+	"""The templateHash value of each template the field map has a transform for."""
+	return set(templates[t.key].written_hash for t in field_map.transforms)
+
+
+def read_cap(path):
+	"""(hashes whose value starts with true, the other rows as (hash, value)) of a cap file."""
+	listed, kept = set(), []
+	if not os.path.exists(path):
+		return listed, kept
+	with open(path, encoding='utf-8', newline='') as f:
+		rows = list(csv.reader(f))
+	for row in rows[1:]:
+		if not row or not row[0]:
+			continue
+		value = row[1] if len(row) > 1 else ''
+		if value.startswith('true'):
+			listed.add(row[0])
+		else:
+			kept.append((row[0], value))
+	return listed, kept
+
+
+def cap_text(hashes, kept=()):
+	kept_hashes = set(h for h, _ in kept)
+	rows = sorted([(h, 'true') for h in hashes if h not in kept_hashes] + list(kept))
+	return CAP_HEADER + ''.join('"%s",%s\n' % (h.replace('"', '""'), v) for h, v in rows)
+
+
+def write_if_changed(path, text):
+	"""
+	Writes text to path through a temporary file in the same folder and a rename. Returns False,
+	writing nothing, when the file already holds exactly this text.
+	"""
+	try:
+		with open(path, encoding='utf-8', newline='') as f:
+			if f.read() == text:
+				return False
+	except (IOError, OSError):
+		pass
+	folder = os.path.dirname(os.path.abspath(path))
+	os.makedirs(folder, exist_ok=True)
+	# mkstemp creates the file readable by its owner only; give it the mode the file has, or the mode
+	# open() would give a new file.
+	try:
+		mode = os.stat(path).st_mode & 0o777
+	except (IOError, OSError):
+		umask = os.umask(0)
+		os.umask(umask)
+		mode = 0o666 & ~umask
+	fd, tmp = tempfile.mkstemp(prefix='.%s.' % os.path.basename(path), suffix='.tmp', dir=folder)
+	try:
+		with os.fdopen(fd, 'w', encoding='utf-8', newline='') as f:
+			f.write(text)
+			f.flush()
+			os.fsync(f.fileno())
+		os.chmod(tmp, mode)
+		os.replace(tmp, path)
+	except BaseException:
+		if os.path.exists(tmp):
+			os.remove(tmp)
+		raise
+	return True
+
+
+def cap_before_app(path, hashes):
+	"""
+	Before the app is written: the cap file without the listed hashes that have no transform any
+	more (created with its header alone when absent). Returns a summary for the report.
+	"""
+	listed, kept = read_cap(path)
+	kept_hashes = set(h for h, _ in kept)
+	now = (listed & hashes) - kept_hashes
+	written = write_if_changed(path, cap_text(now, kept))
+	return collections.OrderedDict([('cap_file', path), ('listed_before', len(listed)),
+		('removed', len(listed - hashes)), ('listed_now', len(now)), ('cap_file_written', written),
+		('waiting_for_activation', len(hashes - kept_hashes - now)), ('rows_kept_as_written', len(kept))])
+
+
+def cap_after_app(path, hashes):
+	"""After the app is written: the pending list, every template with a transform."""
+	_, kept = read_cap(path)
+	return write_if_changed(path + CAP_PENDING_SUFFIX, cap_text(hashes, kept))
+
+
+class Splunkd(object):
+	"""The management port of the instance that parses the data (REST, JSON)."""
+
+	def __init__(self, url, auth=None, token=None, tls_verify=True):
+		self.url = url.rstrip('/')
+		self.headers = {}
+		if token:
+			self.headers['Authorization'] = 'Splunk %s' % token
+		elif auth:
+			self.headers['Authorization'] = 'Basic ' + base64.b64encode(auth.encode('utf-8')).decode('ascii')
+		self.ctx = None
+		if self.url.startswith('https') and not tls_verify:
+			self.ctx = ssl.create_default_context()
+			self.ctx.check_hostname = False
+			self.ctx.verify_mode = ssl.CERT_NONE
+
+	def call(self, method, path, params=None):
+		params = dict(params or {}, output_mode='json')
+		url, data = self.url + path, None
+		if method == 'GET':
+			url += '?' + urllib.parse.urlencode(params)
+		else:
+			data = urllib.parse.urlencode(params).encode('ascii')
+		req = urllib.request.Request(url, data=data, method=method, headers=self.headers)
+		with urllib.request.urlopen(req, context=self.ctx, timeout=120) as res:
+			body = res.read()
+		return json.loads(body) if body.strip() else {}
+
+	def stanzas(self, app, conf):
+		"""The stanzas of <conf>.conf that app holds, as the instance reads them now: name -> settings."""
+		res = self.call('GET', '/servicesNS/nobody/%s/configs/conf-%s' % (urllib.parse.quote(app), conf),
+			{'count': 0})
+		return dict((e['name'], e.get('content', {})) for e in res.get('entry', [])
+			if e.get('acl', {}).get('app') == app)
+
+
+def read_conf(path):
+	parser = configparser.RawConfigParser(strict=False, interpolation=None, delimiters=('=',),
+		comment_prefixes=('#',), empty_lines_in_values=False)
+	parser.optionxform = str
+	parser.read(path, encoding='utf-8')
+	return collections.OrderedDict((name, dict(parser[name])) for name in parser.sections())
+
+
+def not_installed(splunkd, app_dir, app_name):
+	"""The stanzas of the app's transforms.conf and props.conf the instance does not hold as written."""
+	differ = []
+	for conf in ('transforms', 'props'):
+		have = splunkd.stanzas(app_name, conf)
+		for name, settings in read_conf(os.path.join(app_dir, 'default', conf + '.conf')).items():
+			got = have.get(name)
+			if got is None:
+				differ.append('%s.conf [%s] missing' % (conf, name))
+			elif any(str(got.get(k, '')).strip() != v.strip() for k, v in settings.items()):
+				differ.append('%s.conf [%s] differs' % (conf, name))
+	return differ
+
+
+def activate(app_dir, cap_file, splunkd, app_name=None, out=sys.stdout):
+	"""
+	Has the instance reload its index-time configuration, checks that it holds the app as generated,
+	and only then renames the pending list over the cap file. Returns 0, or 1 with the cap file left
+	as it was.
+	"""
+	pending = cap_file + CAP_PENDING_SUFFIX
+	if not os.path.exists(pending):
+		out.write('activate: nothing pending (%s)\n' % pending)
+		return 0
+	app_name = app_name or os.path.basename(os.path.abspath(app_dir))
+	splunkd.call('POST', RELOAD_ENDPOINT)
+	differ = not_installed(splunkd, app_dir, app_name)
+	if differ:
+		out.write('activate: the instance does not hold app %s as generated (%d stanzas, first %s); '
+			'cap file left as it was\n' % (app_name, len(differ), differ[0]))
+		return 1
+	before, _ = read_cap(cap_file)
+	after, _ = read_cap(pending)
+	os.replace(pending, cap_file)
+	out.write('activate: app %s reloaded and checked; %s lists %d templates (%d added, %d removed)\n'
+		% (app_name, cap_file, len(after), len(after - before), len(before - after)))
+	return 0
+
+
+# ---------------------------------------------------------------------------------------------
 # Command line
 
 def _build(args):
@@ -1384,15 +1604,45 @@ def build_parser():
 			p.add_argument('--sourcetype-field', default=SOURCETYPE_FIELD,
 				help='indexed field every event of the compact sourcetype gets as <field>::"<sourcetype>", which '
 					'tenx-events names so that `tx` finds these events (default %s; none: not written)' % SOURCETYPE_FIELD)
+			p.add_argument('--cap-file', help='the Receiver\'s compact cap file (compactReceiverLookupFile, keyed on '
+				'templateHash): drop listed templates that lost their transform, and write <cap file>.pending, '
+				'which activate makes the cap file once the app is active where the data is parsed')
+			_splunkd_args(p, required=False)
 		else:
 			p.add_argument('--encoded', required=True)
 			p.add_argument('--raw', required=True)
 			p.add_argument('--raw-split', help='regex between raw events (default: the reader\'s)')
+
+	p = sub.add_parser('activate', help='reload the parsing instance, check it holds the app, then list its templates')
+	p.add_argument('--app', required=True, help='the app folder gen wrote, as installed on the instance')
+	p.add_argument('--app-name', help='the app\'s name on the instance (default: the folder name)')
+	p.add_argument('--cap-file', required=True)
+	_splunkd_args(p, required=True)
 	return ap
+
+
+def _splunkd_args(p, required):
+	p.add_argument('--splunkd', required=required,
+		help='management URL of the instance that parses the data, e.g. https://127.0.0.1:8089; with gen, '
+			'activate runs right after the app is written (the app folder is on that instance)')
+	p.add_argument('--splunkd-auth-env', default='TENX_SPLUNKD_AUTH',
+		help='environment variable holding user:password (default TENX_SPLUNKD_AUTH)')
+	p.add_argument('--splunkd-token-env', default='TENX_SPLUNKD_TOKEN',
+		help='environment variable holding a session key, used instead of user:password (default TENX_SPLUNKD_TOKEN)')
+	p.add_argument('--tls-verify', choices=('on', 'off'), default='on',
+		help='off: accept the instance\'s certificate without checking it (a self-signed management port)')
+
+
+def _splunkd(args):
+	return Splunkd(args.splunkd, auth=os.environ.get(args.splunkd_auth_env),
+		token=os.environ.get(args.splunkd_token_env), tls_verify=args.tls_verify == 'on')
 
 
 def main(argv=None):
 	args = build_parser().parse_args(argv)
+	if args.mode == 'activate':
+		return activate(args.app, args.cap_file, _splunkd(args), args.app_name)
+
 	target, templates, field_map = _build(args)
 
 	if args.mode == 'verify':
@@ -1401,8 +1651,16 @@ def main(argv=None):
 
 	settings, not_copied = parsing_settings(args.app_props)
 	sourcetype_field = None if args.sourcetype_field == 'none' else args.sourcetype_field
+	cap = None
+	if args.cap_file:
+		hashes = cap_hashes(field_map, templates)
+		cap = cap_before_app(args.cap_file, hashes)
 	sizes = write_app(args.out, target, field_map, settings, args.search_hash == 'on', sourcetype_field)
+	if args.cap_file:
+		cap['pending_file_written'] = cap_after_app(args.cap_file, hashes)
 	report = field_map.report()
+	if cap is not None:
+		report['compact_cap'] = cap
 	report['settings_copied_from_tenx_encoded'] = [k for k, _ in settings]
 	report['settings_not_copied'] = not_copied
 	report['file_bytes'] = sizes
@@ -1419,6 +1677,10 @@ def main(argv=None):
 		sys.stdout.write('for tx: add %s::%s to the tenx-events macro, for example\n'
 			'    index=* (sourcetype::tenx_encoded OR %s::%s)\n' % (sourcetype_field, target['sourcetype'], sourcetype_field,
 			target['sourcetype']))
+	if cap is not None:
+		sys.stdout.write('compact cap: %s\n' % json.dumps(cap))
+		if args.splunkd:
+			return activate(args.out, args.cap_file, _splunkd(args))
 	return 0
 
 
