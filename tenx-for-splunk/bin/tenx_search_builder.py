@@ -102,6 +102,7 @@ from enum import Enum, auto
 import urllib.error
 
 import tenx_util
+import tenx_prefilter_parser
 import tenx_spl_parser
 import tenx_search_manager
 
@@ -131,11 +132,6 @@ PER_PIECE_HASH_LIMIT = 500
 # to narrow, which is correct and wider.
 PROBE_BUDGET_MS = 30000
 PROBE_MAX_MS = 10000
-
-# A hash containing '*' cannot be matched as a whole phrase, because the '*' is a wildcard
-# even inside quotes. The text before the first '*' is matched instead, when it is long
-# enough to be a filter: "~-" matched 12,648 of 20,000 events and "~" matched 16,746.
-HASH_PREFIX_MIN = 2
 
 
 # Text a rendered timestamp can contain. A compact event stores its timestamp as epoch
@@ -403,22 +399,21 @@ def hash_predicate(dml_hash):
 	"""
 	The SPL that selects the compact events of one template.
 
-	Phrase "~<hash>" when the hash has no '*'; phrase "~<prefix>" for the text before the
-	first '*' when that prefix is at least HASH_PREFIX_MIN characters (a superset, since other
-	hashes may share the prefix); otherwise a field predicate, which Splunk answers by
-	extraction rather than from the lexicon and which is itself a wildcard match. All three
-	are supersets at worst, and the post-expansion search removes the excess. Measured
-	coverage on 2,991 templates: 20,000 of 20,000 events.
+	Phrase "~<hash>" when the hash has no '*'. A '*' is a wildcard in a search term even inside
+	quotes, so a hash holding one is selected by TERM(<term>) with the term the `tx` prefilter
+	uses for it, tenx_prefilter_parser.hash_term: a run of the hash between Splunk's major
+	breakers that the index holds for every event of the template and that Splunk also finds
+	when the search compares a field. Other templates' events can hold the same term, so this
+	is a superset at worst, and the post-expansion search removes the excess.
+
+	Before, such a hash was selected by the phrase of the text before its first '*', or by
+	tenx_hash="<hash>" when fewer than two characters preceded it. That field predicate found
+	none of the events of 6 of 74 such templates on 17,011 events (Splunk 10.4.3).
 	"""
 	if '*' not in dml_hash:
 		return quoted_term('~' + dml_hash)
 
-	prefix = dml_hash.split('*', 1)[0]
-
-	if len(prefix) >= HASH_PREFIX_MIN:
-		return quoted_term('~' + prefix)
-
-	return 'tenx_hash=' + quoted_term(dml_hash)
+	return 'TERM(' + tenx_prefilter_parser.hash_term(dml_hash) + ')'
 
 
 def hash_clause(hashes):

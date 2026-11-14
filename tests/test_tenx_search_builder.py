@@ -28,12 +28,13 @@ from tenx_search_builder import (
 	conjoin,
 	is_wrapped,
 )
+from tenx_prefilter_parser import hash_term
 
 from support.local_search_manager import LocalSearchManager, CsvTemplateStore
 
 
-# Hashes shaped like the real ones: an interior space, a '*' after a usable prefix, a '*'
-# too early for a prefix, and plain. The words are the non-'$' tokens of each pattern.
+# Hashes shaped like the real ones: an interior space, a '*' after a longer run, a '*' after
+# one character, and plain. The words are the non-'$' tokens of each pattern.
 TEMPLATES = [
 	('KC 2c#eEev', 'cartstore called with $ for $'),
 	('0PIlry*uDJ', 'cart bootstrap $ items'),
@@ -131,14 +132,27 @@ class TestHashPredicate:
 		# 305 of 2,991 real hashes contain a space; tenx_hash="KC 2c#eEev" found nothing.
 		assert hash_predicate('KC 2c#eEev') == '"~KC 2c#eEev"'
 
-	def test_star_hash_uses_prefix_before_star(self):
-		# tenx_hash="0PIlry*uDJ" gave 0 of 39 events; the phrase "~0PIlry" gave 39.
-		assert hash_predicate('0PIlry*uDJ') == '"~0PIlry"'
+	def test_star_hash_uses_a_term_of_the_hash(self):
+		# '*' is a wildcard even inside quotes, so a hash holding one is selected by one run of
+		# it between Splunk's major breakers, as TERM(): the term the tx prefilter uses.
+		assert hash_predicate('0PIlry*uDJ') == 'TERM(~0PIlry)'
+		assert hash_predicate('0PIlry*uDJ') == 'TERM(%s)' % hash_term('0PIlry*uDJ')
 
-	def test_star_too_early_falls_back_to_field_predicate(self):
-		# "~a" would be no filter at all ("~-" matched 12,648 of 20,000 events).
-		assert hash_predicate('a*bc') == 'tenx_hash="a*bc"'
-		assert hash_predicate('*abc') == 'tenx_hash="*abc"'
+	def test_star_hash_never_uses_the_field_predicate(self):
+		# tenx_hash="H*ly1wX1N{" found 0 of 1 event and tenx_hash="*FejY3hyM " 0 of 2 (Splunk
+		# 10.4.3, the search comparing sourcetype=); TERM(ly1wX1N) and TERM(FejY3hyM) found them.
+		assert hash_predicate('H*ly1wX1N{') == 'TERM(ly1wX1N)'
+		assert hash_predicate('*FejY3hyM ') == 'TERM(FejY3hyM)'
+		assert hash_predicate('a*bc') == 'TERM(~a)'
+		assert hash_predicate('*abc') == 'TERM(abc)'
+		for dml_hash in ('a*bc', '*abc', '-*', '*', '-*Hf8l*8.5}'):
+			assert 'tenx_hash=' not in hash_predicate(dml_hash)
+
+	def test_star_hash_skips_a_run_between_two_stars(self):
+		# TERM(Hf8l) found the 4 events of -*Hf8l*8.5} from the index alone and 0 of them with
+		# sourcetype=tenx_encoded in the same search.
+		assert hash_predicate('-*Hf8l*8.5}') == 'TERM(8.5)'
+		assert hash_predicate('-M;*DEsWy*;') == 'TERM(~-M)'
 
 	def test_quotes_and_backslashes_are_escaped(self):
 		assert hash_predicate('a"b\\c') == '"~a\\"b\\\\c"'
@@ -150,8 +164,8 @@ class TestHashPredicate:
 
 class TestHashClause:
 	def test_sorted_and_deduplicated(self):
-		# two hashes sharing a prefix before '*' collapse to one predicate
-		assert hash_clause(['zz*1', 'h_b', 'zz*2', 'h_a']) == '("~h_a" OR "~h_b" OR "~zz")'
+		# two hashes whose chosen term is the same collapse to one predicate
+		assert hash_clause(['zz*1', 'h_b', 'zz*2', 'h_a']) == '("~h_a" OR "~h_b" OR TERM(~zz))'
 
 	def test_same_set_same_text(self):
 		assert hash_clause(['h_b', 'h_a']) == hash_clause(['h_a', 'h_b'])
@@ -191,7 +205,7 @@ class TestCompiledPrefilter:
 	def test_space_and_star_hashes_are_selectable(self):
 		# live: `bootstrap` 6 of 8 (two hashes unreachable), `cartstore` 1,075 of 1,974
 		result, _ = compile_search('sourcetype=tenx_encoded bootstrap')
-		assert prefilter(result.resolved) == '("bootstrap" OR ("~0PIlry"))'
+		assert prefilter(result.resolved) == '("bootstrap" OR (TERM(~0PIlry)))'
 
 		result, _ = compile_search('sourcetype=tenx_encoded cartstore')
 		assert prefilter(result.resolved) == '("cartstore" OR ("~KC 2c#eEev" OR "~h_err2"))'
@@ -411,8 +425,8 @@ class TestSubTokenValues:
 		result, _ = compile_search('sourcetype=tenx_encoded ip-192-168-42-205.ec2.internal')
 
 		assert prefilter(result.resolved) == (
-			'("ip" OR (tenx_hash="a*bc")) AND ("192") AND ("168") AND ("42") AND ("205") '
-			'AND ("ec2" OR (tenx_hash="a*bc")) AND ("internal" OR (tenx_hash="a*bc"))')
+			'("ip" OR (TERM(~a))) AND ("192") AND ("168") AND ("42") AND ("205") '
+			'AND ("ec2" OR (TERM(~a))) AND ("internal" OR (TERM(~a)))')
 		assert result.resolved.endswith('| search ip-192-168-42-205.ec2.internal')
 
 	def test_region(self):
@@ -420,7 +434,7 @@ class TestSubTokenValues:
 		result, _ = compile_search('sourcetype=tenx_encoded us-west-2')
 
 		assert prefilter(result.resolved) == (
-			'("us" OR (tenx_hash="a*bc")) AND ("west" OR (tenx_hash="a*bc")) AND ("2")')
+			'("us" OR (TERM(~a))) AND ("west" OR (TERM(~a))) AND ("2")')
 		assert result.resolved.endswith('| search us-west-2')
 
 	def test_repeated_piece_is_probed_once(self):
