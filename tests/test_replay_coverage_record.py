@@ -285,3 +285,89 @@ def test_an_index_that_gets_the_field_leaves_the_negative_record_at_the_check():
 	stale = dict(covered, **{'app:kv': {'indexes': 'app', 'unit': b.unit_macro('app:kv')},
 						   b.NOCARRIER_STANZA: before})
 	assert b.rewrite_replay(stale, ['quiet']) is None
+
+
+# ---------------------------------------------------------------------------
+# Compiled alerts: the check dispatches "Recompile Compiled Alerts" when the record changes
+# ---------------------------------------------------------------------------
+
+RECOMPILE_SCENARIO = r'''
+def run_check(fake, apply=True):
+	cmd = tenxreplay.TenxReplayCommand()
+	cmd._metadata = types.SimpleNamespace(searchinfo=types.SimpleNamespace(
+		username='splunk-system-user', splunkd_uri='https://127.0.0.1:8089', session_key='key',
+		earliest_time='-10m', latest_time='now'))
+	cmd._apply, cmd._only_new, cmd._lookback = apply, True, '-7d'
+	cmd._rest = fake.rest
+	fake.searches, fake.writes, fake.dispatches = [], [], []
+	return list(cmd.generate())
+
+out = {}
+fake = FakeSplunk([('app:kv', '/var/app/a.log', 'web-1', 5, 'app', True)])
+fake.compact_only = {'quiet': 40, 'sec_compact': 7}
+fake.dispatches = []
+run(fake)
+out['first_rebuild'] = (fake.dispatches, len(fake.writes))
+fake.dispatches = []
+run(fake)
+out['unchanged_rebuild'] = fake.dispatches
+# last_seen moves every hour; that alone changes no compiled text
+fake.conf['app:kv']['last_seen'] = '1000'
+fake.dispatches = []
+run(fake)
+out['last_seen_only'] = (fake.dispatches, fake.writes)
+rows = run_check(fake)
+out['quiet_check'] = (fake.dispatches, rows[0].get('recompile_dispatched'))
+# app:kv events with the field start arriving in index quiet, which the record lists as having none
+fake.rows = fake.rows + [('app:kv', '/var/app/a.log', 'web-1', 3, 'quiet', True)]
+fake.compact_only = {'sec_compact': 7}
+rows = run_check(fake, apply=False)
+out['dry_check'] = (fake.dispatches, fake.writes)
+rows = run_check(fake)
+out['moving_check'] = (fake.dispatches, fake.writes, rows[0].get('recompile_dispatched'), rows[0].get('written'))
+out['again'] = (run_check(fake)[0].get('recompile_dispatched'), fake.dispatches)
+# a stale negative record for an index the stanza already lists: the check alone fixes it
+fake.conf['tenx:nocarrier'] = {'indexes': 'quiet,sec_compact'}
+rows = run_check(fake)
+out['check_only'] = (fake.dispatches, fake.writes, rows[0].get('recompile_dispatched'), rows[0].get('written'))
+# a dispatch that fails is logged; the writes stand
+fake.conf['tenx:nocarrier'] = {'indexes': 'quiet,sec_compact'}
+fake.dispatch_fails = True
+rows = run_check(fake)
+out['failed_dispatch'] = (fake.writes, rows[0].get('recompile_dispatched'), fake.conf.get('tenx:nocarrier'))
+print(json.dumps(out))
+'''
+
+
+def test_a_record_change_dispatches_the_recompile_once_and_only_then():
+	out = child_run(RECOMPILE_SCENARIO)
+	name = 'Recompile Compiled Alerts'
+	# the first rebuild writes the app:kv stanza and the negative record: one dispatch, after them
+	dispatches, writes = out['first_rebuild']
+	assert dispatches == [[name, writes]], out['first_rebuild']
+	assert out['unchanged_rebuild'] == []
+	dispatches, writes = out['last_seen_only']
+	assert ['conf~', 'app:kv'] in writes and dispatches == []
+	assert out['quiet_check'] == [[], 'no']
+	# apply=false writes nothing and dispatches nothing
+	assert out['dry_check'] == [[], []]
+	# the 5-minute check takes quiet out of the negative record and adds it to app:kv's indexes,
+	# then dispatches once, right after those two writes
+	dispatches, writes, flag, written = out['moving_check']
+	assert ['conf~', 'tenx:nocarrier'] in writes and ['conf~', 'app:kv'] in writes
+	# (app:kv in quiet is new to its stanza, so the full rebuild follows; it changes nothing more)
+	assert dispatches == [[name, 2]] and flag == 'yes' and written == 'no change'
+	assert out['again'] == ['no', []]
+	assert out['check_only'] == [[[name, 1]], [['conf~', 'tenx:nocarrier']], 'yes', 'indexes recorded']
+	writes, flag, nocarrier = out['failed_dispatch']
+	assert ['conf~', 'tenx:nocarrier'] in writes and flag == 'no' and nocarrier == {'indexes': 'sec_compact'}
+
+
+def test_the_recompile_search_named_exists():
+	conf = configparser.RawConfigParser(strict=False)
+	conf.read(os.path.join(APP, 'default', 'savedsearches.conf'))
+	import tenx_replay_builder  # noqa: F401 (the command module needs splunk; read its constant as text)
+	text = open(os.path.join(APP, 'bin', 'tenxreplay.py'), encoding='utf-8').read()
+	assert "RECOMPILE_SEARCH = 'Recompile Compiled Alerts'" in text
+	assert conf.has_section('Recompile Compiled Alerts')
+	assert conf.get('Recompile Compiled Alerts', 'search').strip() == '| tenxrecompile'

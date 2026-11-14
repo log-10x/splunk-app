@@ -552,10 +552,18 @@ class FakeSplunk(object):
 		self.conf = {}
 		self.searches = []
 		self.writes = []
+		self.dispatches = []
 
 	def rest(self, path, data=None, method=None):
 		p = urllib.parse.urlparse(path)
 		route, query = p.path, dict(urllib.parse.parse_qsl(p.query))
+		if route.startswith(NS + 'saved/searches/') and route.endswith('/dispatch'):
+			if getattr(self, 'dispatch_fails', False):
+				raise OSError('dispatch refused')
+			# the saved search's name, and how many writes this run had made before it
+			self.dispatches.append((urllib.parse.unquote(route[len(NS + 'saved/searches/'):-len('/dispatch')]),
+									len(self.writes)))
+			return {'sid': 'scheduler_test'}
 		if route.endswith('/search/jobs'):
 			s = data['search']
 			self.searches.append((s, data.get('earliest_time')))

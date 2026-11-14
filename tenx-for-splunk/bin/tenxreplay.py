@@ -40,6 +40,13 @@ original sourcetype, or a sourcetype with a source, host or index, appears that 
 replay does not cover. (The template consumer cannot do this check: a template record holds
 only the hash and the template text, not the sourcetype of the events that use it.)
 
+A compiled alert stores the search rewrite's text, which names the replay units for the indexes
+it searches, and "Recompile Compiled Alerts" rewrites it every 15 minutes. So that an alert does
+not wait for that run, whenever this command changes what the rewrite chooses for an index (a
+stanza's indexes or unit, a stanza added or removed, the negative record [tenx:nocarrier]) it
+dispatches "Recompile Compiled Alerts" once, after its writes. A failed dispatch is logged and
+changes nothing else: the scheduled run still comes.
+
 Logging
 -------
 Logs to: $SPLUNK_HOME/var/log/splunk/tenx_replay_command.log
@@ -71,6 +78,8 @@ tenx_util.setup_logger('tenx_replay_command', logging.INFO)
 
 MACRO = 'tenx-replay'
 CONF = 'tenx_replay'
+# default/savedsearches.conf: rewrites every managed compiled alert whose compiled text changed.
+RECOMPILE_SEARCH = 'Recompile Compiled Alerts'
 SAMPLE_EVENTS = 1000
 
 
@@ -353,6 +362,7 @@ class TenxReplayCommand(GeneratingCommand):
 			value = builder.listed_value(set(listed) | ixs)
 			self._rest(self._ns('configs/conf-%s/%s' % (CONF, urllib.parse.quote(st, safe=''))), {'indexes': value})
 			changed.append('indexes:' + st)
+		self.rewrite_changed += changed
 		return changed
 
 	def _write_retired(self, had, want, exists):
@@ -405,11 +415,16 @@ class TenxReplayCommand(GeneratingCommand):
 			if have is None:
 				self._rest(self._ns('configs/conf-%s' % CONF), dict(want, name=st))
 				changed.append(st)
+				self.rewrite_changed.append(st)
 			elif any(have.get(k, '') != v for k, v in want.items()):
 				self._rest(self._ns('configs/conf-%s/%s' % (CONF, urllib.parse.quote(st, safe=''))), want)
 				changed.append(st)
+				if any(k in want and have.get(k, '') != want[k] for k in ('indexes', 'unit')):
+					self.rewrite_changed.append(st)
 		if nocarrier is not None:
-			changed += self._write_nocarrier(existing.get(builder.NOCARRIER_STANZA), nocarrier)
+			moved = self._write_nocarrier(existing.get(builder.NOCARRIER_STANZA), nocarrier)
+			changed += moved
+			self.rewrite_changed += moved
 		want = ','.join(not_in_text)
 		have = existing.get(builder.NARROWING_STANZA)
 		if not narrowing:
@@ -431,7 +446,28 @@ class TenxReplayCommand(GeneratingCommand):
 															  builder.NOCARRIER_STANZA):
 				self._rest(self._ns('configs/conf-%s/%s' % (CONF, urllib.parse.quote(st, safe=''))), method='DELETE')
 				changed.append('-' + st)
+				self.rewrite_changed.append('-' + st)
 		return changed
+
+	def _recompile_alerts(self):
+		"""
+		Dispatches "Recompile Compiled Alerts" when this run changed what the search rewrite chooses
+		for an index, so a compiled alert on that index gets the new text now instead of at the
+		next scheduled run (every 15 minutes). Returns whether it dispatched.
+		"""
+		if not (self.apply and self.rewrite_changed):
+			return False
+		changed, self.rewrite_changed = self.rewrite_changed, []
+		try:
+			self._rest(self._ns('saved/searches/%s/dispatch' % urllib.parse.quote(RECOMPILE_SEARCH, safe='')), {})
+		except Exception as e:
+			self.logger.warning("tenxreplay: the replay record changed (%s) but '%s' could not be dispatched (%s); "
+								"compiled alerts get the new text at its next scheduled run", changed[:20],
+								RECOMPILE_SEARCH, e)
+			return False
+		self.dispatched += changed
+		self.logger.info("tenxreplay: the replay record changed (%s); dispatched '%s'", changed[:20], RECOMPILE_SEARCH)
+		return True
 
 	def _covered(self):
 		try:
@@ -444,6 +480,7 @@ class TenxReplayCommand(GeneratingCommand):
 														  builder.NOCARRIER_STANZA))
 
 	def generate(self):
+		self.rewrite_changed, self.dispatched = [], []
 		earliest, latest = self._time_range()
 		if self.only_new:
 			try:
@@ -453,12 +490,14 @@ class TenxReplayCommand(GeneratingCommand):
 				new = builder.uncovered(seen, covered) + builder.uncovered_values(rows, covered)
 				if self.apply:
 					self._check_indexes(rows)
+					self._recompile_alerts()
 			except Exception as e:
 				self.logger.exception("tenxreplay: the coverage check failed")
 				self.error_exit(e, "tenxreplay: could not check what the replay covers (%s); nothing was written." % e)
 				return
 			if not new:
-				yield {'sourcetype': '', 'written': 'no change', 'checked': len(seen),
+				yield {'sourcetype': '', 'written': 'indexes recorded' if self.dispatched else 'no change',
+					   'checked': len(seen), 'recompile_dispatched': 'yes' if self.dispatched else 'no',
 					   'warnings': ['every original sourcetype and source in this time range is covered']}
 				return
 			self.logger.info("tenxreplay: not covered %s; rebuilding over %s", new[:20], self.lookback)
@@ -551,8 +590,10 @@ class TenxReplayCommand(GeneratingCommand):
 									  failed, now, settings, nocarrier)
 			except Exception as e:
 				self.logger.exception("tenxreplay: writing the macro failed")
+				self._recompile_alerts()
 				self.error_exit(e, "tenxreplay: could not write the %s macro (%s)." % (MACRO, e))
 				return
+			self._recompile_alerts()
 		self.logger.info("tenxreplay: %d sourcetypes, %d steps, written %s, warnings %s",
 			len(replay.per_sourcetype), len(replay.steps), written, replay.warnings)
 		events = {}
@@ -576,6 +617,7 @@ class TenxReplayCommand(GeneratingCommand):
 				'txf': 'txf(%s)' % st,
 				'indexes': builder.listed_value(cov.get(st, {}).get('indexes', set())),
 				'written': 'yes' if written else ('no change' if self.apply else 'dry run'),
+				'recompile_dispatched': 'yes' if self.dispatched else 'no',
 			}
 			if not self.apply:
 				row['definition'] = replay.spl()
@@ -584,6 +626,6 @@ class TenxReplayCommand(GeneratingCommand):
 		if not replay.per_sourcetype:
 			yield {'sourcetype': '', 'compact_events': 0,
 				   'warnings': ['no compact event in this time range carries %s' % builder.CARRIER_FIELD],
-				   'written': 'yes' if written else 'no change'}
+				   'written': 'yes' if written else 'no change', 'recompile_dispatched': 'yes' if self.dispatched else 'no'}
 
 dispatch(TenxReplayCommand, sys.argv, sys.stdin, sys.stdout, __name__)
