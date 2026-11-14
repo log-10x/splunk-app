@@ -70,13 +70,32 @@ Rules this keeps from the first generator of these files (b2_gen.py), each count
   one). The REGEX allows spaces on both sides of the hash by default.
 * FORMAT cannot express every value: text with a line break, text with a double quote (FORMAT
   values are quoted), text holding `$<digit>` (read as a capture group), and a capture group
-  followed by a digit (`$1` then `2` reads as `$12`). Such a field is left out, and the
-  report names it. A field name must be one capture group or a literal field name.
-* Spaces and tabs at the ends of a value are dropped for the xml-windows reader, as the
-  add-on's search-time extraction drops them (Splunk 10.4.3: LogonProcessName "NtLmSsp "
-  in the XML reads as "NtLmSsp"); `--trim-values off` keeps them, as the first generated files did.
-* The timestamp slot is captured as the epoch the compact line carries, so a field whose value
-  holds the timestamp is written as epoch digits (`--timestamp-values skip` leaves it out).
+  followed by a digit (`$1` then `2` reads as `$12`). Such a value is written by one
+  index-time INGEST_EVAL transform, last in the TRANSFORMS- list (`--eval-values on`, the
+  default; `off` leaves the field out and the report names it, as the first generated files did).
+  The template's own transform writes which form of the field its template has,
+  tenx_fmf_<name>::"<form>", and the compact values the form reads, tenx_fmv_<name>_<j>::"$<group>";
+  the INGEST_EVAL builds each such field as a case() over its forms, the template text as SPL
+  strings through urldecode() (no line break, quote, backslash, '$' or '%' in the .conf line),
+  then removes the working fields (`:=null()`, transforms.conf.spec). One transform serves
+  every template because an INGEST_EVAL has no REGEX of its own: it "overrides all but one of
+  other index-time settings (such as REGEX, DEST_KEY, etc)" (transforms.conf.spec), so one per
+  template would run on every event once per template. A field whose name is a compact value
+  is still left out: "The capability of the search-time |eval operator to name the destination
+  field based on the value of another field (like "| eval {destname}=1") is NOT available for
+  index-time evaluations" (transforms.conf.spec). So is one whose name is not a plain field
+  name (a JSON path): NOT CHECKED whether INGEST_EVAL takes such a name as written.
+  A field name for FORMAT must be one capture group or a literal field name.
+* Whitespace at the ends of a value is dropped for the xml-windows reader, as the add-on's
+  search-time extraction drops it (Splunk 10.4.3: LogonProcessName "NtLmSsp " in the XML reads
+  as "NtLmSsp", and UserAccountControl, whose text starts with a line break and two tabs, as
+  "%%2080 ..."). With `--eval-values off` only spaces and tabs are dropped, as before;
+  `--trim-values off` keeps all of it, as the first generated files did.
+* A field whose value holds the timestamp is written as the event wrote it (`--timestamp-values
+  text`, the default) by the same INGEST_EVAL, which renders the compact epoch with the
+  record's format in UTC the way tenx-inflate does at search time. `epoch` writes the epoch
+  digits the compact line carries, by FORMAT, as the first generated files did; `skip` leaves
+  the field out.
 * Transform stanza names carry the template's position in the sorted input by default, because
   two hashes can be equal once their punctuation is replaced by `_`.
 
@@ -128,6 +147,22 @@ WHY_NAME_NOT_FIELD = "name not a field name"
 WHY_TIMESTAMP = "value carries the timestamp"
 WHY_SPLIT_ESCAPE = "escape sequence split by a value"
 WHY_RESERVED = "name collides with a Splunk default field"
+WHY_EVAL_NAME = "name from a value, which INGEST_EVAL cannot write"
+WHY_EVAL_NAME_SHAPE = "name INGEST_EVAL does not take as written"
+WHY_EVAL_TWICE = "second value of a field INGEST_EVAL writes"
+WHY_EVAL_FORMAT = "timestamp directive not rendered at index time"
+
+# Values FORMAT cannot write that INGEST_EVAL writes instead (--eval-values on): text with a line
+# break, a double quote or $<digit>, and a capture group followed by a digit.
+EVAL_REASONS = frozenset((WHY_LINE_BREAK, WHY_QUOTE, WHY_DOLLAR_DIGIT, WHY_GROUP_DIGIT))
+# Working fields the template's own FORMAT writes for the INGEST_EVAL, which removes them.
+EVAL_FORM_PREFIX = 'tenx_fmf_'
+EVAL_VALUE_PREFIX = 'tenx_fmv_'
+EVAL_NAME = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\Z')
+# What Splunk drops at the ends of an extracted value: spaces and tabs (LogonProcessName "NtLmSsp "
+# reads as "NtLmSsp"), and line breaks (UserAccountControl's text in the XML starts with a line
+# break and two tabs; the add-on's extraction of the raw event starts at "%%2080").
+TRIM_CHARS = ' \t\r\n\v\f'
 
 # Field names Splunk gives every event itself. An indexed field whose name equals one of them,
 # ignoring case, does not arrive under its own name: on Splunk Enterprise 10.4.3 the
@@ -609,6 +644,132 @@ def to_format(expr, is_name, field_name=None, mixed_names=False):
 	return text, None
 
 
+# ---------------------------------------------------------------------------------------------
+# INGEST_EVAL
+
+# Literal text written as a quoted SPL string; anything else goes through urldecode(), so a
+# line break, a tab, a quote, a backslash, '$' or '%' never sits in the .conf line or the string.
+_SPL_PLAIN = re.compile(r'[A-Za-z0-9 _.:/-]*\Z')
+
+
+def spl_text(text):
+	"""Literal text as an SPL expression."""
+	if _SPL_PLAIN.match(text):
+		return '"%s"' % text
+	return 'urldecode("%s")' % ''.join(c if c.isascii() and c.isalnum() else ''.join('%%%02X' % b for b in c.encode('utf-8'))
+		for c in text)
+
+
+_TS_TOKEN = re.compile(r'%(?:%|-[HIMSdmj]|:::z|:z|\d+Q|[A-Za-z])|[^%]+')
+_TS_DATE = frozenset(('%Y', '%y', '%B', '%b', '%m', '%-m', '%V', '%j', '%-j', '%d', '%-d', '%A', '%a'))
+
+
+def spl_timestamp(v, fmt):
+	"""
+	SPL that renders the compact epoch v (an SPL expression: 13 or 19 digits) with the record's
+	Splunk strftime format in UTC, the way the app's tenx-inflate macro does at search time:
+	hours, minutes and seconds from the epoch by arithmetic, fraction digits copied from the
+	value, the zone as UTC, and the date with strftime() from that day's noon shifted by the
+	instance's own offset at noon, which is the UTC date in every zone. Returns None for a
+	directive this does not render.
+	"""
+	if fmt == tenx_dml_builder.EPOCH_PASSTHROUGH:
+		return v
+	sec = 'tonumber(substr(%s, 1, 10))' % v
+	sod = '(%s - floor(%s / 86400) * 86400)' % (sec, sec)
+	noon = '(%s - %s + 43200)' % (sec, sod)
+	tz = 'strftime(%s, "%%z")' % noon
+	utc = '(%s - if(substr(%s, 1, 1) == "-", -1, 1) * (tonumber(substr(%s, 2, 2)) * 3600 + tonumber(substr(%s, 4, 2)) * 60))' % (
+		noon, tz, tz, tz)
+	hour = 'floor(%s / 3600)' % sod
+	minute = 'floor((%s %% 3600) / 60)' % sod
+	second = '(%s %% 60)' % sod
+	hour12 = 'if(%s %% 12 == 0, 12, %s %% 12)' % (hour, hour)
+
+	def two(x):
+		return 'substr("0" . %s, -2)' % x
+
+	time_parts = {
+		'%H': two(hour), '%-H': 'tostring(%s)' % hour, '%I': two(hour12), '%-I': 'tostring(%s)' % hour12,
+		'%M': two(minute), '%-M': 'tostring(%s)' % minute, '%S': two(second), '%-S': 'tostring(%s)' % second,
+		'%p': 'if(%s < 12, "AM", "PM")' % hour, '%Z': '"UTC"', '%z': '"+0000"', '%:z': '"+00:00"', '%:::z': '"+00"',
+		'%%': '"%"',
+	}
+	out, date = [], []
+
+	def flush():
+		if date:
+			out.append('strftime(%s, "%s")' % (utc, ''.join(date)))
+			del date[:]
+
+	for m in _TS_TOKEN.finditer(fmt):
+		tok = m.group(0)
+		if tok in _TS_DATE:
+			date.append(tok)
+		elif not tok.startswith('%'):
+			if date and _SPL_PLAIN.match(tok):
+				date.append(tok)
+			else:
+				flush()
+				out.append(spl_text(tok))
+		else:
+			flush()
+			q = re.fullmatch(r'%(\d+)Q', tok)
+			if q:
+				out.append('substr(%s . "000000000", 11, %s)' % (v, q.group(1)))
+			elif tok in time_parts:
+				out.append(time_parts[tok])
+			else:
+				return None
+	flush()
+	return ' . '.join(out) if out else '""'
+
+
+def eval_field_name(prefix, name, j=None):
+	return '%s%s' % (prefix, name) if j is None else '%s%s_%d' % (prefix, name, j)
+
+
+def ingest_eval_text(field_map):
+	"""
+	The one INGEST_EVAL of the field map: each field as a case() over its forms, keyed on the form
+	the event's template transform wrote, then the working fields removed. An event whose template
+	has no form of a field gets null(), which writes no field.
+	"""
+	by_name = collections.OrderedDict()
+	for (name, pieces, ts), form in field_map.forms.items():
+		by_name.setdefault(name, []).append((form, pieces, ts))
+	exprs = []
+	for name, forms in by_name.items():
+		branches = []
+		for form, pieces, ts in forms:
+			parts = []
+			for piece in pieces:
+				if isinstance(piece, int):
+					value = 'coalesce(%s, "")' % eval_field_name(EVAL_VALUE_PREFIX, name, abs(piece))
+					parts.append(spl_timestamp(value, ts) if piece < 0 else value)
+				else:
+					parts.append(spl_text(piece))
+			branches.append('%s=="%d", %s' % (eval_field_name(EVAL_FORM_PREFIX, name), form, ' . '.join(parts) or '""'))
+		exprs.append('%s=case(%s)' % (name, ', '.join(branches)))
+	for name, count in field_map.eval_values_per_name.items():
+		exprs.append('%s:=null()' % eval_field_name(EVAL_FORM_PREFIX, name))
+		exprs.extend('%s:=null()' % eval_field_name(EVAL_VALUE_PREFIX, name, j) for j in range(1, count + 1))
+	return ', '.join(exprs)
+
+
+def eval_value(form_key, groups, timestamp_format):
+	"""The value a form gives for the captured values `groups` (verify's Python reading)."""
+	name, pieces, ts = form_key
+	out = []
+	for piece in pieces:
+		if isinstance(piece, int):
+			v = groups[abs(piece) - 1] or ''
+			out.append(format_timestamp(v, ts) if piece < 0 else v)
+		else:
+			out.append(piece)
+	return ''.join(out)
+
+
 def reserved_name(name):
 	"""True when an indexed field of this name would collide with a Splunk default field."""
 	low = name.lower()
@@ -634,7 +795,8 @@ def stanza_name(prefix, position, key, style):
 	raise ValueError('unknown stanza name style: %s' % style)
 
 
-Transform = collections.namedtuple('Transform', 'key stanza regex format fields value_count')
+# evals: the fields of the template INGEST_EVAL writes, as (name, form, capture groups the form reads).
+Transform = collections.namedtuple('Transform', 'key stanza regex format fields value_count evals', defaults=((),))
 
 
 class FieldMap(object):
@@ -644,8 +806,19 @@ class FieldMap(object):
 
 	def __init__(self, templates, reader, prefix, stanza_names='indexed', hash_match='tolerant',
 			timestamp_values='epoch', keep=None, refused=None, mixed_names=False, trim_values=None,
-			reserved_names='skip', reserved_prefix='extracted_', mark=None):
+			reserved_names='skip', reserved_prefix='extracted_', mark=None, eval_values=False):
 		self.reader = reader
+		# Values FORMAT cannot write, and with timestamp_values 'text' the timestamp as the event
+		# wrote it, go to one INGEST_EVAL transform (see ingest_eval_text). Off: left out as before.
+		self.eval_values = eval_values
+		self.timestamp_values = timestamp_values
+		# (name, pieces, timestamp format) -> form number, from 1 in order of first use. A piece is
+		# literal text or the 1-based position of a compact value in the form.
+		self.forms = collections.OrderedDict()
+		# name -> the most values one of its forms reads
+		self.eval_values_per_name = collections.OrderedDict()
+		self.eval_fields = collections.Counter()
+		self.timestamp_text_fields = collections.Counter()
 		# Written last by every FORMAT as <mark>::"1", unless None.
 		self.mark = mark
 		# A literal name that collides with a Splunk default field: 'skip' leaves it out, 'prefix'
@@ -656,6 +829,9 @@ class FieldMap(object):
 		# Spaces and tabs at the ends of a value come only from template text (a compact value
 		# never holds one), so trimming the marked text trims the value Splunk would see.
 		self.trim_values = reader.trims_values if trim_values is None else trim_values
+		# With INGEST_EVAL on, line breaks at the ends go too (TRIM_CHARS); off, spaces and tabs only,
+		# as the first generated files had it.
+		self.trim_chars = TRIM_CHARS if eval_values else ' \t'
 		self.transforms = []
 		self.refused = dict(refused or {})
 		self.skipped = collections.Counter()
@@ -701,25 +877,32 @@ class FieldMap(object):
 			seen_stanzas[stanza] = key
 
 			tokens = []
+			evals = []
 			for name_expr, value_expr in reader.pairs(text):
 				name, why = to_format(name_expr, True, reader.field_name, mixed_names)
 				if name is None:
 					self._skip(key, stanza, 'name: ' + why, name_expr)
 					continue
 				if self.trim_values:
-					value_expr = value_expr.strip(' \t')
+					value_expr = value_expr.strip(self.trim_chars)
 				value, why = to_format(value_expr, False)
+				carries_ts = bool(t.timestamp_format) and (MARK % 0) in value_expr
+				by_eval = False
 				if value is None:
-					self._skip(key, stanza, 'value: ' + why, name_expr)
+					if not (self.eval_values and why in EVAL_REASONS):
+						self._skip(key, stanza, 'value: ' + why, name_expr)
+						continue
+					by_eval = True
+				elif value == '':
 					continue
-				if value == '':
-					continue
-				if t.timestamp_format and (MARK % 0) in value_expr:
+				if carries_ts and not by_eval:
 					if timestamp_values == 'skip':
 						self._skip(key, stanza, 'value: ' + WHY_TIMESTAMP, name_expr)
 						continue
-					self.timestamp_fields[_shown(name_expr)] += 1
-					self.explained[key].append(name_expr)
+					by_eval = timestamp_values == 'text'
+					if not by_eval:
+						self.timestamp_fields[_shown(name_expr)] += 1
+						self.explained[key].append(name_expr)
 				if '$' not in name and reserved_name(name):
 					self.reserved[name] += 1
 					if self.reserved_names == 'skip':
@@ -727,21 +910,70 @@ class FieldMap(object):
 						continue
 					self.explained[key].extend([name_expr, self.reserved_prefix + name_expr])
 					name = self.reserved_prefix + name
+				if by_eval:
+					reason = self._eval_field(name, value_expr, t.timestamp_format if carries_ts else '', evals)
+					if reason:
+						self._skip(key, stanza, reason, name_expr)
+					elif carries_ts:
+						self.timestamp_text_fields[name] += 1
+					continue
 				tokens.append('%s::"%s"' % (name, value))
 				if '$' not in name:
 					self.literal_names[name] += 1
 				elif not name.startswith('$'):
 					self.mixed_names[name] += 1
 
+			for name, form, groups in evals:
+				tokens.append('%s%s::"%d"' % (EVAL_FORM_PREFIX, name, form))
+				tokens.extend('%s%s_%d::"$%d"' % (EVAL_VALUE_PREFIX, name, j, g) for j, g in enumerate(groups, 1))
+				self.eval_fields[name] += 1
+				self.literal_names[name] += 1
+
 			if not tokens:
 				self.refused[key] = REFUSED_NO_FIELDS
 				continue
 
-			fields = len(tokens)
+			fields = len(tokens) - sum(1 + len(groups) for _, _, groups in evals) + len(evals)
 			if self.mark:
 				tokens.append('%s::"1"' % self.mark)
 			self.transforms.append(Transform(key, stanza, compact_line_regex(key, n, hash_match), ' '.join(tokens),
-				fields, n))
+				fields, n, tuple(evals)))
+
+	def _eval_field(self, name, value_expr, timestamp_format, evals):
+		"""
+		Records a field INGEST_EVAL writes for this template: its form, and the capture groups the
+		form reads, in order. Returns None, or the reason the field is left out.
+		"""
+		if '$' in name:
+			return 'name: ' + WHY_EVAL_NAME
+		if not EVAL_NAME.match(name):
+			return 'name: ' + WHY_EVAL_NAME_SHAPE
+		if any(n == name for n, _, _ in evals):
+			return 'value: ' + WHY_EVAL_TWICE
+		if UNDECODABLE in value_expr:
+			return 'value: ' + WHY_SPLIT_ESCAPE
+		groups, pieces = [], []
+		for piece in MARK_SPLIT.split(value_expr):
+			m = MARK_RE.fullmatch(piece)
+			if m is None:
+				if piece:
+					pieces.append(piece)
+				continue
+			k = int(m.group(1))
+			if k + 1 not in groups:
+				groups.append(k + 1)
+			pieces.append(groups.index(k + 1) + 1)
+		ts = timestamp_format if timestamp_format and 1 in groups else ''
+		if ts:
+			if spl_timestamp('v', ts) is None:
+				return 'value: ' + WHY_EVAL_FORMAT
+			# the epoch is value 0, group 1: mark its position in the form
+			pieces = [-p if isinstance(p, int) and groups[p - 1] == 1 else p for p in pieces]
+		key = (name, tuple(pieces), ts)
+		form = self.forms.setdefault(key, len(self.forms) + 1)
+		self.eval_values_per_name[name] = max(self.eval_values_per_name.get(name, 0), len(groups))
+		evals.append((name, form, tuple(groups)))
+		return None
 
 	def _skip(self, key, stanza, reason, name_expr):
 		self.skipped[reason] += 1
@@ -762,6 +994,11 @@ class FieldMap(object):
 			('hashes_with_outer_spaces', self.outer_space_hashes),
 			('templates_without_transform', dict(refused)),
 			('timestamp_written_as_epoch', dict(self.timestamp_fields)),
+			('timestamp_written_as_text', dict(self.timestamp_text_fields)),
+			('written_by_ingest_eval', collections.OrderedDict([
+				('templates_per_field', dict(self.eval_fields)),
+				('forms_per_field', dict(collections.Counter(name for name, _, _ in self.forms))),
+				('working_fields_per_event_max', max([sum(1 + len(g) for _, _, g in t.evals) for t in self.transforms] or [0]))])),
 			('reserved_field_names', collections.OrderedDict([
 				('action', 'left out' if self.reserved_names == 'skip' else 'written as %s<name>' % self.reserved_prefix),
 				('templates_per_name', dict(self.reserved))])),
@@ -825,6 +1062,10 @@ def sourcetype_stanza(target):
 	return '%s_sourcetype' % target['transform_prefix']
 
 
+def eval_stanza(target):
+	return '%s_ingest_eval' % target['transform_prefix']
+
+
 def props_text(target, field_map, settings, search_hash=True, sourcetype_field=SOURCETYPE_FIELD):
 	lines = [
 		'# %s. Index-time: the app\'s [%s] parsing plus one' % (target['description'], SOURCE_STANZA),
@@ -833,6 +1074,8 @@ def props_text(target, field_map, settings, search_hash=True, sourcetype_field=S
 	]
 	lines += ['%s = %s' % kv for kv in settings]
 	names = ([sourcetype_stanza(target)] if sourcetype_field else []) + [t.stanza for t in field_map.transforms]
+	if field_map.forms:
+		names.append(eval_stanza(target))
 	lines.append('TRANSFORMS-%s = %s' % (target['transforms_class'], ', '.join(names)))
 	lines.append('rename = %s' % target['rename'])
 	if search_hash:
@@ -851,6 +1094,10 @@ def transforms_text(field_map, search_hash=True, target=None, sourcetype_field=S
 	if sourcetype_field and target:
 		stanzas.insert(0, '# Every event of %s, for tenx-events.\n[%s]\nREGEX = .\nFORMAT = %s::"%s"\nWRITE_META = true\n' % (
 			target['sourcetype'], sourcetype_stanza(target), sourcetype_field, target['sourcetype']))
+	if field_map.forms and target:
+		stanzas.append('# Values FORMAT cannot write (a line break, a double quote, $<digit>) and timestamps as written,\n'
+			'# built from the tenx_fmf_* and tenx_fmv_* fields the transforms above write, which it then removes.\n'
+			'# Last in the TRANSFORMS- list.\n[%s]\nINGEST_EVAL = %s\n' % (eval_stanza(target), ingest_eval_text(field_map)))
 	header = ('# Generated by tenx_field_map.py from the app\'s template records: one index-time transform per '
 		'template.\n\n')
 	text = header + '\n'.join(stanzas)
@@ -935,8 +1182,11 @@ def raw_events(path, split):
 _FORMAT_TOKEN = re.compile(r'(\S+?)::"([^"]*)"')
 
 
-def apply_transform(transform, compact_line):
-	"""Pairs the transform writes for one compact line, as Python reads REGEX and FORMAT."""
+def apply_transform(transform, compact_line, forms=None):
+	"""
+	Pairs the transform writes for one compact line, as Python reads REGEX and FORMAT, and with the
+	field map's forms, the fields its INGEST_EVAL builds from the working fields.
+	"""
 	m = re.match(transform.regex, compact_line)
 	if m is None:
 		return None
@@ -945,7 +1195,14 @@ def apply_transform(transform, compact_line):
 	def sub(text):
 		return re.sub(r'\$(\d+)', lambda g: groups[int(g.group(1)) - 1] or '', text)
 
-	return [(sub(n), sub(v)) for n, v in _FORMAT_TOKEN.findall(transform.format) if n != MARK_FIELD]
+	pairs = [(sub(n), sub(v)) for n, v in _FORMAT_TOKEN.findall(transform.format)
+		if n != MARK_FIELD and not n.startswith((EVAL_FORM_PREFIX, EVAL_VALUE_PREFIX))]
+	if transform.evals and forms is not None:
+		by_number = dict((form, key) for key, form in forms.items())
+		for name, form, groups_used in transform.evals:
+			key = by_number[form]
+			pairs.append((name, eval_value(key, [groups[g - 1] for g in groups_used], key[2])))
+	return pairs
 
 
 def verify(templates, field_map, encoded_path, raw_path, raw_split=None, out=sys.stdout):
@@ -999,14 +1256,14 @@ def verify(templates, field_map, encoded_path, raw_path, raw_split=None, out=sys
 		if transform is None:
 			no_transform += 1
 			continue
-		written_pairs = apply_transform(transform, line)
+		written_pairs = apply_transform(transform, line, field_map.forms)
 		if written_pairs is None:
 			no_match += 1
 			continue
 		got = collections.Counter((n_, v) for n_, v in written_pairs if v != '')
 		for n_ in set(n_ for n_, _ in got if reserved_name(n_)):
 			reserved_dynamic[n_] += 1
-		want = collections.Counter((n_, v.strip(' \t') if field_map.trim_values else v)
+		want = collections.Counter((n_, v.strip(field_map.trim_chars) if field_map.trim_values else v)
 			for n_, v in reader.pairs(expanded) if v != '' and reader.field_name.match(n_))
 		want = collections.Counter({k: c for k, c in want.items() if k[1] != ''})
 		if got == want:
@@ -1072,7 +1329,7 @@ def _build(args):
 		keep=keep, refused=refused, mixed_names=args.mixed_names,
 		reserved_names=args.reserved_names, reserved_prefix=args.reserved_prefix,
 		trim_values={'auto': None, 'on': True, 'off': False}[args.trim_values],
-		mark=None if args.mark == 'none' else args.mark)
+		mark=None if args.mark == 'none' else args.mark, eval_values=args.eval_values == 'on')
 	return target, templates, field_map
 
 
@@ -1099,7 +1356,12 @@ def build_parser():
 			help='indexed: <prefix>_<position>_<hash> (default); hash: <prefix>_<hash>, refused on a clash; '
 				'stable: <prefix>_<hash>_<sha1 prefix>, unchanged when templates are added')
 		p.add_argument('--hash-match', choices=('tolerant', 'exact'), default='tolerant')
-		p.add_argument('--timestamp-values', choices=('epoch', 'skip'), default='epoch')
+		p.add_argument('--timestamp-values', choices=('text', 'epoch', 'skip'), default='text',
+			help='a field holding the timestamp: text: as the event wrote it, by INGEST_EVAL (default); '
+				'epoch: the epoch digits of the compact line, by FORMAT; skip: left out')
+		p.add_argument('--eval-values', choices=('on', 'off'), default='on',
+			help='on: values FORMAT cannot write (a line break, a double quote, $<digit>, a group followed by a digit) '
+				'are written by one INGEST_EVAL transform (default); off: left out and reported')
 		p.add_argument('--trim-values', choices=('auto', 'on', 'off'), default='auto',
 			help='drop spaces and tabs at the ends of a value; auto: as the reader\'s Splunk extraction does '
 				'(xml-windows on, json and kv off)')
@@ -1150,7 +1412,8 @@ def main(argv=None):
 	with open(report_path, 'w', encoding='utf-8') as f:
 		json.dump(report, f, indent=1)
 	summary = collections.OrderedDict((k, report[k]) for k in ('templates', 'fields_per_template_min_max', 'skipped',
-		'literal_field_names', 'templates_without_transform', 'timestamp_written_as_epoch', 'reserved_field_names'))
+		'literal_field_names', 'templates_without_transform', 'timestamp_written_as_epoch', 'timestamp_written_as_text',
+		'written_by_ingest_eval', 'reserved_field_names'))
 	sys.stdout.write(json.dumps(summary, indent=1) + '\nreport: %s\n' % report_path)
 	if sourcetype_field:
 		sys.stdout.write('for tx: add %s::%s to the tenx-events macro, for example\n'

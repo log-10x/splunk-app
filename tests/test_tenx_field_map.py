@@ -362,11 +362,13 @@ class TestApp:
 		assert sorted(os.listdir(str(out / 'default'))) == ['app.conf', 'fields.conf', 'props.conf', 'transforms.conf']
 		assert (out / 'metadata' / 'default.meta').read_text() == '[]\nexport = system\n'
 		props = (out / 'default' / 'props.conf').read_text()
-		assert '[tenx_fw]\n' in props and 'TRANSFORMS-tenx_fw = tenx_fw_sourcetype, tenx_fw_00000_k1\n' in props
+		assert '[tenx_fw]\n' in props and \
+			'TRANSFORMS-tenx_fw = tenx_fw_sourcetype, tenx_fw_00000_k1, tenx_fw_ingest_eval\n' in props
 		assert 'rename = fw:traffic\n' in props
 		assert props.endswith('[fw:traffic]\nREPORT-tenx_fm_hash_vars = tenx_fm_hash_vars\n')
 		assert '[tenx_fw_00000_k1]\nREGEX = ^~ *k1 *,([^,]*),([^,]*),([^,]*)$\n' \
-			'FORMAT = time::"$1" user::"$2" src::"$3" tenx_mapped::"1"\nWRITE_META = true\n' in (out / 'default' / 'transforms.conf').read_text()
+			'FORMAT = user::"$2" src::"$3" tenx_fmf_time::"1" tenx_fmv_time_1::"$1" tenx_mapped::"1"\nWRITE_META = true\n' \
+			in (out / 'default' / 'transforms.conf').read_text()
 		assert '[user]\nINDEXED_VALUE = false\n' in (out / 'default' / 'fields.conf').read_text()
 		report = json.loads((tmp_path / 'app_report.json').read_text())
 		assert report['hashes_with_outer_spaces'] == 1 and report['templates'] == 1
@@ -404,6 +406,78 @@ class TestApp:
 
 
 # -------------------------------------------------------------------------------------------
+# Values written by INGEST_EVAL
+
+class TestIngestEval:
+	def xml(self):
+		# UserAccountControl's text holds line breaks; SystemTime is the timestamp slot.
+		return tpl('h', ["<Event><System><TimeCreated SystemTime='__TENX_TS__'/><EventID>",
+			"</EventID></System><EventData><Data Name='UserAccountControl'>\n\t\t%%", "\n\t\t%%",
+			"</Data><Data Name='CommandLine'>\"C:\\x\\"], ".exe\" --a</Data></EventData></Event>",
+			ts='%Y-%m-%dT%H:%M:%S.%7QZ')
+
+	def test_values_format_cannot_hold_go_to_one_ingest_eval(self):
+		f = fm.FieldMap({'h': self.xml()}, fm.XmlWindowsReader(), 'p', eval_values=True, timestamp_values='text')
+		[tr] = f.transforms
+		assert tr.format == ('EventID::"$2" tenx_fmf_SystemTime::"1" tenx_fmv_SystemTime_1::"$1" '
+			'tenx_fmf_UserAccountControl::"2" tenx_fmv_UserAccountControl_1::"$3" tenx_fmv_UserAccountControl_2::"$4" '
+			'tenx_fmf_CommandLine::"3" tenx_fmv_CommandLine_1::"$5"')
+		assert tr.fields == 4 and f.skipped == {}
+		text = fm.ingest_eval_text(f)
+		# the line break leaves the field's ends, as Splunk trims it; the one inside stays
+		assert 'UserAccountControl=case(tenx_fmf_UserAccountControl=="2", urldecode("%25%25") . ' \
+			'coalesce(tenx_fmv_UserAccountControl_1, "") . urldecode("%0A%09%09%25%25") . ' \
+			'coalesce(tenx_fmv_UserAccountControl_2, ""))' in text
+		assert text.endswith('tenx_fmf_SystemTime:=null(), tenx_fmv_SystemTime_1:=null(), '
+			'tenx_fmf_UserAccountControl:=null(), tenx_fmv_UserAccountControl_1:=null(), '
+			'tenx_fmv_UserAccountControl_2:=null(), tenx_fmf_CommandLine:=null(), tenx_fmv_CommandLine_1:=null()')
+		# no line break, tab, quote, backslash, dollar or percent sign in the .conf line itself
+		assert not re.search(r'[\n\t\\$]', text) and '"C:' not in text
+
+	def test_off_leaves_them_out_as_before(self):
+		f = fm.FieldMap({'h': self.xml()}, fm.XmlWindowsReader(), 'p')
+		[tr] = f.transforms
+		assert tr.format == 'EventID::"$2" SystemTime::"$1"' and not f.forms
+		assert f.skipped == {'value: ' + fm.WHY_LINE_BREAK: 1, 'value: ' + fm.WHY_QUOTE: 1}
+
+	def test_the_python_reading_of_a_form_is_the_expanded_text(self):
+		f = fm.FieldMap({'h': self.xml()}, fm.XmlWindowsReader(), 'p', eval_values=True, timestamp_values='text')
+		[tr] = f.transforms
+		pairs = dict(fm.apply_transform(tr, '~h,1697157342412381800,4624,2080,2082,prog', f.forms))
+		assert pairs == {'EventID': '4624', 'SystemTime': '2023-10-13T00:35:42.4123818Z',
+			'UserAccountControl': '%%2080\n\t\t%%2082', 'CommandLine': '"C:\\x\\prog.exe" --a'}
+
+	def test_templates_with_the_same_shape_share_a_form(self):
+		a = tpl('a', ["</Data><Data Name='N'>"], '</Data></EventData></Event>', ts='',
+			part_0="<Event><EventData><Data Name='L'>x\n")
+		b = tpl('b', ["</Data><Data Name='L'>x\n"], '</Data></EventData></Event>', ts='',
+			part_0="<Event><EventData><Data Name='N'>")
+		f = fm.FieldMap({'a': a, 'b': b}, fm.XmlWindowsReader(), 'p', eval_values=True)
+		assert len(f.forms) == 1 and f.eval_fields == {'L': 2}
+		assert [t.evals for t in f.transforms] == [(('L', 1, (1,)),), (('L', 1, (2,)),)]
+
+	def test_a_name_from_a_value_is_left_out(self):
+		t = tpl('h', ["'>a\nb"], '</Data></EventData></Event>', ts='', part_0="<Event><EventData><Data Name='")
+		f = fm.FieldMap({'h': t}, fm.XmlWindowsReader(), 'p', eval_values=True)
+		assert f.skipped == {'name: ' + fm.WHY_EVAL_NAME: 1}
+
+	def test_spl_text(self):
+		assert fm.spl_text('C:/Program Files') == '"C:/Program Files"'
+		assert fm.spl_text('a"b\n%$\\+') == 'urldecode("a%22b%0A%25%24%5C%2B")'
+		from urllib.parse import unquote
+		for text in ('a"b\n%$\\+', '\t\t%%', 'é ü', "'x'"):
+			assert unquote(fm.spl_text(text)[len('urldecode("'):-2]) == text
+
+	def test_spl_timestamp_uses_no_strftime_for_the_time_of_day(self):
+		expr = fm.spl_timestamp('v', '%Y-%m-%dT%H:%M:%S.%7QZ')
+		# the date from noon shifted by the instance's offset; the hour, minute, second by arithmetic
+		assert expr.count('strftime(') == 4 and ', "%Y-%m-%dT")' in expr and ', "%z")' in expr
+		assert 'substr(v . "000000000", 11, 7)' in expr and expr.endswith(' . "Z"')
+		assert fm.spl_timestamp('v', fm.tenx_dml_builder.EPOCH_PASSTHROUGH) == 'v'
+		assert fm.spl_timestamp('v', '%H:%M:%S %Q') is None
+
+
+# -------------------------------------------------------------------------------------------
 # Samples and the files validated on Splunk (not in this repository)
 
 SAMPLES = os.environ.get('TENX_FIELD_MAP_SAMPLES', '/nonexistent')
@@ -434,7 +508,8 @@ def run_verify(argv):
 
 T4663 = ('data', 't3', 'win_security_4663_redline', 'splunk')
 # The first validated files had neither the tenx_mapped mark nor the search-time hash extraction.
-FIRST_FILES = ['--mark', 'none', '--search-hash', 'off', '--sourcetype-field', 'none']
+FIRST_FILES = ['--mark', 'none', '--search-hash', 'off', '--sourcetype-field', 'none', '--eval-values', 'off',
+	'--timestamp-values', 'epoch']
 TAUTH = ('data', 't3', 'win_security_auth_change', 'splunk')
 
 
@@ -471,22 +546,41 @@ class TestGoldenWindows:
 		assert [(t.key, t.regex, t.format) for t in a.transforms] == [(t.key, t.regex, t.format) for t in b.transforms]
 		assert b.outer_space_hashes == 26
 
+	V662 = ['--records', sample('data', 'b2_kv_rows.json'), '--target', 'windows-security',
+		'--encoded', sample(*TAUTH + ('encoded.log',)), '--raw', sample('samples', 'win_security_auth_change.xml.log')]
+	V4663 = ['--records', sample('data', 'b2_kv_rows_all.json'), '--only-hashes-in',
+		sample(*T4663 + ('templates.json',)), '--target', 'windows-security',
+		'--encoded', sample(*T4663 + ('encoded.log',)), '--raw', sample('samples', 'win_security_4663_redline.xml.log')]
+	FORMAT_ONLY = ['--eval-values', 'off', '--timestamp-values', 'epoch']
+
 	def test_verify_662_event_sample(self):
-		result, f = run_verify(['--records', sample('data', 'b2_kv_rows.json'), '--target', 'windows-security',
-			'--encoded', sample(*TAUTH + ('encoded.log',)), '--raw', sample('samples', 'win_security_auth_change.xml.log')])
+		result, f = run_verify(self.V662)
 		assert result['compact_lines'] == result['expanded_equal_raw'] == 662
 		assert result['transform_regex_did_not_match'] == 0
+		assert result['events_all_fields_equal'] == 662
+		assert result['fields_missing_or_different_events'] == {} and result['fields_extra_or_different_events'] == {}
+		assert f.report()['written_by_ingest_eval']['templates_per_field'] == {
+			'SystemTime': 96, 'UserAccountControl': 2, 'CommandLine': 4, 'PrivilegeList': 2}
+
+	def test_verify_662_event_sample_format_only(self):
+		result, f = run_verify(self.V662 + self.FORMAT_ONLY)
 		assert result['events_differing_only_as_reported'] == 662
 		assert set(result['fields_missing_or_different_events']) == {
 			'CommandLine', 'PrivilegeList', 'UserAccountControl', 'SystemTime'}
 		assert set(result['fields_extra_or_different_events']) == {'SystemTime'}
 
 	def test_verify_4663_sample(self):
-		result, f = run_verify(['--records', sample('data', 'b2_kv_rows_all.json'), '--only-hashes-in',
-			sample(*T4663 + ('templates.json',)), '--target', 'windows-security',
-			'--encoded', sample(*T4663 + ('encoded.log',)), '--raw', sample('samples', 'win_security_4663_redline.xml.log')])
+		result, f = run_verify(self.V4663)
 		assert result['compact_lines'] == result['expanded_equal_raw'] == 7649
 		assert result['transform_regex_did_not_match'] == 0
+		assert result['events_all_fields_equal'] == 7649
+		# AccessList is "%%" and a value once the line break and tabs at its end are trimmed, as
+		# Splunk trims them, so FORMAT writes it; only the timestamp is left to INGEST_EVAL.
+		assert f.report()['written_by_ingest_eval']['templates_per_field'] == {'SystemTime': 1783}
+		assert f.report()['skipped'] == {}
+
+	def test_verify_4663_sample_format_only(self):
+		result, f = run_verify(self.V4663 + self.FORMAT_ONLY)
 		assert result['events_differing_only_as_reported'] == 7649
 		assert result['fields_missing_or_different_events'] == {'AccessList': 7649, 'SystemTime': 7649}
 
@@ -514,7 +608,10 @@ class TestJsonAndKeyValueSamples:
 		# the paths under them mixed names, left out by default.
 		assert result['events_differing_only_as_reported'] == 8100
 		assert len(f.transforms) == 11
-		assert set(f.skipped) == {'name: ' + fm.WHY_NAME_MIXES, 'value: ' + fm.WHY_SPLIT_ESCAPE, 'name: ' + fm.WHY_RESERVED}
+		# A timestamp under a JSON path name is left out: INGEST_EVAL is given plain names only.
+		assert set(f.skipped) == {'name: ' + fm.WHY_NAME_MIXES, 'value: ' + fm.WHY_SPLIT_ESCAPE, 'name: ' + fm.WHY_RESERVED,
+			'name: ' + fm.WHY_EVAL_NAME_SHAPE}
+		assert f.report()['timestamp_written_as_text'] == {'eventTime': 5}
 
 	def test_cloudtrail_eventtype_is_reported_and_left_out(self):
 		result, f = run_verify(self.ct('--mixed-names'))
@@ -526,18 +623,17 @@ class TestJsonAndKeyValueSamples:
 		result, f = run_verify(self.ct('--mixed-names'))
 		assert result['events_differing_only_as_reported'] == 8100
 		assert set(result['fields_missing_or_different_events']) == {
-			'eventTime', 'userIdentity.sessionContext.attributes.creationDate', 'responseElements.credentials.sessionToken',
-			'eventType'}
-		assert set(result['fields_extra_or_different_events']) == {
-			'eventTime', 'userIdentity.sessionContext.attributes.creationDate'}
+			'userIdentity.sessionContext.attributes.creationDate', 'responseElements.credentials.sessionToken', 'eventType'}
+		assert result['fields_extra_or_different_events'] == {}
 
 	def test_fortigate_key_value(self):
 		result, f = run_verify(self.fg())
 		assert result['compact_lines'] == result['expanded_equal_raw'] == 82
 		assert result['transform_regex_did_not_match'] == 0
-		assert result['events_all_fields_equal'] + result['events_differing_only_as_reported'] == 82
+		assert result['events_all_fields_equal'] == 56 and result['events_differing_only_as_reported'] == 26
 		# FortiGate's own eventtype= key is Splunk's eventtype field: left out and reported.
-		assert result['fields_missing_or_different_events'] == {'time': 81, 'msg': 1, 'eventtype': 26}
+		assert result['fields_missing_or_different_events'] == {'eventtype': 26}
+		assert f.report()['written_by_ingest_eval']['templates_per_field'] == {'time': 78, 'msg': 1}
 		assert f.report()['reserved_field_names']['templates_per_name'] == {'eventtype': 25}
 		assert f.outer_space_hashes == 2
 
@@ -586,7 +682,7 @@ class TestWhatTxNeeds:
 	def test_every_event_of_the_compact_sourcetype_gets_the_sourcetype_field(self, tmp_path):
 		props, transforms = self.gen(tmp_path)
 		# first in the list, so it does not depend on any template's transform
-		assert 'TRANSFORMS-tenx_fw = tenx_fw_sourcetype, tenx_fw_00000_h1\n' in props
+		assert 'TRANSFORMS-tenx_fw = tenx_fw_sourcetype, tenx_fw_00000_h1, tenx_fw_ingest_eval\n' in props
 		assert '[tenx_fw_sourcetype]\nREGEX = .\nFORMAT = tenx_compact_st::"tenx_fw"\nWRITE_META = true\n' in transforms
 		# no mark: an event of a template without a transform, or written whole, gets it too
 		assert 'tenx_mapped' not in transforms.split('[tenx_fw_sourcetype]', 1)[1].split('\n[', 1)[0]
@@ -603,7 +699,7 @@ class TestWhatTxNeeds:
 	def test_the_sourcetype_field_can_be_left_out(self, tmp_path, capsys):
 		props, transforms = self.gen(tmp_path, '--sourcetype-field', 'none')
 		assert 'tenx_compact_st' not in transforms and 'tenx_fw_sourcetype' not in props
-		assert 'TRANSFORMS-tenx_fw = tenx_fw_00000_h1\n' in props
+		assert 'TRANSFORMS-tenx_fw = tenx_fw_00000_h1, tenx_fw_ingest_eval\n' in props
 		assert 'tenx-events' not in capsys.readouterr().out
 
 	def test_the_sourcetype_field_is_not_a_tenx_mapped_field(self):
