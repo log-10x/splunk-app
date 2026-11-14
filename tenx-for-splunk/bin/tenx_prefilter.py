@@ -7,6 +7,10 @@ subsearch: it reads the running job's own search text through the REST API, pars
 after `tx` (tenx_prefilter_parser), asks the template dictionary which templates carry each
 word, and returns one row whose `search` field is the prefilter.
 
+A field comparison (field=value, field IN (...)) narrows only when tenx_config.conf [config] has
+field_narrowing = true, tenxreplay has written the list of fields whose value is not text of the
+event, and the field is not on it. Off (the default), no field comparison restricts the prefilter.
+
 When it cannot read the search (tx inside another subsearch, or wrapped in another macro) or
 cannot parse the words, it returns `(*)`, so every compact event in range is expanded and the
 words are applied to the expanded text: slower, never fewer results. Two things it stops with
@@ -36,6 +40,9 @@ import tenx_prefilter_parser as parser
 # Matches every event like *, and gives Splunk Web no keyword to highlight (* lit every event).
 EVERY_EVENT = "(*)"
 
+# The tenx_replay.conf stanza tenxreplay writes: fields whose value is not text of the event.
+NARROWING_STANZA = "tenx:narrowing"
+
 SUBSEARCH_SID = re.compile(r"^subsearch_(.+)_\d+\.\d+$")
 
 
@@ -62,6 +69,26 @@ class TenxPrefilterCommand(GeneratingCommand):
 		job = self._rest("/services/search/jobs/%s?output_mode=json" % urllib.parse.quote(match.group(1), safe=""))
 		return parser.text_after_macro(job["entry"][0]["content"].get("search", ""))
 
+	def _text_field(self):
+		"""
+		Which field comparisons may narrow, or None for none: then no field comparison restricts
+		the prefilter. Field narrowing is off unless tenx_config.conf [config] says
+		field_narrowing = true, and needs the [tenx:narrowing] stanza the tenxreplay command
+		writes (only while some compact event carries tenx_sourcetype). Anything unreadable
+		means off. The setting is read from the app's conf files on disk, so with narrowing off
+		this makes no REST call (a REST read of the setting cost 0.01 to 0.03 s per search with a
+		field comparison, observed on Splunk Enterprise 10.4.3).
+		"""
+		if not parser.narrowing_on_disk(apphome):
+			return None
+		try:
+			entry = self._rest("/servicesNS/nobody/%s/configs/conf-tenx_replay/%s?output_mode=json" % (
+				APP_NAME, urllib.parse.quote(NARROWING_STANZA, safe="")))["entry"][0]["content"]
+		except Exception:
+			return None
+		names = [n.strip() for n in str(entry.get("fields_not_in_text", "") or "").split(",") if n.strip()]
+		return parser.text_field_predicate(names)
+
 	def generate(self):
 		try:
 			text = self._search_text()
@@ -85,8 +112,10 @@ class TenxPrefilterCommand(GeneratingCommand):
 		if reader.unquoted_comma:
 			self.error_exit(RuntimeError("comma after tx"),
 				"tx: a comma after `tx` is matched literally, so this search would miss events. Remove it, or put the text in quotes.")
+		# The setting is read only when it can change the prefilter (see narrowing_matters).
+		text_field = self._text_field() if parser.narrowing_matters(tree) else None
 		dictionary = {}
-		pieces = parser.lookup_pieces(tree)
+		pieces = parser.lookup_pieces(tree, text_field=text_field)
 		if pieces:
 			try:
 				result = self._rest(
@@ -99,7 +128,7 @@ class TenxPrefilterCommand(GeneratingCommand):
 				self.write_warning("tx: the template lookup did not complete; every compact event in range is expanded.")
 				yield {"search": EVERY_EVENT}
 				return
-		yield {"search": parser.prefilter(tree, dictionary) or EVERY_EVENT}
+		yield {"search": parser.prefilter(tree, dictionary, text_field) or EVERY_EVENT}
 
 
 dispatch(TenxPrefilterCommand, sys.argv, sys.stdin, sys.stdout, __name__)
