@@ -362,7 +362,7 @@ class TestApp:
 		assert sorted(os.listdir(str(out / 'default'))) == ['app.conf', 'fields.conf', 'props.conf', 'transforms.conf']
 		assert (out / 'metadata' / 'default.meta').read_text() == '[]\nexport = system\n'
 		props = (out / 'default' / 'props.conf').read_text()
-		assert '[tenx_fw]\n' in props and 'TRANSFORMS-tenx_fw = tenx_fw_00000_k1\n' in props
+		assert '[tenx_fw]\n' in props and 'TRANSFORMS-tenx_fw = tenx_fw_sourcetype, tenx_fw_00000_k1\n' in props
 		assert 'rename = fw:traffic\n' in props
 		assert props.endswith('[fw:traffic]\nREPORT-tenx_fm_hash_vars = tenx_fm_hash_vars\n')
 		assert '[tenx_fw_00000_k1]\nREGEX = ^~ *k1 *,([^,]*),([^,]*),([^,]*)$\n' \
@@ -434,7 +434,7 @@ def run_verify(argv):
 
 T4663 = ('data', 't3', 'win_security_4663_redline', 'splunk')
 # The first validated files had neither the tenx_mapped mark nor the search-time hash extraction.
-FIRST_FILES = ['--mark', 'none', '--search-hash', 'off']
+FIRST_FILES = ['--mark', 'none', '--search-hash', 'off', '--sourcetype-field', 'none']
 TAUTH = ('data', 't3', 'win_security_auth_change', 'splunk')
 
 
@@ -580,8 +580,35 @@ class TestWhatTxNeeds:
 
 	def test_every_format_writes_the_mark_last(self, tmp_path):
 		_, transforms = self.gen(tmp_path)
-		formats = [l for l in transforms.splitlines() if l.startswith('FORMAT = ')]
+		formats = [l for l in transforms.splitlines() if l.startswith('FORMAT = ') and 'tenx_compact_st' not in l]
 		assert formats and all(f.endswith(' tenx_mapped::"1"') for f in formats)
+
+	def test_every_event_of_the_compact_sourcetype_gets_the_sourcetype_field(self, tmp_path):
+		props, transforms = self.gen(tmp_path)
+		# first in the list, so it does not depend on any template's transform
+		assert 'TRANSFORMS-tenx_fw = tenx_fw_sourcetype, tenx_fw_00000_h1\n' in props
+		assert '[tenx_fw_sourcetype]\nREGEX = .\nFORMAT = tenx_compact_st::"tenx_fw"\nWRITE_META = true\n' in transforms
+		# no mark: an event of a template without a transform, or written whole, gets it too
+		assert 'tenx_mapped' not in transforms.split('[tenx_fw_sourcetype]', 1)[1].split('\n[', 1)[0]
+
+	def test_gen_names_the_sourcetype_field_for_tenx_events(self, tmp_path, capsys):
+		self.gen(tmp_path)
+		out = capsys.readouterr().out
+		assert 'index=* (sourcetype::tenx_encoded OR tenx_compact_st::tenx_fw)' in out
+		# sourcetype::<compact> is checked against the renamed search-time sourcetype, see the docstring
+		assert 'sourcetype::tenx_fw)' not in out
+		report = json.loads((tmp_path / 'app_report.json').read_text())
+		assert report['sourcetype_field'] == 'tenx_compact_st'
+
+	def test_the_sourcetype_field_can_be_left_out(self, tmp_path, capsys):
+		props, transforms = self.gen(tmp_path, '--sourcetype-field', 'none')
+		assert 'tenx_compact_st' not in transforms and 'tenx_fw_sourcetype' not in props
+		assert 'TRANSFORMS-tenx_fw = tenx_fw_00000_h1\n' in props
+		assert 'tenx-events' not in capsys.readouterr().out
+
+	def test_the_sourcetype_field_is_not_a_tenx_mapped_field(self):
+		# tenx-mapped-hide runs `foreach tenx_mapped*`: a second field of that prefix would run it twice
+		assert not fm.SOURCETYPE_FIELD.startswith(fm.MARK_FIELD)
 
 	def test_the_mark_and_the_extraction_can_be_left_out(self, tmp_path):
 		props, transforms = self.gen(tmp_path, '--mark', 'none', '--search-hash', 'off')
