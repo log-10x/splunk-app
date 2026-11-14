@@ -371,3 +371,62 @@ def test_the_recompile_search_named_exists():
 	assert "RECOMPILE_SEARCH = 'Recompile Compiled Alerts'" in text
 	assert conf.has_section('Recompile Compiled Alerts')
 	assert conf.get('Recompile Compiled Alerts', 'search').strip() == '| tenxrecompile'
+
+
+# ---------------------------------------------------------------------------
+# Index-time masking of the original sourcetype, recorded and reported
+# ---------------------------------------------------------------------------
+
+class TestMaskingIsRecorded:
+	TRANSFORMS = {'mask_card': {'DEST_KEY': '_raw', 'REGEX': '(.*)card=\\d+(.*)', 'FORMAT': '$1card=xxxx$2'},
+				  'route_index': {'DEST_KEY': '_MetaData:Index', 'REGEX': '.', 'FORMAT': 'other'}}
+
+	def stanzas(self):
+		return [b.Stanza('app:kv', {'SEDCMD-pw': 's/password=\\S+/password=xxx/g', 'TRANSFORMS-a': 'mask_card, route_index',
+									'EVAL-k': '"x"'}, {}),
+				b.Stanza('source::/var/app/*.log', {'SEDCMD-tok': 's/token=\\S+/token=xxx/'}, {}),
+				b.Stanza('other:st', {'TRANSFORMS-r': 'route_index'}, {})]
+
+	def test_sedcmd_and_raw_rewriting_transforms_are_found(self):
+		assert b.masking_rules(self.stanzas()[:1], self.TRANSFORMS) == [
+			'SEDCMD-pw in [app:kv]', 'TRANSFORMS-a (mask_card) in [app:kv]']
+		# a transform that routes or sets metadata does not change the text
+		assert b.masking_rules(self.stanzas()[2:], self.TRANSFORMS) == []
+
+	def test_the_replay_reports_them_per_sourcetype(self):
+		replay = b.build(self.stanzas(), [('app:kv', '/var/app/a.log', 'web-1'), ('other:st', '/x', 'h')],
+						 transforms=self.TRANSFORMS)
+		kv = replay.per_sourcetype['app:kv']
+		assert kv['masking'] == ['SEDCMD-pw in [app:kv]', 'SEDCMD-tok in [source::/var/app/*.log]',
+								 'TRANSFORMS-a (mask_card) in [app:kv]']
+		assert any('masked at index time' in w and 'unmasked' in w for w in kv['warnings'])
+		assert replay.per_sourcetype['other:st']['masking'] == []
+
+
+MASK_SCENARIO = r'''
+class MaskingSplunk(FakeSplunk):
+	def rest(self, path, data=None, method=None):
+		route = urllib.parse.urlparse(path).path
+		if route == NS + 'configs/conf-props':
+			out = FakeSplunk.rest(self, path, data, method)
+			out['entry'][0]['content']['SEDCMD-pw'] = 's/password=\\S+/password=xxx/g'
+			return out
+		return FakeSplunk.rest(self, path, data, method)
+
+fake = MaskingSplunk([('app:kv', '/var/app/a.log', 'web-1', 5, 'app', True), ('app:json', '/var/other/b.log', 'api-1', 3, 'shared', True)])
+rows = run(fake)
+print(json.dumps([fake.conf['app:kv'].get('masked_at_index_time'), fake.conf['app:json'].get('masked_at_index_time'),
+				  [r['masked_at_index_time'] for r in rows if r['sourcetype'] == 'app:kv']]))
+'''
+
+
+def test_the_record_holds_the_masking_rules_of_each_sourcetype():
+	kv, js, row = child_run(MASK_SCENARIO)
+	assert kv == 'SEDCMD-pw in [app:kv]' and js == '' and row == [['SEDCMD-pw in [app:kv]']]
+
+
+def test_the_diagnostics_dashboard_lists_them():
+	text = open(os.path.join(APP, 'default', 'data', 'ui', 'views', 'tenx_diagnostics.xml'), encoding='utf-8').read()
+	assert 'Original Sourcetypes Masked at Index Time' in text and 'masked_at_index_time' in text
+	spec = open(os.path.join(APP, 'README', 'tenx_replay.conf.spec'), encoding='utf-8').read()
+	assert 'masked_at_index_time = ' in spec

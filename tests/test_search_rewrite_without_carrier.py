@@ -19,6 +19,8 @@ from test_tenx_search_builder import compile_search
 PLAIN_REWRITE = '`tenx-inflate` | extract | spath | fields - tenx_hash, tenx_var_0, tenx_vars'
 PLAIN_KV = ' | extract kvdelim="=" pairdelim=" "'
 PLAIN_TX = '`tenx-inflate` | fields - _kv | extract | fields - tenx_hash, tenx_var_0, tenx_vars'
+REFUSED_STEP = ' | eval tenx_expand_refused=if(len(tenx_expand_refused)>0, tenx_expand_refused, null())'
+PLAIN_TX += REFUSED_STEP
 
 
 def kv_pairs(event):
@@ -141,7 +143,7 @@ class TestTxfWithoutCarrierIsTx:
 		import os
 		conf = configparser.RawConfigParser(strict=False)
 		conf.read(os.path.join(os.path.dirname(__file__), '..', 'tenx-for-splunk', 'default', 'macros.conf'))
-		# `tx` is unchanged (tests/test_replay_units.py pins it); the replay is `txf`.
+		# tests/test_replay_units.py pins `tx`; the replay is `txf`.
 		tx = conf.get('txf', 'definition')
 		tail = tx[tx.index('eval tenx_compact_raw=_raw'):tx.rindex(' | search *')]
 		for definition in (' | '.join(b.UNCHANGED), GENERATED):

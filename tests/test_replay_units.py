@@ -38,9 +38,13 @@ MACROS = os.path.join(ROOT, 'tenx-for-splunk', 'default', 'macros.conf')
 # default/macros.conf [tx] at commit e12ec4e (release 1.1.7)
 TX_SHIPPED = ('`tenx-events` [| tenxprefilter] | `tenx-inflate` | fields - _kv | extract | '
 			  'fields - tenx_hash, tenx_var_0, tenx_vars | search *')
-# [tx] now: the same, with the field-map guard around `extract` (see TestTxIsTheShippedMacro)
+# The one step `tx` and `txf` add before their final search: the template lookup gives
+# tenx_expand_refused an empty value on every event it expands, and only a refused event keeps it.
+REFUSED_STEP = ' | eval tenx_expand_refused=if(len(tenx_expand_refused)>0, tenx_expand_refused, null())'
+# [tx] now: the same, with the field-map guard around `extract` and REFUSED_STEP before the final
+# search (see TestTxIsTheShippedMacro)
 TX_DEFINITION = ('`tenx-events` [| tenxprefilter] | `tenx-inflate` | `tenx-mapped-hide` | fields - _kv | extract | '
-				 '`tenx-mapped-restore` | fields - tenx_hash, tenx_var_0, tenx_vars | search *')
+				 '`tenx-mapped-restore` | fields - tenx_hash, tenx_var_0, tenx_vars' + REFUSED_STEP + ' | search *')
 GUARD_CALLS = (' | `tenx-mapped-hide`', ' | `tenx-mapped-restore`')
 
 
@@ -78,16 +82,38 @@ def mapped_guard_macros():
 	return dict((n, conf.get(n, 'definition')) for n in ('tenx-mapped-hide', 'tenx-mapped-restore'))
 
 
+class TestTheRefusedStep:
+	"""REFUSED_STEP, as the end of `tx` and `txf` runs it, on the three kinds of event."""
+	def run(self, value):
+		event = {'_raw': 'x'}
+		if value is not None:
+			event['tenx_expand_refused'] = value
+		return visible(Model().run(REFUSED_STEP.lstrip(' |'), [event])[0])
+
+	def test_an_expanded_event_has_no_such_field(self):
+		# the lookup's empty value for a template that expands
+		assert 'tenx_expand_refused' not in self.run('')
+
+	def test_a_refused_event_keeps_its_reason(self):
+		for reason in ('back-reference', 'multi-timestamp', 'hash-conflict'):
+			assert self.run(reason)['tenx_expand_refused'] == reason
+
+	def test_an_event_of_an_unknown_template_is_unchanged(self):
+		assert self.run(None) == {'_raw': 'x'}
+
+
 class TestTxIsTheShippedMacro:
 	"""
 	`tx` is the shipped macro with one addition: tenx-mapped-hide before its `extract` and
 	tenx-mapped-restore after it, for events indexed with a field map (tenx_mapped). Each is a
 	foreach over tenx_mapped*, which runs only on a chunk of results holding such an event, and
 	each eval is guarded per event; TestTheMappedGuard runs both on events with and without it.
+	And REFUSED_STEP before its final search, which removes the empty tenx_expand_refused the
+	template lookup leaves on every expanded event (TestTheRefusedStep).
 	"""
 	def test_the_definition(self):
 		assert macros().get('tx', 'definition') == TX_DEFINITION
-		assert without_guard(TX_DEFINITION) == TX_SHIPPED
+		assert without_guard(TX_DEFINITION).replace(REFUSED_STEP, '') == TX_SHIPPED
 
 	def test_every_other_shipped_stanza_is_unchanged_character_for_character(self):
 		try:
@@ -101,7 +127,7 @@ class TestTxIsTheShippedMacro:
 		shipped = configparser.RawConfigParser(strict=False)
 		shipped.read_string(base.stdout)
 		assert macros().get('tx', 'definition') != shipped.get('tx', 'definition')
-		assert without_guard(macros().get('tx', 'definition')) == shipped.get('tx', 'definition')
+		assert without_guard(macros().get('tx', 'definition')).replace(REFUSED_STEP, '') == shipped.get('tx', 'definition')
 		# every other stanza shipped at e12ec4e is unchanged, its comments included
 		for name in shipped.sections():
 			if name != 'tx':
@@ -115,7 +141,7 @@ class TestTxIsTheShippedMacro:
 		head = ('`tenx-events` [| tenxprefilter] | eval tenx_compact_raw=_raw | `tenx-inflate` | fields - _kv | '
 				'`tenx-mapped-hide` | ')
 		tail = (' | `tenx-mapped-restore` | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars'
-				' | search *')
+				+ REFUSED_STEP + ' | search *')
 		assert conf.get('txf', 'definition') == head + '`tenx-replay`' + tail
 		# Splunk Enterprise 10.4.3 refuses a colon in a macro name, so txf(1) computes the unit's
 		# name with md5() in eval; on 10.4.3, md5 in eval equals hashlib's for the five names tried
@@ -124,7 +150,7 @@ class TestTxIsTheShippedMacro:
 													 '"` | `tenx-replay-tags`' + tail + '"')
 		assert without_guard(conf.get('txf', 'definition')) == (
 			'`tenx-events` [| tenxprefilter] | eval tenx_compact_raw=_raw | `tenx-inflate` | fields - _kv | '
-			'`tenx-replay` | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars | search *')
+			'`tenx-replay` | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars' + REFUSED_STEP + ' | search *')
 		assert conf.get('txf(1)', 'args') == 'st'
 		assert conf.get('txf(1)', 'validation') == 'match(st, "^[A-Za-z0-9_.:/-]+$")'
 		assert conf.get('txf(1)', 'errormsg')
@@ -352,8 +378,8 @@ def units():
 	return dict((st, b.build_unit(STANZAS, st, cov[st], LOOKUP_FIELDS).spl()) for st in cov)
 
 
-TXF = 'eval tenx_compact_raw=_raw | `tenx-inflate` | fields - _kv | %s | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars'
-PLAIN_TX = '`tenx-inflate` | fields - _kv | extract | fields - tenx_hash, tenx_var_0, tenx_vars'
+TXF = 'eval tenx_compact_raw=_raw | `tenx-inflate` | fields - _kv | %s | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars' + REFUSED_STEP.replace('%', '%%')
+PLAIN_TX = '`tenx-inflate` | fields - _kv | extract | fields - tenx_hash, tenx_var_0, tenx_vars' + REFUSED_STEP
 
 
 def run_txf(replay, evs):

@@ -103,7 +103,7 @@ class TestDashboardsFindCompactEvents:
 	def test_every_compact_panel_reads_the_macro(self):
 		for f in ('tenx_dashboard.xml', 'tenx_diagnostics.xml'):
 			compact = [q for q in queries(f) if 'inputlookup' not in q and 'index=_internal' not in q
-					   and 'sourcetype=tenx_dml' not in q]
+					   and 'sourcetype=tenx_dml' not in q and not q.lstrip().startswith('| rest ')]
 			assert compact, f
 			assert all('`tenx-events`' in q for q in compact), f
 
