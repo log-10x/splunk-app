@@ -406,6 +406,7 @@ class TenxReplayCommand(GeneratingCommand):
 		for st, info in replay.per_sourcetype.items():
 			seen = cov.get(st)
 			want = {'computed_fields': ','.join(info['computed']), 'aliased_fields': ','.join(info['aliased']),
+					'masked_at_index_time': ', '.join(info.get('masking', [])),
 					'sources': builder.listed_value(seen['sources']) if seen else builder.sources_value(info['sources']),
 					'last_seen': str(last_seen[st])}
 			if seen:
@@ -582,6 +583,10 @@ class TenxReplayCommand(GeneratingCommand):
 			replay.warnings.insert(0, 'expired after replay_expire_days = %d: %s' % (settings['replay_expire_days'], builder._listed(expired)))
 		for note in replay.warnings + [w for st in sorted(units) for w in units[st].warnings if 'replays nothing' in w]:
 			self.logger.warning("tenxreplay: %s", note)
+		for st, info in sorted(replay.per_sourcetype.items()):
+			if info.get('masking'):
+				self.logger.warning("tenxreplay: original sourcetype %s is masked at index time (%s); its compact events "
+									"hold those values unmasked", st, ', '.join(info['masking']))
 		not_in_text = builder.fields_not_in_text(stanzas, transforms, lookups, keep, not_raw)
 		written = []
 		if self.apply:
@@ -608,6 +613,7 @@ class TenxReplayCommand(GeneratingCommand):
 				'calculated_fields': info['calculated'],
 				'lookups': info['lookups'],
 				'computed_fields': info['computed'],
+				'masked_at_index_time': info.get('masking', []),
 				'warnings': info['warnings'] + replay.warnings,
 				'kept_indexed_fields': keep,
 				'fields_not_in_text': len(not_in_text),

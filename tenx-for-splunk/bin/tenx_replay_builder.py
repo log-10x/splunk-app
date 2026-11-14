@@ -814,6 +814,27 @@ def clearing_steps(names, keep_rx, warnings, compact=False):
 	return steps
 
 
+def masking_rules(stanzas, transforms=None):
+	"""
+	The index-time rules among `stanzas` that change an event's text: every SEDCMD- key, and every
+	TRANSFORMS- class naming a transform with DEST_KEY = _raw. Splunk runs them while it parses an
+	event under its original sourcetype, source and host. A compact event is parsed as the compact
+	sourcetype, so its values are stored as the sender wrote them and `tx` shows them unmasked.
+	Returns sorted 'SEDCMD-x in [stanza]' and 'TRANSFORMS-x (name) in [stanza]' strings.
+	"""
+	transforms = transforms or {}
+	found = set()
+	for s in stanzas:
+		for key, value in sorted(s.settings.items()):
+			if key.startswith('SEDCMD-'):
+				found.add('%s in [%s]' % (key, s.name))
+			elif key.startswith('TRANSFORMS-'):
+				for name in (n.strip() for n in str(value or '').split(',') if n.strip()):
+					if str((transforms.get(name) or {}).get('DEST_KEY', '')).strip() == '_raw':
+						found.add('%s (%s) in [%s]' % (key, name, s.name))
+	return sorted(found)
+
+
 def build(stanzas, present, lookup_fields=None, keep_fields=(), all_shared=True, rejected=None, bad_lookups=None,
 		  transforms=None, only=False, seen=None, with_tags=True):
 	"""
@@ -923,6 +944,16 @@ def build(stanzas, present, lookup_fields=None, keep_fields=(), all_shared=True,
 			info[st]['warnings'].append('INDEXED_EXTRACTIONS fields are index-time and are not replayed')
 		if str(settings.get('rename', '') or '').strip():
 			info[st]['warnings'].append('rename = %s is not replayed' % settings.get('rename'))
+		# Index-time rules: every stanza that matches the sourcetype, a recorded source or host,
+		# whether or not it has a search-time rule the replay chose.
+		info[st]['masking'] = masking_rules([s for s in stanzas if (s.kind == 'sourcetype' and s.name == st)
+											 or (s.kind == 'source' and any(s.matches(v) is not False for v in srcs))
+											 or (s.kind == 'host' and any(s.matches(v) is not False for v in hsts))],
+											transforms)
+		if info[st]['masking']:
+			info[st]['warnings'].append('masked at index time for this sourcetype: %s; compact events of it hold '
+										'those values as sent, unmasked (mask them before compaction)'
+										% ', '.join(info[st]['masking']))
 	replay.warnings[:] = sorted(set(replay.warnings))
 
 	if with_tags:

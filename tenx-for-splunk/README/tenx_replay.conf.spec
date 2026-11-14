@@ -13,6 +13,13 @@ computed_fields = <comma-separated list>
 aliased_fields = <comma-separated list>
 * Fields that a field alias (FIELDALIAS-) produces for events of this sourcetype.
 
+masked_at_index_time = <comma-separated list>
+* The index-time rules that change the text of this sourcetype's events: SEDCMD- keys, and
+  TRANSFORMS- classes whose transform sets DEST_KEY = _raw, in its own props stanza and the
+  source:: and host:: stanzas recorded for it. Splunk does not run them on compact events, which
+  are parsed as the compact sourcetype, so the values they mask are stored as sent and `tx`
+  shows them unmasked. Empty when there are none. The Diagnostics dashboard lists them.
+
 sources = <comma-separated list>|*
 * The sources of this sourcetype's compact events: every source a rebuild has seen with it, or *
   when there were more than 200 or a name could not be listed. `| tenxreplay only_new=true`
