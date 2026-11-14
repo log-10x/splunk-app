@@ -35,9 +35,14 @@ from test_tenx_search_builder import TEMPLATES, CountingManager, EXPAND, make_co
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 MACROS = os.path.join(ROOT, 'tenx-for-splunk', 'default', 'macros.conf')
 
-# default/macros.conf [tx], unchanged since commit e12ec4e
-TX_DEFINITION = ('`tenx-events` [| tenxprefilter] | `tenx-inflate` | fields - _kv | extract | '
-				 'fields - tenx_hash, tenx_var_0, tenx_vars | search *')
+# default/macros.conf [tx] at commit e12ec4e (release 1.1.7)
+TX_SHIPPED = ('`tenx-events` [| tenxprefilter] | `tenx-inflate` | fields - _kv | extract | '
+			  'fields - tenx_hash, tenx_var_0, tenx_vars | search *')
+# The one step `tx` and `txf` add before their final search: the template lookup gives
+# tenx_expand_refused an empty value on every event it expands, and only a refused event keeps it.
+REFUSED_STEP = ' | eval tenx_expand_refused=if(len(tenx_expand_refused)>0, tenx_expand_refused, null())'
+# [tx] now
+TX_DEFINITION = TX_SHIPPED.replace(' | search *', REFUSED_STEP + ' | search *')
 
 
 def macros():
@@ -59,11 +64,37 @@ def stanza_text(text, name):
 	return '\n'.join(lines[start:end])
 
 
-class TestTxIsTheShippedMacro:
-	def test_the_definition_is_unchanged(self):
-		assert macros().get('tx', 'definition') == TX_DEFINITION
+class TestTheRefusedStep:
+	"""REFUSED_STEP, as the end of `tx` and `txf` runs it, on the three kinds of event."""
+	def run(self, value):
+		event = {'_raw': 'x'}
+		if value is not None:
+			event['tenx_expand_refused'] = value
+		return visible(Model().run(REFUSED_STEP.lstrip(' |'), [event])[0])
 
-	def test_the_stanza_is_unchanged_character_for_character(self):
+	def test_an_expanded_event_has_no_such_field(self):
+		# the lookup's empty value for a template that expands
+		assert 'tenx_expand_refused' not in self.run('')
+
+	def test_a_refused_event_keeps_its_reason(self):
+		for reason in ('back-reference', 'multi-timestamp', 'hash-conflict'):
+			assert self.run(reason)['tenx_expand_refused'] == reason
+
+	def test_an_event_of_an_unknown_template_is_unchanged(self):
+		assert self.run(None) == {'_raw': 'x'}
+
+
+class TestTxIsTheShippedMacro:
+	"""
+	`tx` is the shipped macro with one step added before its final search, REFUSED_STEP, which
+	removes the empty tenx_expand_refused the template lookup leaves on every expanded event.
+	TestTheRefusedStep runs it on a refused, an expanded and an unknown template's event.
+	"""
+	def test_the_definition(self):
+		assert macros().get('tx', 'definition') == TX_DEFINITION
+		assert TX_DEFINITION.replace(REFUSED_STEP, '') == TX_SHIPPED
+
+	def test_every_other_shipped_stanza_is_unchanged_character_for_character(self):
 		try:
 			base = subprocess.run(['git', 'show', 'e12ec4e:tenx-for-splunk/default/macros.conf'], cwd=ROOT,
 								  capture_output=True, text=True, timeout=30)
@@ -72,9 +103,13 @@ class TestTxIsTheShippedMacro:
 		if base.returncode != 0:
 			pytest.skip('commit e12ec4e is not in this checkout')
 		ours = open(MACROS, encoding='utf-8').read()
-		assert stanza_text(ours, 'tx') == stanza_text(base.stdout, 'tx')
-		# and every other stanza shipped at e12ec4e is unchanged too: the new ones are added after
-		assert ours.startswith(base.stdout)
+		shipped = configparser.RawConfigParser(strict=False)
+		shipped.read_string(base.stdout)
+		assert macros().get('tx', 'definition').replace(REFUSED_STEP, '') == shipped.get('tx', 'definition')
+		# every other stanza shipped at e12ec4e is unchanged, its comments included
+		for name in shipped.sections():
+			if name != 'tx':
+				assert stanza_text(ours, name) == stanza_text(base.stdout, name), name
 
 	def test_tx_runs_no_replay(self):
 		assert 'tenx-replay' not in macros().get('tx', 'definition')
@@ -82,7 +117,7 @@ class TestTxIsTheShippedMacro:
 	def test_txf_is_tx_with_the_replay(self):
 		conf = macros()
 		head = '`tenx-events` [| tenxprefilter] | eval tenx_compact_raw=_raw | `tenx-inflate` | fields - _kv | '
-		tail = ' | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars | search *'
+		tail = ' | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars' + REFUSED_STEP + ' | search *'
 		assert conf.get('txf', 'definition') == head + '`tenx-replay`' + tail
 		# Splunk Enterprise 10.4.3 refuses a colon in a macro name, so txf(1) computes the unit's
 		# name with md5() in eval; on 10.4.3, md5 in eval equals hashlib's for the five names tried
@@ -316,8 +351,8 @@ def units():
 	return dict((st, b.build_unit(STANZAS, st, cov[st], LOOKUP_FIELDS).spl()) for st in cov)
 
 
-TXF = 'eval tenx_compact_raw=_raw | `tenx-inflate` | fields - _kv | %s | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars'
-PLAIN_TX = '`tenx-inflate` | fields - _kv | extract | fields - tenx_hash, tenx_var_0, tenx_vars'
+TXF = 'eval tenx_compact_raw=_raw | `tenx-inflate` | fields - _kv | %s | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars' + REFUSED_STEP.replace('%', '%%')
+PLAIN_TX = '`tenx-inflate` | fields - _kv | extract | fields - tenx_hash, tenx_var_0, tenx_vars' + REFUSED_STEP
 
 
 def run_txf(replay, evs):
