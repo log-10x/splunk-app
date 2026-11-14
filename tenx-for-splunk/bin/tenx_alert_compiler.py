@@ -338,18 +338,17 @@ class TenxAlertCompiler:
 				"if a term appears as a variable value, not as template text. Confirm "
 				"that is the intent, or recompile once a matching template exists")
 
-		# Field conditions filter post-inflate via generic key=value extraction from the decoded
-		# event text (logfmt-style, space-separated). That works, but it depends on the decoded
-		# events actually carrying these as extractable fields: on a differently-shaped payload
-		# (JSON, key:value, quoted values with spaces) the field may not extract and the alert
-		# would silently never fire, or a bare key=value fragment elsewhere could over-match.
-		# Flag for a human to confirm against real data rather than certifying it clean.
+		# Field conditions filter post-inflate on the fields the decoded text gets from the event's
+		# own extraction (key=value pairs and JSON) and, for XML text, from spath. That works, but
+		# it depends on the decoded events actually carrying these as extractable fields: a field
+		# that only a field alias, calculated field or lookup of the original sourcetype gives is
+		# not there, and the alert would silently never fire. Flag for a human to confirm against
+		# real data rather than certifying it clean.
 		if result.field_terms:
 			review_reasons.append(
-				"filters on field condition(s) {} via key=value extraction from the decoded event "
-				"text; confirm those decode as fields (space-separated key=value). Other "
-				"payload shapes may not extract, and the alert would then not fire".format(
-					", ".join(result.field_terms)))
+				"filters on field condition(s) {} using the fields extracted from the decoded event "
+				"text (key=value pairs, JSON, XML paths); confirm the decoded events carry them, "
+				"or the alert will not fire".format(", ".join(result.field_terms)))
 
 		if review_reasons:
 			return AlertCompileResult(
