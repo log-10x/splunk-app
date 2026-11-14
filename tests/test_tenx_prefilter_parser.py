@@ -159,3 +159,44 @@ class TestDictionary:
 	def test_rows_with_one_or_many_terms(self):
 		d = p.dictionary_from_rows([{"piece": "a", "n": "1", "hs": "TERM(~a)"}, {"piece": "b", "n": "2", "hs": ["TERM(~b)", "TERM(~c)"]}])
 		assert d == {"a": (1, ["TERM(~a)"]), "b": (2, ["TERM(~b)", "TERM(~c)"])}
+
+
+class TestDigitsOfAWrittenDateOrTime:
+	"""
+	The engine stores a timestamp as an epoch and `tx` prints it again, so no digit of a written
+	date or time is a term of the compact event. A piece inside one places no restriction. On
+	Splunk Enterprise 10.4.3, `tx "20:11:45.936"` found 0 of the 71 OpenTelemetry records that
+	hold it (TERM(936) was required), whether addresses were stored cut or whole.
+	"""
+
+	def test_the_fraction_of_a_time_places_no_restriction(self):
+		for text in ('"20:11:45.936"', '"20:13:14,964"', '"08:00:00.123456"', '"20:11:46:346"'):
+			assert plan(text)[0] is None, text
+		assert plan("error 20:11:45.936")[0] == "(((TERM(error) OR TERM(~e1))))"
+
+	def test_dates_offsets_and_epochs(self):
+		for text in ('"12/Nov/2025:23:00:00 +0000"', '"15.03.2024"', '20240315080000',
+					 '1763020800.123', '1763020800123456', '"-04:00"'):
+			assert plan(text)[0] is None, text
+
+	def test_a_number_outside_a_date_or_time_still_narrows(self):
+		assert plan("error 936")[0] == "(((TERM(error) OR TERM(~e1))) AND (TERM(936)))"
+		assert plan('"took 1234 ms"')[0] == "(TERM(took) AND TERM(1234) AND TERM(ms))"
+		assert plan("error-404")[0] == "((TERM(error) OR TERM(~e1)) AND TERM(404))"
+
+	def test_the_prefilter_only_ever_widens(self):
+		# The pieces used are a subset of the pieces the earlier rule used, in the same order: a
+		# conjunction of fewer clauses selects every compact event it selected before, so the
+		# search after `tx` never keeps fewer events than it did.
+		texts = ['"20:11:45.936"', 'error 936', '"2025-11-12T23:00:00.062Z" kafka', '10:00 to 11:30 x9z',
+				 '"12/Nov/2025:23:00:00 +0000" GET /a/b 200', 'id=123456 ts=1700000000.5', 'v1.2.3-rc4 +0530 -1']
+		for text in texts:
+			kept, before = p.pieces_outside_times(text), p.pieces_of(text)
+			it = iter(before)
+			assert all(piece in it for piece in kept), text
+
+	def test_numbers_beside_a_colon_or_dots_that_are_no_date_or_time_still_narrow(self):
+		# a port after an address, and the parts of an address, are not a time or a date
+		assert "TERM(8443)" in plan("10.0.1.14:8443")[0]
+		assert plan("192.168.33.161")[0] == "(TERM(192) AND TERM(168) AND TERM(161))"
+		assert "TERM(1234)" in plan("job:1234")[0]

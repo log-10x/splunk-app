@@ -16,6 +16,13 @@ own search text, and this module
    used when a rendered timestamp could print it, when it holds a character outside a-z and
    0-9, or when more than MAX_TEMPLATES templates carry it. A field comparison, a NOT and a
    subsearch place no restriction. An OR with any unrestricted branch places none.
+   "When a rendered timestamp could print it" is read two ways: the piece alone looks like
+   timestamp text (TIMESTAMP_PIECE: one or two digits, a year, an epoch, a month name ...), or
+   the piece sits inside a written date or time in the searched text (TIME_FORMS: 20:11:45.936,
+   2025-11-12, 20251112, a zone offset +0000). The engine stores a timestamp as an epoch and
+   tx-inflate prints it again, so no digit of such a form is a term of the compact event: the
+   936 of "20:11:45.936" is three digits, which the first test alone kept, and the search found
+   none of the events that hold it.
 
 Anything the prefilter leaves unrestricted is still applied, exactly, by the search that
 follows `tx` on the expanded text. The prefilter only selects which compact events to expand,
@@ -35,6 +42,24 @@ TIMESTAMP_PIECE = re.compile(
 	r"september|october|november|december|mon|tue|wed|thu|fri|sat|sun|monday|tuesday|wednesday|"
 	r"thursday|friday|saturday|sunday|am|pm|utc|gmt)$")
 FIELD_TERM = re.compile(r"^([A-Za-z0-9_.:@{}\-]+)(!=|<=|>=|=|<|>)(.*)$", re.S)
+# Written forms of a date or a time in searched text (see the module docstring). A piece that
+# overlaps one is not used. Matching more than a timestamp prints only leaves a piece unused,
+# which expands more compact events and never drops one the search after `tx` would keep.
+TIME_FORMS = (
+	# times: 08:00, 8:00:00, 08:00:00.123456, 08:00:00,123, 20:11:46:346 (not 10.0.1.14:8443)
+	re.compile(r"(?<![0-9])(?:[01]?\d|2[0-3]):[0-5]\d(?::[0-5]\d)?(?:[.,:]\d{1,9})?(?![0-9])"),
+	# dates: 2024-03-15, 2024/03/15, 15.03.2024, 03/15/24 (not inside 192.168.33.161)
+	re.compile(r"(?<![0-9.])(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[-/.]\d{1,2}[-/.]\d{2,4})(?![0-9]|\.[0-9])"),
+	# an epoch with a fraction: 1763020800.123, 1763020800123.456
+	re.compile(r"(?<![0-9])(?:\d{10}|\d{13})[.,]\d{1,9}(?![0-9])"),
+	# dates and times without separators: 20240315, 20240315080000, 080000, 080000123
+	re.compile(r"(?<![0-9])(?:19|20)\d{2}(?:0[1-9]|1[0-2])(?:0[1-9]|[12]\d|3[01])\d*(?![0-9])"),
+	re.compile(r"(?<![0-9])(?:[01]\d|2[0-3])[0-5]\d[0-5]\d\d*(?![0-9])"),
+	# epochs in microseconds and nanoseconds (10 and 13 digits are TIMESTAMP_PIECE already)
+	re.compile(r"(?<![0-9])(?:\d{16}|\d{19})(?![0-9])"),
+	# zone offsets: +0000, -04:00
+	re.compile(r"[-+](?:[01]\d|2[0-3]):?[0-5]\d(?![0-9])"),
+)
 
 
 class Unparsed(Exception):
@@ -245,6 +270,34 @@ def pieces_of(text):
 	return pieces
 
 
+def time_spans(text):
+	"""The positions of `text` inside a written date or time (TIME_FORMS)."""
+	covered = set()
+	for rx in TIME_FORMS:
+		for m in rx.finditer(text):
+			covered.update(range(m.start(), m.end()))
+	return covered
+
+
+def pieces_outside_times(text):
+	"""pieces_of(text) without the pieces that overlap a written date or time."""
+	low = text.lower()
+	covered = time_spans(low)
+	pieces, buf, start = [], [], 0
+	for i, ch in enumerate(low):
+		if ch.isalnum() or ch == "*":
+			if not buf:
+				start = i
+			buf.append(ch)
+		elif buf:
+			if not covered.intersection(range(start, i)):
+				pieces.append("".join(buf))
+			buf = []
+	if buf and not covered.intersection(range(start, len(low))):
+		pieces.append("".join(buf))
+	return pieces
+
+
 def usable(piece):
 	return bool(re.fullmatch(r"[a-z0-9*]+", piece)) and piece.strip("*") != "" and not TIMESTAMP_PIECE.match(piece)
 
@@ -253,7 +306,7 @@ def lookup_pieces(node, found=None):
 	"""Every usable piece the prefilter would look up in the template dictionary."""
 	found = set() if found is None else found
 	if node[0] == "text":
-		found.update(p for p in pieces_of(node[1]) if usable(p))
+		found.update(p for p in pieces_outside_times(node[1]) if usable(p))
 	elif node[0] in ("and", "or"):
 		for child in node[1]:
 			lookup_pieces(child, found)
@@ -268,7 +321,7 @@ def prefilter(node, dictionary):
 	kind = node[0]
 	if kind == "text":
 		clauses = []
-		for piece in pieces_of(node[1]):
+		for piece in pieces_outside_times(node[1]):
 			if not usable(piece):
 				continue
 			count, terms = dictionary.get(piece, (0, []))
