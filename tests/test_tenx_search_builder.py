@@ -402,7 +402,9 @@ class TestSubTokenValues:
 
 		assert prefilter(result.resolved) == '("192") AND ("168") AND ("45") AND ("200")'
 		assert result.resolved.endswith('| search 192.168.45.200')
-		assert manager.probes == ['"192"', '"168"', '"45"', '"200"']
+		# Address parts are required without a dictionary lookup: digits only, never template
+		# text.
+		assert manager.probes == []
 
 	def test_hostname_mixes_required_and_template_pieces(self):
 		# live row 14: `ip-192-168-42-205.ec2.internal` returned 0 against 20,000. "ip",
@@ -427,7 +429,11 @@ class TestSubTokenValues:
 		result, manager = compile_search('sourcetype=tenx_encoded 10.0.0.1')
 
 		assert prefilter(result.resolved) == '("10") AND ("0") AND ("1")'
-		assert manager.probes == ['"10"', '"0"', '"1"']
+		assert manager.probes == []   # an address: its parts need no lookup
+		result, manager = compile_search('sourcetype=tenx_encoded zq9.zq8.zq9')
+
+		assert prefilter(result.resolved) == '("zq9") AND ("zq8")'
+		assert manager.probes == ['"zq9"', '"zq8"']
 
 	def test_pieces_matching_many_templates_share_one_clause(self):
 		# a piece present in more templates than PER_PIECE_HASH_LIMIT does not repeat the
