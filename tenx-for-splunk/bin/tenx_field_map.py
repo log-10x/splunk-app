@@ -132,6 +132,7 @@ import re
 import ssl
 import sys
 import tempfile
+import time
 import urllib.parse
 import urllib.request
 
@@ -1338,9 +1339,10 @@ def verify(templates, field_map, encoded_path, raw_path, raw_split=None, out=sys
 # * gen --cap-file first rewrites the file without the listed hashes that no longer have a transform,
 #   then writes the app, then writes <cap file>.pending, the list as it should be once the app is
 #   active. gen never adds a hash to the cap file itself.
-# * activate has the instance that parses the data reload its index-time configuration, reads the
-#   app's transforms and props back from that instance over REST, and only when every stanza equals
-#   the generated one renames the pending list over the cap file. gen --splunkd runs it right after
+# * activate restarts the instance that parses the data when the pending list adds templates (a
+#   conf reload does not reach a stream that is already flowing, see below), reads the app's
+#   transforms and props back from that instance over REST, and only when every stanza equals the
+#   generated one renames the pending list over the cap file. gen --splunkd runs it right after
 #   writing the app, for an app written in place on that instance.
 #
 # Rows: `"<hash>",true`, the hash as the engine writes it (outer spaces kept), always quoted (a hash
@@ -1353,9 +1355,14 @@ def verify(templates, field_map, encoded_path, raw_path, raw_split=None, out=sys
 
 CAP_HEADER = 'pattern_hash,value\n'
 CAP_PENDING_SUFFIX = '.pending'
-# app.conf in $SPLUNK_HOME/etc/system/default: reload.props and reload.transforms =
-# access_endpoints /admin/transforms-reload, /admin/metrics-reload, /admin/metric-schema-reload.
-RELOAD_ENDPOINT = '/services/admin/transforms-reload/_reload'
+# Measured on Splunk Enterprise 10.4.3, one instance, with one compact event of the template sent
+# after each step: a transform stanza written to the app takes effect for a new input stream after
+# POST conf-transforms/_reload and conf-props/_reload, but a stream (host, source and sourcetype) that
+# already carried events before the reload keeps the configuration it started with: 0 of 9 events of
+# such a stream got the new transform over 3 minutes, also after reloading the HEC input, and a
+# forwarder's stream carries events all day. After a restart every stream uses the new
+# configuration. So activate restarts the instance when the pending list adds templates.
+RESTART_ENDPOINT = '/services/server/control/restart'
 
 
 def cap_hashes(field_map, templates):
@@ -1487,6 +1494,15 @@ def read_conf(path):
 	return collections.OrderedDict((name, dict(parser[name])) for name in parser.sections())
 
 
+_BOOLEAN = {'true': '1', 't': '1', 'yes': '1', '1': '1', 'false': '0', 'f': '0', 'no': '0', '0': '0'}
+
+
+def _same_setting(key, written, held):
+	# REST returns a boolean setting as 1 or 0 (WRITE_META = true comes back as "1").
+	a, b = str(written).strip(), str(held).strip()
+	return a == b or (a.lower() in _BOOLEAN and _BOOLEAN[a.lower()] == _BOOLEAN.get(b.lower()))
+
+
 def not_installed(splunkd, app_dir, app_name):
 	"""The stanzas of the app's transforms.conf and props.conf the instance does not hold as written."""
 	differ = []
@@ -1496,33 +1512,52 @@ def not_installed(splunkd, app_dir, app_name):
 			got = have.get(name)
 			if got is None:
 				differ.append('%s.conf [%s] missing' % (conf, name))
-			elif any(str(got.get(k, '')).strip() != v.strip() for k, v in settings.items()):
+			elif not all(_same_setting(k, v, got.get(k, '')) for k, v in settings.items()):
 				differ.append('%s.conf [%s] differs' % (conf, name))
 	return differ
 
 
+def wait_for(splunkd, seconds=600):
+	"""After a restart: True once the management port answers again."""
+	deadline = time.time() + seconds
+	time.sleep(10)
+	while time.time() < deadline:
+		try:
+			splunkd.call('GET', '/services/server/info')
+			return True
+		except Exception:
+			time.sleep(5)
+	return False
+
+
 def activate(app_dir, cap_file, splunkd, app_name=None, out=sys.stdout):
 	"""
-	Has the instance reload its index-time configuration, checks that it holds the app as generated,
-	and only then renames the pending list over the cap file. Returns 0, or 1 with the cap file left
-	as it was.
+	When the pending list adds templates, restarts the instance; then checks that it holds the app as
+	generated, and only then renames the pending list over the cap file. Returns 0, or 1 with the cap
+	file left as it was.
 	"""
 	pending = cap_file + CAP_PENDING_SUFFIX
 	if not os.path.exists(pending):
 		out.write('activate: nothing pending (%s)\n' % pending)
 		return 0
 	app_name = app_name or os.path.basename(os.path.abspath(app_dir))
-	splunkd.call('POST', RELOAD_ENDPOINT)
+	before, _ = read_cap(cap_file)
+	after, _ = read_cap(pending)
+	restarted = bool(after - before)
+	if restarted:
+		splunkd.call('POST', RESTART_ENDPOINT)
+		if not wait_for(splunkd):
+			out.write('activate: the instance did not come back after the restart; cap file left as it was\n')
+			return 1
 	differ = not_installed(splunkd, app_dir, app_name)
 	if differ:
 		out.write('activate: the instance does not hold app %s as generated (%d stanzas, first %s); '
 			'cap file left as it was\n' % (app_name, len(differ), differ[0]))
 		return 1
-	before, _ = read_cap(cap_file)
-	after, _ = read_cap(pending)
 	os.replace(pending, cap_file)
-	out.write('activate: app %s reloaded and checked; %s lists %d templates (%d added, %d removed)\n'
-		% (app_name, cap_file, len(after), len(after - before), len(before - after)))
+	out.write('activate: app %s %schecked; %s lists %d templates (%d added, %d removed)\n'
+		% (app_name, 'restarted and ' if restarted else '', cap_file, len(after), len(after - before),
+			len(before - after)))
 	return 0
 
 
@@ -1613,7 +1648,8 @@ def build_parser():
 			p.add_argument('--raw', required=True)
 			p.add_argument('--raw-split', help='regex between raw events (default: the reader\'s)')
 
-	p = sub.add_parser('activate', help='reload the parsing instance, check it holds the app, then list its templates')
+	p = sub.add_parser('activate', help='restart the parsing instance when templates are added, check it holds the app, '
+		'then list them')
 	p.add_argument('--app', required=True, help='the app folder gen wrote, as installed on the instance')
 	p.add_argument('--app-name', help='the app\'s name on the instance (default: the folder name)')
 	p.add_argument('--cap-file', required=True)
@@ -1624,7 +1660,8 @@ def build_parser():
 def _splunkd_args(p, required):
 	p.add_argument('--splunkd', required=required,
 		help='management URL of the instance that parses the data, e.g. https://127.0.0.1:8089; with gen, '
-			'activate runs right after the app is written (the app folder is on that instance)')
+			'activate runs right after the app is written (the app folder is on that instance), and restarts it '
+			'when templates are added')
 	p.add_argument('--splunkd-auth-env', default='TENX_SPLUNKD_AUTH',
 		help='environment variable holding user:password (default TENX_SPLUNKD_AUTH)')
 	p.add_argument('--splunkd-token-env', default='TENX_SPLUNKD_TOKEN',

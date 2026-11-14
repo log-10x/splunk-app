@@ -721,15 +721,16 @@ class TestWhatTxNeeds:
 
 class FakeSplunkd(object):
 	"""
-	A management port in a thread: POST /services/admin/transforms-reload/_reload records the cap
-	file as it is at that moment; GET .../configs/conf-<conf> returns the stanzas of the app folder
-	it serves (or of `installed`, a folder that can differ from what gen wrote).
+	A management port in a thread, holding a loaded configuration as Splunk 10.4.3 does: GET
+	.../configs/conf-<conf> returns the stanzas of the folder loaded last (none at first), booleans as
+	digits; a POST (server/control/restart) loads the folder on disk. Every call is
+	recorded with the cap file's text at that moment.
 	"""
 
-	def __init__(self, installed, app_name, cap_file):
+	def __init__(self, on_disk, app_name, cap_file, loaded=None):
 		import http.server
 		import threading
-		self.installed, self.app_name, self.cap_file = installed, app_name, cap_file
+		self.on_disk, self.app_name, self.cap_file, self.loaded = on_disk, app_name, cap_file, loaded
 		self.calls = []
 		outer = self
 
@@ -747,20 +748,29 @@ class FakeSplunkd(object):
 
 			def do_POST(self):
 				self.rfile.read(int(self.headers.get('Content-Length') or 0))
-				outer.calls.append(('POST', self.path.split('?')[0], read(outer.cap_file)))
+				path = self.path.split('?')[0]
+				outer.calls.append(('POST', path, read(outer.cap_file)))
+				outer.loaded = outer.on_disk
 				self._send({})
 
 			def do_GET(self):
 				path = self.path.split('?')[0]
 				outer.calls.append(('GET', path, None))
-				conf = path.rsplit('/conf-', 1)[1]
-				entries = [{'name': n, 'content': c, 'acl': {'app': outer.app_name}} for n, c in
-					fm.read_conf(os.path.join(outer.installed, 'default', conf + '.conf')).items()]
+				entries = []
+				if '/conf-' in path and outer.loaded:
+					conf = path.rsplit('/conf-', 1)[1]
+					# REST returns a boolean setting as a digit
+					entries = [{'name': n, 'content': dict((k, '1' if v == 'true' else v) for k, v in c.items()),
+						'acl': {'app': outer.app_name}} for n, c in
+						fm.read_conf(os.path.join(outer.loaded, 'default', conf + '.conf')).items()]
 				self._send({'entry': entries})
 
 		self.server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
 		self.url = 'http://127.0.0.1:%d' % self.server.server_address[1]
 		threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+	def posts(self):
+		return [c for c in self.calls if c[0] == 'POST']
 
 	def close(self):
 		self.server.shutdown()
@@ -828,6 +838,10 @@ class TestCapFile:
 			os.umask(umask)
 		assert os.stat(str(fresh)).st_mode & 0o777 == 0o644 and os.stat(str(old)).st_mode & 0o777 == 0o640
 
+	def test_rest_returns_booleans_as_digits(self):
+		assert fm._same_setting('WRITE_META', 'true', '1') and fm._same_setting('FORMAT', 'a::"1"', 'a::"1" ')
+		assert not fm._same_setting('WRITE_META', 'true', '0') and not fm._same_setting('FORMAT', 'a', 'b')
+
 	def test_kv_rows_give_the_hash_as_written(self, tmp_path):
 		p = tmp_path / 'kv.json'
 		p.write_text(json.dumps([{'_key': 'h', 'pattern_hash': ' h', 'pattern_parts': ['a=__TENX_TS__ b='],
@@ -835,28 +849,42 @@ class TestCapFile:
 		[t] = fm.load_templates(str(p))
 		assert t.key == 'h' and t.written_hash == ' h'
 
-	def test_activate_reloads_checks_then_lists(self, tmp_path):
+	def test_activate_restarts_checks_then_lists(self, tmp_path, monkeypatch):
 		cap = tmp_path / 'compact-cap.csv'
 		assert self.gen(tmp_path, ['k1', 'k2'], cap) == 0
 		app = str(tmp_path / 'fm_fw')
 		fake = FakeSplunkd(app, 'fm_fw', str(cap))
+		monkeypatch.setattr(fm.time, 'sleep', lambda s: None)
 		try:
 			assert fm.activate(app, str(cap), fm.Splunkd(fake.url), out=io.StringIO()) == 0
 		finally:
 			fake.close()
-		# the reload came first, while the cap file still listed nothing
-		assert fake.calls[0] == ('POST', fm.RELOAD_ENDPOINT, 'pattern_hash,value\n')
-		assert [c[1].rsplit('/', 1)[1] for c in fake.calls[1:]] == ['conf-transforms', 'conf-props']
+		# the restart came first, while the cap file still listed nothing; then the check
+		assert fake.posts() == [('POST', fm.RESTART_ENDPOINT, 'pattern_hash,value\n')]
+		assert [c[1].rsplit('/', 1)[1] for c in fake.calls if c[0] == 'GET'][-2:] == ['conf-transforms', 'conf-props']
 		assert read(str(cap)) == 'pattern_hash,value\n"k1",true\n"k2",true\n'
 		assert not os.path.exists(str(cap) + '.pending')
 
-	def test_activate_leaves_the_list_when_the_instance_holds_another_app(self, tmp_path):
+	def test_no_restart_when_nothing_is_added(self, tmp_path):
 		cap = tmp_path / 'compact-cap.csv'
-		# the instance holds the app of an earlier run, with k1 only
+		cap.write_text('pattern_hash,value\n"gone",true\n"k1",true\n', encoding='utf-8')
+		assert self.gen(tmp_path, ['k1'], cap) == 0
+		app = str(tmp_path / 'fm_fw')
+		fake = FakeSplunkd(app, 'fm_fw', str(cap), loaded=app)
+		try:
+			assert fm.activate(app, str(cap), fm.Splunkd(fake.url), out=io.StringIO()) == 0
+		finally:
+			fake.close()
+		assert fake.posts() == [] and read(str(cap)) == 'pattern_hash,value\n"k1",true\n'
+
+	def test_activate_leaves_the_list_when_the_instance_does_not_load_the_app(self, tmp_path, monkeypatch):
+		cap = tmp_path / 'compact-cap.csv'
+		assert self.gen(tmp_path, ['k1', 'k2'], cap) == 0
+		# the instance's folder holds the app of an earlier run, with k1 only
 		os.makedirs(str(tmp_path / 'old'))
 		assert self.gen(tmp_path / 'old', ['k1'], tmp_path / 'old' / 'cap.csv') == 0
-		assert self.gen(tmp_path, ['k1', 'k2'], cap) == 0
 		fake = FakeSplunkd(str(tmp_path / 'old' / 'fm_fw'), 'fm_fw', str(cap))
+		monkeypatch.setattr(fm.time, 'sleep', lambda s: None)
 		try:
 			out = io.StringIO()
 			assert fm.activate(str(tmp_path / 'fm_fw'), str(cap), fm.Splunkd(fake.url), out=out) == 1
@@ -870,11 +898,12 @@ class TestCapFile:
 		cap = tmp_path / 'compact-cap.csv'
 		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
 		monkeypatch.setenv('TENX_SPLUNKD_AUTH', 'admin:x')
+		monkeypatch.setattr(fm.time, 'sleep', lambda s: None)
 		try:
 			assert self.gen(tmp_path, ['k1'], cap, '--splunkd', fake.url) == 0
 		finally:
 			fake.close()
-		assert fake.calls[0][2] == 'pattern_hash,value\n'
+		assert fake.posts()[0][2] == 'pattern_hash,value\n'
 		assert read(str(cap)) == 'pattern_hash,value\n"k1",true\n'
 
 	def test_without_the_option_nothing_changes(self, tmp_path):
