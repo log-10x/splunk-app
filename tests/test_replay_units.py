@@ -402,6 +402,26 @@ class TestTheMappedGuard:
 	def test_without_a_mapped_event_the_guard_runs_nothing(self):
 		assert run_tx(events()) == [visible(e) for e in model().run(TX_STEPS, events())]
 
+	def test_txf_leaves_a_mapped_event_that_carries_its_sourcetype_as_tx_does(self):
+		# A forwarder that sets tenx_sourcetype sets it on mapped events too. The replay must not
+		# run on them: their fields are indexed, and the replay would clear and recompute its
+		# fields from the hidden event (Splunk Enterprise 10.4.3, 662 mapped Windows events carrying
+		# tenx_sourcetype: 86 of 186 fields differed from raw through txf, among them action, dest,
+		# user and eventtype; 0 differ through tx).
+		def ev():
+			e = mapped(dept='eng', x='X', user='u9')
+			e.update(sourcetype='app:kv', tenx_sourcetype='app:kv')
+			return e
+		guarded = TXF % '`tenx-mapped-hide` | %s | `tenx-mapped-restore`'
+		for replay in ('`tenx-replay`', '`%s` | `tenx-replay-tags`' % b.unit_macro('app:kv')):
+			m = model(**dict({'tenx-replay': full_macro(), 'tenx-replay-tags': ' | '.join(b.TAGS_STEPS)},
+							 **dict((b.unit_macro(st), u) for st, u in units().items())))
+			out = [visible(e) for e in m.run(guarded % replay, [ev()] + events())]
+			want = [visible(e) for e in model().run(TX_STEPS, [ev()])]
+			assert out[0] == want[0], replay
+			# and the other events of the chunk get what txf gives them without a mapped event
+			assert out[1:] == run_txf(replay, events())
+
 
 class TestTxfOfOneSourcetype:
 	def unit(self, st):
