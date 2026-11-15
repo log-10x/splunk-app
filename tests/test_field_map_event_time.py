@@ -283,6 +283,14 @@ class TestReaderRules:
 	def test_an_empty_value_without_quotes_is_left_out_as_before(self):
 		assert fm.DelimsReader().pairs('a= b=1 c=""') == [('b', '1'), ('c', '')]
 
+	def test_spaces_at_the_ends_of_a_quoted_value_go_and_an_empty_one_gives_no_field(self):
+		# Splunk Enterprise 10.4.3, the FortiGate add-on's DELIMS extraction: msg=" Fortigate ..." gave "Fortigate ...",
+		# user="" gave no value, "  a b  " gave "a b", " " gave no value.
+		t = ('h', 'logid=$ msg=" Fortigate scheduled update $" user="" a="  a b  " s=" " v=" $ "')
+		f = fm.FieldMap(templates(t), fm.DelimsReader(), 'p', rules=fm.RULES_LOOKUP)
+		assert fm.apply_lookup_row(row(f, 'h'), '~h,1,fcni=yes,x') == [
+			('logid', '1'), ('msg', 'Fortigate scheduled update fcni=yes'), ('a', 'a b'), ('v', 'x')]
+
 
 class TestValueCount:
 	def test_a_template_of_422_values_gets_a_row(self):

@@ -684,14 +684,18 @@ class DelimsReader(object):
 	  sample\test.xls, forwardedfor="abcd0e.xff\"></script>..." gave abcd0e.xff"></script>...); before any
 	  other character the backslash stays (rawdata="...charset\=UTF-8" gave ...charset\=UTF-8). A backslash
 	  before a compact value stays as well: a compact value holds no double quote and no backslash;
-	* an empty quoted value is a field with an empty value (user="").
+	* spaces at both ends of a quoted value go, and a quoted value that is empty, or empty once its
+	  spaces go, gives no field: msg=" Fortigate scheduled update ..." gave "Fortigate scheduled update ..."
+	  (50 of 50 events), user="" gave no value (isnull(user) on 2,660 of 2,660 FortiGate UTM events), and on
+	  probe lines "  a b  " gave "a b", "x " gave "x", " " and "" gave no value.
 	Not checked: msg="... a=b \"quoted\" c=" gave "... a=b "quoted" c" (the last "=" not kept; this reader
-	keeps it), how Splunk names a key that is empty once cleaned, and an empty value without quotes.
+	keeps it), how Splunk names a key that is empty once cleaned, an empty value without quotes, and tabs or
+	line breaks at the ends of a value.
 	"""
 	name = 'delims'
 	raw_split = r'\n'
-	trims_values = False
-	keeps_empty = True
+	trims_values = True
+	keeps_empty = False
 	field_name = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\Z')
 
 	PAIR = re.compile(r'(?:^|(?<=[ ,]))([^ ,="]+)=(?:"((?:[^"\\]|\\.)*)"(?=[ ,]|\Z)|([^ ,]*))', re.S)
