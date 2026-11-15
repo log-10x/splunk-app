@@ -243,6 +243,25 @@ class Parser(object):
 		if kind == "subsearch":
 			return ("true",)
 		if kind == "phrase":
+			following = self._peek()
+			if following[0] == "word" and OPERATOR.match(following[1]):
+				# A quoted field name compared: `"requestParameters.VersioningConfiguration.Status"=Suspended`,
+				# `"usr" != root`. Read as text, the name and the value were required words, and for != the
+				# value is what the search excludes. The value is read as for an unquoted name; anything else
+				# after the operator is not read with certainty, and the search is not narrowed at all.
+				self._take()
+				op = OPERATOR.match(following[1])
+				rest = following[1][op.end():]
+				if not rest:
+					kind_, rest = self._peek()
+					if kind_ == "phrase":
+						self._take()
+						rest = '"' + rest.replace('\\', '\\\\').replace('"', '\\"') + '"'
+					elif kind_ == "word" and rest not in ("AND", "OR", "NOT") and not OPERATOR.match(rest):
+						self._take()
+					else:
+						raise Unparsed("a comparison whose value is not a word or a phrase: " + value)
+				return ("field", value, op.group(0), unquote(rest))
 			return ("text", value)
 		if kind != "word":
 			raise Unparsed("unexpected %s" % kind)
@@ -282,6 +301,22 @@ class Parser(object):
 						rest = '"' + rest.replace('\\', '\\\\').replace('"', '\\"') + '"'
 				value = value + op.group(0) + rest
 		match = FIELD_TERM.match(value)
+		if match and match.group(1) and not match.group(3) and self._peek()[0] is not None:
+			# The operator ends the word and the value follows after a space: `SignatureStatus!= Valid`,
+			# `count>= 5`, `user= "a b"`. Read as a comparison with no value, the next word was required
+			# text, and for != that is the value the search excludes (Splunk Enterprise 10.4.3, Sysmon,
+			# `SignatureStatus!= Valid`: 108 events through `txf` against 259). The next word or phrase is
+			# the value. Anything else after the operator is not read with certainty, so the search is not
+			# narrowed at all (Unparsed: every compact event in range is expanded).
+			kind_, rest = self._peek()
+			if kind_ == "phrase":
+				self._take()
+				rest = '"' + rest.replace('\\', '\\\\').replace('"', '\\"') + '"'
+			elif kind_ == "word" and rest not in ("AND", "OR", "NOT") and not OPERATOR.match(rest):
+				self._take()
+			else:
+				raise Unparsed("a comparison whose value is not a word or a phrase: %s" % value)
+			match = FIELD_TERM.match(value + rest)
 		if match and match.group(1):
 			if match.group(1).lower() in TIME_FIELDS:
 				self.time_modifier = True
