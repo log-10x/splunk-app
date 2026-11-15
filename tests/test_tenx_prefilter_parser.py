@@ -159,3 +159,75 @@ class TestDictionary:
 	def test_rows_with_one_or_many_terms(self):
 		d = p.dictionary_from_rows([{"piece": "a", "n": "1", "hs": "TERM(~a)"}, {"piece": "b", "n": "2", "hs": ["TERM(~b)", "TERM(~c)"]}])
 		assert d == {"a": (1, ["TERM(~a)"]), "b": (2, ["TERM(~b)", "TERM(~c)"])}
+
+
+class TestHashTerm:
+	"""
+	The term that selects a template's compact events. Measured on Splunk 10.4.3: every run of
+	'~<hash>' between major breakers is found by TERM(), from the index alone and with a field
+	comparison in the same search, except a run with '*' on both sides, which only the index
+	alone finds (-*Hf8l*8.5}: TERM(Hf8l) 4 events, sourcetype=tenx_encoded TERM(Hf8l) 0).
+	"""
+
+	def test_the_longest_run(self):
+		assert p.hash_term("KC 2c#eEev") == "2c#eEev"
+		assert p.hash_term("H*ly1wX1N{") == "ly1wX1N"
+		assert p.hash_term("-K<dSy@u*az") == "dSy@u"
+
+	def test_a_run_between_two_stars_is_never_used(self):
+		assert p.hash_term("-*Hf8l*8.5}") == "8.5"
+		assert p.hash_term("-M;*DEsWy*;") == "~-M"
+		assert p.hash_term("Nss*tLW2r*") == "~Nss"
+		for dml_hash in ("-*Hf8l*8.5}", "-M;*DEsWy*;", "Nss*tLW2r*", "*ab*cd*", "a*bcdefg*h"):
+			text = "~" + dml_hash
+			term = p.hash_term(dml_hash)
+			i = text.index(term)
+			assert not (text[i - 1:i] == "*" and text[i + len(term):i + len(term) + 1] == "*"), dml_hash
+
+	def test_the_first_run_when_nothing_else_qualifies(self):
+		# The first run begins with '~' and nothing precedes it, so it is never between two stars.
+		assert p.hash_term("*abc*") == "~"
+		assert p.hash_term("-*") == "~-"
+		assert p.hash_term("**") == "~"
+		assert p.hash_term("-.*") == "~-."
+
+	def test_a_leading_tilde_stays_attached(self):
+		assert p.hash_term("0PIlry*uDJ") == "~0PIlry"
+		assert p.hash_term("-JEmd{tpmg*") == "~-JEmd"
+
+	def test_the_term_is_a_whole_run_of_the_hash(self):
+		import random
+		alphabet = " !#$&*+./0123456789:;<>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[]^_abcdefghijklmnopqrstuvwxyz{|}"
+		rnd = random.Random(84)
+		for _ in range(5000):
+			dml_hash = ("-" if rnd.random() < 0.5 else "") + "".join(rnd.choice(alphabet) for _ in range(rnd.randint(1, 10)))
+			runs = p.HASH_SEGMENT.findall("~" + dml_hash)
+			assert p.hash_term(dml_hash) in runs, dml_hash
+
+	def test_the_dictionary_search_computes_the_same_term(self):
+		# The prefilter's search computes the term in SPL. Run its three replace() patterns, split,
+		# filter and pick in Python, with SPL's string escapes read back, and compare.
+		import random
+		import re
+		s = p.dictionary_search({"x"})
+		chain = re.search(r'eval segs=split\(replace\(replace\(replace\("~" \. dml_hash, "(.*?)", " "\), "(.*?)", " "\), "(.*?)", " "\), " "\)', s)
+		assert chain, s
+		pats = [re.compile(g.replace('\\"', '"')) for g in chain.groups()]
+
+		def spl(dml_hash):
+			text = "~" + dml_hash
+			for pat in pats:
+				text = pat.sub(" ", text)
+			segs = text.split(" ")
+			cand = [x for x in segs if len(x) >= 2 and re.search(r"[A-Za-z0-9]", x)]
+			return max(cand, key=lambda x: "%03d" % len(x) + x) if cand else segs[0]
+
+		alphabet = " !#$&*+./0123456789:;<>?@ABCDEFGHIJKLMNOPQRSTUVWXYZ[]^_abcdefghijklmnopqrstuvwxyz{|}"
+		rnd = random.Random(10)
+		hashes = ["-*Hf8l*8.5}", "*abc*", "a*bc", "-M;*DEsWy*;", "**", "-*", "*a*b*c*d"]
+		hashes += [("-" if rnd.random() < 0.5 else "") + "".join(rnd.choice(alphabet) for _ in range(rnd.randint(1, 10)))
+				   for _ in range(5000)]
+		for dml_hash in hashes:
+			assert spl(dml_hash) == p.hash_term(dml_hash), dml_hash
+		# and the shipped split alone would pick the run between the stars
+		assert "(?<=\\*)" in chain.group(2) and "(?=\\*)" in chain.group(2)

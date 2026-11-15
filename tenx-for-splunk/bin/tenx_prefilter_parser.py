@@ -285,11 +285,39 @@ def prefilter(node, dictionary):
 	return None
 
 
+# The runs of a compact event's '~<hash>' between Splunk's index-time major breakers
+# (etc/system/default/segmenters.conf). Of the hash alphabet (log10x format spec S5.5), space
+# ! & * + ; < > ? [ ] { | } are major breakers; '~' is not one, so it is part of the first run.
+HASH_SEGMENT = re.compile(r"[^ !;<>{}|&?+\[\]*,()'\"]+")
+
+
+def hash_term(dml_hash):
+	"""
+	The term that selects the compact events of a template, as TERM(<term>): one run of
+	'~<hash>' between major breakers, which Splunk indexes as a term of every event of the
+	template. A run with '*' directly before and after it is not used: TERM() finds it from the
+	index alone, but not when the search also compares a field such as host= or sourcetype=,
+	which is how `tx` is written (measured on Splunk 10.4.3 over every pair of neighbouring
+	characters and 5,550 hashes; every other run was found both ways). Of the runs left, the
+	longest of at least two characters holding a letter or a digit; when there is none, the
+	first run, which begins with '~' and has nothing before it.
+	"""
+	text = "~" + dml_hash
+	runs = [(m.group(0), m.start(), m.end()) for m in HASH_SEGMENT.finditer(text)]
+	usable = [run for run, start, end in runs
+			  if not (text[start - 1:start] == "*" and text[end:end + 1] == "*")
+			  and len(run) >= 2 and re.search(r"[A-Za-z0-9]", run)]
+	if usable:
+		return max(usable, key=lambda run: "%03d" % len(run) + run)
+	return runs[0][0]
+
+
 def dictionary_search(pieces):
 	"""
 	The search that answers, for each piece, which templates carry it, as the TERM() clause of
-	the longest token of each template's hash between Splunk's major breakers (a leading ~ stays
-	attached to a letter or digit, so it is part of the token).
+	each template's hash_term, computed in SPL: the runs with '*' on both sides are blanked, the
+	text is split at the major breakers, and the longest run of at least two characters with a
+	letter or a digit is taken, else the first run.
 	"""
 	plist = sorted(pieces)
 	return (
@@ -297,7 +325,8 @@ def dictionary_search(pieces):
 		' | eval piece=split("%s", " ") | mvexpand piece'
 		' | where match(lower(_raw), "(^|[^\\p{L}\\p{N}])" . replace(piece, "\\*", "[\\p{L}\\p{N}]*") . "([^\\p{L}\\p{N}]|$)")'
 		' | stats count by piece, dml_hash'
-		' | eval segs=split(replace(replace("~" . dml_hash, "--|%%[0-9A-Fa-f]{2}", " "), "[ !;<>{}|&?+\\[\\]*,()\'\\"]", " "), " ")'
+		' | eval segs=split(replace(replace(replace("~" . dml_hash, "--|%%[0-9A-Fa-f]{2}", " "),'
+		' "(?<=\\*)[^ !;<>{}|&?+\\[\\]*,()\'\\"]+(?=\\*)", " "), "[ !;<>{}|&?+\\[\\]*,()\'\\"]", " "), " ")'
 		' | eval cand=mvfilter(len(segs) >= 2 AND match(segs, "[\\p{L}\\p{N}]"))'
 		' | eval best=substr(mvindex(mvsort(mvmap(cand, printf("%%03d", len(cand)) . cand)), -1), 4)'
 		' | eval h="TERM(" . coalesce(best, mvindex(segs, 0)) . ")"'
