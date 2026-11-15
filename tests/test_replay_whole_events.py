@@ -21,6 +21,7 @@ import tenx_replay_builder as b
 from support.spl_model import visible
 from test_replay_indexed_per_sourcetype import LOOKUP_FIELDS, PRESENT, STANZAS, model, run, txf_steps, unit_call, \
 	win_compact
+import tenx_search_builder as sb
 
 
 def whole_win():
@@ -101,3 +102,53 @@ class TestEventsThatArriveWhole:
 			'<Event>4670</Event>', 'win', 'XmlWinEventLog:Security', 'dc01')
 		assert out[0]['EventID'] == '4670' and 'tenx_rst' not in out[0]
 		assert not [k for k in out[0] if k.startswith(('tenx_hk_', 'tenx_hx_', 'tenx_go'))]
+		# and it carries the mark the rewrite hides it by; `txf` (no hide flag) never sets it
+		assert out[0][b.AS_IS] == 1
+		assert b.AS_IS not in run(evs=[whole_win()])[0]
+
+
+
+class Command(object):
+	debug = False
+
+
+def rewrite(replay, held=None):
+	"""The search rewrite's steps after the base search when it replays (tenx_search_builder's
+	inflate_suffix and replay_restore), with the hide condition `held` in place of the shipped one."""
+	text = sb.TenxSearchCommand.inflate_suffix(Command(), replay) + sb.TenxSearchCommand.replay_restore(Command())
+	if held is not None:
+		text = text.replace(sb.REPLAY_HELD, held).replace(', tenx_rst, %s' % b.AS_IS, ', tenx_rst')
+	return text.strip().lstrip('| ')
+
+
+def run_rewrite(evs, replay='`tenx-replay`', held=None):
+	full = b.build(STANZAS, PRESENT, LOOKUP_FIELDS).spl()
+	units = dict((b.unit_macro(st), b.build_unit(STANZAS, st, {'sources': {src}, 'hosts': {host}, 'indexes': set()},
+												 LOOKUP_FIELDS).spl()) for st, src, host in PRESENT)
+	m = model(full, units)
+	m.commands['spath'] = lambda e, _: None
+	return [visible(e) for e in m.run(rewrite(replay, held), evs)]
+
+
+class TestTheSearchRewrite:
+	"""| tx, | tenxsearch, the search hook and compiled alerts run the same steps (tenx_search_builder)."""
+
+	def test_a_whole_event_read_under_its_own_sourcetype_is_left_as_read(self):
+		want = visible(whole_win())
+		for replay in ('`tenx-replay`', b.compose_units(['win', 'fgt'])):
+			out = run_rewrite([whole_win(), win_compact()], replay)
+			assert out[0] == want, replay
+			assert out[1]['EventID'] == '4624' and out[1]['app'] == 'win:remote'
+		# hidden from the rewrite's extract by the hide condition alone: with the earlier condition
+		# (replayed events only) the rewrite's extract adds EventID a second time
+		before = run_rewrite([whole_win()], held='isnotnull(tenx_rst)')
+		assert before[0]['EventID'] == ['4670', '4670']
+
+	def test_every_other_event_gets_what_it_got_before(self):
+		def evs():
+			return [win_compact(), dict(win_compact(), tenx_sourcetype='fgt'), whole_ct(),
+					dict(win_compact(), **{'tenx_sourcetype': None})]
+		for replay in ('`tenx-replay`', b.compose_units(['win', 'ct'])):
+			events = [dict((k, v) for k, v in e.items() if v is not None) for e in evs()]
+			before = [dict((k, v) for k, v in e.items() if v is not None) for e in evs()]
+			assert run_rewrite(events, replay) == run_rewrite(before, replay, held='isnotnull(tenx_rst)'), replay

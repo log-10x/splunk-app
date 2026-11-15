@@ -136,6 +136,12 @@ PLACEHOLDER = 'tenx_hidden'
 #           except the kept ones (see whole_clearing_steps()).
 AS_READ = 'tenx_gox'
 WHOLE = 'tenx_gow'
+# The search rewrite runs its own `extract` (and spath and key=value pass) after the macro, on the
+# events the macro did not replay. An AS_READ event must be kept from it too, so when the
+# rewrite's hide flag is on, the macro leaves this mark on it (AS_READ itself is removed with the
+# block flags): tenx_search_builder hides marked events as it hides replayed ones, and removes it.
+# Without the hide flag (`txf`) it is never set.
+AS_IS = 'tenx_asis'
 
 
 def extract_steps(as_read=False):
@@ -1175,7 +1181,8 @@ def build(stanzas, present, lookup_fields=None, keep_fields=(), all_shared=True,
 
 	if with_tags:
 		steps.append(tags_block())
-	# tenx_rst stays: the search rewrite reads it after the macro. Callers remove it.
+	steps.append(block(AS_READ, ['eval %s=if(isnotnull(%s) AND isnotnull(%s), 1, %s)' % (AS_IS, HIDE, AS_READ, AS_IS)]))
+	# tenx_rst and AS_IS stay: the search rewrite reads them after the macro. Callers remove them.
 	steps.append('fields - tenx_go*')
 	return replay
 

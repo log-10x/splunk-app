@@ -125,6 +125,11 @@ class ResolvedState(Enum):
 # and without a field replay.
 XML_AND_KV_STEPS = (' | fields - _kv | extract | eval tenx_xml=if(match(_raw, "^\\s*<"), _raw, null())'
 					' | spath input=tenx_xml | fields - tenx_xml, tenx_hash, tenx_var_0, tenx_vars')
+# The events kept from those steps when the search replays: the replayed ones (tenx_rst), and the
+# ones that arrived whole and that Splunk read under the sourcetype whose rules they need, which
+# the replay leaves as read (tenx_replay_builder.AS_IS). Those steps on such an event added every
+# field an extraction with MV_ADD gives a second time.
+REPLAY_HELD = 'isnotnull(tenx_rst) OR isnotnull(%s)' % tenx_replay_builder.AS_IS
 
 # A search term written as TERM(<x>) or CASE(<x>).
 TERM_CALL = re.compile(r'^(TERM|CASE)\((.*)\)$', re.S)
@@ -1145,12 +1150,13 @@ class TenxSearchCommand(TenxSplCommand):
 		if replay is None:
 			# Nothing to replay: the suffix without any replay step.
 			return (" | " + tenx_util.splunk_inflate_macro(self.debug) + XML_AND_KV_STEPS)
+		held = REPLAY_HELD
 		return (" | eval tenx_compact_raw=_raw | " + tenx_util.splunk_inflate_macro(self.debug)
 				+ " | eval tenx_hide_others=1 | " + replay + " | fields - tenx_hide_others"
-				+ " | eval tenx_h_raw=if(isnotnull(tenx_rst), _raw, null()), tenx_h_st=if(isnotnull(tenx_rst), sourcetype, null()),"
-				+ " tenx_h_src=if(isnotnull(tenx_rst), source, null()), tenx_h_host=if(isnotnull(tenx_rst), host, null())"
-				+ " | eval _raw=if(isnotnull(tenx_rst), \"\", _raw), sourcetype=if(isnotnull(tenx_rst), \"tenx_replayed\", sourcetype),"
-				+ " source=if(isnotnull(tenx_rst), \"tenx_replayed\", source), host=if(isnotnull(tenx_rst), \"tenx_replayed\", host)"
+				+ " | eval tenx_h_raw=if(%s, _raw, null()), tenx_h_st=if(%s, sourcetype, null()),"
+				  " tenx_h_src=if(%s, source, null()), tenx_h_host=if(%s, host, null())" % ((held,) * 4)
+				+ " | eval _raw=if(%s, \"\", _raw), sourcetype=if(%s, \"tenx_replayed\", sourcetype),"
+				  " source=if(%s, \"tenx_replayed\", source), host=if(%s, \"tenx_replayed\", host)" % ((held,) * 4)
 				+ XML_AND_KV_STEPS)
 
 	def replay_steps(self):
@@ -1170,7 +1176,8 @@ class TenxSearchCommand(TenxSplCommand):
 		"""Gives a replayed event back its text, sourcetype, source and host (see inflate_suffix)."""
 		return (" | eval _raw=coalesce(tenx_h_raw, _raw), sourcetype=coalesce(tenx_h_st, sourcetype),"
 				" source=coalesce(tenx_h_src, source), host=coalesce(tenx_h_host, host)"
-				" | fields - tenx_h_raw, tenx_h_st, tenx_h_src, tenx_h_host, tenx_compact_raw, tenx_rst")
+				" | fields - tenx_h_raw, tenx_h_st, tenx_h_src, tenx_h_host, tenx_compact_raw, tenx_rst, "
+				+ tenx_replay_builder.AS_IS)
 
 	def field_extraction(self):
 		"""Nothing: the fields come from the event's own extraction in inflate_suffix (a generic
