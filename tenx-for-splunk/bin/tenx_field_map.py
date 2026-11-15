@@ -680,9 +680,8 @@ class DelimsReader(object):
 	  priority, so a value that holds letters there would give Splunk another name (not checked);
 	* the first value of a key is kept: tz="UTC-5:00" ... tz=-0500 gave tz "UTC-5:00";
 	* inside double quotes a backslash escapes the next character: \\ gives one backslash and \" a double
-	  quote that does not end the value (msg="...XSS\\" gave ...XSS\, filename="sample\\test.xls" gave
-	  sample\test.xls, forwardedfor="abcd0e.xff\"></script>..." gave abcd0e.xff"></script>...); before any
-	  other character the backslash stays (rawdata="...charset\=UTF-8" gave ...charset\=UTF-8). A backslash
+	  quote that does not end the value (msg="a b\\" gave a b\, f="s\\t.txt" gave s\t.txt, g="x\"></y"
+	  gave x"></y); before any other character the backslash stays (r="c\=d" gave c\=d). A backslash
 	  before a compact value stays as well: a compact value holds no double quote and no backslash;
 	* spaces at both ends of a quoted value go, and a quoted value that is empty, or empty once its
 	  spaces go, gives no field: msg=" Fortigate scheduled update ..." gave "Fortigate scheduled update ..."
