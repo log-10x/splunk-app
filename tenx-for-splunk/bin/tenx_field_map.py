@@ -1316,12 +1316,20 @@ def lookup_eval_text(lookup_def, time_rule=None, trim=False):
 			'%s=json_extract(%s, "%s")' % (w, row, LOOKUP_TIME_COLUMN),
 			# Only for an event whose fields were written (the same regex matched), and a row with a recipe.
 			'%s=if(isnull(%s) OR %s==%s OR coalesce(len(%s), 0)==0, null(), %s)' % (wt, m, m, x, w, text),
-			'%s=if(isnull(%s), null(), coalesce(%s))' % (tt, wt, ', '.join('strptime(%s, "%s")' % (wt, fmt)
-				for fmt in time_rule.formats)),
+			# One format is strptime() alone: Splunk Enterprise 10.4.3 refuses to compile an INGEST_EVAL that calls
+			# coalesce() with one argument ("Invalid function argument") and then writes none of the transform's fields.
+			'%s=if(isnull(%s), null(), %s)' % (tt, wt, time_parse_text(wt, time_rule.formats)),
 			'_time=if(isnotnull(%s) AND %s >= time() - %d AND %s <= time() + %d, %s, _time)' % (
 				tt, tt, time_rule.max_days_ago * 86400, tt, time_rule.max_days_hence * 86400, tt),
 		]
 	return ', '.join(exprs)
+
+
+def time_parse_text(text, formats):
+	"""The eval expression that reads <text> with the rule's formats: strptime() for one format, the first that parses
+	(coalesce) for more than one."""
+	parts = ['strptime(%s, "%s")' % (text, fmt) for fmt in formats]
+	return parts[0] if len(parts) == 1 else 'coalesce(%s)' % ', '.join(parts)
 
 
 def lookup_columns(field_map):
