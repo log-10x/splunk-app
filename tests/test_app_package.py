@@ -137,6 +137,27 @@ class TestSplunkbaseListingRules:
 	def test_package_id_matches_the_folder(self):
 		assert conf('app.conf').get('package', 'id') == os.path.basename(APP)
 
+	def test_the_manifest_names_the_app_and_the_three_workloads(self):
+		# slim partition (Splunk's packaging toolkit) reads targetWorkloads to give search heads, indexers and
+		# forwarders their own package; the indexer and forwarder packages keep the parsing settings only.
+		import json
+		m = json.load(open(os.path.join(APP, 'app.manifest'), encoding='utf-8'))
+		assert m['schemaVersion'] == '2.0.0'
+		assert m['info']['id']['name'] == os.path.basename(APP)
+		assert m['info']['id']['version'] == conf('app.conf').get('id', 'version')
+		assert m['targetWorkloads'] == ['_search_heads', '_indexers', '_forwarders']
+		assert '_distributed' in m['supportedDeployments'] and '_search_head_clustering' in m['supportedDeployments']
+
+	def test_scripts_find_their_libraries_next_to_themselves(self):
+		# An app pushed in an indexer cluster's bundle lives in etc/peer-apps, not etc/apps.
+		for name in sorted(os.listdir(os.path.join(APP, 'bin'))):
+			if not name.endswith('.py'):
+				continue
+			text = open(os.path.join(APP, 'bin', name), encoding='utf-8').read()
+			assert 'get_base_path' not in text, name
+			if 'apphome =' in text:
+				assert 'apphome = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))' in text, name
+
 
 class TestSideNavigationIsLegible:
 	def test_views_in_the_nav_start_with_distinct_characters(self):
