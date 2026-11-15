@@ -138,6 +138,7 @@ import ssl
 import sys
 import tempfile
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -1855,6 +1856,8 @@ PROBE_HOST = 'tenx-fm-probe'
 PROBE_SOURCE = 'tenx:fm:probe'
 # A hash no template has: the event that opens the probe stream gets no fields.
 HEARTBEAT_LINE = '~tenx-fm-heartbeat,probe'
+# With --probe-hec given once per parsing node, each probe carries the node it was sent to in this indexed field.
+PROBE_NODE_FIELD = 'tenx_fm_probe_node'
 # limits.conf [lookup] ingest_lookup_refresh_period_secs as shipped; activate reads the instance's own value.
 LOOKUP_REFRESH_DEFAULT = 60
 
@@ -1950,7 +1953,11 @@ class Splunkd(object):
 
 	def __init__(self, url, auth=None, token=None, tls_verify=True, hec_url=None, hec_token=None):
 		self.url = url.rstrip('/')
-		self.hec_url, self.hec_token = (hec_url or '').rstrip('/'), hec_token
+		# hec_url: one HTTP Event Collector URL, or a list with one per parsing node (each indexer's or heavy
+		# forwarder's own endpoint, not a load balancer), which activate and check then prove one by one.
+		urls = [u.rstrip('/') for u in (hec_url if isinstance(hec_url, (list, tuple)) else [hec_url]) if u]
+		self.hec_url, self.hec_token = (urls[0] if urls else ''), hec_token
+		self.nodes = urls if len(urls) > 1 else [None]
 		self.headers = {}
 		if token:
 			self.headers['Authorization'] = 'Splunk %s' % token
@@ -1974,10 +1981,33 @@ class Splunkd(object):
 			body = res.read()
 		return json.loads(body) if body.strip() else {}
 
+	def send_node(self, node, lines, index, host, source, sourcetype):
+		"""The lines to one parsing node's HTTP Event Collector, each event carrying PROBE_NODE_FIELD = the
+		node's host:port. True when the node took them; False when it cannot be reached or answers that it is
+		busy (503): a node that is down receives no events either, so it is left out, not counted as wrong."""
+		label = urllib.parse.urlsplit(node).netloc
+		body = '\n'.join(json.dumps({'event': l, 'index': index, 'host': host, 'source': source, 'sourcetype': sourcetype,
+			'fields': {PROBE_NODE_FIELD: label}}) for l in lines).encode('utf-8')
+		req = urllib.request.Request(node + '/services/collector/event', data=body, method='POST',
+			headers={'Authorization': 'Splunk %s' % self.hec_token})
+		try:
+			with urllib.request.urlopen(req, context=self.ctx, timeout=10) as res:
+				res.read()
+		except urllib.error.HTTPError as e:
+			if e.code == 503:
+				return False
+			raise
+		except (urllib.error.URLError, OSError):
+			return False
+		return True
+
 	def send(self, lines, index, host, source, sourcetype):
 		"""Raw lines into the parsing pipeline, one event per line: through HTTP Event Collector when hec_url
 		is set (the path compact events take from the Receiver, so the probe is parsed where they are), else
-		through the management port's receivers/simple (the compact sourcetype breaks on line ends)."""
+		through the management port's receivers/simple (the compact sourcetype breaks on line ends).
+		Returns the nodes that took them: [None] for the one endpoint, else those of self.nodes that answered."""
+		if self.nodes != [None]:
+			return [n for n in self.nodes if self.send_node(n, lines, index, host, source, sourcetype)]
 		if self.hec_url:
 			body = '\n'.join(json.dumps({'event': l, 'index': index, 'host': host, 'source': source, 'sourcetype': sourcetype})
 				for l in lines).encode('utf-8')
@@ -1985,12 +2015,13 @@ class Splunkd(object):
 				headers={'Authorization': 'Splunk %s' % self.hec_token})
 			with urllib.request.urlopen(req, context=self.ctx, timeout=120) as res:
 				res.read()
-			return
+			return [None]
 		q = urllib.parse.urlencode({'index': index, 'host': host, 'source': source, 'sourcetype': sourcetype})
 		req = urllib.request.Request(self.url + '/services/receivers/simple?' + q, data=('\n'.join(lines) + '\n').encode('utf-8'),
 			method='POST', headers=self.headers)
 		with urllib.request.urlopen(req, context=self.ctx, timeout=120) as res:
 			res.read()
+		return [None]
 
 	def search(self, spl):
 		"""Rows of a one-shot search over all time."""
@@ -2077,6 +2108,29 @@ def probe_states(splunkd, index, sourcetype, since):
 	return states
 
 
+def node_states(splunkd, index, sourcetype, since):
+	"""(hash, node) -> probe_states' pair, per node when splunkd has one HEC endpoint per parsing node
+	(node = the URL), else (hash, None)."""
+	if splunkd.nodes == [None]:
+		return dict(((h, None), v) for h, v in probe_states(splunkd, index, sourcetype, since).items())
+	by_label = dict((urllib.parse.urlsplit(n).netloc, n) for n in splunkd.nodes)
+	rows = splunkd.search('search index="%s" host="%s" source="%s" _index_earliest=%d | eval tenx_fm_probe_h=trim('
+		'replace(_raw, "^~([^,]*).*$", "\\1")), tenx_fm_probe_n=coalesce(%s, ""), tenx_fm_probe_m=if(isnull(%s), 0, 1), '
+		'tenx_fm_probe_w=%s | stats max(tenx_fm_probe_m) as m values(tenx_fm_probe_w) as w by tenx_fm_probe_h tenx_fm_probe_n' % (
+			index, PROBE_HOST, PROBE_SOURCE, int(since), PROBE_NODE_FIELD, MARK_FIELD, UNMAPPED_FIELD))
+	states = {}
+	for r in rows:
+		n = by_label.get(r.get('tenx_fm_probe_n'))
+		if n:
+			w = r.get('w') or []
+			states[(r['tenx_fm_probe_h'], n)] = (r.get('m') == '1', sorted(w if isinstance(w, list) else [w]))
+	return states
+
+
+def _on(node):
+	return '' if node is None else ' sent to %s' % node
+
+
 def probe_results(splunkd, index, sourcetype, since):
 	"""hash -> True when a probe event of that hash indexed since `since` has tenx_mapped."""
 	return dict((h, v[0]) for h, v in probe_states(splunkd, index, sourcetype, since).items())
@@ -2109,6 +2163,11 @@ def activate(app_dir, cap_file, splunkd, app_name=None, probe_index=None, timeou
 	returns 1 at once. A new template whose probe, indexed once the instance must have reread the lookup
 	file (ingest_lookup_refresh_period_secs plus one poll after the start), has no fields stays pending
 	and is not probed again in this run.
+
+	With one HEC endpoint per parsing node (splunkd.nodes), every probe goes to every node, and a template
+	is listed only once the probe sent to each node that took that round's probes came back with its fields:
+	a node that answers without them holds it back, a node that cannot be reached is left out until it
+	answers again.
 	"""
 	pending = cap_file + CAP_PENDING_SUFFIX
 	if not os.path.exists(pending):
@@ -2145,7 +2204,7 @@ def activate(app_dir, cap_file, splunkd, app_name=None, probe_index=None, timeou
 		# A probe indexed from this time on was parsed with the file that was installed when activate started.
 		settled = start + refresh + poll
 		splunkd.send([HEARTBEAT_LINE], probe_index, PROBE_HOST, PROBE_SOURCE, sourcetype)
-		probes, checks = 0, 0
+		probes, checks, away = 0, 0, set()
 		while True:
 			todo = [h for h in added if h not in confirmed and h not in failed and h.strip() in rows]
 			if not todo:
@@ -2154,29 +2213,30 @@ def activate(app_dir, cap_file, splunkd, app_name=None, probe_index=None, timeou
 			# Until one template has its fields, one stands for all of them (after the refresh period, the
 			# next one once it has failed), so a lookup that gives no rows costs one probe a round.
 			batch = todo if confirmed else todo[:1]
-			splunkd.send([probe_line(h, rows[h.strip()], int(now)) for h in batch], probe_index, PROBE_HOST, PROBE_SOURCE,
+			up = splunkd.send([probe_line(h, rows[h.strip()], int(now)) for h in batch], probe_index, PROBE_HOST, PROBE_SOURCE,
 				sourcetype)
-			probes += len(batch)
+			away |= set(splunkd.nodes) - set(up)
+			probes += len(batch) * len(up)
 			if before:
 				# check's probe of a listed template, in place of the wait for this round's probes.
 				held = io.StringIO()
 				checks += 1
-				if check(app_dir, cap_file, splunkd, app_name, probe_index, 1, check_timeout, poll, held, clock, sleep, rng):
+				if check(app_dir, cap_file, splunkd, app_name, probe_index, 1, check_timeout, poll, held, clock, sleep, rng) == 1:
 					out.write(held.getvalue())
 					out.write('activate: stopped after %.0f s, the list withdrawn by check; %d of %d new templates '
 						'had their fields; all stay pending\n' % (clock() - start, len(confirmed), len(added)))
 					return 1
 			else:
 				sleep(poll)
-			seen = probe_states(splunkd, probe_index, sourcetype, start - 1)
-			confirmed |= set(h for h in todo if seen.get(h.strip(), (False,))[0])
+			seen = node_states(splunkd, probe_index, sourcetype, start - 1)
+			confirmed |= set(h for h in todo if up and all(seen.get((h.strip(), n), (False,))[0] for n in up))
 			now = clock()
 			if now >= settled:
-				late = probe_states(splunkd, probe_index, sourcetype, settled)
+				late = node_states(splunkd, probe_index, sourcetype, settled)
 				for h in todo:
-					got = late.get(h.strip())
-					if h not in confirmed and got is not None and not got[0]:
-						failed[h] = got[1]
+					got = [late[(h.strip(), n)] for n in up if (h.strip(), n) in late]
+					if h not in confirmed and got and not all(g[0] for g in got):
+						failed[h] = sorted(set(w for g in got if not g[0] for w in g[1]))
 			if now - start > timeout:
 				break
 		missing = [h for h in added if h not in confirmed and h not in failed]
@@ -2186,6 +2246,8 @@ def activate(app_dir, cap_file, splunkd, app_name=None, probe_index=None, timeou
 				'' if not failed else '; without their fields after the file was read: %s' % ', '.join(
 					'%r (%s=%s)' % (h, UNMAPPED_FIELD, ','.join(failed[h]) or 'none') for h in sorted(failed)[:5]),
 				'' if not missing else '; not yet: %s' % ', '.join(repr(h) for h in missing[:5])))
+		if away:
+			out.write('activate: did not answer in at least one round, so left out of those rounds: %s\n' % ', '.join(sorted(away)))
 	now = (before & after) | confirmed
 	if now == after:
 		# Written anew rather than renamed: the pending file can be as old as the cap file it replaces (check
@@ -2208,6 +2270,10 @@ def check(app_dir, cap_file, splunkd, app_name=None, probe_index=None, sample=1,
 	file keeps only its rows that do not start with true, every listed template is left pending
 	(<cap file>.pending, merged with a pending list already there), and returns 1: the Receiver sends
 	those templates whole until activate proves them again.
+
+	With one HEC endpoint per parsing node (splunkd.nodes), the probes go to every node, and the answer of
+	each node that took them counts; a node that cannot be reached is left out. When no node takes them,
+	nothing is checked and check returns 2 without changing the list.
 	"""
 	import random
 	listed, kept = read_cap(cap_file)
@@ -2232,22 +2298,31 @@ def check(app_dir, cap_file, splunkd, app_name=None, probe_index=None, sample=1,
 	else:
 		probed = sorted((rng or random.Random()).sample(sorted(listed), min(sample, len(listed))))
 		start = clock()
-		splunkd.send([probe_line(h, rows[h.strip()], int(clock())) for h in probed], probe_index, PROBE_HOST, PROBE_SOURCE,
+		up = splunkd.send([probe_line(h, rows[h.strip()], int(clock())) for h in probed], probe_index, PROBE_HOST, PROBE_SOURCE,
 			sourcetype)
+		away = '' if len(up) == len(splunkd.nodes) else '; did not answer, left out: %s' % ', '.join(
+			sorted(set(splunkd.nodes) - set(up)))
+		if not up:
+			out.write('check: no parsing node took the probes%s; nothing checked, cap file left as it was\n' % away)
+			return 2
+		pairs = [(h, n) for h in probed for n in up]
 		while True:
 			sleep(poll)
-			states = probe_states(splunkd, probe_index, sourcetype, start - 1)
-			got = [states.get(h.strip()) for h in probed]
-			bad = [(h, g[1]) for h, g in zip(probed, got) if g is not None and not g[0]]
+			states = node_states(splunkd, probe_index, sourcetype, start - 1)
+			got = [states.get((h.strip(), n)) for h, n in pairs]
+			bad = [(h, n, g[1]) for (h, n), g in zip(pairs, got) if g is not None and not g[0]]
 			if bad:
-				why = 'probe of %r indexed without its fields (%s=%s)' % (bad[0][0], UNMAPPED_FIELD, ','.join(bad[0][1]) or 'none')
+				why = 'probe of %r%s indexed without its fields (%s=%s)' % (bad[0][0], _on(bad[0][1]), UNMAPPED_FIELD,
+					','.join(bad[0][2]) or 'none')
 				break
 			if all(got):
-				out.write('check: %d of %d listed templates probed, all indexed with their fields (%.0f s)\n' % (
-					len(probed), len(listed), clock() - start))
+				out.write('check: %d of %d listed templates probed%s, all indexed with their fields (%.0f s)%s\n' % (
+					len(probed), len(listed), '' if up == [None] else ' on %d nodes' % len(up), clock() - start, away))
 				return 0
 			if clock() - start > timeout:
-				why = '%d of %d probes not indexed within %.0f s' % (sum(1 for g in got if g is None), len(probed), timeout)
+				late = [n for (h, n), g in zip(pairs, got) if g is None]
+				why = '%d of %d probes not indexed within %.0f s%s' % (len(late), len(pairs), timeout,
+					'' if up == [None] else ' (%s)' % ', '.join(sorted(set(late))))
 				break
 	withdraw(cap_file, why, out)
 	return 1
@@ -2396,10 +2471,13 @@ def _splunkd_args(p, required, timeout=300, timeout_help='seconds activate keeps
 		help='environment variable holding user:password (default TENX_SPLUNKD_AUTH)')
 	p.add_argument('--splunkd-token-env', default='TENX_SPLUNKD_TOKEN',
 		help='environment variable holding a session key, used instead of user:password (default TENX_SPLUNKD_TOKEN)')
-	p.add_argument('--probe-hec',
+	p.add_argument('--probe-hec', action='append',
 		help='HTTP Event Collector URL to send the probe events to, e.g. https://indexer:8088: the endpoint the Receiver '
 			'sends to, so a probe is parsed where the compact events are (default: the --splunkd management port, '
-			'which parses them on that instance)')
+			'which parses them on that instance). Where several instances parse the data (indexer peers, heavy '
+			'forwarders behind a load balancer), give it once for each of them, with each node\'s own endpoint: '
+			'activate then lists a template only once every node that answers returns its probe with fields, and '
+			'check probes every node')
 	p.add_argument('--probe-hec-token-env', default='TENX_PROBE_HEC_TOKEN',
 		help='environment variable holding the HEC token for --probe-hec (default TENX_PROBE_HEC_TOKEN)')
 	p.add_argument('--tls-verify', choices=('on', 'off'), default='on',
