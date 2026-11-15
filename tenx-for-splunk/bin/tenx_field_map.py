@@ -216,6 +216,13 @@ SOURCETYPE_FIELD = 'tenx_compact_st'
 # Search-time hash and values of a compact event under the rename target (see the docstring).
 HASH_TRANSFORM = 'tenx_fm_hash_vars'
 HASH_REGEX = '^~(?<tenx_hash>[^,]+)(?:,(?<tenx_var_0>[^,]+)(?:,(?<tenx_vars>.*))?)?'
+# --reserved-names restore: one search-time transform per reserved name, under the rename target's stanza,
+# that reads the indexed <reserved_prefix><name> and writes <name>. A search-time field may carry such a
+# name: KV_MODE = json gives eventType on uncompacted CloudTrail events. Extractions run before field
+# aliases, calculated fields and lookups (props.conf.spec), so the add-on's rules that read the name
+# (FIELDALIAS-... = eventType AS app, EVAL-user's eventType="AwsConsoleSignIn") find it.
+RESTORE_TRANSFORM = 'tenx_fm_restore_'
+RESTORE_REGEX = '^([\\s\\S]*)$'
 
 # re.escape's set of escaped characters on Python 3.7 and later, written out so the generated
 # REGEX does not depend on the interpreter, plus "/" (escaped by the first generator as well).
@@ -628,7 +635,62 @@ class KeyValueReader(object):
 		return out
 
 
-READERS = {r.name: r for r in (XmlWindowsReader, JsonReader, KeyValueReader)}
+class DelimsReader(object):
+	"""
+	A transforms.conf DELIMS extraction with pair delimiters space and comma and the key-value
+	delimiter "=", as the FortiGate add-on's [field_extract] (DELIMS = "\\ ,", "="), read from what Splunk
+	Enterprise 10.4.3 extracted on 239 raw FortiGate events with KV_MODE = none:
+	* a pair runs from a delimiter (or the start) to the next delimiter outside double quotes; its key is
+	  the text before the first "=", and a value in double quotes loses them;
+	* the key is cleaned as Splunk cleans extracted names: text before the first letter goes (a syslog
+	  priority "<190>date=" gives date: 62 of 62 such events), and every other character that is not a
+	  letter, digit or "_" becomes "_". A compact value in that leading text is read as the digits of a
+	  priority, so a value that holds letters there would give Splunk another name (not checked);
+	* the first value of a key is kept: tz="UTC-5:00" ... tz=-0500 gave tz "UTC-5:00".
+	Not checked: a value with an unterminated quote, a quote inside a value, and how Splunk names a key
+	that is empty once cleaned.
+	"""
+	name = 'delims'
+	raw_split = r'\n'
+	trims_values = False
+	field_name = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\Z')
+
+	PAIR = re.compile(r'(?:^|(?<=[ ,]))([^ ,="]+)=(?:"([^"]*)"(?=[ ,]|\Z)|([^ ,]*))')
+
+	@staticmethod
+	def clean(key):
+		"""
+		The key as Splunk names it: other characters as "_", and no text before the first letter. A
+		compact value before the first letter of text goes with it (read as a priority's digits); a key
+		with no letter in its text, a compact value alone for example, is kept as it is.
+		"""
+		parts = [p for p in MARK_SPLIT.split(key) if p]
+		first = next((i for i, p in enumerate(parts) if not MARK_RE.fullmatch(p) and re.search('[A-Za-z]', p)), None)
+		out = []
+		for i, part in enumerate(parts):
+			if MARK_RE.fullmatch(part):
+				if first is None or i > first:
+					out.append(part)
+				continue
+			if first is not None and i < first:
+				continue
+			if i == first:
+				part = re.sub(r'^[^A-Za-z]+', '', part)
+			out.append(re.sub(r'[^A-Za-z0-9_]', '_', part))
+		return ''.join(out)
+
+	def pairs(self, text):
+		out, seen = [], set()
+		for m in self.PAIR.finditer(text):
+			key = self.clean(m.group(1))
+			if not key or key in seen:
+				continue
+			seen.add(key)
+			out.append((key, m.group(2) if m.group(2) is not None else m.group(3)))
+		return out
+
+
+READERS = {r.name: r for r in (XmlWindowsReader, JsonReader, KeyValueReader, DelimsReader)}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1164,7 +1226,8 @@ class FieldMap(object):
 		# Written last by every FORMAT as <mark>::"1", unless None.
 		self.mark = mark
 		# A literal name that collides with a Splunk default field: 'skip' leaves it out, 'prefix'
-		# writes it as <reserved_prefix><name>. Both are counted in the report.
+		# writes it as <reserved_prefix><name>, and 'restore' does the same and also gives the field
+		# back under its own name at search time (see RESTORE_TRANSFORM). All are counted in the report.
 		self.reserved_names = reserved_names
 		self.reserved_prefix = reserved_prefix
 		self.reserved = collections.Counter()
@@ -1256,7 +1319,8 @@ class FieldMap(object):
 					if self.reserved_names == 'skip':
 						self._skip(key, stanza, 'name: ' + WHY_RESERVED, name_expr)
 						continue
-					self.explained[key].extend([name_expr, self.reserved_prefix + name_expr])
+					if self.reserved_names != 'restore':
+						self.explained[key].extend([name_expr, self.reserved_prefix + name_expr])
 					name = self.reserved_prefix + name
 				if by_eval:
 					reason = self._eval_field(name, value_expr, t.timestamp_format if carries_ts else '', evals)
@@ -1346,7 +1410,8 @@ class FieldMap(object):
 				if self.reserved_names == 'skip':
 					self._skip(key, stanza, 'name: ' + WHY_RESERVED, name_expr)
 					continue
-				self.explained[key].extend([name_expr, self.reserved_prefix + name_expr])
+				if self.reserved_names != 'restore':
+					self.explained[key].extend([name_expr, self.reserved_prefix + name_expr])
 				name = self.reserved_prefix + name
 				name_expr = self.reserved_prefix + name_expr
 			value = [(k, meta_escape(v) if k == 'text' else v) for k, v in groups_of(value_expr, as_text)]
@@ -1431,7 +1496,9 @@ class FieldMap(object):
 				('forms_per_field', dict(collections.Counter(name for name, _, _ in self.forms))),
 				('working_fields_per_event_max', max([sum(1 + len(g) for _, _, g in t.evals) for t in self.transforms] or [0]))])),
 			('reserved_field_names', collections.OrderedDict([
-				('action', 'left out' if self.reserved_names == 'skip' else 'written as %s<name>' % self.reserved_prefix),
+				('action', 'left out' if self.reserved_names == 'skip' else (
+					'written as %s<name>' % self.reserved_prefix if self.reserved_names == 'prefix' else
+					'written as %s<name>, given back as <name> at search time' % self.reserved_prefix)),
 				('templates_per_name', dict(self.reserved))])),
 			('values_per_template_max', max([t.value_count for t in self.transforms] or [0])),
 			('skipped_detail', self.skipped_detail),
@@ -1497,6 +1564,17 @@ def eval_stanza(target):
 	return '%s_ingest_eval' % target['transform_prefix']
 
 
+def restored_names(field_map):
+	"""The literal reserved names --reserved-names restore gives back at search time, sorted."""
+	if field_map.reserved_names != 'restore':
+		return []
+	return sorted(field_map.reserved)
+
+
+def restore_stanza(name):
+	return RESTORE_TRANSFORM + sanitize(name)
+
+
 def props_text(target, field_map, settings, search_hash=True, sourcetype_field=SOURCETYPE_FIELD):
 	lines = [
 		'# %s. Index-time: the app\'s [%s] parsing plus one' % (target['description'], SOURCE_STANZA),
@@ -1520,6 +1598,13 @@ def props_text(target, field_map, settings, search_hash=True, sourcetype_field=S
 			'# with "~" (every uncompacted %s event) gets nothing from it.' % target['rename'],
 			'[%s]' % target['rename'],
 			'REPORT-%s = %s' % (HASH_TRANSFORM, HASH_TRANSFORM)]
+	restored = restored_names(field_map)
+	if restored:
+		if not search_hash:
+			lines += ['', '[%s]' % target['rename']]
+		lines += ['# Search-time: each name Splunk does not keep for an indexed field, given back from %s<name>.'
+			% field_map.reserved_prefix,
+			'REPORT-tenx_fm_restore = %s' % ', '.join(restore_stanza(n) for n in restored)]
 	return '\n'.join(lines) + '\n'
 
 
@@ -1547,6 +1632,10 @@ def transforms_text(field_map, search_hash=True, target=None, sourcetype_field=S
 	if search_hash:
 		text += ('\n# Search-time: tenx-hash-vars-extraction (tenx-for-splunk) with the leading "~" required.\n'
 			'[%s]\nREGEX = %s\n' % (HASH_TRANSFORM, HASH_REGEX))
+	for name in restored_names(field_map):
+		text += ('\n# Search-time: %s, written at index time as %s%s.\n[%s]\nSOURCE_KEY = %s%s\nREGEX = %s\n'
+			'FORMAT = %s::$1\n' % (name, field_map.reserved_prefix, name, restore_stanza(name), field_map.reserved_prefix,
+				name, RESTORE_REGEX, name))
 	return text
 
 
@@ -1755,6 +1844,11 @@ def verify(templates, field_map, encoded_path, raw_path, raw_split=None, out=sys
 		got = collections.Counter((n_, v) for n_, v in written_pairs if v != '')
 		for n_ in set(n_ for n_, _ in got if reserved_name(n_)):
 			reserved_dynamic[n_] += 1
+		if field_map.reserved_names == 'restore':
+			# What the search-time restore gives back under the field's own name.
+			back = set(field_map.reserved_prefix + n_ for n_ in field_map.reserved)
+			got = collections.Counter(dict(((n_[len(field_map.reserved_prefix):] if n_ in back else n_, v), c)
+				for (n_, v), c in got.items()))
 		want = collections.Counter((n_, v.strip(field_map.trim_chars) if field_map.trim_values else v)
 			for n_, v in reader.pairs(expanded) if v != '' and reader.field_name.match(n_))
 		want = collections.Counter({k: c for k, c in want.items() if k[1] != ''})
@@ -2266,11 +2360,12 @@ def build_parser():
 		p.add_argument('--trim-values', choices=('auto', 'on', 'off'), default='auto',
 			help='drop spaces and tabs at the ends of a value; auto: as the reader\'s Splunk extraction does '
 				'(xml-windows on, json and kv off)')
-		p.add_argument('--reserved-names', choices=('skip', 'prefix'), default='skip',
+		p.add_argument('--reserved-names', choices=('skip', 'prefix', 'restore'), default='skip',
 			help='a field named like a Splunk default field (eventtype, host, source, ...; any case): '
-				'skip it (default) or write it under --reserved-prefix; both are reported')
+				'skip it (default), write it under --reserved-prefix (prefix), or write it under the prefix and give it '
+				'back under its own name at search time, under the rename target (restore); all are reported')
 		p.add_argument('--reserved-prefix', default='extracted_',
-			help='prefix for --reserved-names prefix (default extracted_, the name Splunk 10.4.3 itself gave)')
+			help='prefix for --reserved-names prefix and restore (default extracted_, the name Splunk 10.4.3 itself gave)')
 		p.add_argument('--mark', default=MARK_FIELD,
 			help='indexed field every FORMAT writes as <mark>::"1" (default %s; none: no mark). `tx` keeps the '
 				'indexed fields of an event that has it from being extracted a second time' % MARK_FIELD)
