@@ -24,6 +24,7 @@ import json
 import os
 import re
 import time
+import urllib.parse
 
 import pytest
 
@@ -1016,7 +1017,8 @@ class FakeSplunkd(object):
 						h = e['event'][1:].split(',', 1)[0].strip()
 						if not outer.drop:
 							outer.events.append(dict(index=e['index'], host=e['host'], source=e['source'], sourcetype=e['sourcetype'],
-								raw=e['event'], hash=h, mapped=h in outer.rows and not outer.hec_unmapped, t=outer.now(), via='hec'))
+								raw=e['event'], hash=h, mapped=h in outer.rows and not outer.hec_unmapped, t=outer.now(), via='hec',
+								node=e.get('fields', {}).get(fm.PROBE_NODE_FIELD, '')))
 					self._send({'text': 'Success', 'code': 0})
 				elif path == '/services/receivers/simple':
 					q = dict(up.parse_qsl(query))
@@ -1031,13 +1033,18 @@ class FakeSplunkd(object):
 					assert m['exec_mode'] == 'oneshot' and 'host="%s"' % fm.PROBE_HOST in m['search']
 					since = int(re.search(r'_index_earliest=(-?\d+)', m['search']).group(1))
 					res, why = {}, {}
+					# per node when the search groups by the probe's node field, as activate does with several endpoints
+					per_node = 'tenx_fm_probe_n' in m['search']
 					for e in outer.events:
 						if e['host'] == fm.PROBE_HOST and e['source'] == fm.PROBE_SOURCE and e['t'] >= since:
-							res[e['hash']] = max(res.get(e['hash'], 0), int(e['mapped']))
+							k = (e['hash'], e.get('node', '')) if per_node else e['hash']
+							res[k] = max(res.get(k, 0), int(e['mapped']))
 							if not e['mapped']:
-								why.setdefault(e['hash'], set()).add(fm.WHY_NO_ROW)
-					self._send({'results': [dict({'tenx_fm_probe_h': h, 'm': str(v)}, **({'w': sorted(why[h])} if h in why else {}))
-						for h, v in res.items()]})
+								why.setdefault(k, set()).add(fm.WHY_NO_ROW)
+					def key(k):
+						return {'tenx_fm_probe_h': k[0], 'tenx_fm_probe_n': k[1]} if per_node else {'tenx_fm_probe_h': k}
+					self._send({'results': [dict(key(k), m=str(v), **({'w': sorted(why[k])} if k in why else {}))
+						for k, v in res.items()]})
 				else:
 					self._send({})
 
@@ -1542,3 +1549,175 @@ class TestCapFile:
 		generate(tmp_path, 'a', ['--records', records, '--reader', 'kv', '--sourcetype', 'tenx_fw', '--rename', 'fw:traffic'])
 		report = json.loads((tmp_path / 'a_report.json').read_text())
 		assert 'compact_cap' not in report and sorted(os.listdir(str(tmp_path))) == ['a', 'a_report.json', 'templates.json']
+
+
+class FakeNode(object):
+	"""One parsing node's HTTP Event Collector in a thread: indexes each probe into the FakeSplunkd's events (so
+	the search head finds it) with tenx_mapped when its hash has a row in this node's lookup as last read, and
+	with the node field the probe carries. busy answers 503; close() stops it, so it can no longer be reached."""
+
+	def __init__(self, fake, rows):
+		import http.server
+		import threading
+		self.fake, self.rows, self.busy = fake, set(rows), False
+		outer = self
+
+		class Handler(http.server.BaseHTTPRequestHandler):
+			def log_message(self, *a):
+				pass
+
+			def do_POST(self):
+				outer.fake.run_schedule()
+				data = self.rfile.read(int(self.headers.get('Content-Length') or 0)).decode('utf-8')
+				if outer.busy:
+					self.send_response(503)
+					self.end_headers()
+					return
+				for line in data.splitlines():
+					e = json.loads(line)
+					h = e['event'][1:].split(',', 1)[0].strip()
+					outer.fake.events.append(dict(index=e['index'], host=e['host'], source=e['source'], sourcetype=e['sourcetype'],
+						raw=e['event'], hash=h, mapped=h in outer.rows, t=outer.fake.now(), via='hec',
+						node=e.get('fields', {}).get(fm.PROBE_NODE_FIELD, '')))
+				body = b'{"text":"Success","code":0}'
+				self.send_response(200)
+				self.send_header('Content-Length', str(len(body)))
+				self.end_headers()
+				self.wfile.write(body)
+
+		self.server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+		self.url = 'http://127.0.0.1:%d' % self.server.server_address[1]
+		threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+	def close(self):
+		self.server.shutdown()
+		self.server.server_close()
+
+
+class TestEveryParsingNode:
+	"""--probe-hec given once per parsing node: a template is listed only when every node that answers returns its
+	probe with fields, check probes every node, a node that cannot be reached is left out."""
+	gen, records = TestCapFile.gen, TestCapFile.records
+	Clock = TestCapFile.Clock
+
+	def setup(self, tmp_path, listed, added, ready):
+		"""The cap file lists `listed`, the pending list adds `added`; three nodes, those in `ready` (0, 1, 2) already
+		read the new lookup file, the others still hold the rows of `listed` alone."""
+		cap = tmp_path / 'compact-cap.csv'
+		assert self.gen(tmp_path, list(listed) + list(added), cap) == 0
+		cap.write_text(fm.cap_text(set(listed)), encoding='utf-8')
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		clock = self.Clock()
+		fake.now = clock
+		nodes = [FakeNode(fake, set(listed) | (set(added) if i in ready else set())) for i in range(3)]
+		return cap, fake, clock, nodes
+
+	def splunkd(self, fake, nodes):
+		return fm.Splunkd(fake.url, hec_url=[n.url for n in nodes], hec_token='t')
+
+	def close(self, fake, nodes):
+		for n in nodes:
+			try:
+				n.close()
+			except Exception:
+				pass
+		fake.close()
+
+	def test_a_template_is_listed_only_once_every_node_returns_it_with_fields(self, tmp_path):
+		cap, fake, clock, nodes = self.setup(tmp_path, ['k1'], ['k2'], ready=[0])
+		out = io.StringIO()
+		# two of three nodes read the new file 25 s in (one refresh), the first already has it
+		fake.schedule = [(1025, lambda: [nodes[i].rows.add('k2') for i in (1, 2)])]
+		try:
+			rc = fm.activate(str(tmp_path / 'fm_fw'), str(cap), self.splunkd(fake, nodes), out=out, probe_index='probes',
+				timeout=20, poll=5, check_timeout=10, clock=clock, sleep=clock.sleep)
+			# within 20 s only one node gave k2 its fields: k2 is not listed although node 0 confirmed it
+			assert rc == 1 and read(str(cap)) == 'pattern_hash,value\n"k1",true\n' and "not yet: 'k2'" in out.getvalue()
+			rc = fm.activate(str(tmp_path / 'fm_fw'), str(cap), self.splunkd(fake, nodes), out=out, probe_index='probes',
+				timeout=60, poll=5, check_timeout=10, clock=clock, sleep=clock.sleep)
+		finally:
+			self.close(fake, nodes)
+		assert rc == 0 and read(str(cap)) == 'pattern_hash,value\n"k1",true\n"k2",true\n'
+		# every probe was sent to every node, each carrying the node it went to
+		k2 = [e for e in fake.events if e['hash'] == 'k2']
+		labels = set(urllib.parse.urlsplit(n.url).netloc for n in nodes)
+		assert set(e['node'] for e in k2) == labels and all(e['via'] == 'hec' for e in k2)
+		assert all(e['mapped'] for e in k2 if e['t'] >= 1025)
+
+	def test_check_withdraws_when_one_node_returns_a_probe_without_fields(self, tmp_path):
+		cap, fake, clock, nodes = self.setup(tmp_path, ['k1', 'k2'], [], ready=[0, 1, 2])
+		nodes[2].rows = set()
+		out = io.StringIO()
+		try:
+			rc = fm.check(str(tmp_path / 'fm_fw'), str(cap), self.splunkd(fake, nodes), probe_index='probes', sample=1,
+				timeout=20, poll=5, out=out, clock=clock, sleep=clock.sleep)
+		finally:
+			self.close(fake, nodes)
+		label = urllib.parse.urlsplit(nodes[2].url).netloc
+		assert rc == 1 and read(str(cap)) == 'pattern_hash,value\n'
+		assert 'sent to %s indexed without its fields (tenx_unmapped=no_row)' % nodes[2].url in out.getvalue()
+		assert set(e['node'] for e in fake.events) == set(urllib.parse.urlsplit(n.url).netloc for n in nodes) and label
+
+	def test_activate_withdraws_within_two_rounds_when_one_node_stops_giving_rows(self, tmp_path):
+		cap, fake, clock, nodes = self.setup(tmp_path, ['k1'], ['k2'], ready=[])
+		fake.schedule = [(1015, lambda: setattr(nodes[1], 'rows', set()))]
+		out = io.StringIO()
+		try:
+			rc = fm.activate(str(tmp_path / 'fm_fw'), str(cap), self.splunkd(fake, nodes), out=out, probe_index='probes',
+				timeout=300, poll=10, check_timeout=20, clock=clock, sleep=clock.sleep)
+		finally:
+			self.close(fake, nodes)
+		assert rc == 1 and read(str(cap)) == 'pattern_hash,value\n' and 'withdrawn by check' in out.getvalue()
+		assert 'sent to %s' % nodes[1].url in out.getvalue() and clock.t - 1015 <= 2 * 10
+
+	def test_a_node_that_cannot_be_reached_is_left_out_and_counted_again_once_it_answers(self, tmp_path):
+		cap, fake, clock, nodes = self.setup(tmp_path, ['k1'], ['k2'], ready=[0, 1])
+		down = nodes[2]
+		down.close()
+		out = io.StringIO()
+		try:
+			rc = fm.activate(str(tmp_path / 'fm_fw'), str(cap), self.splunkd(fake, nodes), out=out, probe_index='probes',
+				timeout=60, poll=5, check_timeout=10, clock=clock, sleep=clock.sleep)
+			assert rc == 0 and read(str(cap)) == 'pattern_hash,value\n"k1",true\n"k2",true\n'
+			assert 'left out of those rounds: %s' % down.url in out.getvalue()
+			out = io.StringIO()
+			rc = fm.check(str(tmp_path / 'fm_fw'), str(cap), self.splunkd(fake, nodes), probe_index='probes', sample=2,
+				timeout=20, poll=5, out=out, clock=clock, sleep=clock.sleep)
+			assert rc == 0 and 'on 2 nodes' in out.getvalue() and 'left out: %s' % down.url in out.getvalue()
+			# a node busy (503) is left out as well, not counted as wrong
+			nodes[1].busy = True
+			rc = fm.check(str(tmp_path / 'fm_fw'), str(cap), self.splunkd(fake, nodes), probe_index='probes', sample=2,
+				timeout=20, poll=5, out=io.StringIO(), clock=clock, sleep=clock.sleep)
+			assert rc == 0 and read(str(cap)) == 'pattern_hash,value\n"k1",true\n"k2",true\n'
+			nodes[1].busy = False
+			# the node comes back without the rows: the next check withdraws the list
+			back = FakeNode(fake, set())
+			nodes[2] = back
+			out = io.StringIO()
+			rc = fm.check(str(tmp_path / 'fm_fw'), str(cap), self.splunkd(fake, nodes), probe_index='probes', sample=1,
+				timeout=20, poll=5, out=out, clock=clock, sleep=clock.sleep)
+		finally:
+			self.close(fake, nodes)
+		assert rc == 1 and read(str(cap)) == 'pattern_hash,value\n' and 'sent to %s' % back.url in out.getvalue()
+
+	def test_with_no_node_reachable_check_changes_nothing(self, tmp_path):
+		cap, fake, clock, nodes = self.setup(tmp_path, ['k1'], [], ready=[0, 1, 2])
+		for n in nodes:
+			n.close()
+		out = io.StringIO()
+		try:
+			rc = fm.check(str(tmp_path / 'fm_fw'), str(cap), self.splunkd(fake, nodes), probe_index='probes', sample=1,
+				timeout=20, poll=5, out=out, clock=clock, sleep=clock.sleep)
+		finally:
+			fake.close()
+		assert rc == 2 and read(str(cap)) == 'pattern_hash,value\n"k1",true\n'
+		assert 'no parsing node took the probes' in out.getvalue() and 'nothing checked' in out.getvalue()
+
+	def test_the_option_given_several_times_gives_one_endpoint_per_node(self, tmp_path, monkeypatch):
+		seen = {}
+		monkeypatch.setattr(fm, 'check', lambda app, cap, splunkd, *a, **k: seen.setdefault('nodes', splunkd.nodes) and 0)
+		fm.main(['check', '--app', str(tmp_path), '--cap-file', str(tmp_path / 'c.csv'), '--splunkd', 'https://sh:8089',
+			'--probe-index', 'p', '--probe-hec', 'https://idx1:8088', '--probe-hec', 'https://idx2:8088/'])
+		assert seen['nodes'] == ['https://idx1:8088', 'https://idx2:8088']
+		assert fm.Splunkd('https://sh:8089', hec_url='https://lb:8088').nodes == [None]
+		assert fm.Splunkd('https://sh:8089', hec_url=['https://lb:8088']).nodes == [None]
