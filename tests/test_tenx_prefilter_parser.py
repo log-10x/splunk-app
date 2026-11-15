@@ -360,3 +360,40 @@ class TestWholeAddress:
 
 	def test_other_words_keep_their_dictionary_clause(self):
 		assert plan("kafka 10.0.1.14")[0].startswith("(((TERM(kafka) OR TERM(~k1))) AND ((TERM(10) OR TERM(10.0.1.14))")
+
+
+class TestWindowsPaths:
+	"""Words of a Windows path, which the engine's windowsPathSingleToken option stores as one value
+	(C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe). Splunk indexes each run between its
+	breakers inside that value as a term, so the pieces must be cut at those breakers only."""
+
+	def test_a_folder_or_file_name_is_a_term(self):
+		assert plan("Chrome")[0] == "(TERM(chrome))"
+		assert plan("chrome.exe")[0] == "(TERM(chrome) AND TERM(exe))"
+		assert plan("fileserver01")[0] == "(TERM(fileserver01))"
+
+	def test_a_short_name_is_one_term_and_places_no_restriction(self):
+		# ~ is no breaker: PROGRA~1 is one index term, and TERM(progra) would select nothing
+		assert p.pieces_of("PROGRA~1") == ["progra~1"]
+		assert plan("PROGRA~1")[0] is None
+		assert plan("C:\\PROGRA~1\\WINDOW~1\\wordpad.exe")[0] == "(TERM(c) AND TERM(wordpad) AND TERM(exe))"
+
+	def test_a_path_in_a_phrase_is_cut_at_its_backslashes(self):
+		assert plan('"C:\\Program Files\\Google\\Chrome"')[0] == (
+			"(TERM(c) AND TERM(program) AND TERM(files) AND TERM(google) AND TERM(chrome))")
+		assert p.pieces_of(p.tokenize('"\\\\fileserver01\\Finance$\\Q3"')[0][1]) == ["fileserver01", "finance", "q3"]
+
+	def test_a_phrase_still_unescapes_a_quote_and_a_backslash(self):
+		assert p.tokenize('"say \\"hi\\" a\\\\b"') == [("phrase", 'say "hi" a\\b')]
+		assert p.tokenize('"C:\\Windows"') == [("phrase", "C:\\Windows")]
+
+	def test_an_unquoted_path_and_term_read_the_same(self):
+		assert plan("C:\\Windows\\explorer.exe")[0] == "(TERM(c) AND TERM(windows) AND TERM(explorer) AND TERM(exe))"
+		assert plan("TERM(C:\\Windows\\explorer.exe)")[0] == plan("C:\\Windows\\explorer.exe")[0]
+
+	def test_a_field_comparison_places_no_restriction(self):
+		assert plan('ObjectName="*Chrome*"')[0] is None
+
+	def test_the_breakers_are_the_search_rewrite_breakers(self):
+		import tenx_search_builder
+		assert p.SEGMENT_BREAKERS == tenx_search_builder.SEGMENT_BREAKERS
