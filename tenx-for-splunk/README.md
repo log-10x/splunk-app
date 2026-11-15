@@ -509,9 +509,7 @@ record that can be `userIdentity.sessionContext.attributes.creationDate`, which 
 CloudTrail event the raw event's `_time`.
 
 A FortiGate line has its date and time in two fields, `date=` and `time=`. The Receiver reads the
-time and supplies the date, so a compact FortiGate event's `_time` can fall on another day. A
-FortiGate field map built with the time options (below) gives every compact FortiGate event the
-raw event's `_time`.
+time and supplies the date, so a compact FortiGate event's `_time` can fall on another day.
 
 ## Data Models and Detections: the Field Map
 
@@ -527,18 +525,23 @@ sourcetype. The add-on's search-time rules, the CIM data models and the detectio
 event as on the raw one.
 
 A field map covers the templates stored when it is generated. The steps below are for Windows
-Security; the commands for CloudTrail and FortiGate follow them. Steps 1, 6 and 7 keep the Receiver
-from compacting the events of a template before its fields can be written; they were measured with
-the Windows map.
+Security; CloudTrail follows them. Steps 1, 6 and 7 keep the Receiver from compacting the events of
+a template before its fields can be written; they were measured with the Windows map and the
+CloudTrail map, each through its own Receiver.
+
+A field map has its own Receiver and its own cap file. Send the mapped source, and only that
+source, through that Receiver: with the cap list on, an event of any template that is not listed
+arrives whole.
 
 1. Before compact events are sent, set the Receiver to compact only the templates a cap file lists.
    In its `pipelines/run/receive/compact/config.yaml`, set `fieldNames` to `[templateHash]`
    (`default: false` is the shipped value). Create the cap file with its header row, in a place the
    Receiver reads and the host that runs `activate` and `check` can write, and add
-   `compactReceiverLookupFile /etc/tenx/compact-cap.csv` to the Receiver's command line:
+   `compactReceiverLookupFile /etc/tenx/win/compact-cap.csv` to the Receiver's command line:
 
    ```sh
-   printf 'pattern_hash,value\n' > /etc/tenx/compact-cap.csv
+   mkdir -p /etc/tenx/win
+   printf 'pattern_hash,value\n' > /etc/tenx/win/compact-cap.csv
    ```
 
    Every event arrives whole, with all its fields, until its template is listed.
@@ -560,7 +563,7 @@ the Windows map.
    ```sh
    $SPLUNK_HOME/bin/splunk cmd python3 $SPLUNK_HOME/etc/apps/tenx-for-splunk/bin/tenx_field_map.py gen \
      --records kv_0.json --records kv_1.json --target windows-security --rules lookup \
-     --app-name fm_win --cap-file /etc/tenx/compact-cap.csv --out fm_win
+     --app-name fm_win --cap-file /etc/tenx/win/compact-cap.csv --out fm_win
    ```
 
    This writes the apps `fm_win` and `fm_win_floor` and the file `compact-cap.csv.pending`, and
@@ -581,7 +584,7 @@ the Windows map.
    ```sh
    TENX_SPLUNKD_TOKEN=<token> TENX_PROBE_HEC_TOKEN=<HEC token> $SPLUNK_HOME/bin/splunk cmd python3 \
      $SPLUNK_HOME/etc/apps/tenx-for-splunk/bin/tenx_field_map.py activate \
-     --app $SPLUNK_HOME/etc/apps/fm_win --cap-file /etc/tenx/compact-cap.csv \
+     --app $SPLUNK_HOME/etc/apps/fm_win --cap-file /etc/tenx/win/compact-cap.csv \
      --splunkd https://<parsing instance>:8089 --probe-hec https://<parsing instance>:8088 \
      --probe-index tenx_probe
    ```
@@ -599,7 +602,7 @@ the Windows map.
    ```sh
    TENX_SPLUNKD_TOKEN=<token> TENX_PROBE_HEC_TOKEN=<HEC token> $SPLUNK_HOME/bin/splunk cmd python3 \
      $SPLUNK_HOME/etc/apps/tenx-for-splunk/bin/tenx_field_map.py check \
-     --app $SPLUNK_HOME/etc/apps/fm_win --cap-file /etc/tenx/compact-cap.csv \
+     --app $SPLUNK_HOME/etc/apps/fm_win --cap-file /etc/tenx/win/compact-cap.csv \
      --splunkd https://<parsing instance>:8089 --probe-hec https://<parsing instance>:8088 \
      --probe-index tenx_probe --timeout 20 --poll 5
    ```
@@ -621,41 +624,45 @@ forwarders), give `activate` and `check` each node's HTTP Event Collector,
 `--probe-hec https://<node>:8088` once per node. A template is then listed only when every node
 writes its fields, and `check` empties the list when any node does not.
 
-Step 4 for the other sources; the compact sourcetype is the one named by `--sourcetype`:
+**AWS CloudTrail** has a second Receiver with its own cap file, `/etc/tenx/cloudtrail/compact-cap.csv`,
+set up as in step 1. Steps 2, 3 and 5 are as for Windows Security, with the app `fm_cloudtrail`, the
+compact sourcetype `tenx_cloudtrail` and `tenx_compact_st::tenx_cloudtrail` in `tenx-events`. Step 4
+generates the map with the AWS add-on's time settings, so every compact event takes the raw event's
+`_time`:
 
-- **AWS CloudTrail.** Generate the map with the AWS add-on's time settings, so every compact
-  event takes the raw event's `_time`:
+```sh
+$SPLUNK_HOME/bin/splunk cmd python3 $SPLUNK_HOME/etc/apps/tenx-for-splunk/bin/tenx_field_map.py gen \
+  --records kv_0.json --records kv_1.json --rules lookup --reader json \
+  --sourcetype tenx_cloudtrail --rename aws:cloudtrail --reserved-names restore --mixed-names \
+  --time-props $SPLUNK_HOME/etc/apps/Splunk_TA_aws/default/props.conf \
+  --time-format '%Y-%m-%dT%H:%M:%S.%6N%Z' \
+  --app-name fm_cloudtrail --cap-file /etc/tenx/cloudtrail/compact-cap.csv --out fm_cloudtrail
+```
 
-  ```sh
-  $SPLUNK_HOME/bin/splunk cmd python3 $SPLUNK_HOME/etc/apps/tenx-for-splunk/bin/tenx_field_map.py gen \
-    --records kv_0.json --records kv_1.json --rules lookup --reader json \
-    --sourcetype tenx_cloudtrail --rename aws:cloudtrail --reserved-names restore --mixed-names \
-    --time-props $SPLUNK_HOME/etc/apps/Splunk_TA_aws/default/props.conf \
-    --time-format '%Y-%m-%dT%H:%M:%S.%6N%Z' --out fm_cloudtrail
-  ```
+Steps 6 and 7 take that map's app and cap file:
 
-- **FortiGate.** One map per log type, each with its own compact sourcetype; the sender sets the
-  sourcetype `tenx_fgt_traffic`, `tenx_fgt_utm`, `tenx_fgt_event` or `tenx_fgt_anomaly` by the line's
-  `type=`. The time options give every compact event the raw event's `_time`:
+```sh
+TENX_SPLUNKD_TOKEN=<token> TENX_PROBE_HEC_TOKEN=<HEC token> $SPLUNK_HOME/bin/splunk cmd python3 \
+  $SPLUNK_HOME/etc/apps/tenx-for-splunk/bin/tenx_field_map.py activate \
+  --app $SPLUNK_HOME/etc/apps/fm_cloudtrail --cap-file /etc/tenx/cloudtrail/compact-cap.csv \
+  --splunkd https://<parsing instance>:8089 --probe-hec https://<parsing instance>:8088 \
+  --probe-index tenx_probe
 
-  ```sh
-  for t in traffic utm event anomaly; do
-    $SPLUNK_HOME/bin/splunk cmd python3 $SPLUNK_HOME/etc/apps/tenx-for-splunk/bin/tenx_field_map.py gen \
-      --records kv_0.json --records kv_1.json --rules lookup --reader delims \
-      --sourcetype tenx_fgt_$t --rename fortigate_$t --reserved-names restore \
-      --time-props $SPLUNK_HOME/etc/apps/Splunk_TA_fortinet_fortigate/default/props.conf \
-      --time-prefix 'date=' --time-format '%Y-%m-%d time=%H:%M:%S' --out fm_fgt_$t
-  done
-  ```
+TENX_SPLUNKD_TOKEN=<token> TENX_PROBE_HEC_TOKEN=<HEC token> $SPLUNK_HOME/bin/splunk cmd python3 \
+  $SPLUNK_HOME/etc/apps/tenx-for-splunk/bin/tenx_field_map.py check \
+  --app $SPLUNK_HOME/etc/apps/fm_cloudtrail --cap-file /etc/tenx/cloudtrail/compact-cap.csv \
+  --splunkd https://<parsing instance>:8089 --probe-hec https://<parsing instance>:8088 \
+  --probe-index tenx_probe --timeout 20 --poll 5
+```
 
-- **All fields on a plain search, CloudTrail and FortiGate.** Set `indexed_kv_limit = 0` under
-  `[kv]` in `limits.conf` on the indexers and heavy forwarders, in the cluster bundle on a cluster
-  (a search head does not pass `limits.conf` to its peers). It takes a restart; on a cluster the
-  bundle push restarts the peers one by one. Splunk's default, 200, caps the indexed fields a plain
-  search shows on one event; 0 shows every field. Data model counts and detections through the map are the same
-  at either value.
+For all fields on a plain search of mapped CloudTrail events, set `indexed_kv_limit = 0` under
+`[kv]` in `limits.conf` on the indexers and heavy forwarders, in the cluster bundle on a cluster (a
+search head does not pass `limits.conf` to its peers). It takes a restart; on a cluster the bundle
+push restarts the peers one by one. Splunk's default, 200, caps the indexed fields a plain search
+shows on one event; 0 shows every field. Data model counts and detections through the map are the
+same at either value.
 
-Checked with the Windows, AWS and FortiGate add-ons against the same events indexed raw; the results are in the [listing's checks](../splunkbase/LISTING.md#checks-run-on-this-package).
+Checked with the Windows and AWS add-ons against the same events indexed raw; the results are in the [listing's checks](../splunkbase/LISTING.md#checks-run-on-this-package).
 
 ## What to Install on Each Tier
 
