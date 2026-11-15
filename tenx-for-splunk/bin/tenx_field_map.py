@@ -247,10 +247,19 @@ RULES_LOOKUP = 'lookup'
 # references up to \1215 gave every value). A CloudTrail UpdateSAMLProvider event has 422 values.
 LOOKUP_MAX_VALUES = 984
 # One value: the rule's regex (PCRE) and this module's reading of it (Python re, which has no POSIX
-# classes). [:cntrl:] keeps a line break out of a value, so text of two lines gets no fields, and needs
-# no backslash: the rule cuts its regex from a string constant by length, which an escape would change.
-LOOKUP_VALUE_GROUP = ',([^,[:cntrl:]]*)'
-LOOKUP_VALUE_GROUP_PY = ',([^,\\x00-\\x1f\\x7f]*)'
+# classes). A value holds no comma and no control character except a carriage return: a line feed stays
+# out, so two compact lines a line-merging input joined into one event get no fields, while the carriage
+# return of a CR LF line end, which the engine leaves at the end of the value before the template's line
+# feed (the OpenTelemetry Collector keeps CR LF; Fluent Bit's records had none), is part of the value. The
+# group needs no backslash: the rule cuts its regex from a string constant by length, which an escape
+# would change, so LOOKUP_CR stands for the carriage return and the rule puts one in after the cut.
+LOOKUP_CR = '@'
+LOOKUP_VALUE_GROUP = ',([^,[:cntrl:]]*(?:@[^,[:cntrl:]]*)*)'
+LOOKUP_VALUE_GROUP_PY = ',([^,\\x00-\\x1f\\x7f]*(?:\\r[^,\\x00-\\x1f\\x7f]*)*)'
+# Whitespace at the two ends of a field value, which the rule drops for a reader whose add-on trims values
+# (TRIM_CHARS, the POSIX class [:space:]). Template text there is cut when the app is generated; this is
+# for a value's own carriage return at the end of a field (AccessList "%%1538\r" before "\n\t\t\t\t").
+LOOKUP_EDGE_SPACE_PY = (re.compile('::"[ \\t\\n\\x0b\\x0c\\r]+'), re.compile('[ \\t\\n\\x0b\\x0c\\r]+"'))
 # Appended to the compact line, after "|<timestamp text>|", so the replacement can write these
 # characters by reference instead of as text: replace() reads a backslash followed by digits as a
 # reference (greedily), so a literal backslash, and a digit right after a reference, would be read wrong.
@@ -1066,8 +1075,9 @@ def time_text(rule, text, prefix_re=None):
 # getting n (values), t (timestamp format, or empty) and f (the recipe); render the timestamp as text
 # when t is set; then one replace() on
 #     <compact line>|<timestamp text>|0123456789\<tab><line feed><carriage return>
-# with the regex "^~[^,[:cntrl:]]*" + ",([^,[:cntrl:]]*)" * n + "[|]([^|[:cntrl:]]*)[|]" + "([^|])" * 14 + "$" and the
-# recipe as the replacement. The result is index-time field text, name::"value" pairs as WRITE_META
+# with the regex "^~[^,[:cntrl:]]*" + ",([^,[:cntrl:]]*(?:<CR>[^,[:cntrl:]]*)*)" * n + "[|]([^|[:cntrl:]]*)[|]" +
+# "([^|])" * 14 + "$" (a value holds no comma and no control character but a carriage return; see
+# LOOKUP_VALUE_GROUP) and the recipe as the replacement. The result is index-time field text, name::"value" pairs as WRITE_META
 # writes them, which the rule appends to _meta. A compact line that does not have n values leaves the
 # text unchanged and gets nothing. replace() reads "\<digits>" as a reference to that group when it
 # exists and leaves it as text when it does not; any other backslash is text (10.4.3, measured at
@@ -1075,7 +1085,9 @@ def time_text(rule, text, prefix_re=None):
 # text, n+2..n+11 for a digit right after a reference, n+12 for a backslash and n+13..n+15 for tab,
 # line feed and carriage return; it holds no other backslash. In the field text a value's backslash is
 # written "\\" and its double quote "\"" (how Splunk writes them itself), and a line break inside a
-# value reads back as a space, as for an INGEST_EVAL field.
+# value reads back as a space, as for an INGEST_EVAL field. For a reader whose add-on trims values
+# (xml-windows) the rule then drops whitespace at the two ends of each field value, which only a value's
+# own carriage return can leave there (template text at the ends is cut when the app is generated).
 #
 # If the lookup file is missing, or larger than limits.conf ingest_max_memtable_bytes (default
 # 10485760), lookup() fails at index time and Splunk drops the event (10.4.3: 0 of 6 and 0 of 22 events
@@ -1229,12 +1241,14 @@ def lookup_ts_supported(fmt):
 	return True
 
 
-def lookup_eval_text(lookup_def, time_rule=None):
+def lookup_eval_text(lookup_def, time_rule=None, trim=False):
 	"""The static INGEST_EVAL of --rules lookup (see "Lookup rules"). Every intermediate value sits in a
 	pd: key, which is not indexed. A compact event the rule writes no fields for gets UNMAPPED_FIELD with
 	the reason (see "Lookup failures"). With time_rule, the row's column w also sets _time (see "Event
-	time"); without it the text is as before."""
+	time"); without it the text is as before. With trim, whitespace at the two ends of each field value is
+	dropped, as the add-on of a reader that trims values drops it."""
 	row, f, t, e, x, m, nt, ok, why = ('$pd:tenx_fm_%s$' % k for k in ('row', 'f', 't', 'e', 'x', 'm', 'n', 'ok', 'why'))
+	mt = '$pd:tenx_fm_mt$'
 	w, wt, tt = ('$pd:tenx_fm_%s$' % k for k in ('w', 'wt', 'tt'))
 	n = 'tonumber(%s)' % nt
 	sec = 'tonumber(substr(%s, 1, 10))' % e
@@ -1259,8 +1273,9 @@ def lookup_eval_text(lookup_def, time_rule=None):
 	for token, expr in pieces:
 		fmt = 'replace(%s, "%s", %s)' % (fmt, token, expr)
 	ts = 'if(len(%s) > 0, strftime(%s, %s), "")' % (t, utc, fmt)
-	regex = '"^~[^,[:cntrl:]]*" . substr("%s", 1, %d * %s) . if(%s == 0, ",?", "") . "[|]([^|[:cntrl:]]*)[|]%s$"' % (
-		LOOKUP_VALUE_GROUP * LOOKUP_MAX_VALUES, len(LOOKUP_VALUE_GROUP), n, n, '([^|])' * len(LOOKUP_TAIL))
+	regex = '"^~[^,[:cntrl:]]*" . replace(substr("%s", 1, %d * %s), "%s", urldecode("%%0D")) . if(%s == 0, ",?", "") . "[|]([^|[:cntrl:]]*)[|]%s$"' % (
+		LOOKUP_VALUE_GROUP * LOOKUP_MAX_VALUES, len(LOOKUP_VALUE_GROUP), n, LOOKUP_CR, n, '([^|])' * len(LOOKUP_TAIL))
+	quote = 'urldecode("%22")'
 	tail = '"|0123456789" . urldecode("%5C%09%0A%0D")'
 	compact = 'substr(_raw, 1, 1)=="~"'
 	columns = '"n", "t", "f"' + (', "%s"' % LOOKUP_TIME_COLUMN if time_rule else '')
@@ -1275,11 +1290,15 @@ def lookup_eval_text(lookup_def, time_rule=None):
 		# gets a regex it cannot compile.
 		'%s=if(isnotnull(%s) AND isnotnull(%s), if(match(%s, "::") AND match(%s, "^[0-9]{1,3}$"), if(%s <= %d, 1, 0), 0), 0)' % (
 			ok, f, nt, f, nt, n, LOOKUP_MAX_VALUES),
-		'%s=if(len(%s) > 0, replace(_raw, "^~[^,]*,([^,|]*).*$", "\\1"), "")' % (e, t),
+		'%s=if(len(%s) > 0, replace(_raw, "(?s)^~[^,]*,([^,|]*).*$", "\\1"), "")' % (e, t),
 		'%s=if(%s == 1, _raw . "|" . %s . %s, null())' % (x, ok, ts, tail),
 		'%s=if(isnull(%s), null(), replace(%s, %s, %s))' % (m, x, x, regex, f),
+	] + ([
+		'%s=if(isnull(%s) OR %s==%s, %s, replace(replace(%s, "::" . %s . "[[:space:]]+", "::" . %s), '
+		'"[[:space:]]+" . %s, %s))' % (mt, m, m, x, m, m, quote, quote, quote, quote),
+	] if trim else []) + [
 		# _meta is null on an event no earlier rule gave an indexed field (an HEC event without "fields").
-		'_meta=if(isnull(%s) OR %s==%s, _meta, coalesce(_meta, "") . " " . %s)' % (m, m, x, m),
+		'_meta=if(isnull(%s) OR %s==%s, _meta, coalesce(_meta, "") . " " . %s)' % (m, m, x, mt if trim else m),
 		'%s=case(%s, null(), isnull(%s) AND isnull(%s), "%s", %s != 1, "%s", isnull(%s) OR %s==%s, "%s")' % (
 			why, compact.replace('==', '!='), f, nt, WHY_NO_ROW, ok, WHY_BAD_ROW, m, m, x, WHY_NO_MATCH),
 		# No row: the floor copy of the file, which holds only FLOOR_HASH, says the rows are missing as a whole.
@@ -1350,15 +1369,18 @@ def _lookup_groups(transform, compact_line):
 	return [m.group(0)] + list(m.groups())
 
 
-def apply_lookup_row(transform, compact_line):
+def apply_lookup_row(transform, compact_line, trim=False):
 	"""
 	The pairs the static rule writes for one compact line with this template's row, as Splunk was
-	measured to read the regex and the replacement; None when the line does not have its n values.
+	measured to read the regex and the replacement; None when the line does not have its n values. With
+	trim, whitespace at the two ends of each value goes, as the rule drops it for a reader that trims.
 	"""
 	groups = _lookup_groups(transform, compact_line)
 	if groups is None:
 		return None
 	text = splunk_replace_expand(transform.recipe, groups)
+	if trim:
+		text = LOOKUP_EDGE_SPACE_PY[1].sub('"', LOOKUP_EDGE_SPACE_PY[0].sub('::"', text))
 	return [(n, v) for n, v in parse_meta(text) if n != MARK_FIELD]
 
 
@@ -1417,8 +1439,9 @@ class FieldMap(object):
 		self.reserved_names = reserved_names
 		self.reserved_prefix = reserved_prefix
 		self.reserved = collections.Counter()
-		# Spaces and tabs at the ends of a value come only from template text (a compact value
-		# never holds one), so trimming the marked text trims the value Splunk would see.
+		# Spaces and tabs at the ends of a value come only from template text (a compact value never
+		# holds one), so trimming the marked text trims the value Splunk would see. A compact value can
+		# end with the carriage return of a CR LF line end; the lookup rule trims that at index time.
 		self.trim_values = reader.trims_values if trim_values is None else trim_values
 		# With INGEST_EVAL on, line breaks at the ends go too (TRIM_CHARS); off, spaces and tabs only,
 		# as the first generated files had it. The lookup recipe writes line breaks, so it trims as eval on.
@@ -1851,7 +1874,7 @@ def transforms_text(field_map, search_hash=True, target=None, sourcetype_field=S
 			'case_sensitive_match = true\n' % (lookup_file_name(target), lookup_stanza(target), lookup_file_name(target)),
 			'# Every compact event: its template\'s row gives the fields, written to _meta. The same for every\n'
 			'# template, so adding one changes only the lookup file.\n[%s]\nINGEST_EVAL = %s\n' % (
-				lookup_eval_stanza(target), lookup_eval_text(lookup_stanza(target), field_map.time_rule))]
+				lookup_eval_stanza(target), lookup_eval_text(lookup_stanza(target), field_map.time_rule, field_map.trim_values))]
 	else:
 		stanzas = ['[%s]\nREGEX = %s\nFORMAT = %s\nWRITE_META = true\n' % (t.stanza, t.regex, t.format)
 			for t in field_map.transforms]
@@ -2046,8 +2069,9 @@ def verify(templates, field_map, encoded_path, raw_path, raw_split=None, out=sys
 	reserved_dynamic = collections.Counter()
 	missing, extra = collections.Counter(), collections.Counter()
 
-	with open(encoded_path, encoding='utf-8') as f:
-		compact_lines = f.read().splitlines()
+	# Lines end at a line feed only: a value can hold the carriage return of a CR LF line end.
+	with open(encoded_path, encoding='utf-8', newline='') as f:
+		compact_lines = f.read().split('\n')
 
 	for line in compact_lines:
 		if not line:
@@ -2068,10 +2092,12 @@ def verify(templates, field_map, encoded_path, raw_path, raw_split=None, out=sys
 			differs.append((key, 'value count %d vs %d' % (len(values), n)))
 			continue
 		expanded = expand(text, values, t.timestamp_format)
-		if remaining[expanded] <= 0:
+		# raw_events reads the raw file without carriage returns; the fields are read from the expansion,
+		# which keeps those of the values.
+		if remaining[expanded.replace('\r', '')] <= 0:
 			differs.append((key, expanded[:120]))
 			continue
-		remaining[expanded] -= 1
+		remaining[expanded.replace('\r', '')] -= 1
 		ok += 1
 
 		transform = by_key.get(key)
@@ -2092,7 +2118,7 @@ def verify(templates, field_map, encoded_path, raw_path, raw_split=None, out=sys
 				if len(time_examples) < 5:
 					time_examples.append((key, want_t, got_t))
 		if field_map.rules == RULES_LOOKUP:
-			written_pairs = apply_lookup_row(transform, line)
+			written_pairs = apply_lookup_row(transform, line, field_map.trim_values)
 		else:
 			written_pairs = apply_transform(transform, line, field_map.forms)
 		if written_pairs is None:
