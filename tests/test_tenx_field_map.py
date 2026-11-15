@@ -18,6 +18,7 @@ each compact line, expanded from the marked template, against the raw sample's e
 CR removed; then the fields the generated REGEX and FORMAT write, applied in Python, against
 the reader's fields on the raw event. Neither says what Splunk does with the files.
 """
+import gzip
 import io
 import json
 import os
@@ -901,7 +902,10 @@ class FakeSplunkd(object):
 	receivers/simple indexes each line as an event of the probe stream, with tenx_mapped when the
 	line's hash has a row in the lookup file as last read (refresh() rereads it from the folder, as
 	Splunk does every ingest_lookup_refresh_period_secs); search/jobs (oneshot) answers activate's probe
-	search from those events. Every call is recorded with the cap file's text at that moment.
+	search from those events, indexed at or after its _index_earliest. Every call is recorded with the
+	cap file's text at that moment. now gives each event its index time (a test can give it the clock it
+	gives activate); schedule holds (time, function) pairs, each run once at the first request at or after
+	its time; limits, when set, is what GET configs/conf-limits/lookup returns.
 	"""
 
 	def __init__(self, on_disk, app_name, cap_file, loaded=True):
@@ -914,6 +918,7 @@ class FakeSplunkd(object):
 		self.drop, self.floor = False, True
 		# hec_unmapped: events sent through HEC are parsed where the app is not installed (no fields)
 		self.hec_unmapped = False
+		self.now, self.schedule, self.limits = time.time, [], None
 		self.loaded = on_disk if loaded else None
 		if loaded:
 			self.refresh()
@@ -932,6 +937,7 @@ class FakeSplunkd(object):
 				self.wfile.write(body)
 
 			def do_POST(self):
+				outer.run_schedule()
 				data = self.rfile.read(int(self.headers.get('Content-Length') or 0)).decode('utf-8')
 				path, _, query = self.path.partition('?')
 				outer.calls.append(('POST', path, read(outer.cap_file) if os.path.exists(outer.cap_file) else None))
@@ -941,7 +947,7 @@ class FakeSplunkd(object):
 						h = e['event'][1:].split(',', 1)[0].strip()
 						if not outer.drop:
 							outer.events.append(dict(index=e['index'], host=e['host'], source=e['source'], sourcetype=e['sourcetype'],
-								raw=e['event'], hash=h, mapped=h in outer.rows and not outer.hec_unmapped, t=time.time(), via='hec'))
+								raw=e['event'], hash=h, mapped=h in outer.rows and not outer.hec_unmapped, t=outer.now(), via='hec'))
 					self._send({'text': 'Success', 'code': 0})
 				elif path == '/services/receivers/simple':
 					q = dict(up.parse_qsl(query))
@@ -949,14 +955,15 @@ class FakeSplunkd(object):
 						if outer.drop:
 							continue
 						h = line[1:].split(',', 1)[0].strip()
-						outer.events.append(dict(q, raw=line, hash=h, mapped=h in outer.rows, t=time.time()))
+						outer.events.append(dict(q, raw=line, hash=h, mapped=h in outer.rows, t=outer.now()))
 					self._send({})
 				elif path == '/services/search/jobs':
 					m = dict(up.parse_qsl(data))
 					assert m['exec_mode'] == 'oneshot' and 'host="%s"' % fm.PROBE_HOST in m['search']
+					since = int(re.search(r'_index_earliest=(-?\d+)', m['search']).group(1))
 					res, why = {}, {}
 					for e in outer.events:
-						if e['host'] == fm.PROBE_HOST and e['source'] == fm.PROBE_SOURCE:
+						if e['host'] == fm.PROBE_HOST and e['source'] == fm.PROBE_SOURCE and e['t'] >= since:
 							res[e['hash']] = max(res.get(e['hash'], 0), int(e['mapped']))
 							if not e['mapped']:
 								why.setdefault(e['hash'], set()).add(fm.WHY_NO_ROW)
@@ -966,10 +973,14 @@ class FakeSplunkd(object):
 					self._send({})
 
 			def do_GET(self):
+				outer.run_schedule()
 				path = self.path.split('?')[0]
 				outer.calls.append(('GET', path, None))
 				entries = []
-				if '/conf-' in path and outer.loaded:
+				if path == '/services/configs/conf-limits/lookup':
+					if outer.limits is not None:
+						entries = [{'name': 'lookup', 'content': outer.limits}]
+				elif '/conf-' in path and outer.loaded:
 					conf = path.rsplit('/conf-', 1)[1]
 					app = up.unquote(path.split('/servicesNS/nobody/', 1)[1].split('/', 1)[0])
 					folder = outer.loaded if app == outer.app_name else (fm.floor_dir(outer.loaded)
@@ -986,6 +997,12 @@ class FakeSplunkd(object):
 	def refresh(self):
 		layout = fm.lookup_app(self.on_disk)
 		self.rows = set(fm.read_lookup_file(layout[1])) if layout else set()
+
+	def run_schedule(self):
+		due = [x for x in self.schedule if self.now() >= x[0]]
+		self.schedule = [x for x in self.schedule if x not in due]
+		for _, f in sorted(due, key=lambda x: x[0]):
+			f()
 
 	def posts(self):
 		return [c for c in self.calls if c[0] == 'POST']
@@ -1010,7 +1027,8 @@ class TestCapFile:
 	def activate(self, tmp_path, cap, fake, **kw):
 		out = io.StringIO()
 		kw.setdefault('probe_index', 'probes')
-		rc = fm.activate(str(tmp_path / 'fm_fw'), str(cap), fm.Splunkd(fake.url), out=out, sleep=lambda s: None, **kw)
+		kw.setdefault('sleep', lambda s: None)
+		rc = fm.activate(str(tmp_path / 'fm_fw'), str(cap), fm.Splunkd(fake.url), out=out, **kw)
 		return rc, out.getvalue()
 
 	def test_rows_quote_every_hash_keep_outer_spaces_and_sort(self):
@@ -1107,9 +1125,13 @@ class TestCapFile:
 		assert fake.events[0]['raw'] == fm.HEARTBEAT_LINE and probes[0]['raw'].startswith('~k1,')
 		assert all(e['host'] == fm.PROBE_HOST and e['source'] == fm.PROBE_SOURCE and e['index'] == 'probes'
 			and e['sourcetype'] == 'tenx_fw' for e in fake.events)
-		assert [e['raw'].split(',')[0] for e in probes][-1] == '~k2 ' and probes[-1]['mapped']
+		k2 = [e for e in probes if e['hash'] == 'k2']
+		assert k2[-1]['mapped']
 		# value 0 is the timestamp (19 digits), the other values are the word probe
-		assert re.fullmatch(r'~k2 ,\d{19},probe', probes[-1]['raw'])
+		assert re.fullmatch(r'~k2 ,\d{19},probe', k2[-1]['raw'])
+		# while it waited for k2, every round also probed the listed k1, as check does
+		second = probes[probes.index(k2[0]):]
+		assert [e['hash'] for e in second] == ['k2', 'k1'] * (len(second) // 2) and all(e['mapped'] for e in second)
 
 	def test_while_the_file_is_not_read_one_template_stands_for_all(self, tmp_path):
 		cap = tmp_path / 'compact-cap.csv'
@@ -1311,6 +1333,140 @@ class TestCapFile:
 		finally:
 			fake.close()
 		assert rc == 0 and fake.posts() == [] and 'nothing listed' in out
+
+	class Clock(object):
+		"""Time that moves only when activate or check sleeps."""
+
+		def __init__(self, t=1000.0):
+			self.t = t
+
+		def __call__(self):
+			return self.t
+
+		def sleep(self, s):
+			self.t += s
+
+	def waiting(self, tmp_path, listed, added):
+		"""The cap file lists `listed`; the pending list adds `added`; the instance still holds the lookup
+		file of `listed` alone, so it has no row for `added` until refresh() is called."""
+		cap = tmp_path / 'compact-cap.csv'
+		os.makedirs(str(tmp_path / 'old'))
+		assert self.gen(tmp_path / 'old', listed or ['k0'], tmp_path / 'old' / 'cap.csv') == 0
+		assert self.gen(tmp_path, list(listed) + list(added), cap) == 0
+		cap.write_text(fm.cap_text(set(listed)), encoding='utf-8')
+		fake = FakeSplunkd(str(tmp_path / 'old' / 'fm_fw'), 'fm_fw', str(cap))
+		clock = self.Clock()
+		fake.now = clock
+		return cap, fake, clock
+
+	def test_activate_withdraws_the_list_when_the_lookup_stops_giving_rows_while_it_waits(self, tmp_path):
+		# a new template waits for the instance to read the new file; meanwhile the file is emptied
+		cap, fake, clock = self.waiting(tmp_path, ['k1'], ['k2'])
+		fake.schedule = [(1015, lambda: setattr(fake, 'rows', set()))]
+		try:
+			rc, out = self.activate(tmp_path, cap, fake, timeout=300, poll=10, check_timeout=20, clock=clock,
+				sleep=clock.sleep)
+		finally:
+			fake.close()
+		assert rc == 1 and read(str(cap)) == 'pattern_hash,value\n'
+		assert read(str(cap) + '.pending') == 'pattern_hash,value\n"k1",true\n"k2",true\n'
+		assert "probe of 'k1' indexed without its fields (tenx_unmapped=no_row)" in out and 'withdrawn by check' in out
+		# found by the first probe of the listed template sent after the change, one round later
+		assert clock.t - 1015 <= 2 * 10
+
+	def test_activate_stops_probing_a_new_template_whose_row_does_not_work_once_the_file_was_read(self, tmp_path):
+		cap, fake, clock = self.waiting(tmp_path, [], ['k1', 'k2'])
+		# the instance has read the new file, but the row of k2 gives no fields
+		fake.rows = {'k1'}
+		try:
+			rc, out = self.activate(tmp_path, cap, fake, timeout=300, poll=10, clock=clock, sleep=clock.sleep)
+		finally:
+			fake.close()
+		assert rc == 1 and read(str(cap)) == 'pattern_hash,value\n"k1",true\n'
+		assert read(str(cap) + '.pending') == 'pattern_hash,value\n"k1",true\n"k2",true\n'
+		assert "without their fields after the file was read: 'k2' (tenx_unmapped=no_row)" in out
+		assert 'lookup refresh 60 s, the default: not read from the instance' in out
+		# ended one round after the refresh period plus one poll, not at --timeout
+		assert clock.t == 1000 + 60 + 10 + 10
+
+	def test_activate_waits_for_the_refresh_period_the_instance_has(self, tmp_path):
+		for limits, rc_expected in ((None, 1), ({'ingest_lookup_refresh_period_secs': '120'}, 0)):
+			case = tmp_path / ('c%d' % rc_expected)
+			os.makedirs(str(case))
+			cap, fake, clock = self.waiting(case, ['k1'], ['k2'])
+			fake.limits = limits
+			# the instance reads the new file 100 s after activate starts
+			fake.schedule = [(1100, lambda: (setattr(fake, 'on_disk', str(case / 'fm_fw')), fake.refresh()))]
+			try:
+				rc, out = self.activate(case, cap, fake, timeout=300, poll=10, clock=clock, sleep=clock.sleep)
+			finally:
+				fake.close()
+			assert rc == rc_expected, out
+			if limits:
+				assert 'lookup refresh 120 s)' in out and read(str(cap)) == 'pattern_hash,value\n"k1",true\n"k2",true\n'
+			else:
+				assert read(str(cap)) == 'pattern_hash,value\n"k1",true\n' and "'k2' (tenx_unmapped=no_row)" in out
+
+	def test_activate_probes_a_listed_template_on_every_round(self, tmp_path):
+		cap, fake, clock = self.waiting(tmp_path, ['k1', 'k3'], ['k2'])
+		try:
+			rc, out = self.activate(tmp_path, cap, fake, timeout=300, poll=10, clock=clock, sleep=clock.sleep)
+		finally:
+			fake.close()
+		listed = [e['t'] for e in fake.events if e['hash'] in ('k1', 'k3')]
+		new = [e['t'] for e in fake.events if e['hash'] == 'k2']
+		# rounds at 0, 10, ... 70 s: the probe indexed at 70 s (refresh 60 + poll 10) is the one that counts
+		assert rc == 1 and len(listed) == len(new) == 8 and '8 checks' in out
+		assert max(b - a for a, b in zip(listed, listed[1:])) == 10
+
+	def test_without_rows_activate_sends_one_probe_a_round_and_lists_templates_once_rows_return(self, tmp_path):
+		added = ['k1', 'k2', 'k3', 'k4', 'k5', 'k6']
+		cap, fake, clock = self.waiting(tmp_path, [], added)
+		fake.rows = set()
+		fake.schedule = [(1085, lambda: setattr(fake, 'rows', set(added)))]
+		try:
+			rc, out = self.activate(tmp_path, cap, fake, timeout=300, poll=10, clock=clock, sleep=clock.sleep)
+			probes = [e for e in fake.events if e['raw'] != fm.HEARTBEAT_LINE]
+			# one stand-in a round until one has its fields: k1 and k2 failed after the refresh period, k3 had them
+			assert [e['hash'] for e in probes] == ['k1'] * 8 + ['k2', 'k3', 'k4', 'k5', 'k6']
+			assert rc == 1 and read(str(cap)) == fm.cap_text({'k3', 'k4', 'k5', 'k6'})
+			assert "without their fields after the file was read: 'k1' (tenx_unmapped=no_row), 'k2'" in out
+			# the next run lists the two that failed
+			rc, out = self.activate(tmp_path, cap, fake, timeout=300, poll=10, clock=clock, sleep=clock.sleep)
+		finally:
+			fake.close()
+		assert rc == 0 and read(str(cap)) == fm.cap_text(set(added)) and not os.path.exists(str(cap) + '.pending')
+
+	def test_check_withdraws_when_a_listed_template_has_no_row_in_the_lookup_file(self, tmp_path):
+		for rows, sample in (([], 1), (['k1'], 1), (['k1'], 2)):
+			case = tmp_path / ('c%d_%d' % (len(rows), sample))
+			os.makedirs(str(case))
+			cap = case / 'compact-cap.csv'
+			assert self.gen(case, rows or ['k0'], cap) == 0
+			if not rows:
+				# the file emptied to its header
+				table = str(case / 'fm_fw' / 'lookups' / 'tenx_fw_fields.csv.gz')
+				with gzip.open(table, 'rt', encoding='utf-8') as f:
+					header = f.readline()
+				with gzip.open(table, 'wt', encoding='utf-8') as f:
+					f.write(header)
+			cap.write_text(fm.cap_text({'k1', 'k2'}), encoding='utf-8')
+			os.remove(str(cap) + '.pending')
+			fake = FakeSplunkd(str(case / 'fm_fw'), 'fm_fw', str(cap))
+			try:
+				rc, out = self.check(case, cap, fake, sample=sample)
+			finally:
+				fake.close()
+			assert rc == 1 and fake.posts() == [] and read(str(cap)) == 'pattern_hash,value\n', out
+			assert '%d listed templates have no row' % (2 - len(rows)) in out
+			assert read(str(cap) + '.pending') == 'pattern_hash,value\n"k1",true\n"k2",true\n'
+
+	def test_activate_takes_check_timeout_from_the_command_line(self, tmp_path, monkeypatch):
+		seen = {}
+		monkeypatch.setattr(fm, 'activate', lambda *a, **kw: seen.update(kw) or 0)
+		assert fm.main(['activate', '--app', str(tmp_path), '--cap-file', str(tmp_path / 'c.csv'), '--splunkd',
+			'https://127.0.0.1:1', '--check-timeout', '7']) == 0
+		assert seen == {'check_timeout': 7.0}
 
 	def test_without_the_option_nothing_changes(self, tmp_path):
 		records = self.records(tmp_path, ['k1'])
