@@ -589,13 +589,14 @@ arrives whole.
      --probe-index tenx_probe
    ```
 
-   `<token>` is a Splunk authentication token of a user whose role holds the capabilities
-   `search`, `edit_tcp` and `list_all_objects` and may search the probe index;
-   `TENX_SPLUNKD_AUTH=<user>:<password>` works as well. `activate` sends one small probe event per
-   new template through the HTTP Event Collector into the probe index, an index to keep out of data
-   model and detection index lists. When Splunk writes a probe's fields, that template moves from
-   `compact-cap.csv.pending` into `compact-cap.csv`, and the Receiver, which rereads the file, then
-   compacts its events. Nothing is restarted.
+   On an instance that still has Splunk's default self-signed certificate, the tool's certificate
+   check fails; add `--tls-verify off`. `<token>` is a Splunk authentication token of a user
+   whose role holds the capabilities `search`, `edit_tcp` and `list_all_objects` and may search
+   the probe index; `TENX_SPLUNKD_AUTH=<user>:<password>` works as well. `activate` sends one
+   small probe event per new template through the HTTP Event Collector into the probe index, an
+   index to keep out of data model and detection index lists. When Splunk writes a probe's
+   fields, that template moves from `compact-cap.csv.pending` into `compact-cap.csv`, and the
+   Receiver, which rereads the file, then compacts its events. Nothing is restarted.
 
 7. Schedule `check` with the arguments of `activate`, for example from cron:
 
@@ -607,11 +608,11 @@ arrives whole.
      --probe-index tenx_probe --timeout 20 --poll 5
    ```
 
-   `check` sends the probe of a listed template. When it comes back without its fields, or is not
-   indexed within `--timeout`, `check` empties `compact-cap.csv`, and the Receiver sends every
-   event whole until `activate` has proven the templates again. Events indexed between the moment
-   a listed template stops getting its fields and that `check` are kept, marked `tenx_unmapped`,
-   and lack their index-time fields.
+   Add `--tls-verify off` as in step 6. `check` sends the probe of a listed template. When it comes
+   back without its fields, or is not indexed within `--timeout`, `check` empties
+   `compact-cap.csv`, and the Receiver sends every event whole until `activate` has proven the
+   templates again. Events indexed between the moment a listed template stops getting its fields
+   and that `check` are kept, marked `tenx_unmapped`, and lack their index-time fields.
 
 A template that appears later arrives whole until steps 3, 4 and 6 run again. `gen` then changes
 only the lookup file: copy `lookups/` of both apps over the installed ones (on a cluster, into
@@ -639,7 +640,7 @@ $SPLUNK_HOME/bin/splunk cmd python3 $SPLUNK_HOME/etc/apps/tenx-for-splunk/bin/te
   --app-name fm_cloudtrail --cap-file /etc/tenx/cloudtrail/compact-cap.csv --out fm_cloudtrail
 ```
 
-Steps 6 and 7 take that map's app and cap file:
+Steps 6 and 7 take that map's app and cap file, and `--tls-verify off` as in step 6:
 
 ```sh
 TENX_SPLUNKD_TOKEN=<token> TENX_PROBE_HEC_TOKEN=<HEC token> $SPLUNK_HOME/bin/splunk cmd python3 \
