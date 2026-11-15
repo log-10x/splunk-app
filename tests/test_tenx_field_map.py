@@ -1537,6 +1537,19 @@ class TestCapFile:
 			assert '%d listed templates have no row' % (2 - len(rows)) in out
 			assert read(str(cap) + '.pending') == 'pattern_hash,value\n"k1",true\n"k2",true\n'
 
+	def test_without_a_timeout_activate_probes_for_the_refresh_period_plus_three_polls(self, tmp_path):
+		for limits, ends in ((None, 1000 + 60 + 30 + 10), ({'ingest_lookup_refresh_period_secs': '120'}, 1000 + 120 + 30 + 10)):
+			case = tmp_path / ('c%d' % ends)
+			os.makedirs(str(case))
+			cap, fake, clock = self.waiting(case, [], ['k1'])
+			fake.limits, fake.drop = limits, True
+			try:
+				rc, out = self.activate(case, cap, fake, poll=10, clock=clock, sleep=clock.sleep)
+			finally:
+				fake.close()
+			# no probe comes back: the run ends at the first round past the timeout
+			assert rc == 1 and clock.t == ends and 'of at most %d,' % (ends - 1010) in out
+
 	def test_activate_takes_check_timeout_from_the_command_line(self, tmp_path, monkeypatch):
 		seen = {}
 		monkeypatch.setattr(fm, 'activate', lambda *a, **kw: seen.update(kw) or 0)
