@@ -397,6 +397,10 @@ searches written with them keep working.
 - A template appears in the dictionary when the Consume KV search stores it, every five
   minutes. Until then its events stay compact, and a search for a word of that template does
   not select them.
+- Through the `| tx` and `tenxsearch` commands, classic dashboards and compiled alerts, a
+  wildcard inside a word, such as `Se*Privilege`, can return more events than the same
+  search on the original lines; put the wildcard at the start or end of the word, or use
+  the `tx` macro.
 
 **Speed.** On one laptop running Splunk 10.4.3, a `tx` search over 157,228 compact events
 returned in about 1.5 to 4 seconds, where the same search over the raw lines took under a
