@@ -1,7 +1,6 @@
-# tenx-for-splunk/bin/tenx_search_builder.py as of commit e12ec4e, without field replay, kept
-# unchanged below this header as a test fixture for tests/test_replay_units.py: the search
-# rewrite on an install where no compact event carries tenx_sourcetype must produce exactly this
-# module's text.
+# tenx-for-splunk/bin/tenx_search_builder.py of main before the field replay, kept unchanged below
+# this header as a test fixture for tests/test_replay_units.py: the search rewrite on an install
+# where no compact event carries tenx_sourcetype must produce exactly this module's text.
 """
 Tenx Search Builder Module
 =========================
@@ -106,8 +105,10 @@ from enum import Enum, auto
 import urllib.error
 
 import tenx_util
+import tenx_prefilter_parser
 import tenx_spl_parser
 import tenx_search_manager
+import tenx_prefilter_parser
 
 
 class ResolvedState(Enum):
@@ -121,6 +122,9 @@ class ResolvedState(Enum):
 # breakers together, as single characters. '*' is a major breaker for the indexer but a live
 # wildcard in a search term, so it stays attached to its piece. The multi-character majors
 # ('--' and the %XX escapes) are covered by their single characters.
+# A search term written as TERM(<x>) or CASE(<x>).
+TERM_CALL = re.compile(r'^(TERM|CASE)\((.*)\)$', re.S)
+
 SEGMENT_BREAKERS = frozenset("[]<>(){}|!;,'\"\n\r\t &?+/:=@.-$#%\\_")
 
 # A piece that matches more templates than this does not get its own ("piece" OR <hashes>)
@@ -135,11 +139,6 @@ PER_PIECE_HASH_LIMIT = 500
 # to narrow, which is correct and wider.
 PROBE_BUDGET_MS = 30000
 PROBE_MAX_MS = 10000
-
-# A hash containing '*' cannot be matched as a whole phrase, because the '*' is a wildcard
-# even inside quotes. The text before the first '*' is matched instead, when it is long
-# enough to be a filter: "~-" matched 12,648 of 20,000 events and "~" matched 16,746.
-HASH_PREFIX_MIN = 2
 
 
 # Text a rendered timestamp can contain. A compact event stores its timestamp as epoch
@@ -407,22 +406,21 @@ def hash_predicate(dml_hash):
 	"""
 	The SPL that selects the compact events of one template.
 
-	Phrase "~<hash>" when the hash has no '*'; phrase "~<prefix>" for the text before the
-	first '*' when that prefix is at least HASH_PREFIX_MIN characters (a superset, since other
-	hashes may share the prefix); otherwise a field predicate, which Splunk answers by
-	extraction rather than from the lexicon and which is itself a wildcard match. All three
-	are supersets at worst, and the post-expansion search removes the excess. Measured
-	coverage on 2,991 templates: 20,000 of 20,000 events.
+	Phrase "~<hash>" when the hash has no '*'. A '*' is a wildcard in a search term even inside
+	quotes, so a hash holding one is selected by TERM(<term>) with the term the `tx` prefilter
+	uses for it, tenx_prefilter_parser.hash_term: a run of the hash between Splunk's major
+	breakers that the index holds for every event of the template and that Splunk also finds
+	when the search compares a field. Other templates' events can hold the same term, so this
+	is a superset at worst, and the post-expansion search removes the excess.
+
+	Before, such a hash was selected by the phrase of the text before its first '*', or by
+	tenx_hash="<hash>" when fewer than two characters preceded it. That field predicate found
+	none of the events of 6 of 74 such templates on 17,011 events (Splunk 10.4.3).
 	"""
 	if '*' not in dml_hash:
 		return quoted_term('~' + dml_hash)
 
-	prefix = dml_hash.split('*', 1)[0]
-
-	if len(prefix) >= HASH_PREFIX_MIN:
-		return quoted_term('~' + prefix)
-
-	return 'tenx_hash=' + quoted_term(dml_hash)
+	return 'TERM(' + tenx_prefilter_parser.hash_term(dml_hash) + ')'
 
 
 def hash_clause(hashes):
@@ -725,12 +723,25 @@ class TenxSearchCommand(TenxSplCommand):
 		A piece that could be text printed from a timestamp is left unrestricted too: the
 		compact event holds the timestamp as epoch digits and the template holds only its
 		format, so the printed date and time are in neither, and are found after expansion.
+
+		The parts of an IPv4 address, and of a prefix of three parts and a wildcard (10.0.1.*),
+		are required in the raw without a dictionary lookup, as the `tx` prefilter does
+		(tenx_prefilter_parser.addresses_of, address_parts, prefix_parts): a part is digits only,
+		so never template text (FORMAT_SPEC S3.2), and a term of the compact event whether the
+		engine stored the address cut or whole (observed on Splunk Enterprise 10.4.3). A first
+		part of 1 is still looked up, since "-1" before a dot is template text.
 		"""
 		pieces = []
 		printed = set()
+		address_parts = set()
 
 		for word in tenx_util.strip_string(term_text).split():
 			printed |= timestamp_text_pieces(word, self._timestamp_text_patterns())
+
+			for address in tenx_prefilter_parser.addresses_of(word):
+				address_parts.update(tenx_prefilter_parser.address_parts(address))
+
+			address_parts.update(tenx_prefilter_parser.prefix_parts(word))
 
 			for piece in split_pieces(word):
 				if piece not in pieces:
@@ -746,6 +757,10 @@ class TenxSearchCommand(TenxSplCommand):
 		for piece in pieces:
 			if piece in printed:
 				self.timestamp_text = True
+				continue
+
+			if piece in address_parts:
+				conjuncts.append(quoted_term(piece))
 				continue
 
 			hashes, truncated = self._probe(piece)
@@ -794,7 +809,11 @@ class TenxSearchCommand(TenxSplCommand):
 		rule_type = node.rule_type
 
 		if rule_type == 'index_expression':
-			return self._term_prefilter(node.text)
+			# TERM(x) and CASE(x) match x as written (a whole indexed term, or with its case);
+			# the prefilter requires x's pieces, which every event matching either holds. The
+			# search after expansion applies TERM() or CASE() itself (original_search_terms).
+			call = TERM_CALL.match(node.text)
+			return self._term_prefilter(call.group(2) if call else node.text)
 
 		if rule_type in ('not_logical_expression', 'field_modifier', 'search_modifier'):
 			return None
@@ -1074,36 +1093,47 @@ class TenxSearchCommand(TenxSplCommand):
 
 	def inflate_suffix(self):
 		"""
-		Returns the suffix needed to chain into the 'tenx-inflate' macro, as well as chaining into SPL 'extract'
-		so we will restore the user defined extractions after we decode, and 'spath' so a decoded JSON
-		or XML line gets its structured fields back: 'extract' alone leaves them out, so a search for
-		kubernetes.container_name=accounting after expansion found 0 of 69. On a plain-text line 'spath'
-		extracts nothing and costs little.
+		Returns the suffix that expands the compact events and gives them the search-time fields
+		of their expanded text.
 
-		'extract' re-runs every search-time extraction of the compact sourcetype on the expanded line,
-		including the compact-format one, whose regex matches any line containing a comma. That put a
-		tenx_hash of '{"stream":"stdout"' and a tenx_vars of the rest of the line on every expanded
-		event, in the field sidebar. Those three are removed again; tenx_expand_refused, which the
-		macro keeps on purpose, is not.
+		Splunk marks a compact event as already extracted (_kv), and `extract` skips an event with
+		that mark. The suffix drops it first, as the `tx` macro does, so `extract` runs the event's
+		own extraction on the expanded text: key=value pairs and JSON. Then `spath` reads the
+		events whose expanded text starts with "<" (input=tenx_xml, set only for those), which
+		gives XML text its path fields (Event.System.EventID and the like).
+
+		Measured on Splunk Enterprise 10.4.3 against the earlier suffix (`extract` with the mark
+		still set, then `spath` on every event), every field of every event compared:
+		- 400 key=value lines: usr, status, act and the other pairs on 400 of 400 (before: 0, and
+		  only a search with a field term got them, from a generic `extract kvdelim="="` pass);
+		- 200 JSON lines and 21,455 multi-line JSON records: the same fields with the same values
+		  (`extract` gives them now; running `spath` on them as well gave every field twice);
+		- 120 XML lines and 662 Windows XML events: every path field identical; the key=value
+		  attributes of the XML text are added (xmlns, Name, SystemTime and the like), as `tx`
+		  gives them.
+		Plain text that is neither JSON nor XML got no field from `spath` before either.
+
+		`extract` also re-runs the compact-format extraction, whose regex matches any expanded
+		line with a comma, so tenx_hash, tenx_var_0 and tenx_vars are removed again;
+		tenx_expand_refused, which the inflate macro keeps on purpose, is not.
 
 		Different macro chosen if we're running in debug mode or not, either 'tenx-inflate' or 'tenx-inflate-debug'
 		"""
 		return (" | " + tenx_util.splunk_inflate_macro(self.debug)
-				+ " | extract | spath | fields - tenx_hash, tenx_var_0, tenx_vars")
+				+ ' | fields - _kv | extract | eval tenx_xml=if(match(_raw, "^\\s*<"), _raw, null())'
+				+ " | spath input=tenx_xml | fields - tenx_xml, tenx_hash, tenx_var_0, tenx_vars")
 
 	def field_search(self):
 		"""
-		Returns the clause that filters on the field conditions the user requested.
-
-		The decoded events carry the user's original key=value pairs, but the encoded sourcetype's
-		own extraction is the compact comma form, which does not match the decoded text - so
-		`| extract` alone leaves those fields unextracted. We force generic key=value extraction on
-		the decoded _raw, then filter with search-command semantics (which is what the user wrote;
-		unlike `| where`, `| search field=value` reads a bare value as a literal, not a field
-		reference, so a string value like `level=error` matches instead of silently comparing two
-		fields). This handles string and numeric values, and IN(...) lists, uniformly.
+		Returns the clause that filters on the field conditions the user requested, with
+		search-command semantics (which is what the user wrote; unlike `| where`, `| search
+		field=value` reads a bare value as a literal, not a field reference, so a string value
+		like `level=error` matches instead of silently comparing two fields). The fields are the
+		ones inflate_suffix() extracted with the event's own rules. (The generic
+		`extract kvdelim="=" pairdelim=" "` pass this used to add would now give a key=value field a
+		second copy of its value: 33 of 77 events for status=500 on Splunk Enterprise 10.4.3.)
 		"""
-		return ' | extract kvdelim="=" pairdelim=" " | search ' + " ".join([item.text for item in self.user_field_terms])
+		return ' | search ' + " ".join([item.text for item in self.user_field_terms])
 
 	def original_search_terms(self):
 		"""

@@ -193,8 +193,8 @@ class TestRewriteWithoutCarrierMatchesTheBaseline:
 
 	def test_what_it_compares_against_is_the_baselines_shape(self):
 		state, text = compiled('sourcetype=tenx_encoded status=500 payment', False, baseline_builder)
-		assert text.endswith('| `tenx-inflate` | extract | spath | fields - tenx_hash, tenx_var_0, tenx_vars'
-							 ' | extract kvdelim="=" pairdelim=" " | search status=500 | search payment')
+		assert text.endswith('| `tenx-inflate` | fields - _kv | extract | eval tenx_xml=if(match(_raw, "^\\s*<"), _raw, null()) | spath input=tenx_xml | fields - tenx_xml, tenx_hash, tenx_var_0, tenx_vars'
+							 ' | search status=500 | search payment')
 		assert 'tenx-replay' not in text and 'tenx_compact_raw' not in text
 
 
@@ -236,7 +236,7 @@ class TestRewriteRunsWhatTheSearchNeeds:
 
 	def test_field_terms_are_filtered_after_the_replayed_events_are_back(self):
 		_, text = compiled('index=wineventlog sourcetype=tenx_encoded EventCode=4625', COVERED)
-		assert text.index(b.unit_macro('XmlWinEventLog')) < text.index('extract kvdelim') \
+		assert text.index(b.unit_macro('XmlWinEventLog')) < text.index('spath input=tenx_xml') \
 			< text.index('tenx_h_raw, _raw)') < text.index('| search EventCode=4625')
 
 
@@ -414,7 +414,7 @@ class TestTxfOfOneSourcetype:
 		assert out == run_tx(events())
 
 
-PLAIN_REWRITE = '`tenx-inflate` | extract | spath | fields - tenx_hash, tenx_var_0, tenx_vars'
+PLAIN_REWRITE = '`tenx-inflate` | fields - _kv | extract | eval tenx_xml=if(match(_raw, "^\\s*<"), _raw, null()) | spath input=tenx_xml | fields - tenx_xml, tenx_hash, tenx_var_0, tenx_vars'
 
 
 def rewrite_tail(replay):

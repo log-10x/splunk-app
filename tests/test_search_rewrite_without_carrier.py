@@ -16,8 +16,8 @@ import tenx_replay_builder as b
 from support.spl_model import Model, visible
 from test_tenx_search_builder import compile_search
 
-PLAIN_REWRITE = '`tenx-inflate` | extract | spath | fields - tenx_hash, tenx_var_0, tenx_vars'
-PLAIN_KV = ' | extract kvdelim="=" pairdelim=" "'
+PLAIN_REWRITE = '`tenx-inflate` | fields - _kv | extract | eval tenx_xml=if(match(_raw, "^\\s*<"), _raw, null()) | spath input=tenx_xml | fields - tenx_xml, tenx_hash, tenx_var_0, tenx_vars'
+PLAIN_KV = ''
 PLAIN_TX = '`tenx-inflate` | fields - _kv | extract | fields - tenx_hash, tenx_var_0, tenx_vars'
 REFUSED_STEP = ' | eval tenx_expand_refused=if(len(tenx_expand_refused)>0, tenx_expand_refused, null())'
 PLAIN_TX += REFUSED_STEP

@@ -280,10 +280,12 @@ class TestCompiledPrefilter:
 	def test_key_value_fields_are_extracted_without_a_field_term(self):
 		# The rewrite ran extract with the _kv mark set, so a search without a field term got no
 		# key=value field from the expanded text (0 of 400 on Splunk Enterprise 10.4.3). It now
-		# drops the mark whatever the search holds, as tx does, and needs no second pass.
+		# drops the mark whatever the search holds, as tx does, and needs no second pass. With the
+		# field replay, the steps run after the replay macro, on the events it did not replay.
 		for search in ('sourcetype=tenx_encoded payment', 'sourcetype=tenx_encoded status=500'):
 			resolved = compile_search(search)[0].resolved
-			assert '| `tenx-inflate` | fields - _kv | extract |' in resolved, search
+			assert '| `tenx-inflate` |' in resolved and '| fields - _kv | extract |' in resolved, search
+			assert resolved.index('`tenx-inflate`') < resolved.index('| fields - _kv | extract |'), search
 			assert 'kvdelim' not in resolved, search
 
 	def test_spath_reads_only_xml_text(self):
