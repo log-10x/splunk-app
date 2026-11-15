@@ -83,6 +83,12 @@ def compile_search(search, **manager_kwargs):
 	return result, manager
 
 
+# What follows the prefilter: expand, drop the _kv mark, the event's own extraction (the same
+# steps as the tx macro).
+EXPAND = ('| `tenx-inflate` | fields - _kv | extract | eval tenx_xml=if(match(_raw, "^\\s*<"), _raw, null()) '
+		  '| spath input=tenx_xml | fields - tenx_xml, tenx_hash, tenx_var_0, tenx_vars ')
+
+
 def prefilter(compiled):
 	"""The text between the modifiers and the inflate macro: the compact-event prefilter."""
 	head = compiled.split('| `tenx-inflate`')[0]
@@ -199,7 +205,7 @@ class TestCompiledPrefilter:
 
 		assert result.state == ResolvedState.SUCCESS
 		assert prefilter(result.resolved) == '("error" OR ("~h_err" OR "~h_err2"))'
-		assert result.resolved.endswith('| `tenx-inflate` | extract | spath | fields - tenx_hash, tenx_var_0, tenx_vars | search error')
+		assert result.resolved.endswith(EXPAND + '| search error')
 		assert manager.probes == ['"error"']
 
 	def test_space_and_star_hashes_are_selectable(self):
@@ -267,8 +273,24 @@ class TestCompiledPrefilter:
 		# matches any line with a comma; without this the sidebar shows a tenx_hash of
 		# '{"stream":"stdout"' on every expanded event. tenx_expand_refused stays.
 		result, _ = compile_search('sourcetype=tenx_encoded payment')
-		assert '| spath | fields - tenx_hash, tenx_var_0, tenx_vars |' in result.resolved
+		assert '| fields - tenx_xml, tenx_hash, tenx_var_0, tenx_vars |' in result.resolved
 		assert 'tenx_expand_refused' not in result.resolved
+
+	def test_key_value_fields_are_extracted_without_a_field_term(self):
+		# The rewrite ran extract with the _kv mark set, so a search without a field term got no
+		# key=value field from the expanded text (0 of 400 on Splunk Enterprise 10.4.3). It now
+		# drops the mark whatever the search holds, as tx does, and needs no second pass.
+		for search in ('sourcetype=tenx_encoded payment', 'sourcetype=tenx_encoded status=500'):
+			resolved = compile_search(search)[0].resolved
+			assert '| `tenx-inflate` | fields - _kv | extract |' in resolved, search
+			assert 'kvdelim' not in resolved, search
+
+	def test_spath_reads_only_xml_text(self):
+		# JSON gets its fields from extract; spath on it too gave every JSON field twice. XML text
+		# keeps spath's path fields (Event.System.EventID), which extract does not give.
+		resolved = compile_search('sourcetype=tenx_encoded payment')[0].resolved
+		assert '| eval tenx_xml=if(match(_raw, "^\\s*<"), _raw, null()) | spath input=tenx_xml |' in resolved
+		assert resolved.count('spath') == 1 and '| spath |' not in resolved
 
 	def test_original_terms_are_always_reapplied(self):
 		# the prefilter is a superset (the prefix branch over-selects), so even a single
@@ -281,7 +303,7 @@ class TestCompiledPrefilter:
 
 		assert prefilter(result.resolved) == ''
 		assert manager.probes == []
-		assert result.resolved.endswith('| extract kvdelim="=" pairdelim=" " | search status=500')
+		assert result.resolved.endswith(EXPAND + '| search status=500')
 		assert not result.no_prefilter   # no keywords at all is has_search_terms=False, not this
 
 	def test_downstream_pipeline_is_preserved(self):
@@ -368,7 +390,7 @@ class TestNegation:
 
 		assert result.state == ResolvedState.SUCCESS
 		assert prefilter(result.resolved) == ''
-		assert result.resolved.endswith('| `tenx-inflate` | extract | spath | fields - tenx_hash, tenx_var_0, tenx_vars | search NOT bootstrap')
+		assert result.resolved.endswith(EXPAND + '| search NOT bootstrap')
 		assert result.no_prefilter
 		assert result.has_search_terms
 		# the negated word is never sent to the dictionary

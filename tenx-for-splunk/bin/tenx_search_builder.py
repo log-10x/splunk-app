@@ -1065,36 +1065,47 @@ class TenxSearchCommand(TenxSplCommand):
 
 	def inflate_suffix(self):
 		"""
-		Returns the suffix needed to chain into the 'tenx-inflate' macro, as well as chaining into SPL 'extract'
-		so we will restore the user defined extractions after we decode, and 'spath' so a decoded JSON
-		or XML line gets its structured fields back: 'extract' alone leaves them out, so a search for
-		kubernetes.container_name=accounting after expansion found 0 of 69. On a plain-text line 'spath'
-		extracts nothing and costs little.
+		Returns the suffix that expands the compact events and gives them the search-time fields
+		of their expanded text.
 
-		'extract' re-runs every search-time extraction of the compact sourcetype on the expanded line,
-		including the compact-format one, whose regex matches any line containing a comma. That put a
-		tenx_hash of '{"stream":"stdout"' and a tenx_vars of the rest of the line on every expanded
-		event, in the field sidebar. Those three are removed again; tenx_expand_refused, which the
-		macro keeps on purpose, is not.
+		Splunk marks a compact event as already extracted (_kv), and `extract` skips an event with
+		that mark. The suffix drops it first, as the `tx` macro does, so `extract` runs the event's
+		own extraction on the expanded text: key=value pairs and JSON. Then `spath` reads the
+		events whose expanded text starts with "<" (input=tenx_xml, set only for those), which
+		gives XML text its path fields (Event.System.EventID and the like).
+
+		Measured on Splunk Enterprise 10.4.3 against the earlier suffix (`extract` with the mark
+		still set, then `spath` on every event), every field of every event compared:
+		- 400 key=value lines: usr, status, act and the other pairs on 400 of 400 (before: 0, and
+		  only a search with a field term got them, from a generic `extract kvdelim="="` pass);
+		- 200 JSON lines and 21,455 multi-line JSON records: the same fields with the same values
+		  (`extract` gives them now; running `spath` on them as well gave every field twice);
+		- 120 XML lines and 662 Windows XML events: every path field identical; the key=value
+		  attributes of the XML text are added (xmlns, Name, SystemTime and the like), as `tx`
+		  gives them.
+		Plain text that is neither JSON nor XML got no field from `spath` before either.
+
+		`extract` also re-runs the compact-format extraction, whose regex matches any expanded
+		line with a comma, so tenx_hash, tenx_var_0 and tenx_vars are removed again;
+		tenx_expand_refused, which the inflate macro keeps on purpose, is not.
 
 		Different macro chosen if we're running in debug mode or not, either 'tenx-inflate' or 'tenx-inflate-debug'
 		"""
 		return (" | " + tenx_util.splunk_inflate_macro(self.debug)
-				+ " | extract | spath | fields - tenx_hash, tenx_var_0, tenx_vars")
+				+ ' | fields - _kv | extract | eval tenx_xml=if(match(_raw, "^\\s*<"), _raw, null())'
+				+ " | spath input=tenx_xml | fields - tenx_xml, tenx_hash, tenx_var_0, tenx_vars")
 
 	def field_search(self):
 		"""
-		Returns the clause that filters on the field conditions the user requested.
-
-		The decoded events carry the user's original key=value pairs, but the encoded sourcetype's
-		own extraction is the compact comma form, which does not match the decoded text - so
-		`| extract` alone leaves those fields unextracted. We force generic key=value extraction on
-		the decoded _raw, then filter with search-command semantics (which is what the user wrote;
-		unlike `| where`, `| search field=value` reads a bare value as a literal, not a field
-		reference, so a string value like `level=error` matches instead of silently comparing two
-		fields). This handles string and numeric values, and IN(...) lists, uniformly.
+		Returns the clause that filters on the field conditions the user requested, with
+		search-command semantics (which is what the user wrote; unlike `| where`, `| search
+		field=value` reads a bare value as a literal, not a field reference, so a string value
+		like `level=error` matches instead of silently comparing two fields). The fields are the
+		ones inflate_suffix() extracted with the event's own rules. (The generic
+		`extract kvdelim="=" pairdelim=" "` pass this used to add would now give a key=value field a
+		second copy of its value: 33 of 77 events for status=500 on Splunk Enterprise 10.4.3.)
 		"""
-		return ' | extract kvdelim="=" pairdelim=" " | search ' + " ".join([item.text for item in self.user_field_terms])
+		return ' | search ' + " ".join([item.text for item in self.user_field_terms])
 
 	def original_search_terms(self):
 		"""
