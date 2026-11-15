@@ -281,12 +281,13 @@ Or modify `savedsearches.conf`:
 ```ini
 [Consume KV]
 cron_schedule = */5 * * * *
-dispatch.earliest_time = -7m
+search = index=tenx_dml sourcetype=tenx_dml_raw_json _index_earliest=-7m _index_latest=now
+dispatch.earliest_time = -24h
 dispatch.latest_time = now
 ```
 
-Keep the window wider than the interval, or a template that arrives between two runs is
-never stored.
+Keep the index-time window (`_index_earliest`) wider than the interval, or a template that
+arrives between two runs is never stored.
 
 ### Loading Templates Indexed Earlier
 
@@ -301,7 +302,8 @@ index=tenx_dml sourcetype=tenx_dml_raw_json earliest=-30d | sendalert tenx_dml_t
 Widen `earliest` to reach older templates. Running it again is safe: templates already
 stored are kept, and their records are brought up to date when this version of the app
 derives them differently. The **Backfill KV** saved search holds the same search; the **Run**
-button does not fire its alert action, so run the search above.
+button does not fire its alert action, so run the search above. To load every template
+record ever indexed, use `earliest=0`.
 
 ### Adding Custom Sourcetypes for Encoded Events
 
