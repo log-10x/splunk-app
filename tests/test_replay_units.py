@@ -569,7 +569,7 @@ class TestUnitText:
 	def test_the_dry_run_runs_units_composed(self):
 		u = dict((st, b.build_unit(STANZAS, st, c, LOOKUP_FIELDS)) for st, c in b.coverage(ROWS).items())
 		spl = b.units_dry_run(u)
-		assert spl.startswith('| makeresults count=3 |') and 'tenx_hide_others=1 | ' + u['app:json'].spl() in spl
+		assert spl.startswith('| makeresults count=5 |') and 'sourcetype) | ' + u['app:json'].spl() in spl
 		assert 'eval tenx_rprev=tenx_rst | ' + u['app:kv'].spl() + ' | eval tenx_rst=coalesce(tenx_rst, tenx_rprev)' in spl
 		assert spl.endswith(' | '.join(b.TAGS_STEPS) + ' | stats count')
 

@@ -125,7 +125,7 @@ class TestPrecedence:
 		assert sorted([a, z_high], key=b.Stanza.sort_key)[0] is z_high
 
 
-BLOCK = re.compile(r'^foreach (tenx_go\d+z|tenx_hide_others)\* fieldstr="@@TENXF@@" matchstr="@@TENXM@@" \[(.*)\]$')
+BLOCK = re.compile(r'^foreach (tenx_go\d+z|tenx_go[xw]|tenx_hide_others)\* fieldstr="@@TENXF@@" matchstr="@@TENXM@@" \[(.*)\]$')
 
 
 def flat(steps):
@@ -142,7 +142,7 @@ def blocks(steps):
 	out = {}
 	for step in steps:
 		m = BLOCK.match(step)
-		if m and m.group(1) not in ('tenx_go0z', b.HIDE):
+		if m and m.group(1) not in ('tenx_go0z', b.HIDE, b.AS_READ, b.WHOLE):
 			out.setdefault(m.group(1), []).extend(m.group(2).split(' | '))
 	return out
 
@@ -245,13 +245,18 @@ class TestBuild:
 	def test_a_chunk_without_replayed_events_runs_no_replay_step(self):
 		steps = build(DEMO, PRESENT, LOOKUPS).steps
 		outside = [s for s in steps if not BLOCK.match(s)]
-		assert outside[0].startswith('eval tenx_rst=') and outside[1].startswith('eval tenx_go0z=')
-		assert outside[2:] == ['extract', 'fields - tenx_go*']
-		flags = re.findall(r'(tenx_go\d+z)=', outside[1])
+		assert outside[0].startswith('eval tenx_rst=')
+		# whole events: marked, and one read under the sourcetype it needs is not replayed
+		assert outside[1].startswith('eval tenx_gox=') and ', tenx_gow=' in outside[1]
+		assert outside[2] == 'eval tenx_rst=if(isnotnull(tenx_gox), null(), tenx_rst)'
+		assert outside[3].startswith('eval tenx_go0z=')
+		assert outside[4:] == ['extract', 'fields - tenx_go*']
+		flags = re.findall(r'(tenx_go\d+z)=', outside[3])
 		assert flags == ['tenx_go0z', 'tenx_go1z', 'tenx_go2z']
 		# no flag pattern matches another flag's name, so each block runs at most once per chunk
-		for f in flags:
-			assert [g for g in flags if re.match(f + '.*$', g)] == [f]
+		marks = flags + ['tenx_gox', 'tenx_gow']
+		for f in marks:
+			assert [g for g in marks if re.match(f + '.*$', g)] == [f]
 
 	def test_lookup_inputs_exist_only_where_the_rule_applies(self):
 		steps = flat(build(DEMO, PRESENT, LOOKUPS).steps)
@@ -307,7 +312,12 @@ class TestBuild:
 		for cleared in ('app', 'user', 'eventtype', 'tag', 'k8s_namespace'):
 			assert cleared in named, cleared
 		assert any(s.startswith('foreach tag::* [eval "<<FIELD>>"=if(isnotnull(tenx_rst), null()') for s in steps)
-		assert not any(s.startswith('foreach * ') for s in steps)
+		# no `foreach *` writes a field by eval; the one there is renames each field to a working name
+		# and back, and clears only events that arrived whole (whole_clearing_steps())
+		assert [s for s in steps if s.startswith('foreach * ')] == ['foreach * [rename "<<FIELD>>" AS tenx_wf']
+		i = steps.index('foreach * [rename "<<FIELD>>" AS tenx_wf')
+		assert steps[i + 1].startswith('eval tenx_wf=if(isnotnull(tenx_gow) AND NOT (')
+		assert steps[i + 2] == 'rename tenx_wf AS "<<FIELD>>"]'
 
 	def test_only_expanded_events_with_an_original_sourcetype_are_replayed(self):
 		first = flat(build(DEMO, PRESENT, LOOKUPS).steps)[0]
