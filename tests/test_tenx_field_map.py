@@ -912,11 +912,13 @@ class TestLookupRules:
 		assert '\\' not in fm.LOOKUP_VALUE_GROUP and '"' not in fm.LOOKUP_VALUE_GROUP
 		text = fm.lookup_eval_text('t')
 		assert 'substr("%s", 1, %d * ' % (fm.LOOKUP_VALUE_GROUP * fm.LOOKUP_MAX_VALUES, len(fm.LOOKUP_VALUE_GROUP)) in text
-		spl = re.search(r'"(\^~\[\^,\[:cntrl:\]\]\*)" \. substr', text).group(1)
+		spl = re.search(r'"(\^~\[\^,\[:cntrl:\]\]\*)" \. replace\(substr', text).group(1)
+		assert 'replace(substr("%s", 1, %d * tonumber($pd:tenx_fm_n$)), "%s", urldecode("%%0D"))' % (
+			fm.LOOKUP_VALUE_GROUP * fm.LOOKUP_MAX_VALUES, len(fm.LOOKUP_VALUE_GROUP), fm.LOOKUP_CR) in text
 		tail = re.search(r'"\[\|\]\(\[\^\|\[:cntrl:\]\]\*\)\[\|\]((?:\(\[\^\|\]\))+)\$"', text).group(1)
 		for n in (0, 1, 5):
 			regex = spl + fm.LOOKUP_VALUE_GROUP * n + (',?' if n == 0 else '') + '[|]([^|[:cntrl:]]*)[|]' + tail + '$'
-			assert regex.replace('[:cntrl:]', '\\x00-\\x1f\\x7f') == fm.lookup_line_regex(n)
+			assert regex.replace('[:cntrl:]', '\\x00-\\x1f\\x7f').replace(fm.LOOKUP_CR, '\\r') == fm.lookup_line_regex(n)
 
 	def test_replace_reads_references_as_measured(self):
 		groups = ['ab', 'a', 'b']
@@ -947,6 +949,60 @@ class TestLookupRules:
 		t = fm.Transform('k', 's', '', '', 1, 1, (), 'user::"\\1" tenx_mapped::"1"', '', False)
 		assert fm.apply_lookup_row(t, '~k,root') == [('user', 'root')]
 		assert fm.apply_lookup_row(t, '~k,root\n~k,admin') is None
+
+	def crlf_windows(self):
+		"""A Windows template as the engine writes it from CR LF text: the carriage return of each line end
+		stays in the value before it, the line feed is template text."""
+		reader = fm.XmlWindowsReader()
+		tpl = fm.Template(key='h', written_hash=' h', parts=["</EventID></System><EventData><Data Name='AccessList'>%%",
+			"\n\t\t\t\t</Data><Data Name='PrivilegeList'>", "\n\t\t"], part_0="<Event><System><EventID>",
+			terminator="</Data></EventData></Event>", timestamp_format='', expand_unsafe='', pattern=None)
+		field_map = fm.FieldMap({'h': tpl}, reader, 'p', rules=fm.RULES_LOOKUP, mark=fm.MARK_FIELD)
+		[t] = field_map.transforms
+		raw = ("<Event><System><EventID>4663</EventID></System><EventData><Data Name='AccessList'>%%1538\r\n\t\t\t\t"
+			"</Data><Data Name='PrivilegeList'>SeA\r\n\t\tSeB</Data></EventData></Event>")
+		want = dict((n, v.strip(field_map.trim_chars)) for n, v in reader.pairs(raw))
+		return field_map, t, want
+
+	def test_a_value_may_end_with_the_carriage_return_of_a_cr_lf_line_end(self):
+		field_map, t, want = self.crlf_windows()
+		assert field_map.trim_values and want == {'EventID': '4663', 'AccessList': '%%1538', 'PrivilegeList': 'SeA\r\n\t\tSeB'}
+		got = dict(fm.apply_lookup_row(t, '~ h ,4663,1538\r,SeA\r,SeB', trim=True))
+		# trimmed at the end of a field, as the add-on trims; kept inside one
+		assert got == want
+		assert dict(fm.apply_lookup_row(t, '~ h ,4663,1538\r,SeA\r,SeB'))['AccessList'] == '%%1538\r'
+		# the same line from text without carriage returns gives the same fields
+		assert dict(fm.apply_lookup_row(t, '~ h ,4663,1538,SeA,SeB', trim=True)) == dict(want, PrivilegeList='SeA\n\t\tSeB')
+
+	def test_verify_reads_cr_lf_data(self, tmp_path):
+		field_map, t, _ = self.crlf_windows()
+		enc, raw = tmp_path / 'encoded.log', tmp_path / 'raw.log'
+		enc.write_bytes('~ h ,4663,1538\r,SeA\r,SeB\n'.encode('utf-8'))
+		raw.write_bytes(("<Event xmlns='x'><System><EventID>4663</EventID></System><EventData><Data Name='AccessList'>%%1538\r\n"
+			"\t\t\t\t</Data><Data Name='PrivilegeList'>SeA\r\n\t\tSeB</Data></EventData></Event>\r\n").encode('utf-8'))
+		templates = {'h': fm.Template(key='h', written_hash=' h', parts=["</EventID></System><EventData><Data Name='AccessList'>%%",
+			"\n\t\t\t\t</Data><Data Name='PrivilegeList'>", "\n\t\t"], part_0="<Event xmlns='x'><System><EventID>",
+			terminator="</Data></EventData></Event>", timestamp_format='', expand_unsafe='', pattern=None)}
+		field_map = fm.FieldMap(templates, fm.XmlWindowsReader(), 'p', rules=fm.RULES_LOOKUP, mark=fm.MARK_FIELD)
+		result = fm.verify(templates, field_map, str(enc), str(raw), out=io.StringIO())
+		assert result['expanded_equal_raw'] == 1 and result['transform_regex_did_not_match'] == 0
+		assert result['events_all_fields_equal'] == 1
+
+	def test_a_line_feed_in_a_value_still_gets_no_fields(self):
+		_, t, _ = self.crlf_windows()
+		assert fm.apply_lookup_row(t, '~ h ,4663,1538\n,SeA,SeB', trim=True) is None
+		assert fm.apply_lookup_row(t, '~ h ,4663,1538,SeA\r\n~ h ,4663', trim=True) is None
+
+	def test_the_rule_trims_field_ends_only_for_a_reader_that_trims(self, tmp_path):
+		xml = fm.lookup_eval_text('t', None, True)
+		assert 'replace(replace($pd:tenx_fm_m$, "::" . urldecode("%22") . "[[:space:]]+", "::" . urldecode("%22")), ' \
+			'"[[:space:]]+" . urldecode("%22"), urldecode("%22"))' in xml
+		assert '_meta=if(isnull($pd:tenx_fm_m$) OR $pd:tenx_fm_m$==$pd:tenx_fm_x$, _meta, coalesce(_meta, "") . " " . ' \
+			'$pd:tenx_fm_mt$)' in xml
+		plain = fm.lookup_eval_text('t')
+		assert '$pd:tenx_fm_mt$' not in plain and '[[:space:]]' not in plain
+		# value 0, the timestamp, is read whatever line ends the text holds
+		assert 'replace(_raw, "(?s)^~[^,]*,([^,|]*).*$", "\\1")' in plain
 
 	def test_quotes_backslashes_and_line_breaks_in_template_text(self):
 		reader = fm.XmlWindowsReader()
