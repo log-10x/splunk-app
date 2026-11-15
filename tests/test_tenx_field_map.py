@@ -905,6 +905,65 @@ class TestLookupRules:
 			'--sourcetype', 'tenx_fw', '--rename', 'fw:traffic'])
 		assert not os.path.exists(str(tmp_path / 'fm_fw_floor')) and not os.path.exists(str(tmp_path / 'fm_tr_floor'))
 
+	def wide(self, names):
+		return [('w1', ' '.join('f%03d=$' % i for i in range(names)))]
+
+	def test_a_map_within_the_default_writes_no_limits_conf(self, tmp_path):
+		_, a = self.gen(tmp_path, self.wide(197), 'fm_fw')
+		assert not os.path.exists(str(a / 'default' / 'limits.conf'))
+		report = json.loads(read(str(tmp_path / 'fm_fw_report.json')))
+		# 197 literal names, tenx_mapped, tenx_compact_st and tenx_unmapped
+		assert report['indexed_kv_limit'] == {'written': None, 'why': '200 literal names, within the default 200',
+			'indexed_names': 200, 'file_changed': False}
+
+	def test_a_map_past_the_default_writes_no_limit(self, tmp_path, capsys):
+		_, a = self.gen(tmp_path, self.wide(198), 'fm_fw')
+		conf = fm.read_conf(str(a / 'default' / 'limits.conf'))
+		assert conf == {'kv': {'indexed_kv_limit': '0'}}
+		text = read(str(a / 'default' / 'limits.conf'))
+		assert text == fm.limits_text(0)
+		report = json.loads(read(str(tmp_path / 'fm_fw_report.json')))
+		assert report['indexed_kv_limit'] == {'written': 0, 'why': '201 literal names, more than the default 200',
+			'indexed_names': 201, 'file_changed': True}
+		assert report['file_bytes']['default/limits.conf'] == len(text.encode('utf-8'))
+		assert 'limits.conf: new in this app;' in capsys.readouterr().out
+
+	def test_the_file_does_not_change_when_templates_are_added(self, tmp_path, capsys):
+		# a changed limits.conf needs a restart where it is read: its text names no count
+		_, a = self.gen(tmp_path, self.wide(250), 'fm_fw')
+		f = str(a / 'default' / 'limits.conf')
+		os.utime(f, (1000000000, 1000000000))
+		before = read(f)
+		capsys.readouterr()
+		self.gen(tmp_path, self.wide(250) + [('w2', 'g1=$ g2=$')], 'fm_fw')
+		assert read(f) == before and os.stat(f).st_mtime == 1000000000
+		assert 'limits.conf:' not in capsys.readouterr().out
+		assert json.loads(read(str(tmp_path / 'fm_fw_report.json')))['indexed_kv_limit']['file_changed'] is False
+		# auto with fewer names keeps the file an earlier gen wrote
+		self.gen(tmp_path, self.wide(3), 'fm_fw')
+		assert read(f) == before
+		assert json.loads(read(str(tmp_path / 'fm_fw_report.json')))['indexed_kv_limit']['written'] == 'keep'
+
+	def test_names_built_from_values_write_no_limit(self, tmp_path):
+		_, a = self.gen(tmp_path, [('k1', 'time=$(HH:mm:ss) $=$')], 'fm_fw')
+		assert fm.read_conf(str(a / 'default' / 'limits.conf')) == {'kv': {'indexed_kv_limit': '0'}}
+		_, b = self.gen(tmp_path, [('k1', 'time=$(HH:mm:ss) x$=$')], 'fm_mx', '--mixed-names')
+		assert fm.read_conf(str(b / 'default' / 'limits.conf')) == {'kv': {'indexed_kv_limit': '0'}}
+		assert json.loads(read(str(tmp_path / 'fm_mx_report.json')))['mixed_field_names'] == 1
+
+	def test_the_limit_can_be_given_or_left_out(self, tmp_path, capsys):
+		_, a = self.gen(tmp_path, self.wide(1), 'fm_a', '--indexed-kv-limit', '1000')
+		assert fm.read_conf(str(a / 'default' / 'limits.conf')) == {'kv': {'indexed_kv_limit': '1000'}}
+		_, b = self.gen(tmp_path, self.wide(250), 'fm_b')
+		assert os.path.exists(str(b / 'default' / 'limits.conf'))
+		# a later gen of the same app with none removes the file the earlier one wrote, and says so
+		capsys.readouterr()
+		_, b = self.gen(tmp_path, self.wide(250), 'fm_b', '--indexed-kv-limit', 'none')
+		assert not os.path.exists(str(b / 'default' / 'limits.conf'))
+		assert 'limits.conf: removed in this app;' in capsys.readouterr().out
+		with pytest.raises(SystemExit):
+			self.gen(tmp_path, self.wide(1), 'fm_c', '--indexed-kv-limit', 'many')
+
 	def test_the_rule_cuts_its_regex_from_a_constant_without_escapes(self):
 		# an escape would change the constant's length once SPL reads the string
 		assert '\\' not in fm.LOOKUP_VALUE_GROUP and '"' not in fm.LOOKUP_VALUE_GROUP

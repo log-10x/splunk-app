@@ -39,6 +39,8 @@ while the event is indexed:
   looks the words of `field="*value*"` up in the index before it reads the field, and on a
   compact event the words of template text are not in the index.
 * app.conf and metadata/default.meta (export = system).
+* limits.conf, [kv] indexed_kv_limit = 0, when the map can write more indexed field names than
+  the 200 Splunk returns by default (--indexed-kv-limit, see "Indexed field names").
 
 * one more index-time transform, first in the list, writes tenx_compact_st::"<compact sourcetype>"
   on every event of the compact sourcetype (--sourcetype-field), compact or not. It is how `tx`
@@ -266,6 +268,25 @@ REFUSED_TOO_MANY = "more values than the lookup rule takes (%d)"
 # no row for the hash; a row the rule cannot use; a line that does not have the row's values; and the
 # floor copy of the file answered, so the rows were not read (see "Lookup failures").
 UNMAPPED_FIELD = 'tenx_unmapped'
+
+# Indexed field names. limits.conf [kv] indexed_kv_limit (default 200) is "the maximum number of
+# fields that can be extracted at index time from a data source", imposed "for each index bucket";
+# it "does not prevent a search from extracting indexed fields that the search needs and explicitly
+# requests", and 0 means no limit (limits.conf.spec, Splunk Enterprise 10.4.3). So past 200 names in
+# a bucket, `fields *`, an export and the field picker leave names out that `name=value` still finds.
+# A CloudTrail map writes more than 200. limits.conf is not read per app: an app's default/limits.conf
+# applies to the whole instance, below system/local and any app's local/limits.conf. Nor is it sent
+# from a search head to its peers: the setting is needed where the buckets are searched (the indexers,
+# where this app's index-time rules already have to be) and on the search head (limits.conf.spec,
+# "About Distributed Search"), which is where this app is installed. Measured on an indexer cluster of
+# Splunk Enterprise 10.4.3 with a CloudTrail map: 0 on the search head alone changed nothing; 0 in the
+# cluster bundle gave the peers' events every field, and that push needed a rolling restart of the peers,
+# where a new field map app without the file needed none. So the file's text names no count (adding
+# templates leaves it unchanged), auto keeps a file an earlier gen wrote, and gen says when the file is
+# new, changed or removed.
+INDEXED_KV_DEFAULT = 200
+INDEXED_KV_AUTO = 'auto'
+INDEXED_KV_NONE = 'none'
 WHY_NO_ROW = 'no_row'
 WHY_BAD_ROW = 'bad_row'
 WHY_NO_MATCH = 'no_match'
@@ -1433,6 +1454,8 @@ class FieldMap(object):
 		self.explained = collections.defaultdict(list)
 		self.literal_names = collections.Counter()
 		self.mixed_names = collections.Counter()
+		# names that are one value (`$=$`): how many distinct names they make is known only from the events
+		self.value_names = 0
 		self.templates_in = len(templates) + len(self.refused)
 		self.templates_kept = 0
 		self.outer_space_hashes = 0
@@ -1520,6 +1543,8 @@ class FieldMap(object):
 					self.literal_names[name] += 1
 				elif not name.startswith('$'):
 					self.mixed_names[name] += 1
+				else:
+					self.value_names += 1
 
 			for name, form, groups in evals:
 				tokens.append('%s%s::"%d"' % (EVAL_FORM_PREFIX, name, form))
@@ -1612,6 +1637,8 @@ class FieldMap(object):
 				self.literal_names[name] += 1
 			elif not name.startswith('$'):
 				self.mixed_names[name] += 1
+			else:
+				self.value_names += 1
 
 		if not pieces:
 			self.refused[key] = REFUSED_NO_FIELDS
@@ -1890,8 +1917,55 @@ def app_conf_text(target):
 		% (target['sourcetype'], target['app_name']))
 
 
+def indexed_names(field_map, sourcetype_field=SOURCETYPE_FIELD):
+	"""The indexed field names this map can write: the literal names of its rows and its own fields."""
+	own = [n for n in (field_map.mark, sourcetype_field, UNMAPPED_FIELD) if n]
+	return len(set(field_map.literal_names) | set(own))
+
+
+def indexed_kv_limit(field_map, choice, sourcetype_field=SOURCETYPE_FIELD, existing=False):
+	"""The indexed_kv_limit to write, or None for no limits.conf, and why (see "Indexed field names").
+
+	A limits.conf that appears, changes or goes away needs a restart where it is read (a rolling restart of the peers
+	when the app reaches them in a cluster bundle), so under auto a file an earlier gen wrote is kept as it is."""
+	if choice == INDEXED_KV_NONE:
+		return None, 'not written (--indexed-kv-limit none)'
+	if choice != INDEXED_KV_AUTO:
+		return int(choice), 'as given (--indexed-kv-limit)'
+	names = indexed_names(field_map, sourcetype_field)
+	if names > INDEXED_KV_DEFAULT:
+		return 0, '%d literal names, more than the default %d' % (names, INDEXED_KV_DEFAULT)
+	if field_map.mixed_names or field_map.value_names:
+		return 0, '%d literal names and names built from values, whose number only the events give' % names
+	if existing:
+		return KEEP, '%d literal names; the file an earlier gen wrote is kept' % names
+	return None, '%d literal names, within the default %d' % (names, INDEXED_KV_DEFAULT)
+
+
+# indexed_kv_limit() under auto: leave the app's limits.conf as an earlier gen wrote it.
+KEEP = 'keep'
+
+
+def limits_text(limit):
+	"""The same text for the same value, whatever the templates: a changed limits.conf needs a restart where it is read."""
+	return ('# Generated by tenx_field_map.py (--indexed-kv-limit). Past limits.conf [kv] indexed_kv_limit indexed field\n'
+		'# names in one index bucket (default %d), `fields *`, exports and the field picker leave fields out; a search that\n'
+		'# names a field still finds it. 0: no limit. This file applies to the whole instance, not to this app alone\n'
+		'# (limits.conf.spec), below system/local and any app\'s local/limits.conf. Splunk reads it where buckets are\n'
+		'# searched (the indexers) and needs a restart there when it appears or changes.\n'
+		'[kv]\nindexed_kv_limit = %d\n' % (INDEXED_KV_DEFAULT, limit))
+
+
+def read_bytes_or_none(path):
+	try:
+		with open(path, 'rb') as f:
+			return f.read()
+	except FileNotFoundError:
+		return None
+
+
 def write_app(out_dir, target, field_map, settings, search_hash=True, sourcetype_field=SOURCETYPE_FIELD,
-		lookup_bytes=None):
+		lookup_bytes=None, kv_limit=(None, None)):
 	for sub in ('default', 'metadata'):
 		os.makedirs(os.path.join(out_dir, sub), exist_ok=True)
 
@@ -1910,6 +1984,14 @@ def write_app(out_dir, target, field_map, settings, search_hash=True, sourcetype
 	])
 	if target['indexed_value_false']:
 		files[os.path.join('default', 'fields.conf')] = fields_text(target)
+	limits = os.path.join('default', 'limits.conf')
+	if kv_limit[0] == KEEP:
+		pass
+	elif kv_limit[0] is not None:
+		files[limits] = limits_text(kv_limit[0])
+	elif os.path.exists(os.path.join(out_dir, limits)):
+		# written by an earlier run of gen for this app, and --indexed-kv-limit none given now
+		os.remove(os.path.join(out_dir, limits))
 
 	sizes = {}
 	for rel, text in files.items():
@@ -2598,6 +2680,14 @@ def _build(args):
 	return target, templates, field_map
 
 
+def _kv_limit_arg(value):
+	if value in (INDEXED_KV_AUTO, INDEXED_KV_NONE):
+		return value
+	if value.isdigit():
+		return value
+	raise argparse.ArgumentTypeError('auto, none or a number of 0 or more, not %r' % value)
+
+
 def build_parser():
 	ap = argparse.ArgumentParser(description='Index-time field map for compact events (see the module docstring).')
 	sub = ap.add_subparsers(dest='mode')
@@ -2662,6 +2752,11 @@ def build_parser():
 			p.add_argument('--sourcetype-field', default=SOURCETYPE_FIELD,
 				help='indexed field every event of the compact sourcetype gets as <field>::"<sourcetype>", which '
 					'tenx-events names so that `tx` finds these events (default %s; none: not written)' % SOURCETYPE_FIELD)
+			p.add_argument('--indexed-kv-limit', default=INDEXED_KV_AUTO, type=_kv_limit_arg,
+				help='limits.conf [kv] indexed_kv_limit for the app: auto (default) writes 0, no limit, when the map can '
+					'write more indexed names than Splunk\'s default 200 per bucket (past it, fields * and exports leave '
+					'names out) and nothing otherwise; none writes nothing; a number writes that number. The setting '
+					'applies to the whole instance')
 			p.add_argument('--lookup-max-bytes', type=int, default=LOOKUP_DEFAULT_MAX_BYTES,
 				help='with --rules lookup, refuse to write a lookup file larger than this (default %d; Splunk drops '
 					'compact events when the file passes limits.conf ingest_max_memtable_bytes, default 10485760)'
@@ -2765,7 +2860,11 @@ def main(argv=None):
 	if args.rules == RULES_LOOKUP and args.floor == 'on':
 		# First, so the definition and a file of its name exist before the rule that reads them.
 		sizes.update(write_floor_app(args.out, target))
-	sizes.update(write_app(args.out, target, field_map, settings, args.search_hash == 'on', sourcetype_field, lookup_bytes))
+	limits_path = os.path.join(args.out, 'default', 'limits.conf')
+	limits_before = read_bytes_or_none(limits_path)
+	kv_limit = indexed_kv_limit(field_map, args.indexed_kv_limit, sourcetype_field, limits_before is not None)
+	sizes.update(write_app(args.out, target, field_map, settings, args.search_hash == 'on', sourcetype_field, lookup_bytes,
+		kv_limit))
 	if args.cap_file:
 		cap['pending_file_written'] = cap_after_app(args.cap_file, hashes)
 	report = field_map.report()
@@ -2775,6 +2874,11 @@ def main(argv=None):
 	report['settings_not_copied'] = not_copied
 	report['file_bytes'] = sizes
 	report['rules'] = args.rules
+	report['indexed_kv_limit'] = collections.OrderedDict([('written', kv_limit[0]), ('why', kv_limit[1]),
+		('indexed_names', indexed_names(field_map, sourcetype_field))])
+	limits_after = read_bytes_or_none(limits_path)
+	limits_changed = limits_after != limits_before
+	report['indexed_kv_limit']['file_changed'] = limits_changed
 	if lookup_bytes is not None:
 		report['lookup_rows'] = len(rows)
 		report['lookup_csv_bytes'] = sum(len(','.join(r)) + 1 for r in rows)
@@ -2791,6 +2895,10 @@ def main(argv=None):
 		sys.stdout.write('for tx: add %s::%s to the tenx-events macro, for example\n'
 			'    index=* (sourcetype::tenx_encoded OR %s::%s)\n' % (sourcetype_field, target['sourcetype'], sourcetype_field,
 			target['sourcetype']))
+	if limits_changed:
+		sys.stdout.write('limits.conf: %s in this app; Splunk reads it where buckets are searched and needs a restart '
+			'there for it, a rolling restart of the peers when it comes in a cluster bundle\n'
+			% ('removed' if limits_after is None else 'new' if limits_before is None else 'changed'))
 	if args.rules == RULES_LOOKUP and args.floor == 'on':
 		sys.stdout.write('floor app: %s; install it wherever %s is installed\n' % (floor_dir(args.out),
 			os.path.basename(os.path.abspath(args.out))))
