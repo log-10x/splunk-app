@@ -164,7 +164,7 @@ $SPLUNK_HOME/bin/splunk restart
 
 In a distributed deployment, install the app on the search heads and on the indexers or heavy
 forwarders that parse compact events. The compact sourcetype's parsing settings, `TRUNCATE` and
-the event time, apply on the instance that parses the data.
+the event time, apply on the instance that parses the data. [What to Install on Each Tier](tenx-for-splunk/README.md#what-to-install-on-each-tier) lists every tier.
 
 ### Step 2: Create the Index and HEC Tokens
 
@@ -223,6 +223,10 @@ index=tenx_dml sourcetype=tenx_dml_raw_json | head 10
 index=your_logs_index `tx` | head 10
 ```
 
+## Security Sources
+
+The `txf` macro gives expanded events the fields, event types and tags of their original sourcetype, and the field map tool makes compact events readable by data models and detections. Setup: [Fields of the Original Sourcetype](tenx-for-splunk/README.md#fields-of-the-original-sourcetype-txf), [the Field Map](tenx-for-splunk/README.md#data-models-and-detections-the-field-map), [What to Install on Each Tier](tenx-for-splunk/README.md#what-to-install-on-each-tier).
+
 ## Analytics Dashboard
 
 The Analytics dashboard finds compact events through the `tenx-events` macro.
@@ -244,6 +248,9 @@ The Analytics dashboard finds compact events through the `tenx-events` macro.
 | **Search Hook** | `dashboard.js`, routing each classic dashboard panel's search to the Search Handler |
 | **Search Handler** | `/tenx-search` REST endpoint rewriting a search for compact events |
 | **tx Macro** | Written in front of a search to search compact events by what the lines say, from the search bar, Dashboard Studio, saved searches and alerts |
+| **txf Macro** | `tx` with the search-time fields of the original sourcetype; see [Fields of the Original Sourcetype](tenx-for-splunk/README.md#fields-of-the-original-sourcetype-txf) |
+| **tenxreplay Command** | Writes the replay macros `txf` runs, from the search head's props; run by the Rebuild Field Replay saved searches |
+| **Field Map Tool** | `bin/tenx_field_map.py`: generates the app that writes compact events' original fields at index time; see [the Field Map](tenx-for-splunk/README.md#data-models-and-detections-the-field-map) |
 | **tenxprefilter Command** | Run once per search by the `tx` macro; reads the search, looks up the templates that carry its words, and selects the compact events to expand |
 | **tx and tenxsearch Commands** | `\| tx <search>` and `\| tenxsearch searchstring="..."`: generating commands that write every event out through Python, kept so saved searches written with them keep working |
 | **tenxrecompile Command** | Recompiles every compiled alert so it picks up new templates |
@@ -254,6 +261,7 @@ The Analytics dashboard finds compact events through the `tenx-events` macro.
 | **Consume KV Search** | Scheduled search storing new templates in the KV Store |
 | **Backfill KV Search** | The same template load over 30 days, for templates indexed before the app was installed |
 | **Recompile Compiled Alerts Search** | Runs `tenxrecompile` every 15 minutes |
+| **Rebuild Field Replay Searches** | Run `tenxreplay` every hour, and every five minutes for sourcetypes not yet covered |
 | **Analytics Dashboard** | Compression and template metrics |
 | **Diagnostics Dashboard** | Troubleshooting and verification tools |
 
