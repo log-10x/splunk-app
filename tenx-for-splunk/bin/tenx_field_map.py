@@ -203,6 +203,16 @@ REFUSED_CONFLICT = "two different templates under one hash"
 REFUSED_COUNT = "number of values unknown (no timestamp, no text before the first value, no pattern)"
 REFUSED_NO_FIELDS = "the reader found no field"
 
+# Why a template's row has no event time recipe (see "Event time").
+WHY_TIME_NO_PREFIX = "TIME_PREFIX not found in the template text"
+WHY_TIME_PREFIX_VALUE = "TIME_PREFIX match includes a value"
+WHY_TIME_EMPTY = "no text after the TIME_PREFIX match"
+WHY_TIME_FORMAT = "timestamp directive not rendered at index time"
+# Splunk's own defaults for the settings the event time rule reads (props.conf.spec).
+TIME_DEFAULT_LOOKAHEAD = 128
+TIME_DEFAULT_DAYS_AGO = 2000
+TIME_DEFAULT_DAYS_HENCE = 2
+
 # Settings of the app's [tenx_encoded] stanza that are copied, in this order, then every key
 # with one of the prefixes in the stanza's own order. Every other key of the stanza is listed
 # in the report as not copied, so a parsing setting added to the app later is seen, not lost.
@@ -232,9 +242,10 @@ _REGEX_SPECIAL = frozenset('()[]{}?*+-|^$\\.&~# \t\n\r\v\f/')
 RULES_TRANSFORMS = 'transforms'
 RULES_LOOKUP = 'lookup'
 # Values a template may have for the static rule: its regex is cut from LOOKUP_VALUE_GROUP repeated
-# this many times, and with the 15 groups that follow the values no reference passes 255 (Splunk
-# Enterprise 10.4.3: replace() with 255 groups and three-digit references gave every value).
-LOOKUP_MAX_VALUES = 240
+# this many times, and with the 15 groups that follow the values no reference passes 999, so a value
+# count stays three digits (Splunk Enterprise 10.4.3: replace() with 437, 915 and 1,215 groups and
+# references up to \1215 gave every value). A CloudTrail UpdateSAMLProvider event has 422 values.
+LOOKUP_MAX_VALUES = 984
 # One value: the rule's regex (PCRE) and this module's reading of it (Python re, which has no POSIX
 # classes). [:cntrl:] keeps a line break out of a value, so text of two lines gets no fields, and needs
 # no backslash: the rule cuts its regex from a string constant by length, which an escape would change.
@@ -245,6 +256,8 @@ LOOKUP_VALUE_GROUP_PY = ',([^,\\x00-\\x1f\\x7f]*)'
 # reference (greedily), so a literal backslash, and a digit right after a reference, would be read wrong.
 LOOKUP_TAIL = '0123456789\\\t\n\r'
 LOOKUP_COLUMNS = ('hash', 'n', 'e', 't', 'f')
+# With an event time rule (see "Event time"), one more column: the recipe of the text after TIME_PREFIX.
+LOOKUP_TIME_COLUMN = 'w'
 # The file must stay under limits.conf [lookup] ingest_max_memtable_bytes (default 10485760): above it
 # lookup() fails at index time and Splunk drops the event (see "Lookup rules").
 LOOKUP_DEFAULT_MAX_BYTES = 10000000
@@ -505,7 +518,15 @@ class JsonReader(object):
 	name = 'json'
 	raw_split = r'\n'
 	trims_values = False  # NOT CHECKED: no JSON value with edge spaces in the CloudTrail sample
-	field_name = re.compile(r'[A-Za-z_][A-Za-z0-9_]*(?:\{\})*(?:\.[A-Za-z_][A-Za-z0-9_]*(?:\{\})*)*\Z')
+	# A key may hold "-" and single ":" after its first character, as KV_MODE = json names them
+	# (requestParameters.x-amz-request-payer, requestParameters.encryptionContext.aws:lambda:FunctionArn on
+	# raw CloudTrail events); Splunk Enterprise 10.4.3 keeps an index-time field of such a name under that
+	# name and finds it when a search names it. "::" and a trailing ":" stay out: they would read as the
+	# separator of index-time field text.
+	field_name = re.compile(r'[A-Za-z_](?:[A-Za-z0-9_-]|:(?=[A-Za-z0-9_-]))*(?:\{\})*'
+		r'(?:\.[A-Za-z_](?:[A-Za-z0-9_-]|:(?=[A-Za-z0-9_-]))*(?:\{\})*)*\Z')
+	# KV_MODE = json gives a field for an empty string ("acl": "" is acl="" on raw CloudTrail events).
+	keeps_empty = True
 
 	_WS = ' \t\r\n'
 	_ESC = {'"': '"', '\\': '\\', '/': '/', 'b': '\b', 'f': '\f', 'n': '\n', 'r': '\r', 't': '\t'}
@@ -636,9 +657,9 @@ class KeyValueReader(object):
 
 
 class DelimsReader(object):
-	"""
+	r"""
 	A transforms.conf DELIMS extraction with pair delimiters space and comma and the key-value
-	delimiter "=", as the FortiGate add-on's [field_extract] (DELIMS = "\\ ,", "="), read from what Splunk
+	delimiter "=", as the FortiGate add-on's [field_extract] (DELIMS = "\ ,", "="), read from what Splunk
 	Enterprise 10.4.3 extracted on 239 raw FortiGate events with KV_MODE = none:
 	* a pair runs from a delimiter (or the start) to the next delimiter outside double quotes; its key is
 	  the text before the first "=", and a value in double quotes loses them;
@@ -646,16 +667,24 @@ class DelimsReader(object):
 	  priority "<190>date=" gives date: 62 of 62 such events), and every other character that is not a
 	  letter, digit or "_" becomes "_". A compact value in that leading text is read as the digits of a
 	  priority, so a value that holds letters there would give Splunk another name (not checked);
-	* the first value of a key is kept: tz="UTC-5:00" ... tz=-0500 gave tz "UTC-5:00".
-	Not checked: a value with an unterminated quote, a quote inside a value, and how Splunk names a key
-	that is empty once cleaned.
+	* the first value of a key is kept: tz="UTC-5:00" ... tz=-0500 gave tz "UTC-5:00";
+	* inside double quotes a backslash escapes the next character: \\ gives one backslash and \" a double
+	  quote that does not end the value (msg="...XSS\\" gave ...XSS\, filename="sample\\test.xls" gave
+	  sample\test.xls, forwardedfor="abcd0e.xff\"></script>..." gave abcd0e.xff"></script>...); before any
+	  other character the backslash stays (rawdata="...charset\=UTF-8" gave ...charset\=UTF-8). A backslash
+	  before a compact value stays as well: a compact value holds no double quote and no backslash;
+	* an empty quoted value is a field with an empty value (user="").
+	Not checked: msg="... a=b \"quoted\" c=" gave "... a=b "quoted" c" (the last "=" not kept; this reader
+	keeps it), how Splunk names a key that is empty once cleaned, and an empty value without quotes.
 	"""
 	name = 'delims'
 	raw_split = r'\n'
 	trims_values = False
+	keeps_empty = True
 	field_name = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\Z')
 
-	PAIR = re.compile(r'(?:^|(?<=[ ,]))([^ ,="]+)=(?:"([^"]*)"(?=[ ,]|\Z)|([^ ,]*))')
+	PAIR = re.compile(r'(?:^|(?<=[ ,]))([^ ,="]+)=(?:"((?:[^"\\]|\\.)*)"(?=[ ,]|\Z)|([^ ,]*))', re.S)
+	ESCAPE = re.compile(r'\\([\\"])')
 
 	@staticmethod
 	def clean(key):
@@ -686,7 +715,10 @@ class DelimsReader(object):
 			if not key or key in seen:
 				continue
 			seen.add(key)
-			out.append((key, m.group(2) if m.group(2) is not None else m.group(3)))
+			if m.group(2) is None and m.group(3) == '':
+				# An empty value without quotes: left out, as before (not checked against Splunk).
+				continue
+			out.append((key, self.ESCAPE.sub(r'\1', m.group(2)) if m.group(2) is not None else m.group(3)))
 		return out
 
 
@@ -912,9 +944,111 @@ def stanza_name(prefix, position, key, style):
 
 
 # evals: the fields of the template INGEST_EVAL writes, as (name, form, capture groups the form reads).
-# recipe, ts_format, epoch: --rules lookup only (the lookup row; see "Lookup rules").
-Transform = collections.namedtuple('Transform', 'key stanza regex format fields value_count evals recipe ts_format epoch',
-	defaults=((), '', '', False))
+# recipe, ts_format, epoch: --rules lookup only (the lookup row; see "Lookup rules"). time_recipe: the
+# text after TIME_PREFIX, with an event time rule only (see "Event time").
+Transform = collections.namedtuple('Transform',
+	'key stanza regex format fields value_count evals recipe ts_format epoch time_recipe',
+	defaults=((), '', '', False, ''))
+
+
+# ---------------------------------------------------------------------------------------------
+# Event time
+#
+# Splunk fixes _time when it parses an event, from the text after the first match of the sourcetype's
+# TIME_PREFIX, read with TIME_FORMAT over at most MAX_TIMESTAMP_LOOKAHEAD characters (props.conf.spec,
+# TIME_PREFIX, MAX_TIMESTAMP_LOOKAHEAD, TIME_FORMAT). A compact event's text has none of that text, so
+# without a rule its _time is what the app's tenx-event-time gives it: the template's first timestamp
+# slot when that is an epoch in Splunk's window, otherwise the time the event arrived. In a CloudTrail
+# event the engine's first timestamp is userIdentity.sessionContext.attributes.creationDate when that
+# field is present (1,489 of 3,617 one-slot templates of a 25,566-event sample), not eventTime, which
+# the add-on's TIME_PREFIX names.
+#
+# With an event time rule (--time-props, --time-prefix, --time-format; --rules lookup only), gen applies
+# TIME_PREFIX to each template's marked text, and the template's row carries, in column w, the recipe of
+# the text that follows the first match: template text and references to the compact values, up to
+# MAX_TIMESTAMP_LOOKAHEAD characters of template text, so the expansion covers at least that many. The
+# static rule rebuilds that text with the same replace() as the fields, keeps its first
+# MAX_TIMESTAMP_LOOKAHEAD characters, reads it with each format in turn (strptime, the first that reads
+# it wins) and sets _time when the result lies within MAX_DAYS_AGO and MAX_DAYS_HENCE of the time the
+# event is indexed. Every other event keeps the _time it had. The rule runs after tenx-event-time: gen
+# puts the copied TRANSFORMS- of [tenx_encoded] first in its own list, which Splunk applies in list
+# order (props.conf.spec, TRANSFORMS-<class>).
+#
+# Measured on Splunk Enterprise 10.4.3 with the AWS add-on 8.3.1 (aws:cloudtrail: TIME_PREFIX
+# \"eventTime\"\s*\:\s*\", TIME_FORMAT %Y-%m-%dT%H:%M:%S%Z, MAX_TIMESTAMP_LOOKAHEAD 28), on 25,566 raw
+# events: eval strptime() with the add-on's TIME_FORMAT on the 28 characters after the prefix equals
+# _time on 17,466 and returns null on the other 8,100, whose eventTime carries six fraction digits that
+# the timestamp processor reads; strptime() with "%Y-%m-%dT%H:%M:%S.%6N%Z" tried second makes it 25,566
+# of 25,566. Hence --time-format, which adds formats after the add-on's. A _time set this way, through a
+# pd: key, metered the event's text and nothing more (2,000 events of 58 bytes, 116,000 bytes in
+# license_usage.log with no rule and with each of three ways of setting a fractional _time: inline, from a
+# pd: text key, from a pd: time key).
+#
+# Not reproduced: the timestamp processor's own recognition when a sourcetype has no TIME_FORMAT
+# (datetime.xml), its use of the previous event's time outside the day window (MAX_DAYS_AGO), and TZ
+# (gen refuses a stanza that sets it). A text that no format reads leaves _time as it was.
+
+TimeRule = collections.namedtuple('TimeRule', 'prefix formats lookahead max_days_ago max_days_hence')
+
+
+def _python_regex(pcre):
+	"""A PCRE pattern as Python's re reads it: named groups (?<name>...) become (?P<name>...)."""
+	return re.sub(r'\(\?<(?![=!])', '(?P<', pcre)
+
+
+def time_prefix_regex(rule):
+	return re.compile(_python_regex(rule.prefix))
+
+
+def read_time_settings(props_path, stanza):
+	"""The timestamp settings of a sourcetype in an add-on's props.conf: [default], then its own stanza."""
+	parser = configparser.RawConfigParser(strict=False, interpolation=None)
+	parser.optionxform = str
+	parser.read(props_path, encoding='utf-8')
+	out = {}
+	for section in ('default', stanza):
+		if parser.has_section(section):
+			for k, v in parser.items(section):
+				if k in ('TIME_PREFIX', 'TIME_FORMAT', 'MAX_TIMESTAMP_LOOKAHEAD', 'MAX_DAYS_AGO', 'MAX_DAYS_HENCE', 'TZ',
+						'DATETIME_CONFIG'):
+					out[k] = v.strip()
+	return out
+
+
+def make_time_rule(settings, prefix=None, formats=(), lookahead=None):
+	"""
+	The event time rule from a sourcetype's settings (read_time_settings) and the command line, or None
+	when there is nothing to read the time with. Raises ValueError for settings the rule does not follow.
+	"""
+	if settings.get('DATETIME_CONFIG', '').upper() in ('CURRENT', 'NONE'):
+		raise ValueError('DATETIME_CONFIG = %s: Splunk does not read a time from the text' % settings['DATETIME_CONFIG'])
+	if settings.get('TZ'):
+		raise ValueError('TZ = %s is set: the rule reads the text in the zone of the indexer (NOT CHECKED), so it is '
+			'not written' % settings['TZ'])
+	all_formats = ([settings['TIME_FORMAT']] if settings.get('TIME_FORMAT') else []) + list(formats)
+	if not all_formats:
+		raise ValueError('no TIME_FORMAT: Splunk recognises the timestamp itself (datetime.xml), which the rule does '
+			'not reproduce; give --time-format')
+	for fmt in all_formats:
+		if '"' in fmt or '\\' in fmt:
+			raise ValueError('a time format with a double quote or a backslash is not written: %r' % fmt)
+	if prefix is None:
+		prefix = settings.get('TIME_PREFIX') or '^'
+	if lookahead is None:
+		lookahead = int(settings.get('MAX_TIMESTAMP_LOOKAHEAD') or TIME_DEFAULT_LOOKAHEAD)
+	rule = TimeRule(prefix, tuple(all_formats), lookahead, int(settings.get('MAX_DAYS_AGO') or TIME_DEFAULT_DAYS_AGO),
+		int(settings.get('MAX_DAYS_HENCE') or TIME_DEFAULT_DAYS_HENCE))
+	time_prefix_regex(rule)
+	return rule
+
+
+def time_text(rule, text, prefix_re=None):
+	"""The text Splunk reads the time from: what follows the first TIME_PREFIX match, cut to the lookahead."""
+	m = (prefix_re or time_prefix_regex(rule)).search(text)
+	if m is None:
+		return None
+	rest = text[m.end():]
+	return rest[:rule.lookahead] if rule.lookahead > 0 else rest
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1095,11 +1229,13 @@ def lookup_ts_supported(fmt):
 	return True
 
 
-def lookup_eval_text(lookup_def):
+def lookup_eval_text(lookup_def, time_rule=None):
 	"""The static INGEST_EVAL of --rules lookup (see "Lookup rules"). Every intermediate value sits in a
 	pd: key, which is not indexed. A compact event the rule writes no fields for gets UNMAPPED_FIELD with
-	the reason (see "Lookup failures")."""
+	the reason (see "Lookup failures"). With time_rule, the row's column w also sets _time (see "Event
+	time"); without it the text is as before."""
 	row, f, t, e, x, m, nt, ok, why = ('$pd:tenx_fm_%s$' % k for k in ('row', 'f', 't', 'e', 'x', 'm', 'n', 'ok', 'why'))
+	w, wt, tt = ('$pd:tenx_fm_%s$' % k for k in ('w', 'wt', 'tt'))
 	n = 'tonumber(%s)' % nt
 	sec = 'tonumber(substr(%s, 1, 10))' % e
 	sod = '(%s - floor(%s / 86400) * 86400)' % (sec, sec)
@@ -1127,9 +1263,10 @@ def lookup_eval_text(lookup_def):
 		LOOKUP_VALUE_GROUP * LOOKUP_MAX_VALUES, len(LOOKUP_VALUE_GROUP), n, n, '([^|])' * len(LOOKUP_TAIL))
 	tail = '"|0123456789" . urldecode("%5C%09%0A%0D")'
 	compact = 'substr(_raw, 1, 1)=="~"'
+	columns = '"n", "t", "f"' + (', "%s"' % LOOKUP_TIME_COLUMN if time_rule else '')
 	exprs = [
 		'%s=if(%s, lookup("%s", json_object("hash", trim(replace(_raw, "(?s)^~([^,]*).*$", "\\1"))), '
-		'json_array("n", "t", "f")), null())' % (row, compact, lookup_def),
+		'json_array(%s)), null())' % (row, compact, lookup_def, columns),
 		'%s=json_extract(%s, "f")' % (f, row),
 		'%s=json_extract(%s, "t")' % (t, row),
 		'%s=json_extract(%s, "n")' % (nt, row),
@@ -1150,23 +1287,42 @@ def lookup_eval_text(lookup_def):
 			why, why, WHY_NO_ROW, lookup_def, FLOOR_HASH, WHY_NO_ROW, WHY_NO_TABLE, why),
 		'_meta=if(isnull(%s), _meta, coalesce(_meta, "") . " %s::" . %s)' % (why, UNMAPPED_FIELD, why),
 	]
+	if time_rule:
+		text = 'replace(%s, %s, %s)' % (x, regex, w)
+		if time_rule.lookahead > 0:
+			text = 'substr(%s, 1, %d)' % (text, time_rule.lookahead)
+		exprs += [
+			'%s=json_extract(%s, "%s")' % (w, row, LOOKUP_TIME_COLUMN),
+			# Only for an event whose fields were written (the same regex matched), and a row with a recipe.
+			'%s=if(isnull(%s) OR %s==%s OR coalesce(len(%s), 0)==0, null(), %s)' % (wt, m, m, x, w, text),
+			'%s=if(isnull(%s), null(), coalesce(%s))' % (tt, wt, ', '.join('strptime(%s, "%s")' % (wt, fmt)
+				for fmt in time_rule.formats)),
+			'_time=if(isnotnull(%s) AND %s >= time() - %d AND %s <= time() + %d, %s, _time)' % (
+				tt, tt, time_rule.max_days_ago * 86400, tt, time_rule.max_days_hence * 86400, tt),
+		]
 	return ', '.join(exprs)
+
+
+def lookup_columns(field_map):
+	return LOOKUP_COLUMNS + ((LOOKUP_TIME_COLUMN,) if field_map.time_rule else ())
 
 
 def lookup_rows(field_map, templates):
 	"""The rows of the lookup file, sorted by hash: hash (trimmed), n, e (1 when value 0 is the
-	timestamp), t (the format the rule renders, or empty), f (the recipe)."""
-	return [(t.key, str(t.value_count), '1' if t.epoch else '0', t.ts_format, t.recipe)
+	timestamp), t (the format the rule renders, or empty), f (the recipe), and with an event time rule
+	w (the recipe of the time text, or empty)."""
+	timed = field_map.time_rule is not None
+	return [(t.key, str(t.value_count), '1' if t.epoch else '0', t.ts_format, t.recipe) + ((t.time_recipe,) if timed else ())
 		for t in sorted(field_map.transforms, key=lambda t: t.key)]
 
 
-def lookup_file_bytes(rows):
+def lookup_file_bytes(rows, columns=LOOKUP_COLUMNS):
 	"""The gzipped CSV, byte for byte the same for the same rows (no time in the gzip header)."""
 	import gzip
 	import io
 	buf = io.StringIO(newline='')
 	w = csv.writer(buf, lineterminator='\n')
-	w.writerow(LOOKUP_COLUMNS)
+	w.writerow(columns)
 	w.writerows(rows)
 	return gzip.compress(buf.getvalue().encode('utf-8'), mtime=0)
 
@@ -1178,11 +1334,8 @@ def read_lookup_file(path):
 		return dict((r['hash'], r) for r in csv.DictReader(f))
 
 
-def apply_lookup_row(transform, compact_line):
-	"""
-	The pairs the static rule writes for one compact line with this template's row, as Splunk was
-	measured to read the regex and the replacement; None when the line does not have its n values.
-	"""
+def _lookup_groups(transform, compact_line):
+	"""The groups the static rule's regex gives for one compact line (groups[0] the whole subject), or None."""
 	head = re.match(r'^~?([^,]*)', compact_line)
 	if head is None:
 		return None
@@ -1194,8 +1347,30 @@ def apply_lookup_row(transform, compact_line):
 	m = re.match(lookup_line_regex(transform.value_count), subject)
 	if m is None:
 		return None
-	text = splunk_replace_expand(transform.recipe, [m.group(0)] + list(m.groups()))
+	return [m.group(0)] + list(m.groups())
+
+
+def apply_lookup_row(transform, compact_line):
+	"""
+	The pairs the static rule writes for one compact line with this template's row, as Splunk was
+	measured to read the regex and the replacement; None when the line does not have its n values.
+	"""
+	groups = _lookup_groups(transform, compact_line)
+	if groups is None:
+		return None
+	text = splunk_replace_expand(transform.recipe, groups)
 	return [(n, v) for n, v in parse_meta(text) if n != MARK_FIELD]
+
+
+def apply_lookup_time(transform, compact_line, rule):
+	"""The text the static rule reads the event time from for one compact line, or None (see "Event time")."""
+	if not transform.time_recipe:
+		return None
+	groups = _lookup_groups(transform, compact_line)
+	if groups is None:
+		return None
+	text = splunk_replace_expand(transform.time_recipe, groups)
+	return text[:rule.lookahead] if rule.lookahead > 0 else text
 
 
 class FieldMap(object):
@@ -1205,8 +1380,19 @@ class FieldMap(object):
 
 	def __init__(self, templates, reader, prefix, stanza_names='indexed', hash_match='tolerant',
 			timestamp_values='epoch', keep=None, refused=None, mixed_names=False, trim_values=None,
-			reserved_names='skip', reserved_prefix='extracted_', mark=None, eval_values=False, rules=RULES_TRANSFORMS):
+			reserved_names='skip', reserved_prefix='extracted_', mark=None, eval_values=False, rules=RULES_TRANSFORMS,
+			time_rule=None):
 		self.reader = reader
+		# A value that is empty in the template is written as name::"" when the reader's Splunk extraction keeps
+		# such a field (Splunk Enterprise 10.4.3 keeps an index-time name::"" as a field with an empty value).
+		self.keeps_empty = getattr(reader, 'keeps_empty', False)
+		# Event time (see "Event time"): --rules lookup only.
+		if time_rule is not None and rules != RULES_LOOKUP:
+			raise ValueError('an event time rule needs --rules lookup')
+		self.time_rule = time_rule
+		self._time_re = time_prefix_regex(time_rule) if time_rule is not None else None
+		self.time_rows = 0
+		self.time_skipped = collections.Counter()
 		# transforms: one REGEX/FORMAT transform per template (and the INGEST_EVAL above); lookup: one row
 		# of the lookup file per template for the static rule (see "Lookup rules"). The lookup recipe
 		# writes every value FORMAT cannot, so eval_values does not apply to it.
@@ -1304,7 +1490,7 @@ class FieldMap(object):
 						self._skip(key, stanza, 'value: ' + why, name_expr)
 						continue
 					by_eval = True
-				elif value == '':
+				elif value == '' and not self.keeps_empty:
 					continue
 				if carries_ts and not by_eval:
 					if timestamp_values == 'skip':
@@ -1388,7 +1574,7 @@ class FieldMap(object):
 			if UNDECODABLE in value_expr:
 				self._skip(key, stanza, 'value: ' + WHY_SPLIT_ESCAPE, name_expr)
 				continue
-			if value_expr == '':
+			if value_expr == '' and not self.keeps_empty:
 				continue
 			carries_ts = bool(fmt) and (MARK % 0) in value_expr
 			as_text = False
@@ -1432,8 +1618,44 @@ class FieldMap(object):
 			return None
 		if self.mark:
 			pieces.append(('text', ' %s::"1"' % self.mark))
+		time_recipe = ''
+		if self.time_rule is not None:
+			time_pieces, why = self._time_pieces(text, n, fmt, groups_of)
+			if why:
+				self.time_skipped[why] += 1
+			else:
+				self.time_rows += 1
+				time_recipe = recipe_text(time_pieces, n)
+				ts_text = ts_text or ('group', n + 1) in time_pieces
 		return Transform(key, stanza, '', '', fields, n, (), recipe_text(pieces, n), fmt if ts_text else '',
-			bool(fmt))
+			bool(fmt), time_recipe)
+
+	def _time_pieces(self, text, n, fmt, groups_of):
+		"""
+		(pieces, None): the text after the template's first TIME_PREFIX match, up to the lookahead counted
+		in template text; or (None, the reason there is none). The timestamp slot is its rendered text
+		(group n+1), as in a field; an epoch format is its digits as written.
+		"""
+		m = self._time_re.search(text)
+		if m is None:
+			return None, WHY_TIME_NO_PREFIX
+		if '\x00' in m.group(0):
+			return None, WHY_TIME_PREFIX_VALUE
+		as_text = bool(fmt) and fmt != tenx_dml_builder.EPOCH_PASSTHROUGH
+		limit = self.time_rule.lookahead
+		pieces, literal = [], 0
+		for kind, v in groups_of(text[m.end():], as_text):
+			if limit > 0 and literal >= limit:
+				break
+			if kind == 'text' and limit > 0:
+				v = v[:limit - literal]
+				literal += len(v)
+			pieces.append((kind, v))
+		if not pieces:
+			return None, WHY_TIME_EMPTY
+		if ('group', n + 1) in pieces and not lookup_ts_supported(fmt):
+			return None, WHY_TIME_FORMAT
+		return pieces, None
 
 	def _eval_field(self, name, value_expr, timestamp_format, evals):
 		"""
@@ -1479,6 +1701,13 @@ class FieldMap(object):
 	def report(self):
 		per = [t.fields for t in self.transforms]
 		refused = collections.Counter(self.refused.values())
+		out = self._report(per, refused)
+		if self.time_rule is not None:
+			out['event_time'] = collections.OrderedDict([('rule', dict(self.time_rule._asdict())),
+				('templates_with_rule', self.time_rows), ('templates_without_rule', dict(self.time_skipped))])
+		return out
+
+	def _report(self, per, refused):
 		return collections.OrderedDict([
 			('templates', len(self.transforms)),
 			('fields_per_template_min_max', [min(per), max(per)] if per else []),
@@ -1581,14 +1810,22 @@ def props_text(target, field_map, settings, search_hash=True, sourcetype_field=S
 		'# generated transform per template. Search-time: renamed to the add-on\'s sourcetype.',
 		'[%s]' % target['sourcetype'],
 	]
+	first = []
+	if field_map.time_rule is not None:
+		# The rule sets _time after tenx-event-time has: the copied TRANSFORMS- go first in the generated
+		# list, which Splunk applies in list order, instead of in classes of their own.
+		first = [s.strip() for k, v in settings if k.startswith('TRANSFORMS-') for s in v.split(',') if s.strip()]
+		settings = [(k, v) for k, v in settings if not k.startswith('TRANSFORMS-')]
 	lines += ['%s = %s' % kv for kv in settings]
 	if field_map.rules == RULES_LOOKUP:
 		lines[1] = '# generated rule reading one lookup row per template. Search-time: renamed to the add-on\'s sourcetype.'
-		names = ([sourcetype_stanza(target)] if sourcetype_field else []) + [lookup_eval_stanza(target)]
+		names = first + ([sourcetype_stanza(target)] if sourcetype_field else []) + [lookup_eval_stanza(target)]
 	else:
 		names = ([sourcetype_stanza(target)] if sourcetype_field else []) + [t.stanza for t in field_map.transforms]
 	if field_map.forms:
 		names.append(eval_stanza(target))
+	if first:
+		lines.append('# %s first, then the fields and the event time from the template\'s row.' % ', '.join(first))
 	lines.append('TRANSFORMS-%s = %s' % (target['transforms_class'], ', '.join(names)))
 	lines.append('rename = %s' % target['rename'])
 	if search_hash:
@@ -1614,7 +1851,7 @@ def transforms_text(field_map, search_hash=True, target=None, sourcetype_field=S
 			'case_sensitive_match = true\n' % (lookup_file_name(target), lookup_stanza(target), lookup_file_name(target)),
 			'# Every compact event: its template\'s row gives the fields, written to _meta. The same for every\n'
 			'# template, so adding one changes only the lookup file.\n[%s]\nINGEST_EVAL = %s\n' % (
-				lookup_eval_stanza(target), lookup_eval_text(lookup_stanza(target)))]
+				lookup_eval_stanza(target), lookup_eval_text(lookup_stanza(target), field_map.time_rule))]
 	else:
 		stanzas = ['[%s]\nREGEX = %s\nFORMAT = %s\nWRITE_META = true\n' % (t.stanza, t.regex, t.format)
 			for t in field_map.transforms]
@@ -1788,13 +2025,20 @@ def verify(templates, field_map, encoded_path, raw_path, raw_split=None, out=sys
 	1. Every compact line, expanded from its template's marked text, equals one raw event (CR
 	   removed from the raw text: the engine drops it, engine PR #240).
 	2. For every line that passed 1, the pairs its transform writes equal the pairs the reader
-	   finds in the raw event (non-empty values, field names the reader accepts).
+	   finds in the raw event (field names the reader accepts; values not empty, unless the reader's
+	   Splunk extraction keeps empty values).
+	3. With an event time rule, the text the rule reads the time from equals the text after the first
+	   TIME_PREFIX match in the raw event, cut to the lookahead (see "Event time").
 	Returns a dict of counts.
 	"""
 	reader = field_map.reader
 	remaining = collections.Counter(raw_events(raw_path, raw_split or reader.raw_split))
 	raw_total = sum(remaining.values())
 	by_key = {t.key: t for t in field_map.transforms}
+	keep_empty = field_map.keeps_empty
+	rule = field_map.time_rule
+	time_counts = collections.Counter()
+	time_examples = []
 
 	lines = ok = 0
 	differs, no_template, no_transform, no_match = [], 0, 0, 0
@@ -1834,6 +2078,19 @@ def verify(templates, field_map, encoded_path, raw_path, raw_split=None, out=sys
 		if transform is None:
 			no_transform += 1
 			continue
+		if rule is not None:
+			want_t = time_text(rule, expanded, field_map._time_re)
+			got_t = apply_lookup_time(transform, line, rule)
+			if want_t is None:
+				time_counts['raw_without_prefix'] += 1
+			elif got_t is None:
+				time_counts['no_rule'] += 1
+			elif got_t == want_t:
+				time_counts['equal'] += 1
+			else:
+				time_counts['differ'] += 1
+				if len(time_examples) < 5:
+					time_examples.append((key, want_t, got_t))
 		if field_map.rules == RULES_LOOKUP:
 			written_pairs = apply_lookup_row(transform, line)
 		else:
@@ -1841,7 +2098,7 @@ def verify(templates, field_map, encoded_path, raw_path, raw_split=None, out=sys
 		if written_pairs is None:
 			no_match += 1
 			continue
-		got = collections.Counter((n_, v) for n_, v in written_pairs if v != '')
+		got = collections.Counter((n_, v) for n_, v in written_pairs if keep_empty or v != '')
 		for n_ in set(n_ for n_, _ in got if reserved_name(n_)):
 			reserved_dynamic[n_] += 1
 		if field_map.reserved_names == 'restore':
@@ -1850,8 +2107,8 @@ def verify(templates, field_map, encoded_path, raw_path, raw_split=None, out=sys
 			got = collections.Counter(dict(((n_[len(field_map.reserved_prefix):] if n_ in back else n_, v), c)
 				for (n_, v), c in got.items()))
 		want = collections.Counter((n_, v.strip(field_map.trim_chars) if field_map.trim_values else v)
-			for n_, v in reader.pairs(expanded) if v != '' and reader.field_name.match(n_))
-		want = collections.Counter({k: c for k, c in want.items() if k[1] != ''})
+			for n_, v in reader.pairs(expanded) if (keep_empty or v != '') and reader.field_name.match(n_))
+		want = collections.Counter({k: c for k, c in want.items() if keep_empty or k[1] != ''})
 		if got == want:
 			fields_equal += 1
 		else:
@@ -1873,6 +2130,8 @@ def verify(templates, field_map, encoded_path, raw_path, raw_split=None, out=sys
 		('reserved_names_from_values_events', dict(reserved_dynamic)),
 		('fields_missing_or_different_events', dict(missing)), ('fields_extra_or_different_events', dict(extra)),
 	])
+	if rule is not None:
+		result['event_time_text'] = dict(time_counts)
 
 	out.write('expansion from marked text equals a raw event (CR removed): %d of %d\n' % (ok, lines))
 	for d in differs[:5]:
@@ -1889,6 +2148,12 @@ def verify(templates, field_map, encoded_path, raw_path, raw_split=None, out=sys
 	for name in sorted(set(missing) | set(extra)):
 		out.write('  %s: raw has it and the transform does not (or not equal) on %d events, '
 			'the transform writes it and raw does not (or not equal) on %d\n' % (name, missing[name], extra[name]))
+	if rule is not None:
+		out.write('event time text: equal to the raw event\'s text after TIME_PREFIX on %d, differs on %d, no rule for '
+			'the template %d, raw event without the prefix %d\n' % (time_counts['equal'], time_counts['differ'],
+				time_counts['no_rule'], time_counts['raw_without_prefix']))
+		for d in time_examples:
+			out.write('  time text differs: %r\n' % (d,))
 	return result
 
 
@@ -2319,12 +2584,17 @@ def _build(args):
 		keep = set()
 		for p in args.only_hashes_in:
 			keep |= hash_keys_in(p)
+	time_rule = None
+	if args.time_props or args.time_format or args.time_prefix is not None:
+		settings = read_time_settings(args.time_props, target['rename']) if args.time_props else {}
+		time_rule = make_time_rule(settings, args.time_prefix, args.time_format or (), args.time_lookahead)
 	field_map = FieldMap(templates, READERS[target['reader']](), target['transform_prefix'],
 		stanza_names=args.stanza_names, hash_match=args.hash_match, timestamp_values=args.timestamp_values,
 		keep=keep, refused=refused, mixed_names=args.mixed_names,
 		reserved_names=args.reserved_names, reserved_prefix=args.reserved_prefix,
 		trim_values={'auto': None, 'on': True, 'off': False}[args.trim_values],
-		mark=None if args.mark == 'none' else args.mark, eval_values=args.eval_values == 'on', rules=args.rules)
+		mark=None if args.mark == 'none' else args.mark, eval_values=args.eval_values == 'on', rules=args.rules,
+		time_rule=time_rule)
 	return target, templates, field_map
 
 
@@ -2375,6 +2645,14 @@ def build_parser():
 			help='transforms: one index-time transform per template (default); lookup: one static rule per sourcetype '
 				'and one row per template in lookups/<prefix>_fields.csv.gz, so adding a template changes only that '
 				'file, which Splunk rereads without a restart (needed for --cap-file)')
+		p.add_argument('--time-props',
+			help='with --rules lookup: the add-on\'s props.conf; its [default] and [<rename>] TIME_PREFIX, TIME_FORMAT, '
+				'MAX_TIMESTAMP_LOOKAHEAD, MAX_DAYS_AGO and MAX_DAYS_HENCE set _time from the template\'s text after '
+				'TIME_PREFIX, as Splunk sets it on the original event (see "Event time")')
+		p.add_argument('--time-prefix', help='TIME_PREFIX for the event time rule, instead of the add-on\'s')
+		p.add_argument('--time-format', action='append',
+			help='a strptime format tried after the add-on\'s TIME_FORMAT (repeat for more); alone, it starts the rule')
+		p.add_argument('--time-lookahead', type=int, help='MAX_TIMESTAMP_LOOKAHEAD for the rule, instead of the add-on\'s')
 		if mode == 'gen':
 			p.add_argument('--out', required=True, help='the app folder to write')
 			p.add_argument('--report', help='report path (default: <out>_report.json)')
@@ -2455,7 +2733,11 @@ def main(argv=None):
 		return check(args.app, args.cap_file, _splunkd(args), args.app_name, args.probe_index, args.sample, args.timeout,
 			args.poll)
 
-	target, templates, field_map = _build(args)
+	try:
+		target, templates, field_map = _build(args)
+	except ValueError as e:
+		sys.stderr.write('%s: %s\n' % (args.mode, e))
+		return 2
 
 	if args.mode == 'verify':
 		result = verify(templates, field_map, args.encoded, args.raw, args.raw_split)
@@ -2470,7 +2752,7 @@ def main(argv=None):
 	lookup_bytes = None
 	if args.rules == RULES_LOOKUP:
 		rows = lookup_rows(field_map, templates)
-		lookup_bytes = lookup_file_bytes(rows)
+		lookup_bytes = lookup_file_bytes(rows, lookup_columns(field_map))
 		if len(lookup_bytes) > args.lookup_max_bytes:
 			sys.stderr.write('gen: the lookup file would be %d bytes, over --lookup-max-bytes %d; nothing written\n'
 				% (len(lookup_bytes), args.lookup_max_bytes))
