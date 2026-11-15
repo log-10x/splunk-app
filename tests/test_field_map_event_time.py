@@ -172,6 +172,19 @@ class TestTimeRuleText:
 		before = fm.lookup_eval_text('t').replace('json_array("n", "t", "f"))', 'json_array("n", "t", "f", "w"))')
 		assert text.startswith(before + ', ')
 
+	def test_one_format_is_read_by_strptime_alone(self):
+		# Splunk Enterprise 10.4.3 refuses to compile coalesce() of one argument in an INGEST_EVAL
+		text = fm.lookup_eval_text('t', fm.make_time_rule(AWS))
+		assert ('$pd:tenx_fm_tt$=if(isnull($pd:tenx_fm_wt$), null(), strptime($pd:tenx_fm_wt$, '
+			'"%Y-%m-%dT%H:%M:%S%Z"))') in text
+		assert 'coalesce(strptime' not in text
+		fgt = fm.make_time_rule({'TIME_PREFIX': '^'}, prefix='date=', formats=['%Y-%m-%d time=%H:%M:%S'])
+		assert ', strptime($pd:tenx_fm_wt$, "%Y-%m-%d time=%H:%M:%S"))' in fm.lookup_eval_text('t', fgt)
+
+	def test_two_formats_take_the_first_that_parses(self):
+		assert fm.time_parse_text('x', ['%s', '%Y']) == 'coalesce(strptime(x, "%s"), strptime(x, "%Y"))'
+		assert fm.time_parse_text('x', ['%s']) == 'strptime(x, "%s")'
+
 	def test_rows_carry_the_recipe_in_a_sixth_column(self):
 		f = field_map(SLOT, NONE)
 		assert fm.lookup_columns(f) == fm.LOOKUP_COLUMNS + ('w',)
