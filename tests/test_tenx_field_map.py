@@ -845,9 +845,9 @@ class TestLookupRules:
 
 	def test_the_rule_builds_a_regex_only_from_a_row_it_can_use(self):
 		text = fm.lookup_eval_text('tenx_fw_fields')
-		# a recipe of name::value pairs and a value count of at most 240 in digits; anything else is bad_row
+		# a recipe of name::value pairs and a value count of at most 984 in digits; anything else is bad_row
 		assert '$pd:tenx_fm_ok$=if(isnotnull($pd:tenx_fm_f$) AND isnotnull($pd:tenx_fm_n$), if(match($pd:tenx_fm_f$, "::") ' \
-			'AND match($pd:tenx_fm_n$, "^[0-9]{1,3}$"), if(tonumber($pd:tenx_fm_n$) <= 240, 1, 0), 0), 0)' in text
+			'AND match($pd:tenx_fm_n$, "^[0-9]{1,3}$"), if(tonumber($pd:tenx_fm_n$) <= 984, 1, 0), 0), 0)' in text
 		assert '$pd:tenx_fm_x$=if($pd:tenx_fm_ok$ == 1, _raw . ' in text
 		assert 'tonumber(json_extract(' not in text
 
