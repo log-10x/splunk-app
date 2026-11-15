@@ -10,10 +10,10 @@ rewritten and expanded exactly as `| tenxsearch searchstring="..."` is.
 import os
 import sys
 
-from splunk.clilib.bundle_paths import get_base_path
 
 APP_NAME = 'tenx-for-splunk'
-apphome = os.path.join(get_base_path(), APP_NAME)
+# The app's own folder, wherever Splunk keeps it (etc/apps, or etc/peer-apps on an indexer cluster peer).
+apphome = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.join(apphome, 'bin'))
 sys.path.append(os.path.join(apphome, 'lib'))
 
