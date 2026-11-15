@@ -61,6 +61,24 @@ class TestDashboardsFindCompactEvents:
 		# spath on non-JSON text invents fields, and on JSON doubles what extract finds.
 		assert 'spath' not in tx
 
+	def test_txf_reruns_splunks_field_extraction_through_the_replay(self):
+		macros = conf('macros.conf')
+		for name in ('txf', 'txf(1)'):
+			txf = macros.get(name, 'definition')
+			assert '| `tenx-inflate` | fields - _kv | `tenx-replay' in txf, name
+			assert 'spath' not in txf, name
+		# The shipped replay is exactly the extraction `tx` runs; tenxreplay writes the rest.
+		assert macros.get('tenx-replay', 'definition').count('| extract |') == 1
+		import tenx_replay_builder
+		assert ' | '.join(tenx_replay_builder.UNCHANGED) == macros.get('tenx-replay', 'definition')
+
+	def test_txf_keeps_the_compact_text_until_the_replay_has_read_it(self):
+		macros = conf('macros.conf')
+		for name in ('txf', 'txf(1)'):
+			txf = macros.get(name, 'definition')
+			assert txf.index('eval tenx_compact_raw=_raw') < txf.index('`tenx-inflate`') < txf.index('`tenx-replay')
+			assert 'fields - tenx_compact_raw' in txf
+
 	def test_the_prefilter_never_returns_a_bare_star(self):
 		# A bare * becomes the highlight keyword *** and lights every event in Splunk Web.
 		src = open(os.path.join(APP, 'bin', 'tenx_prefilter.py'), encoding='utf-8').read()
@@ -71,7 +89,8 @@ class TestDashboardsFindCompactEvents:
 		macros = conf('macros.conf')
 		assert macros.has_section('tx') and macros.has_section('tenx-templates')
 		meta = open(os.path.join(APP, 'metadata', 'default.meta'), encoding='utf-8').read()
-		for name in ('tx', 'tenx-events', 'tenx-templates', 'tenx-inflate'):
+		for name in ('tx', 'tenx-events', 'tenx-templates', 'tenx-inflate', 'tenx-replay', 'tenx-replay-tags', 'txf',
+					 'txf%281%29'):
 			assert re.search(r'\[macros/%s\]\naccess = [^\n]*\nexport = system' % re.escape(name), meta), name
 
 	def test_the_command_tx_calls_is_declared_and_kept_out_of_the_assistant(self):
@@ -84,7 +103,7 @@ class TestDashboardsFindCompactEvents:
 	def test_every_compact_panel_reads_the_macro(self):
 		for f in ('tenx_dashboard.xml', 'tenx_diagnostics.xml'):
 			compact = [q for q in queries(f) if 'inputlookup' not in q and 'index=_internal' not in q
-					   and 'sourcetype=tenx_dml' not in q]
+					   and 'sourcetype=tenx_dml' not in q and not q.lstrip().startswith('| rest ')]
 			assert compact, f
 			assert all('`tenx-events`' in q for q in compact), f
 
@@ -189,3 +208,15 @@ class TestScheduledRecompile:
 		assert saved.get('Recompile Compiled Alerts', 'enableSched') == '1'
 		assert conf('commands.conf').get('tenxrecompile', 'filename') == 'tenxrecompile.py'
 		assert os.path.exists(os.path.join(APP, 'bin', 'tenxrecompile.py'))
+
+	def test_the_field_replay_is_rebuilt_on_a_schedule(self):
+		saved = conf('savedsearches.conf')
+		assert saved.get('Rebuild Field Replay', 'search').strip() == '| tenxreplay'
+		assert saved.get('Rebuild Field Replay', 'enableSched') == '1'
+		assert conf('commands.conf').get('tenxreplay', 'filename') == 'tenxreplay.py'
+		assert os.path.exists(os.path.join(APP, 'bin', 'tenxreplay.py'))
+
+	def test_the_conf_the_replay_writes_is_declared(self):
+		spec = open(os.path.join(APP, 'README', 'tenx_replay.conf.spec')).read()
+		for key in ('computed_fields', 'aliased_fields'):
+			assert re.search(r'^' + key + r' = ', spec, re.M), key

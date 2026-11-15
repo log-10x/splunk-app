@@ -106,6 +106,7 @@ import tenx_prefilter_parser
 import tenx_spl_parser
 import tenx_search_manager
 import tenx_prefilter_parser
+import tenx_replay_builder
 
 
 class ResolvedState(Enum):
@@ -119,6 +120,12 @@ class ResolvedState(Enum):
 # breakers together, as single characters. '*' is a major breaker for the indexer but a live
 # wildcard in a search term, so it stays attached to its piece. The multi-character majors
 # ('--' and the %XX escapes) are covered by their single characters.
+# After expansion: drop the _kv mark so extract runs the event's own extraction (key=value and
+# JSON), and let spath read only text that starts with "<" (XML path fields). The same steps with
+# and without a field replay.
+XML_AND_KV_STEPS = (' | fields - _kv | extract | eval tenx_xml=if(match(_raw, "^\\s*<"), _raw, null())'
+					' | spath input=tenx_xml | fields - tenx_xml, tenx_hash, tenx_var_0, tenx_vars')
+
 # A search term written as TERM(<x>) or CASE(<x>).
 TERM_CALL = re.compile(r'^(TERM|CASE)\((.*)\)$', re.S)
 
@@ -1088,7 +1095,7 @@ class TenxSearchCommand(TenxSplCommand):
 
 		return result
 
-	def inflate_suffix(self):
+	def inflate_suffix(self, replay=tenx_replay_builder.FULL):
 		"""
 		Returns the suffix that expands the compact events and gives them the search-time fields
 		of their expanded text.
@@ -1115,10 +1122,64 @@ class TenxSearchCommand(TenxSplCommand):
 		tenx_expand_refused, which the inflate macro keeps on purpose, is not.
 
 		Different macro chosen if we're running in debug mode or not, either 'tenx-inflate' or 'tenx-inflate-debug'
+
+		The compact text is copied to tenx_compact_raw first, and the `tenx-replay` macro runs
+		right after the inflate macro. On a compact event whose sender recorded its original
+		sourcetype (the indexed field tenx_sourcetype) the macro clears what Splunk found on the
+		compact text, re-types the event and applies that sourcetype's search-time rules (see
+		tenx_replay_builder.py), and leaves tenx_rst set. Every step it runs is guarded, and
+		tenx_hide_others, set here and only here, hides the events it does not replay from its
+		one unguarded step, `extract`: those events reach the rewrite's own extract, spath and
+		key=value pass exactly as they do when nothing is replayed.
+
+		The steps after it (extract, spath and the key=value pass of field_extraction) must not
+		touch a replayed event: on Splunk Enterprise 10.4.3 the key=value pass gave every field of
+		a replayed event a second copy of its value, and spath added fields the original
+		sourcetype does not have.
+		So a replayed event is hidden from them (no text, and a sourcetype, source and host no
+		props stanza names) and given back by replay_restore().
+
+		`replay` is what runs in place of `tenx-replay` (see replay_steps()); None when nothing is
+		replayed, and then the suffix has no replay steps at all.
 		"""
-		return (" | " + tenx_util.splunk_inflate_macro(self.debug)
-				+ ' | fields - _kv | extract | eval tenx_xml=if(match(_raw, "^\\s*<"), _raw, null())'
-				+ " | spath input=tenx_xml | fields - tenx_xml, tenx_hash, tenx_var_0, tenx_vars")
+		if replay is None:
+			# Nothing to replay: the suffix without any replay step.
+			return (" | " + tenx_util.splunk_inflate_macro(self.debug) + XML_AND_KV_STEPS)
+		return (" | eval tenx_compact_raw=_raw | " + tenx_util.splunk_inflate_macro(self.debug)
+				+ " | eval tenx_hide_others=1 | " + replay + " | fields - tenx_hide_others"
+				+ " | eval tenx_h_raw=if(isnotnull(tenx_rst), _raw, null()), tenx_h_st=if(isnotnull(tenx_rst), sourcetype, null()),"
+				+ " tenx_h_src=if(isnotnull(tenx_rst), source, null()), tenx_h_host=if(isnotnull(tenx_rst), host, null())"
+				+ " | eval _raw=if(isnotnull(tenx_rst), \"\", _raw), sourcetype=if(isnotnull(tenx_rst), \"tenx_replayed\", sourcetype),"
+				+ " source=if(isnotnull(tenx_rst), \"tenx_replayed\", source), host=if(isnotnull(tenx_rst), \"tenx_replayed\", host)"
+				+ XML_AND_KV_STEPS)
+
+	def replay_steps(self):
+		"""
+		The field replay this search runs right after expanding, or None for none (see
+		tenx_replay_builder.rewrite_replay): None when tenx_replay.conf says no compact event
+		carries tenx_sourcetype, or none in the indexes the search names; the units of the
+		sourcetypes recorded for those indexes; `tenx-replay` (every sourcetype) when the search
+		names no index, or when the coverage could not be read (the config has no 'tenx_replay'
+		entry, or it is None).
+		"""
+		covered = self.tenx_config.get(tenx_util.REPLAY_COVERAGE) if self.tenx_config else None
+		indexes = self.parsed_command.get_passing_specifiers('index_specifier')
+		return tenx_replay_builder.rewrite_replay(covered, indexes)
+
+	def replay_restore(self):
+		"""Gives a replayed event back its text, sourcetype, source and host (see inflate_suffix)."""
+		return (" | eval _raw=coalesce(tenx_h_raw, _raw), sourcetype=coalesce(tenx_h_st, sourcetype),"
+				" source=coalesce(tenx_h_src, source), host=coalesce(tenx_h_host, host)"
+				" | fields - tenx_h_raw, tenx_h_st, tenx_h_src, tenx_h_host, tenx_compact_raw, tenx_rst")
+
+	def field_extraction(self):
+		"""Nothing: the fields come from the event's own extraction in inflate_suffix (a generic
+		key=value pass here gave a key=value field a second copy of its value)."""
+		return ''
+
+	def field_filter(self):
+		"""The filter on the field conditions the user requested, after the replayed events are back."""
+		return ' | search ' + " ".join([item.text for item in self.user_field_terms])
 
 	def field_search(self):
 		"""
@@ -1180,10 +1241,22 @@ class TenxSearchCommand(TenxSplCommand):
 		# encoded data at this point (self.needs_tenx is True), so the data returned from Splunk will
 		# be encoded, and needs decoding.
 		#
-		result += self.inflate_suffix()
+		replay = self.replay_steps()
 
-		if len(self.user_field_terms) > 0:
-			result += self.field_search()
+		result += self.inflate_suffix(replay)
+
+		if replay is None:
+			# No compact event this search can read carries tenx_sourcetype: no replay steps.
+			if len(self.user_field_terms) > 0:
+				result += self.field_search()
+		else:
+			if len(self.user_field_terms) > 0:
+				result += self.field_extraction()
+
+			result += self.replay_restore()
+
+			if len(self.user_field_terms) > 0:
+				result += self.field_filter()
 
 		if self.needs_original_search_check:
 			result += self.original_search_terms()

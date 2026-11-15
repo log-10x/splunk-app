@@ -83,15 +83,16 @@ def compile_search(search, **manager_kwargs):
 	return result, manager
 
 
-# What follows the prefilter: expand, drop the _kv mark, the event's own extraction (the same
-# steps as the tx macro).
-EXPAND = ('| `tenx-inflate` | fields - _kv | extract | eval tenx_xml=if(match(_raw, "^\\s*<"), _raw, null()) '
-		  '| spath input=tenx_xml | fields - tenx_xml, tenx_hash, tenx_var_0, tenx_vars ')
+# What follows the prefilter: expand, replay the original sourcetype's fields, then the
+# rewrite's own extraction with replayed events hidden from it, and give them back.
+EXPAND_HEAD = '| eval tenx_compact_raw=_raw | `tenx-inflate` | eval tenx_hide_others=1 | `tenx-replay` | fields - tenx_hide_others | eval tenx_h_raw=if(isnotnull(tenx_rst), _raw, null()), tenx_h_st=if(isnotnull(tenx_rst), sourcetype, null()), tenx_h_src=if(isnotnull(tenx_rst), source, null()), tenx_h_host=if(isnotnull(tenx_rst), host, null()) | eval _raw=if(isnotnull(tenx_rst), "", _raw), sourcetype=if(isnotnull(tenx_rst), "tenx_replayed", sourcetype), source=if(isnotnull(tenx_rst), "tenx_replayed", source), host=if(isnotnull(tenx_rst), "tenx_replayed", host) | fields - _kv | extract | eval tenx_xml=if(match(_raw, "^\\s*<"), _raw, null()) | spath input=tenx_xml | fields - tenx_xml, tenx_hash, tenx_var_0, tenx_vars'
+RESTORE = ' | eval _raw=coalesce(tenx_h_raw, _raw), sourcetype=coalesce(tenx_h_st, sourcetype), source=coalesce(tenx_h_src, source), host=coalesce(tenx_h_host, host) | fields - tenx_h_raw, tenx_h_st, tenx_h_src, tenx_h_host, tenx_compact_raw, tenx_rst'
+EXPAND = EXPAND_HEAD + RESTORE + ' '
 
 
 def prefilter(compiled):
 	"""The text between the modifiers and the inflate macro: the compact-event prefilter."""
-	head = compiled.split('| `tenx-inflate`')[0]
+	head = compiled.split('| eval tenx_compact_raw=_raw | `tenx-inflate`')[0]
 	return head.replace('| search sourcetype=tenx_encoded', '', 1).strip()
 
 
@@ -303,7 +304,9 @@ class TestCompiledPrefilter:
 
 		assert prefilter(result.resolved) == ''
 		assert manager.probes == []
-		assert result.resolved.endswith(EXPAND + '| search status=500')
+		# The generic key=value pass runs while a replayed event is hidden from it (it would give
+		# each of the event's fields a second copy); the condition is applied once it is back.
+		assert result.resolved.endswith('tenx_var_0, tenx_vars' + RESTORE + ' | search status=500')
 		assert not result.no_prefilter   # no keywords at all is has_search_terms=False, not this
 
 	def test_downstream_pipeline_is_preserved(self):

@@ -277,6 +277,67 @@ class TestDigitsOfAWrittenDateOrTime:
 		assert "TERM(1234)" in plan("job:1234")[0]
 
 
+class TestFieldNarrowing:
+	"""
+	field=value restricts like its value written as a word, but only for a field whose value is
+	text of the event (text_field). Compared on Splunk Enterprise 10.4.3 against the same
+	searches on raw events.
+	"""
+	TEXT = staticmethod(p.text_field_predicate(["action", "signature_id", "dvc_ip"]))
+
+	def narrowed(self, text):
+		reader = p.Parser(p.tokenize(text))
+		return p.prefilter(reader.parse(), D, self.TEXT)
+
+	def test_without_the_list_no_field_restricts(self):
+		assert plan("user=kafka")[0] is None
+
+	def test_a_text_field_restricts_like_its_value(self):
+		assert self.narrowed("user=kafka") == plan("kafka")[0]
+
+	def test_a_quoted_value_restricts_like_the_phrase(self):
+		assert self.narrowed('msg="migration successfully executed"') == plan('"migration successfully executed"')[0]
+
+	def test_a_computed_field_does_not_restrict(self):
+		assert self.narrowed("action=kafka") is None
+		assert self.narrowed("signature_id=4648") is None
+
+	def test_default_and_indexed_fields_do_not_restrict(self):
+		for field in ("host", "source", "sourcetype", "index", "eventtype", "tag", "tag::action", "date_hour",
+					  "tenx_sourcetype", "_time", "timestamp"):
+			assert self.narrowed("%s=kafka" % field) is None, field
+
+	def test_only_equality_restricts(self):
+		for op in ("!=", ">", "<", ">=", "<="):
+			assert self.narrowed("user%skafka" % op) is None, op
+		assert self.narrowed("NOT user=kafka") is None
+
+	def test_in_is_an_or_of_its_values(self):
+		assert self.narrowed("user IN (kafka, error)") == plan("(kafka OR error)")[0]
+		assert self.narrowed('user IN (kafka, "migration successfully")') == plan('(kafka OR "migration successfully")')[0]
+
+	def test_in_with_a_value_that_places_no_restriction_places_none(self):
+		assert self.narrowed("user IN (kafka, *)") is None
+		assert self.narrowed("action IN (kafka, error)") is None
+
+	def test_a_wildcard_field_name_is_never_a_text_field(self):
+		# (The parser reads us*=kafka as a word, not as a field comparison.)
+		assert self.TEXT("us*") is False and self.TEXT("user") is True
+
+	def test_a_star_in_the_list_turns_narrowing_off(self):
+		reader = p.Parser(p.tokenize("user=kafka"))
+		assert p.prefilter(reader.parse(), D, p.text_field_predicate(["*"])) is None
+
+	def test_pieces_of_field_values_are_looked_up(self):
+		reader = p.Parser(p.tokenize('user=kafka action=warn msg="error x"'))
+		assert p.lookup_pieces(reader.parse(), text_field=self.TEXT) == {"kafka", "error", "x"}
+		reader = p.Parser(p.tokenize('user=kafka'))
+		assert p.lookup_pieces(reader.parse()) == set()
+
+	def test_a_value_with_dots_and_dashes_is_its_pieces(self):
+		assert self.narrowed("dest=web-01.kafka.internal") == plan("web-01.kafka.internal")[0]
+
+
 class TestWholeAddress:
 	"""
 	An IPv4 address requires each of its parts as a term, or the whole address as one term. Cut
@@ -291,12 +352,13 @@ class TestWholeAddress:
 			"((TERM(10) OR TERM(10.0.1.14)) AND (TERM(0) OR TERM(10.0.1.14))"
 			" AND (TERM(1) OR TERM(10.0.1.14)) AND (TERM(14) OR TERM(10.0.1.14)))")
 
-	def test_term_and_quotes_read_as_the_address(self):
+	def test_term_quotes_and_a_text_field_read_as_the_address(self):
 		want = plan("10.0.1.14")[0]
 		assert plan("TERM(10.0.1.14)")[0] == want and plan('"10.0.1.14"')[0] == want
-
-	def test_a_field_comparison_still_places_no_restriction(self):
-		assert plan("IpAddress=10.0.1.14")[0] is None
+		reader = p.Parser(p.tokenize("IpAddress=10.0.1.14"))
+		assert p.prefilter(reader.parse(), D, p.text_field_predicate([])) == want
+		reader = p.Parser(p.tokenize("IpAddress=10.0.1.14"))
+		assert p.prefilter(reader.parse(), D) is None
 
 	def test_three_digit_parts_need_no_dictionary(self):
 		assert plan("192.168.33.161")[0] == (

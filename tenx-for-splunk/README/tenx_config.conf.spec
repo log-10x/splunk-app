@@ -25,3 +25,29 @@ tenx_extraction_name = <string>
 
 tenx_extraction = <string>
 * transforms.conf stanza that extraction uses
+
+replay_max_sourcetypes = <non-negative integer>
+* At most this many original sourcetypes (indexed field tenx_sourcetype of compact events)
+  get their search-time fields replayed by the tenx-replay macro; the least busy are left out
+  and named in tenx_replay_command.log. 0 means no limit.
+* Default: 200
+
+replay_max_macro_chars = <non-negative integer>
+* Largest tenx-replay macro definition tenxreplay writes, in characters. Past it, source:: and
+  host:: rules are limited to those matching a source or host seen, then the least busy
+  original sourcetypes are left out. 0 means no limit.
+* Default: 262144
+
+replay_expire_days = <non-negative integer>
+* An original sourcetype that no compact event has carried for this many days loses its
+  replay at the next rebuild. 0 means never.
+* Default: 400
+
+field_narrowing = <boolean>
+* Whether a field comparison after `tx` (field=value, field IN (...)) narrows which compact
+  events are expanded. Needs the [tenx:narrowing] list in tenx_replay.conf, which tenxreplay
+  writes only while this is true and some compact event carries tenx_sourcetype. A field
+  whose value is not text of the event and that the list does not name (a rule defined only
+  in another app, or private to a user) can then make `tx` return fewer events than the same
+  search on raw events.
+* Default: false
