@@ -59,9 +59,8 @@ timestamp:
   zone: UTC
 ```
 
-Edit the values in place. Passing the same options on the command line, as
-`varMaxRecurIndexes 0`, stops the engine with `should be specified only once`, because
-these files already set them.
+With the shipped configuration, these arguments start the Receiver with these values.
+Setting them in these files instead works as well.
 
 ### Back-references
 

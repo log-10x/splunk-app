@@ -2,6 +2,8 @@
 
 Search-time expansion of 10x compact log events, for Splunk Enterprise 9.4 through 10.6. The package passes AppInspect's Splunk Cloud checks. 10x replaces repetitive patterns with compact template hashes, cutting stored volume while maintaining full searchability.
 
+Compact events and their template records come from the Receiver, the Log10x engine running beside a log forwarder such as Fluent Bit or Fluentd; [deploying the Receiver](https://doc.log10x.com/apps/receiver/deploy/) is described in the Log10x documentation.
+
 ## Table of Contents
 
 - [Overview](#overview)
@@ -31,7 +33,7 @@ Search-time expansion of 10x compact log events, for Splunk Enterprise 9.4 throu
 
 The app provides the infrastructure to:
 
-1. **Receive** template definitions from the 10x pipeline
+1. **Receive** template definitions from the Receiver
 2. **Store** parsed template data in a KV store for efficient lookup
 3. **Inflate** compact events back to their original form at search time
 4. **Search** compact data by what the lines say: the `tx` macro in front of an ordinary search, and classic dashboards unchanged
@@ -45,12 +47,12 @@ The app provides the infrastructure to:
 
 **10x compact form:**
 ```
-~abc123def,1705315845123,john_doe,TX-789012
+~abc123def,1705314645123,john_doe,TX-789012
 ```
 
 **Template stored in KV store:**
 ```
-$(epoch) INFO [main] com.example.Service - Processing request for user $ with transaction id $
+$(yyyy-MM-dd'T'HH:mm:ss.SSS'Z') INFO [main] com.example.Service - Processing request for user $ with transaction id $
 ```
 
 At search time, the `tenx-inflate` macro reconstructs the original event by combining the template with the variable values.
@@ -63,7 +65,7 @@ At search time, the `tenx-inflate` macro reconstructs the original event by comb
 
 ```
                                     +------------------+
-                                    |   10x Pipeline   |
+                                    |   10x Receiver   |
                                     +--------+---------+
                                              |
                      +-----------------------+------------------------+
@@ -197,9 +199,9 @@ The `tenx_dml` collection stores parsed template data with fields:
 
 ### Installation Steps
 
-1. **Copy the app to Splunk:**
+1. **Install the package file:**
    ```bash
-   cp -r tenx-for-splunk $SPLUNK_HOME/etc/apps/
+   $SPLUNK_HOME/bin/splunk install app tenx-for-splunk-<version>.tar.gz
    ```
 
 2. **Restart Splunk:**
@@ -377,7 +379,7 @@ their SPL. To cover another app's dashboards, copy the file into that app's
 - `tx` inside another subsearch (`append`, `join`) or wrapped in another macro cannot read
   its own words. It then expands every compact event in range and applies the words after,
   with a warning: the same result, more slowly.
-- A compact event is the event the 10x engine formed. Lines without a timestamp of their
+- A compact event is the event the Receiver formed. Lines without a timestamp of their
   own, such as the lines of a stack trace, join the line before them, so a stack trace is
   one event, a count counts events, and words joined with AND can match on different lines
   of one event.
@@ -490,6 +492,30 @@ To set it up:
 1. Give every compact event the indexed field `tenx_sourcetype` with its original sourcetype: in
    the HEC event's `fields`, for example `"fields": {"tenx_sourcetype": "XmlWinEventLog"}`, or with
    `_meta = tenx_sourcetype::XmlWinEventLog` in the `inputs.conf` stanza that reads a compact file.
+   With Fluent Bit as in the setup guide, the events the Receiver sends back arrive on Fluent Bit's
+   `forward` input with `Tag_Prefix tenx.`; for each source, a `modify` filter adds the field and
+   the `splunk` output sends it as an indexed field:
+
+   ```
+   [FILTER]
+       Name    modify
+       Match   tenx.<tag of the source>
+       Add     tenx_sourcetype XmlWinEventLog
+
+   [OUTPUT]
+       Name              splunk
+       Match             tenx.<tag of the source>
+       Host              <HEC host>
+       Port              8088
+       Splunk_Token      ${HEC_TOKEN}
+       TLS               On
+       event_index       <compact index>
+       event_sourcetype  tenx_encoded
+       event_key         $log
+       event_field       tenx_sourcetype $tenx_sourcetype
+   ```
+
+   Add `TLS.Verify Off` for an HTTP Event Collector with Splunk's default self-signed certificate.
 2. Install the add-on of each original sourcetype on the search head, as for raw data.
 3. Run `| tenxreplay` once, or wait for the **Rebuild Field Replay When New** saved search, which
    runs every five minutes. It writes the replay macros from the search head's own props for the
@@ -498,7 +524,7 @@ To set it up:
 
 A compact event without `tenx_sourcetype` is expanded and extracted exactly as by `tx`.
 
-Checked with the Windows, AWS and FortiGate add-ons against the same events indexed raw; the results are in the [listing's checks](../splunkbase/LISTING.md#checks-run-on-this-package).
+Checked with the Windows, AWS and FortiGate add-ons against the same events indexed raw; the results are in the [listing's checks](https://github.com/log-10x/splunk-app/blob/main/splunkbase/LISTING.md#checks-run-on-this-package).
 
 For FortiGate, the sender sets `tenx_sourcetype` to `fortigate_traffic`, `fortigate_utm`,
 `fortigate_event` or `fortigate_anomaly` by the line's `type=`.
@@ -513,7 +539,7 @@ time and supplies the date, so a compact FortiGate event's `_time` can fall on a
 
 ## Data Models and Detections: the Field Map
 
-Needs engine 1.1.180 or later.
+Needs the Receiver at release 1.1.180 or later.
 
 Data models, their accelerations, `tstats` and saved searches that do not use `tx` read the
 fields Splunk stored with an event. The field map writes a compact event's original fields while
@@ -534,14 +560,23 @@ source, through that Receiver: with the cap list on, an event of any template th
 arrives whole.
 
 1. Before compact events are sent, set the Receiver to compact only the templates a cap file lists.
-   In its `pipelines/run/receive/compact/config.yaml`, set `fieldNames` to `[templateHash]`
-   (`default: false` is the shipped value). Create the cap file with its header row, in a place the
-   Receiver reads and the host that runs `activate` and `check` can write, and add
-   `compactReceiverLookupFile /etc/tenx/win/compact-cap.csv` to the Receiver's command line:
+   In its configuration folder (`$TENX_CONFIG`), set `fieldNames` to `[templateHash]` in
+   `pipelines/run/receive/compact/config.yaml` (`default: false` is the shipped value). Create the
+   cap file with its header row, in a place the Receiver reads and the host that runs `activate`
+   and `check` can write:
 
    ```sh
    mkdir -p /etc/tenx/win
    printf 'pattern_hash,value\n' > /etc/tenx/win/compact-cap.csv
+   ```
+
+   The first row is a header; the Receiver matches the template hash against the first column,
+   whatever the header names it, and reads `true` or `false` from the second. Start the Receiver
+   with these arguments, which take the place of `receiverOptimize true` in the setup guide's
+   arguments:
+
+   ```
+   @run/input/forwarder/fluentbit @apps/receiver varMaxRecurIndexes 0 timestampZone UTC timestampMaxPerObject 1 compactReceiverLookupFile /etc/tenx/win/compact-cap.csv
    ```
 
    Every event arrives whole, with all its fields, until its template is listed.
@@ -575,11 +610,17 @@ arrives whole.
    search head (see [What to Install on Each Tier](#what-to-install-on-each-tier)), add
    `tenx_compact_st::tenx_win` to the `tenx-events` macro as `gen` printed, for example
    `index=* (sourcetype::tenx_encoded OR tenx_compact_st::tenx_win)`, and send the compact Windows
-   events with sourcetype `tenx_win`. Restart a standalone instance or heavy forwarder after the
+   events with sourcetype `tenx_win`: the Fluent Bit lines of
+   [Fields of the Original Sourcetype](#fields-of-the-original-sourcetype-txf), step 1, with
+   `event_sourcetype tenx_win`. Restart a standalone instance or heavy forwarder after the
    first install. On an indexer cluster, put both apps in `manager-apps` on the cluster manager and
    push the bundle; a new field map app reaches the peers without a restart.
 
-6. Prove the field map and list its templates:
+6. Create the probe index where the compact events are parsed: on a standalone instance or heavy
+   forwarder `curl -k -u admin https://localhost:8089/services/data/indexes -d name=tenx_probe`, on
+   an indexer cluster a `[tenx_probe]` stanza with `repFactor = auto` in an `indexes.conf` of the
+   cluster bundle. The HTTP Event Collector token in `TENX_PROBE_HEC_TOKEN` must allow the probe
+   index. Then prove the field map and list its templates:
 
    ```sh
    TENX_SPLUNKD_TOKEN=<token> TENX_PROBE_HEC_TOKEN=<HEC token> $SPLUNK_HOME/bin/splunk cmd python3 \
@@ -626,8 +667,11 @@ forwarders), give `activate` and `check` each node's HTTP Event Collector,
 writes its fields, and `check` empties the list when any node does not.
 
 **AWS CloudTrail** has a second Receiver with its own cap file, `/etc/tenx/cloudtrail/compact-cap.csv`,
-set up as in step 1. Steps 2, 3 and 5 are as for Windows Security, with the app `fm_cloudtrail`, the
-compact sourcetype `tenx_cloudtrail` and `tenx_compact_st::tenx_cloudtrail` in `tenx-events`. Step 4
+set up as in step 1, with `compactReceiverLookupFile /etc/tenx/cloudtrail/compact-cap.csv` in its
+arguments. Steps 2, 3 and 5 are as for Windows Security, with the app `fm_cloudtrail`, the compact
+sourcetype `tenx_cloudtrail` (`event_sourcetype tenx_cloudtrail` and
+`Add tenx_sourcetype aws:cloudtrail` in the Fluent Bit lines) and
+`tenx_compact_st::tenx_cloudtrail` in `tenx-events`. Step 4
 generates the map with the AWS add-on's time settings, so every compact event takes the raw event's
 `_time`:
 
@@ -663,7 +707,7 @@ push restarts the peers one by one. Splunk's default, 200, caps the indexed fiel
 shows on one event; 0 shows every field. Data model counts and detections through the map are the
 same at either value.
 
-Checked with the Windows and AWS add-ons against the same events indexed raw; the results are in the [listing's checks](../splunkbase/LISTING.md#checks-run-on-this-package).
+Checked with the Windows and AWS add-ons against the same events indexed raw; the results are in the [listing's checks](https://github.com/log-10x/splunk-app/blob/main/splunkbase/LISTING.md#checks-run-on-this-package).
 
 ## What to Install on Each Tier
 
@@ -687,9 +731,9 @@ them.
 
 ## Getting Started
 
-### Step 1: Configure Your 10x Pipeline
+### Step 1: Configure the Receiver
 
-Configure your 10x pipeline to output:
+Configure the Receiver and its forwarder to send:
 
 1. **Templates** to a Splunk HTTP Event Collector (HEC) or file input with:
    - Sourcetype: `tenx_dml_raw_json`
