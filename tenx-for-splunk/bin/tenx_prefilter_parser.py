@@ -324,7 +324,7 @@ def pieces_outside_times(text):
 	covered = time_spans(low)
 	pieces, buf, start = [], [], 0
 	for i, ch in enumerate(low):
-		if ch.isalnum() or ch == "*":
+		if ch not in SEGMENT_BREAKERS and not ch.isspace():
 			if not buf:
 				start = i
 			buf.append(ch)
