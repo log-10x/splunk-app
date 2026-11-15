@@ -459,7 +459,7 @@ def pieces_kept(text):
 	pieces, buf, start = [], [], 0
 	low = text.lower()
 	for i, ch in enumerate(low):
-		if ch.isalnum() or ch == "*":
+		if ch not in SEGMENT_BREAKERS and not ch.isspace():
 			if not buf:
 				start = i
 			buf.append(ch)
