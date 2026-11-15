@@ -22,6 +22,7 @@ import io
 import json
 import os
 import re
+import time
 
 import pytest
 
@@ -553,6 +554,13 @@ class TestGoldenWindows:
 		'--encoded', sample(*T4663 + ('encoded.log',)), '--raw', sample('samples', 'win_security_4663_redline.xml.log')]
 	FORMAT_ONLY = ['--eval-values', 'off', '--timestamp-values', 'epoch']
 
+	def test_verify_lookup_rules_every_field_of_both_samples(self):
+		# the lookup recipe writes what FORMAT cannot (quotes, line breaks, timestamps as written)
+		for argv, n in ((self.V662, 662), (self.V4663, 7649)):
+			result, f = run_verify(argv + ['--rules', 'lookup'])
+			assert result['compact_lines'] == result['expanded_equal_raw'] == result['events_all_fields_equal'] == n
+			assert result['transform_regex_did_not_match'] == 0 and f.skipped == {} and f.forms == {}
+
 	def test_verify_662_event_sample(self):
 		result, f = run_verify(self.V662)
 		assert result['compact_lines'] == result['expanded_equal_raw'] == 662
@@ -717,21 +725,131 @@ class TestWhatTxNeeds:
 
 
 # -------------------------------------------------------------------------------------------
+# --rules lookup: one static rule, one lookup row per template
+
+class TestLookupRules:
+	def records(self, tmp_path, items, name='templates.json'):
+		p = tmp_path / name
+		p.write_text(''.join(json.dumps({'templateHash': h, 'template': t}) + '\n' for h, t in items), encoding='utf-8')
+		return str(p)
+
+	def gen(self, tmp_path, items, out='fm_fw', *extra):
+		rc = fm.main(['gen', '--rules', 'lookup', '--records', self.records(tmp_path, items, out + '.json'), '--reader', 'kv',
+			'--sourcetype', 'tenx_fw', '--rename', 'fw:traffic', '--out', str(tmp_path / out)] + list(extra))
+		return rc, tmp_path / out
+
+	def test_adding_a_template_changes_only_the_lookup_file(self, tmp_path):
+		one = [('k1', 'time=$(HH:mm:ss) user=$ n=1')]
+		_, a = self.gen(tmp_path, one, 'a')
+		_, b = self.gen(tmp_path, one + [('k2', 'user=$ src=$ msg="a b"')], 'b')
+		for rel in ('default/props.conf', 'default/transforms.conf', 'default/fields.conf', 'default/app.conf'):
+			if os.path.exists(str(a / rel)):
+				assert read(str(a / rel)) == read(str(b / rel)), rel
+		la, lb = (fm.read_lookup_file(str(x / 'lookups' / 'tenx_fw_fields.csv.gz')) for x in (a, b))
+		assert sorted(la) == ['k1'] and sorted(lb) == ['k1', 'k2'] and la['k1'] == lb['k1']
+		props = read(str(a / 'default' / 'props.conf'))
+		assert 'TRANSFORMS-tenx_fw = tenx_fw_sourcetype, tenx_fw_fields_eval\n' in props
+		transforms = read(str(a / 'default' / 'transforms.conf'))
+		assert '[tenx_fw_fields]\nfilename = tenx_fw_fields.csv.gz\ncase_sensitive_match = true\n' in transforms
+
+	def test_the_lookup_file_is_the_same_bytes_for_the_same_rows(self, tmp_path):
+		items = [('k2', 'user=$'), ('k1', 'user=$ n=1')]
+		_, a = self.gen(tmp_path, items, 'a')
+		_, b = self.gen(tmp_path, list(reversed(items)), 'b')
+		pa, pb = (str(x / 'lookups' / 'tenx_fw_fields.csv.gz') for x in (a, b))
+		assert open(pa, 'rb').read() == open(pb, 'rb').read()
+		import gzip
+		text = gzip.open(pa, 'rt').read()
+		assert text.splitlines()[0] == 'hash,n,e,t,f' and [l.split(',')[0] for l in text.splitlines()[1:]] == ['k1', 'k2']
+
+	def test_a_lookup_file_over_the_limit_is_not_written(self, tmp_path, capsys):
+		rc, out = self.gen(tmp_path, [('k1', 'user=$')], 'fm_fw', '--lookup-max-bytes', '10')
+		assert rc == 2 and 'over --lookup-max-bytes' in capsys.readouterr().err and not os.path.exists(str(out))
+
+	def test_the_rule_looks_up_compact_events_only(self):
+		text = fm.lookup_eval_text('tenx_fw_fields')
+		assert text.startswith('$pd:tenx_fm_row$=if(substr(_raw, 1, 1)=="~", lookup("tenx_fw_fields", ')
+		# every intermediate value is a pd: key; only _meta is written
+		assert [e.split('=', 1)[0] for e in re.split(r', (?=\$pd:tenx_fm_\w+\$=|_meta=)', text)] == \
+			['$pd:tenx_fm_%s$' % k for k in ('row', 'f', 't', 'e', 'x', 'm')] + ['_meta']
+
+	def test_the_rule_cuts_its_regex_from_a_constant_without_escapes(self):
+		# an escape would change the constant's length once SPL reads the string
+		assert '\\' not in fm.LOOKUP_VALUE_GROUP and '"' not in fm.LOOKUP_VALUE_GROUP
+		text = fm.lookup_eval_text('t')
+		assert 'substr("%s", 1, %d * ' % (fm.LOOKUP_VALUE_GROUP * fm.LOOKUP_MAX_VALUES, len(fm.LOOKUP_VALUE_GROUP)) in text
+		spl = re.search(r'"(\^~\[\^,\[:cntrl:\]\]\*)" \. substr', text).group(1)
+		tail = re.search(r'"\[\|\]\(\[\^\|\[:cntrl:\]\]\*\)\[\|\]((?:\(\[\^\|\]\))+)\$"', text).group(1)
+		for n in (0, 1, 5):
+			regex = spl + fm.LOOKUP_VALUE_GROUP * n + (',?' if n == 0 else '') + '[|]([^|[:cntrl:]]*)[|]' + tail + '$'
+			assert regex.replace('[:cntrl:]', '\\x00-\\x1f\\x7f') == fm.lookup_line_regex(n)
+
+	def test_replace_reads_references_as_measured(self):
+		groups = ['ab', 'a', 'b']
+		assert fm.splunk_replace_expand('\\2\\1', groups) == 'ba'
+		assert fm.splunk_replace_expand('\\12', groups) == '\\12'
+		assert fm.splunk_replace_expand('x\\\\y', groups) == 'x\\\\y'
+		assert fm.splunk_replace_expand('\\U\\1$2&', groups) == '\\Ua$2&'
+		assert fm.splunk_replace_expand('\\0', groups) == 'ab'
+
+	def test_the_recipe_writes_backslashes_tabs_and_digits_after_a_value_by_reference(self):
+		n = 2
+		bs, tab, d4 = n + 2 + fm.LOOKUP_TAIL.index('\\'), n + 2 + fm.LOOKUP_TAIL.index('\t'), n + 2 + 4
+		assert fm.recipe_text([('text', 'C:\\x'), ('group', 1), ('text', '42a\t9')], n) == \
+			'C:\\%dx\\1\\%d\\%da\\%d\\%d' % (bs, d4, n + 2 + 2, tab, n + 2 + 9)
+		assert fm.meta_escape('a"b\\c') == 'a\\"b\\\\c'
+
+	def test_the_timestamp_as_written_and_the_value_count(self, tmp_path):
+		self.gen(tmp_path, [('k1', 'time=$(HH:mm:ss) user=$ n=7')])
+		args = fm.build_parser().parse_args(['verify', '--rules', 'lookup', '--records', str(tmp_path / 'fm_fw.json'),
+			'--reader', 'kv', '--sourcetype', 'tenx_fw', '--rename', 'fw:traffic', '--encoded', '/dev/null', '--raw', '/dev/null'])
+		_, _, field_map = fm._build(args)
+		[t] = field_map.transforms
+		assert (t.value_count, t.epoch, t.ts_format) == (2, True, '%H:%M:%S')
+		assert fm.apply_lookup_row(t, '~k1,1700000000123000000,root') == [('time', '22:13:20'), ('user', 'root'), ('n', '7')]
+		assert fm.apply_lookup_row(t, '~k1,1700000000123000000') is None
+
+	def test_a_line_of_two_lines_gets_no_fields(self):
+		t = fm.Transform('k', 's', '', '', 1, 1, (), 'user::"\\1" tenx_mapped::"1"', '', False)
+		assert fm.apply_lookup_row(t, '~k,root') == [('user', 'root')]
+		assert fm.apply_lookup_row(t, '~k,root\n~k,admin') is None
+
+	def test_quotes_backslashes_and_line_breaks_in_template_text(self):
+		reader = fm.XmlWindowsReader()
+		tpl = fm.Template(key='h', written_hash=' h', parts=[], part_0="<Event><System><EventID>",
+			terminator="</EventID></System><EventData><Data Name='CommandLine'>\"C:\\Program Files\\a.exe\" -n 3"
+			"</Data><Data Name='PrivilegeList'>SeA\n\t\tSeB</Data></EventData></Event>", timestamp_format='',
+			expand_unsafe='', pattern=None)
+		field_map = fm.FieldMap({'h': tpl}, reader, 'p', rules=fm.RULES_LOOKUP, mark=fm.MARK_FIELD)
+		[t] = field_map.transforms
+		pairs = dict(fm.apply_lookup_row(t, '~ h ,4688'))
+		assert pairs['EventID'] == '4688' and pairs['CommandLine'] == '"C:\\Program Files\\a.exe" -n 3'
+		assert pairs['PrivilegeList'] == 'SeA\n\t\tSeB'
+		assert '\t' not in t.recipe and '\n' not in t.recipe and field_map.skipped == {}
+
+
+# -------------------------------------------------------------------------------------------
 # The Receiver's compact cap file
 
 class FakeSplunkd(object):
 	"""
-	A management port in a thread, holding a loaded configuration as Splunk 10.4.3 does: GET
-	.../configs/conf-<conf> returns the stanzas of the folder loaded last (none at first), booleans as
-	digits; a POST (server/control/restart) loads the folder on disk. Every call is
-	recorded with the cap file's text at that moment.
+	A management port in a thread that behaves as Splunk 10.4.3 was measured to: GET
+	.../configs/conf-<conf> returns the stanzas of the app folder it holds (booleans as digits);
+	receivers/simple indexes each line as an event of the probe stream, with tenx_mapped when the
+	line's hash has a row in the lookup file as last read (refresh() rereads it from the folder, as
+	Splunk does every ingest_lookup_refresh_period_secs); search/jobs (oneshot) answers activate's probe
+	search from those events. Every call is recorded with the cap file's text at that moment.
 	"""
 
-	def __init__(self, on_disk, app_name, cap_file, loaded=None):
+	def __init__(self, on_disk, app_name, cap_file, loaded=True):
 		import http.server
 		import threading
-		self.on_disk, self.app_name, self.cap_file, self.loaded = on_disk, app_name, cap_file, loaded
-		self.calls = []
+		import urllib.parse as up
+		self.on_disk, self.app_name, self.cap_file = on_disk, app_name, cap_file
+		self.calls, self.events, self.rows = [], [], set()
+		self.loaded = on_disk if loaded else None
+		if loaded:
+			self.refresh()
 		outer = self
 
 		class Handler(http.server.BaseHTTPRequestHandler):
@@ -747,11 +865,25 @@ class FakeSplunkd(object):
 				self.wfile.write(body)
 
 			def do_POST(self):
-				self.rfile.read(int(self.headers.get('Content-Length') or 0))
-				path = self.path.split('?')[0]
-				outer.calls.append(('POST', path, read(outer.cap_file)))
-				outer.loaded = outer.on_disk
-				self._send({})
+				data = self.rfile.read(int(self.headers.get('Content-Length') or 0)).decode('utf-8')
+				path, _, query = self.path.partition('?')
+				outer.calls.append(('POST', path, read(outer.cap_file) if os.path.exists(outer.cap_file) else None))
+				if path == '/services/receivers/simple':
+					q = dict(up.parse_qsl(query))
+					for line in data.splitlines():
+						h = line[1:].split(',', 1)[0].strip()
+						outer.events.append(dict(q, raw=line, hash=h, mapped=h in outer.rows, t=time.time()))
+					self._send({})
+				elif path == '/services/search/jobs':
+					m = dict(up.parse_qsl(data))
+					assert m['exec_mode'] == 'oneshot' and 'host="%s"' % fm.PROBE_HOST in m['search']
+					res = {}
+					for e in outer.events:
+						if e['host'] == fm.PROBE_HOST and e['source'] == fm.PROBE_SOURCE:
+							res[e['hash']] = max(res.get(e['hash'], 0), int(e['mapped']))
+					self._send({'results': [{'tenx_fm_probe_h': h, 'm': str(v)} for h, v in res.items()]})
+				else:
+					self._send({})
 
 			def do_GET(self):
 				path = self.path.split('?')[0]
@@ -759,7 +891,6 @@ class FakeSplunkd(object):
 				entries = []
 				if '/conf-' in path and outer.loaded:
 					conf = path.rsplit('/conf-', 1)[1]
-					# REST returns a boolean setting as a digit
 					entries = [{'name': n, 'content': dict((k, '1' if v == 'true' else v) for k, v in c.items()),
 						'acl': {'app': outer.app_name}} for n, c in
 						fm.read_conf(os.path.join(outer.loaded, 'default', conf + '.conf')).items()]
@@ -768,6 +899,10 @@ class FakeSplunkd(object):
 		self.server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
 		self.url = 'http://127.0.0.1:%d' % self.server.server_address[1]
 		threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+	def refresh(self):
+		layout = fm.lookup_app(self.on_disk)
+		self.rows = set(fm.read_lookup_file(layout[1])) if layout else set()
 
 	def posts(self):
 		return [c for c in self.calls if c[0] == 'POST']
@@ -785,8 +920,15 @@ class TestCapFile:
 		return str(p)
 
 	def gen(self, tmp_path, hashes, cap, *extra):
-		return fm.main(['gen', '--records', self.records(tmp_path, hashes), '--reader', 'kv', '--sourcetype',
-			'tenx_fw', '--rename', 'fw:traffic', '--out', str(tmp_path / 'fm_fw'), '--cap-file', str(cap)] + list(extra))
+		return fm.main(['gen', '--rules', 'lookup', '--records', self.records(tmp_path, hashes), '--reader', 'kv',
+			'--sourcetype', 'tenx_fw', '--rename', 'fw:traffic', '--out', str(tmp_path / 'fm_fw'), '--cap-file', str(cap)]
+			+ list(extra))
+
+	def activate(self, tmp_path, cap, fake, **kw):
+		out = io.StringIO()
+		kw.setdefault('probe_index', 'probes')
+		rc = fm.activate(str(tmp_path / 'fm_fw'), str(cap), fm.Splunkd(fake.url), out=out, sleep=lambda s: None, **kw)
+		return rc, out.getvalue()
 
 	def test_rows_quote_every_hash_keep_outer_spaces_and_sort(self):
 		assert fm.cap_text({'b', '#a b ', 'x"y'}, [('c', 'false')]) == \
@@ -798,6 +940,13 @@ class TestCapFile:
 		p.write_text(fm.cap_text({'#a b ', 'x"y', ' lead'}), encoding='utf-8')
 		with open(str(p), encoding='utf-8', newline='') as f:
 			assert sorted(r[0] for r in list(csv.reader(f))[1:]) == [' lead', '#a b ', 'x"y']
+
+	def test_the_cap_file_needs_the_lookup_rules(self, tmp_path, capsys):
+		cap = tmp_path / 'compact-cap.csv'
+		rc = fm.main(['gen', '--records', self.records(tmp_path, ['k1']), '--reader', 'kv', '--sourcetype', 'tenx_fw',
+			'--rename', 'fw:traffic', '--out', str(tmp_path / 'fm_fw'), '--cap-file', str(cap)])
+		assert rc == 2 and 'needs --rules lookup' in capsys.readouterr().err
+		assert not os.path.exists(str(cap)) and not os.path.exists(str(tmp_path / 'fm_fw'))
 
 	def test_gen_writes_only_the_header_and_a_pending_list(self, tmp_path):
 		cap = tmp_path / 'policy' / 'compact-cap.csv'
@@ -849,58 +998,102 @@ class TestCapFile:
 		[t] = fm.load_templates(str(p))
 		assert t.key == 'h' and t.written_hash == ' h'
 
-	def test_activate_restarts_checks_then_lists(self, tmp_path, monkeypatch):
+	def test_activate_lists_a_template_only_once_its_probe_event_has_fields(self, tmp_path):
 		cap = tmp_path / 'compact-cap.csv'
-		assert self.gen(tmp_path, ['k1', 'k2'], cap) == 0
-		app = str(tmp_path / 'fm_fw')
-		fake = FakeSplunkd(app, 'fm_fw', str(cap))
-		monkeypatch.setattr(fm.time, 'sleep', lambda s: None)
+		os.makedirs(str(tmp_path / 'old'))
+		assert self.gen(tmp_path / 'old', ['k1'], tmp_path / 'old' / 'cap.csv') == 0
+		assert self.gen(tmp_path, ['k1', 'k2 '], cap) == 0
+		# the instance still holds the lookup file of the earlier run (k1 only)
+		fake = FakeSplunkd(str(tmp_path / 'old' / 'fm_fw'), 'fm_fw', str(cap))
 		try:
-			assert fm.activate(app, str(cap), fm.Splunkd(fake.url), out=io.StringIO()) == 0
+			rc, out = self.activate(tmp_path, cap, fake, timeout=0)
+			assert rc == 1 and read(str(cap)) == 'pattern_hash,value\n"k1",true\n'
+			assert os.path.exists(str(cap) + '.pending') and "not yet: 'k2 '" in out
+			# the instance rereads the file: k2's probe now has fields
+			fake.on_disk = str(tmp_path / 'fm_fw')
+			fake.refresh()
+			rc, out = self.activate(tmp_path, cap, fake, timeout=0)
 		finally:
 			fake.close()
-		# the restart came first, while the cap file still listed nothing; then the check
-		assert fake.posts() == [('POST', fm.RESTART_ENDPOINT, 'pattern_hash,value\n')]
-		assert [c[1].rsplit('/', 1)[1] for c in fake.calls if c[0] == 'GET'][-2:] == ['conf-transforms', 'conf-props']
-		assert read(str(cap)) == 'pattern_hash,value\n"k1",true\n"k2",true\n'
+		assert rc == 0 and read(str(cap)) == 'pattern_hash,value\n"k1",true\n"k2 ",true\n'
 		assert not os.path.exists(str(cap) + '.pending')
+		# nothing restarted or reloaded: the only POSTs are events and searches
+		assert set(c[1] for c in fake.posts()) == {'/services/receivers/simple', '/services/search/jobs'}
+		# each run opens the probe stream with the heartbeat, then probes in the template's own shape
+		probes = [e for e in fake.events if e['raw'] != fm.HEARTBEAT_LINE]
+		assert fake.events[0]['raw'] == fm.HEARTBEAT_LINE and probes[0]['raw'].startswith('~k1,')
+		assert all(e['host'] == fm.PROBE_HOST and e['source'] == fm.PROBE_SOURCE and e['index'] == 'probes'
+			and e['sourcetype'] == 'tenx_fw' for e in fake.events)
+		assert [e['raw'].split(',')[0] for e in probes][-1] == '~k2 ' and probes[-1]['mapped']
+		# value 0 is the timestamp (19 digits), the other values are the word probe
+		assert re.fullmatch(r'~k2 ,\d{19},probe', probes[-1]['raw'])
 
-	def test_no_restart_when_nothing_is_added(self, tmp_path):
+	def test_while_the_file_is_not_read_one_template_stands_for_all(self, tmp_path):
+		cap = tmp_path / 'compact-cap.csv'
+		assert self.gen(tmp_path, ['k1', 'k2', 'k3'], cap) == 0
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		fake.rows = set()
+		clock = iter(range(0, 1000, 10))
+		try:
+			rc, _ = self.activate(tmp_path, cap, fake, timeout=25, clock=lambda: next(clock))
+		finally:
+			fake.close()
+		probes = [e for e in fake.events if e['raw'] != fm.HEARTBEAT_LINE]
+		assert rc == 1 and set(e['hash'] for e in probes) == {'k1'} and read(str(cap)) == 'pattern_hash,value\n'
+
+	def test_removals_need_no_probe(self, tmp_path):
 		cap = tmp_path / 'compact-cap.csv'
 		cap.write_text('pattern_hash,value\n"gone",true\n"k1",true\n', encoding='utf-8')
 		assert self.gen(tmp_path, ['k1'], cap) == 0
-		app = str(tmp_path / 'fm_fw')
-		fake = FakeSplunkd(app, 'fm_fw', str(cap), loaded=app)
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
 		try:
-			assert fm.activate(app, str(cap), fm.Splunkd(fake.url), out=io.StringIO()) == 0
+			assert self.activate(tmp_path, cap, fake, probe_index=None)[0] == 0
 		finally:
 			fake.close()
 		assert fake.posts() == [] and read(str(cap)) == 'pattern_hash,value\n"k1",true\n'
 
-	def test_activate_leaves_the_list_when_the_instance_does_not_load_the_app(self, tmp_path, monkeypatch):
+	def test_activate_leaves_the_list_when_the_instance_does_not_hold_the_rule(self, tmp_path):
 		cap = tmp_path / 'compact-cap.csv'
-		assert self.gen(tmp_path, ['k1', 'k2'], cap) == 0
-		# the instance's folder holds the app of an earlier run, with k1 only
-		os.makedirs(str(tmp_path / 'old'))
-		assert self.gen(tmp_path / 'old', ['k1'], tmp_path / 'old' / 'cap.csv') == 0
-		fake = FakeSplunkd(str(tmp_path / 'old' / 'fm_fw'), 'fm_fw', str(cap))
-		monkeypatch.setattr(fm.time, 'sleep', lambda s: None)
+		assert self.gen(tmp_path, ['k1'], cap) == 0
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap), loaded=False)
 		try:
-			out = io.StringIO()
-			assert fm.activate(str(tmp_path / 'fm_fw'), str(cap), fm.Splunkd(fake.url), out=out) == 1
+			rc, out = self.activate(tmp_path, cap, fake)
 		finally:
 			fake.close()
-		assert 'does not hold app fm_fw' in out.getvalue()
-		assert read(str(cap)) == 'pattern_hash,value\n'
-		assert os.path.exists(str(cap) + '.pending')
+		assert rc == 1 and 'does not hold app fm_fw' in out and fake.events == []
+		assert read(str(cap)) == 'pattern_hash,value\n' and os.path.exists(str(cap) + '.pending')
+
+	def test_activate_needs_a_probe_index_to_add(self, tmp_path):
+		cap = tmp_path / 'compact-cap.csv'
+		assert self.gen(tmp_path, ['k1'], cap) == 0
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		try:
+			rc, out = self.activate(tmp_path, cap, fake, probe_index=None)
+		finally:
+			fake.close()
+		assert rc == 1 and '--probe-index' in out and read(str(cap)) == 'pattern_hash,value\n'
+
+	def test_activate_refuses_per_template_transforms(self, tmp_path):
+		generate(tmp_path, 'fm_fw', ['--records', self.records(tmp_path, ['k1']), '--reader', 'kv', '--sourcetype', 'tenx_fw',
+			'--rename', 'fw:traffic'])
+		cap = tmp_path / 'compact-cap.csv'
+		cap.write_text('pattern_hash,value\n', encoding='utf-8')
+		(tmp_path / 'compact-cap.csv.pending').write_text('pattern_hash,value\n"k1",true\n', encoding='utf-8')
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		try:
+			rc, out = self.activate(tmp_path, cap, fake)
+		finally:
+			fake.close()
+		assert rc == 1 and 'only after a restart' in out and fake.posts() == []
 
 	def test_gen_with_splunkd_activates_the_app_it_wrote(self, tmp_path, monkeypatch):
 		cap = tmp_path / 'compact-cap.csv'
+		assert self.gen(tmp_path, ['k1'], cap) == 0
 		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
 		monkeypatch.setenv('TENX_SPLUNKD_AUTH', 'admin:x')
 		monkeypatch.setattr(fm.time, 'sleep', lambda s: None)
 		try:
-			assert self.gen(tmp_path, ['k1'], cap, '--splunkd', fake.url) == 0
+			assert self.gen(tmp_path, ['k1'], cap, '--splunkd', fake.url, '--probe-index', 'probes') == 0
 		finally:
 			fake.close()
 		assert fake.posts()[0][2] == 'pattern_hash,value\n'

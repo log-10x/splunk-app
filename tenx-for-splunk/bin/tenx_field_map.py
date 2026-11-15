@@ -109,12 +109,15 @@ Usage
     tenx_field_map.py gen --records <kv_rows.json | templates.json> [--records ...]
         --target windows-security | <target.json> [--sourcetype ...] [--rename ...] --out <app dir>
     tenx_field_map.py verify --records ... --target ... --encoded <encoded.log> --raw <raw.log>
-    tenx_field_map.py gen ... --cap-file <compact cap file> [--splunkd <management URL>]
-    tenx_field_map.py activate --app <app dir> --cap-file <compact cap file> --splunkd <management URL>
+    tenx_field_map.py gen --rules lookup ... --cap-file <compact cap file> [--splunkd <management URL> --probe-index <index>]
+    tenx_field_map.py activate --app <app dir> --cap-file <compact cap file> --splunkd <management URL> --probe-index <index>
 
-`--cap-file` keeps the Receiver's compact cap file to the templates whose transform is active where
-the data is parsed, so an event goes compact only once its fields can be written (see "The engine's
-compact cap file" below).
+`--rules lookup` writes one static index-time rule per compact sourcetype and one row per template in
+lookups/<prefix>_fields.csv.gz, so a template added later changes only that file, which Splunk rereads
+on its own, with no reload and no restart, for streams that are already sending (see "Lookup rules"
+below). `--cap-file` keeps the Receiver's compact cap file to the templates whose row Splunk was seen to
+apply, so an event goes compact only once its fields can be written (see "The engine's compact cap
+file" below); it needs `--rules lookup`.
 
 Standard library only.
 """
@@ -216,6 +219,28 @@ HASH_REGEX = '^~(?<tenx_hash>[^,]+)(?:,(?<tenx_var_0>[^,]+)(?:,(?<tenx_vars>.*))
 # re.escape's set of escaped characters on Python 3.7 and later, written out so the generated
 # REGEX does not depend on the interpreter, plus "/" (escaped by the first generator as well).
 _REGEX_SPECIAL = frozenset('()[]{}?*+-|^$\\.&~# \t\n\r\v\f/')
+
+# --rules lookup (see "Lookup rules" below).
+RULES_TRANSFORMS = 'transforms'
+RULES_LOOKUP = 'lookup'
+# Values a template may have for the static rule: its regex is cut from LOOKUP_VALUE_GROUP repeated
+# this many times, and with the 15 groups that follow the values no reference passes 255 (Splunk
+# Enterprise 10.4.3: replace() with 255 groups and three-digit references gave every value).
+LOOKUP_MAX_VALUES = 240
+# One value: the rule's regex (PCRE) and this module's reading of it (Python re, which has no POSIX
+# classes). [:cntrl:] keeps a line break out of a value, so text of two lines gets no fields, and needs
+# no backslash: the rule cuts its regex from a string constant by length, which an escape would change.
+LOOKUP_VALUE_GROUP = ',([^,[:cntrl:]]*)'
+LOOKUP_VALUE_GROUP_PY = ',([^,\\x00-\\x1f\\x7f]*)'
+# Appended to the compact line, after "|<timestamp text>|", so the replacement can write these
+# characters by reference instead of as text: replace() reads a backslash followed by digits as a
+# reference (greedily), so a literal backslash, and a digit right after a reference, would be read wrong.
+LOOKUP_TAIL = '0123456789\\\t\n\r'
+LOOKUP_COLUMNS = ('hash', 'n', 'e', 't', 'f')
+# The file must stay under limits.conf [lookup] ingest_max_memtable_bytes (default 10485760): above it
+# lookup() fails at index time and Splunk drops the event (see "Lookup rules").
+LOOKUP_DEFAULT_MAX_BYTES = 10000000
+REFUSED_TOO_MANY = "more values than the lookup rule takes (%d)"
 
 WINDOWS_WILDCARD_FIELDS = ('object_file_path', 'object_path', 'object_file_name', 'ObjectName', 'ObjectType',
 	'process_path', 'process_name', 'ProcessName', 'file_path', 'file_name')
@@ -814,7 +839,230 @@ def stanza_name(prefix, position, key, style):
 
 
 # evals: the fields of the template INGEST_EVAL writes, as (name, form, capture groups the form reads).
-Transform = collections.namedtuple('Transform', 'key stanza regex format fields value_count evals', defaults=((),))
+# recipe, ts_format, epoch: --rules lookup only (the lookup row; see "Lookup rules").
+Transform = collections.namedtuple('Transform', 'key stanza regex format fields value_count evals recipe ts_format epoch',
+	defaults=((), '', '', False))
+
+
+# ---------------------------------------------------------------------------------------------
+# Lookup rules
+#
+# With --rules lookup the app holds one static index-time rule per compact sourcetype, and the
+# per-template data sits in a lookup file the rule reads with lookup(). Adding a template changes
+# only that file: Splunk rereads a lookup used by lookup() at index time every
+# ingest_lookup_refresh_period_secs (limits.conf [lookup], default 60), with no reload and no
+# restart, and a stream that is already sending uses the new rows (Splunk Enterprise 10.4.3: a row
+# added by a rename reached a running HEC stream 38 s later). Per-template transforms reach such a
+# stream only after a restart.
+#
+# The rule (lookup_eval_text): for an event whose text starts with "~", look up the trimmed hash,
+# getting n (values), t (timestamp format, or empty) and f (the recipe); render the timestamp as text
+# when t is set; then one replace() on
+#     <compact line>|<timestamp text>|0123456789\<tab><line feed><carriage return>
+# with the regex "^~[^,[:cntrl:]]*" + ",([^,[:cntrl:]]*)" * n + "[|]([^|[:cntrl:]]*)[|]" + "([^|])" * 14 + "$" and the
+# recipe as the replacement. The result is index-time field text, name::"value" pairs as WRITE_META
+# writes them, which the rule appends to _meta. A compact line that does not have n values leaves the
+# text unchanged and gets nothing. replace() reads "\<digits>" as a reference to that group when it
+# exists and leaves it as text when it does not; any other backslash is text (10.4.3, measured at
+# search and index time alike). So the recipe refers to group k for value k-1, n+1 for the timestamp
+# text, n+2..n+11 for a digit right after a reference, n+12 for a backslash and n+13..n+15 for tab,
+# line feed and carriage return; it holds no other backslash. In the field text a value's backslash is
+# written "\\" and its double quote "\"" (how Splunk writes them itself), and a line break inside a
+# value reads back as a space, as for an INGEST_EVAL field.
+#
+# If the lookup file is missing, or larger than limits.conf ingest_max_memtable_bytes (default
+# 10485760), lookup() fails at index time and Splunk drops the event (10.4.3: "Runtime exception in
+# pipeline=typing processor=regexreplacement error='Invalid function argument'", 0 of 6 and 0 of 22
+# events indexed). The rule calls lookup() for compact events only, so whole events are kept; the file
+# is gzipped (the limit counts the file: 20,001 rows of 27.8 MB as a 0.63 MB .csv.gz worked), written
+# by a rename so it always exists, and gen refuses to write one over --lookup-max-bytes.
+
+def lookup_stanza(target):
+	return '%s_fields' % target['transform_prefix']
+
+
+def lookup_eval_stanza(target):
+	return '%s_fields_eval' % target['transform_prefix']
+
+
+def lookup_file_name(target):
+	return '%s_fields.csv.gz' % target['transform_prefix']
+
+
+def lookup_line_regex(n):
+	"""The regex the rule builds for a template of n values (Python and PCRE read it alike)."""
+	return ('^~[^,\\x00-\\x1f\\x7f]*' + LOOKUP_VALUE_GROUP_PY * n + (',?' if n == 0 else '')
+		+ '[|]([^|\\x00-\\x1f\\x7f]*)[|]' + '([^|])' * len(LOOKUP_TAIL) + '$')
+
+
+def _tail_group(n, c):
+	return n + 2 + LOOKUP_TAIL.index(c)
+
+
+def recipe_text(pieces, n):
+	"""
+	pieces: ('text', s) or ('group', k). The replacement text for replace(): text as written, except a
+	backslash, tab, line feed or carriage return, and an ASCII digit right after a reference, which
+	refer to their group of the tail.
+	"""
+	out = []
+	after_ref = False
+	for kind, v in pieces:
+		if kind == 'group':
+			out.append('\\%d' % v)
+			after_ref = True
+			continue
+		for c in v:
+			if c in '\\\t\n\r' or (after_ref and c in '0123456789'):
+				out.append('\\%d' % _tail_group(n, c))
+				after_ref = True
+			else:
+				out.append(c)
+				after_ref = False
+	return ''.join(out)
+
+
+def meta_escape(text):
+	"""A value's text inside the quotes of index-time field text."""
+	return text.replace('\\', '\\\\').replace('"', '\\"')
+
+
+def splunk_replace_expand(replacement, groups):
+	"""
+	replace()'s reading of a replacement, as measured on Splunk 10.4.3: a backslash and the digits that
+	follow it name a group, which is written when it exists (groups[0] is the whole match), and the
+	text is kept as written when it does not; every other character is text.
+	"""
+	out, i = [], 0
+	while i < len(replacement):
+		c = replacement[i]
+		if c == '\\' and i + 1 < len(replacement) and replacement[i + 1] in '0123456789':
+			j = i + 1
+			while j < len(replacement) and replacement[j] in '0123456789':
+				j += 1
+			k = int(replacement[i + 1:j])
+			out.append((groups[k] or '') if k < len(groups) else replacement[i:j])
+			i = j
+			continue
+		out.append(c)
+		i += 1
+	return ''.join(out)
+
+
+_META_PAIR = re.compile(r'(\S+?)::"((?:[^"\\]|\\.)*)"')
+
+
+def parse_meta(text):
+	"""(name, value) pairs of index-time field text name::"value", with \\ and \" read back."""
+	return [(m.group(1), re.sub(r'\\(["\\])', r'\1', m.group(2))) for m in _META_PAIR.finditer(text)]
+
+
+_TS_TIME_TOKENS = ('%H', '%-H', '%I', '%-I', '%M', '%-M', '%S', '%-S', '%p', '%Z', '%z', '%:z', '%:::z')
+
+
+def lookup_ts_supported(fmt):
+	"""True when the rule renders this timestamp format: the directives spl_timestamp renders, %1Q to %9Q
+	for the fraction, no '%%', and no '|' or line break in the text."""
+	if fmt == tenx_dml_builder.EPOCH_PASSTHROUGH:
+		return True
+	if '%%' in fmt or '|' in fmt or '\n' in fmt or '\r' in fmt:
+		return False
+	for m in _TS_TOKEN.finditer(fmt):
+		tok = m.group(0)
+		if not tok.startswith('%'):
+			continue
+		if tok in _TS_DATE or tok in _TS_TIME_TOKENS or re.fullmatch(r'%[1-9]Q', tok):
+			continue
+		return False
+	return True
+
+
+def lookup_eval_text(lookup_def):
+	"""The static INGEST_EVAL of --rules lookup (see "Lookup rules"). Every intermediate value sits in a
+	pd: key, which is not indexed."""
+	row, f, t, e, x, m = ('$pd:tenx_fm_%s$' % k for k in ('row', 'f', 't', 'e', 'x', 'm'))
+	n = 'tonumber(json_extract(%s, "n"))' % row
+	sec = 'tonumber(substr(%s, 1, 10))' % e
+	sod = '(%s - floor(%s / 86400) * 86400)' % (sec, sec)
+	noon = '(%s - %s + 43200)' % (sec, sod)
+	tz = 'strftime(%s, "%%z")' % noon
+	utc = '(%s - if(substr(%s, 1, 1) == "-", -1, 1) * (tonumber(substr(%s, 2, 2)) * 3600 + tonumber(substr(%s, 4, 2)) * 60))' % (
+		noon, tz, tz, tz)
+	hour = 'floor(%s / 3600)' % sod
+	minute = 'floor((%s %% 3600) / 60)' % sod
+	second = '(%s %% 60)' % sod
+	hour12 = 'if(%s %% 12 == 0, 12, %s %% 12)' % (hour, hour)
+
+	def two(v):
+		return 'substr("0" . %s, -2)' % v
+
+	pieces = [('%:::z', '"+00"'), ('%:z', '"+00:00"'), ('%z', '"+0000"'), ('%Z', '"UTC"'), ('%-H', 'tostring(%s)' % hour),
+		('%H', two(hour)), ('%-I', 'tostring(%s)' % hour12), ('%I', two(hour12)), ('%-M', 'tostring(%s)' % minute),
+		('%M', two(minute)), ('%-S', 'tostring(%s)' % second), ('%S', two(second)), ('%p', 'if(%s < 12, "AM", "PM")' % hour)]
+	pieces += [('%%%dQ' % k, 'substr(%s . "000000000", 11, %d)' % (e, k)) for k in range(1, 10)]
+	fmt = t
+	for token, expr in pieces:
+		fmt = 'replace(%s, "%s", %s)' % (fmt, token, expr)
+	ts = 'if(len(%s) > 0, strftime(%s, %s), "")' % (t, utc, fmt)
+	regex = '"^~[^,[:cntrl:]]*" . substr("%s", 1, %d * %s) . if(%s == 0, ",?", "") . "[|]([^|[:cntrl:]]*)[|]%s$"' % (
+		LOOKUP_VALUE_GROUP * LOOKUP_MAX_VALUES, len(LOOKUP_VALUE_GROUP), n, n, '([^|])' * len(LOOKUP_TAIL))
+	tail = '"|0123456789" . urldecode("%5C%09%0A%0D")'
+	exprs = [
+		'%s=if(substr(_raw, 1, 1)=="~", lookup("%s", json_object("hash", trim(replace(_raw, "(?s)^~([^,]*).*$", "\\1"))), '
+		'json_array("n", "t", "f")), null())' % (row, lookup_def),
+		'%s=json_extract(%s, "f")' % (f, row),
+		'%s=json_extract(%s, "t")' % (t, row),
+		'%s=if(len(%s) > 0, replace(_raw, "^~[^,]*,([^,|]*).*$", "\\1"), "")' % (e, t),
+		'%s=if(isnull(%s), null(), _raw . "|" . %s . %s)' % (x, f, ts, tail),
+		'%s=if(isnull(%s), null(), replace(%s, %s, %s))' % (m, x, x, regex, f),
+		'_meta=if(isnull(%s) OR %s==%s, _meta, _meta . " " . %s)' % (m, m, x, m),
+	]
+	return ', '.join(exprs)
+
+
+def lookup_rows(field_map, templates):
+	"""The rows of the lookup file, sorted by hash: hash (trimmed), n, e (1 when value 0 is the
+	timestamp), t (the format the rule renders, or empty), f (the recipe)."""
+	return [(t.key, str(t.value_count), '1' if t.epoch else '0', t.ts_format, t.recipe)
+		for t in sorted(field_map.transforms, key=lambda t: t.key)]
+
+
+def lookup_file_bytes(rows):
+	"""The gzipped CSV, byte for byte the same for the same rows (no time in the gzip header)."""
+	import gzip
+	import io
+	buf = io.StringIO(newline='')
+	w = csv.writer(buf, lineterminator='\n')
+	w.writerow(LOOKUP_COLUMNS)
+	w.writerows(rows)
+	return gzip.compress(buf.getvalue().encode('utf-8'), mtime=0)
+
+
+def read_lookup_file(path):
+	"""hash -> row dict of a lookup file gen wrote."""
+	import gzip
+	with gzip.open(path, 'rt', encoding='utf-8', newline='') as f:
+		return dict((r['hash'], r) for r in csv.DictReader(f))
+
+
+def apply_lookup_row(transform, compact_line):
+	"""
+	The pairs the static rule writes for one compact line with this template's row, as Splunk was
+	measured to read the regex and the replacement; None when the line does not have its n values.
+	"""
+	head = re.match(r'^~?([^,]*)', compact_line)
+	if head is None:
+		return None
+	ts = ''
+	if transform.ts_format:
+		v0 = re.match(r'^~[^,]*,([^,|]*)', compact_line)
+		ts = format_timestamp(v0.group(1), transform.ts_format) if v0 else ''
+	subject = compact_line + '|' + ts + '|' + LOOKUP_TAIL
+	m = re.match(lookup_line_regex(transform.value_count), subject)
+	if m is None:
+		return None
+	text = splunk_replace_expand(transform.recipe, [m.group(0)] + list(m.groups()))
+	return [(n, v) for n, v in parse_meta(text) if n != MARK_FIELD]
 
 
 class FieldMap(object):
@@ -824,8 +1072,13 @@ class FieldMap(object):
 
 	def __init__(self, templates, reader, prefix, stanza_names='indexed', hash_match='tolerant',
 			timestamp_values='epoch', keep=None, refused=None, mixed_names=False, trim_values=None,
-			reserved_names='skip', reserved_prefix='extracted_', mark=None, eval_values=False):
+			reserved_names='skip', reserved_prefix='extracted_', mark=None, eval_values=False, rules=RULES_TRANSFORMS):
 		self.reader = reader
+		# transforms: one REGEX/FORMAT transform per template (and the INGEST_EVAL above); lookup: one row
+		# of the lookup file per template for the static rule (see "Lookup rules"). The lookup recipe
+		# writes every value FORMAT cannot, so eval_values does not apply to it.
+		self.rules = rules
+		self.mixed_names_on = mixed_names
 		# Values FORMAT cannot write, and with timestamp_values 'text' the timestamp as the event
 		# wrote it, go to one INGEST_EVAL transform (see ingest_eval_text). Off: left out as before.
 		self.eval_values = eval_values
@@ -848,8 +1101,8 @@ class FieldMap(object):
 		# never holds one), so trimming the marked text trims the value Splunk would see.
 		self.trim_values = reader.trims_values if trim_values is None else trim_values
 		# With INGEST_EVAL on, line breaks at the ends go too (TRIM_CHARS); off, spaces and tabs only,
-		# as the first generated files had it.
-		self.trim_chars = TRIM_CHARS if eval_values else ' \t'
+		# as the first generated files had it. The lookup recipe writes line breaks, so it trims as eval on.
+		self.trim_chars = TRIM_CHARS if (eval_values or rules == RULES_LOOKUP) else ' \t'
 		self.transforms = []
 		self.refused = dict(refused or {})
 		self.skipped = collections.Counter()
@@ -893,6 +1146,12 @@ class FieldMap(object):
 				raise ValueError('stanza name %s is the same for hashes %r and %r; use --stanza-names indexed'
 					% (stanza, seen_stanzas[stanza], key))
 			seen_stanzas[stanza] = key
+
+			if rules == RULES_LOOKUP:
+				row = self._lookup_row(t, key, stanza, text, n)
+				if row is not None:
+					self.transforms.append(row)
+				continue
 
 			tokens = []
 			evals = []
@@ -956,6 +1215,89 @@ class FieldMap(object):
 				tokens.append('%s::"1"' % self.mark)
 			self.transforms.append(Transform(key, stanza, compact_line_regex(key, n, hash_match), ' '.join(tokens),
 				fields, n, tuple(evals)))
+
+	def _lookup_row(self, t, key, stanza, text, n):
+		"""
+		The lookup row of one template (a Transform with recipe, ts_format and epoch), or None with the
+		reason in self.refused. Pairs are chosen as for FORMAT, but every value is written: a quote, a
+		backslash, a line break or a digit after a value need no INGEST_EVAL here.
+		"""
+		if n > LOOKUP_MAX_VALUES:
+			self.refused[key] = REFUSED_TOO_MANY % LOOKUP_MAX_VALUES
+			return None
+		fmt = t.timestamp_format
+		ts_text = False
+		pieces = []
+		fields = 0
+
+		def groups_of(expr, ts_group):
+			out = []
+			for piece in MARK_SPLIT.split(expr):
+				m = MARK_RE.fullmatch(piece)
+				if m is None:
+					if piece:
+						out.append(('text', piece))
+				elif int(m.group(1)) == 0 and ts_group:
+					out.append(('group', n + 1))
+				else:
+					out.append(('group', int(m.group(1)) + 1))
+			return out
+
+		for name_expr, value_expr in self.reader.pairs(text):
+			name, why = to_format(name_expr, True, self.reader.field_name, self.mixed_names_on)
+			if name is None:
+				self._skip(key, stanza, 'name: ' + why, name_expr)
+				continue
+			if self.trim_values:
+				value_expr = value_expr.strip(self.trim_chars)
+			if UNDECODABLE in value_expr:
+				self._skip(key, stanza, 'value: ' + WHY_SPLIT_ESCAPE, name_expr)
+				continue
+			if value_expr == '':
+				continue
+			carries_ts = bool(fmt) and (MARK % 0) in value_expr
+			as_text = False
+			if carries_ts:
+				if self.timestamp_values == 'skip':
+					self._skip(key, stanza, 'value: ' + WHY_TIMESTAMP, name_expr)
+					continue
+				if self.timestamp_values == 'text' and fmt != tenx_dml_builder.EPOCH_PASSTHROUGH:
+					if not lookup_ts_supported(fmt):
+						self._skip(key, stanza, 'value: ' + WHY_EVAL_FORMAT, name_expr)
+						continue
+					as_text = True
+				elif self.timestamp_values == 'epoch':
+					self.timestamp_fields[_shown(name_expr)] += 1
+					self.explained[key].append(name_expr)
+			literal_name = '$' not in name
+			if literal_name and reserved_name(name):
+				self.reserved[name] += 1
+				if self.reserved_names == 'skip':
+					self._skip(key, stanza, 'name: ' + WHY_RESERVED, name_expr)
+					continue
+				self.explained[key].extend([name_expr, self.reserved_prefix + name_expr])
+				name = self.reserved_prefix + name
+				name_expr = self.reserved_prefix + name_expr
+			value = [(k, meta_escape(v) if k == 'text' else v) for k, v in groups_of(value_expr, as_text)]
+			if pieces:
+				pieces.append(('text', ' '))
+			pieces += groups_of(name_expr, False) + [('text', '::"')] + value + [('text', '"')]
+			fields += 1
+			ts_text = ts_text or as_text
+			if as_text:
+				self.timestamp_text_fields[name] += 1
+			if literal_name:
+				self.literal_names[name] += 1
+			elif not name.startswith('$'):
+				self.mixed_names[name] += 1
+
+		if not pieces:
+			self.refused[key] = REFUSED_NO_FIELDS
+			return None
+		if self.mark:
+			pieces.append(('text', ' %s::"1"' % self.mark))
+		return Transform(key, stanza, '', '', fields, n, (), recipe_text(pieces, n), fmt if ts_text else '',
+			bool(fmt))
 
 	def _eval_field(self, name, value_expr, timestamp_format, evals):
 		"""
@@ -1091,7 +1433,11 @@ def props_text(target, field_map, settings, search_hash=True, sourcetype_field=S
 		'[%s]' % target['sourcetype'],
 	]
 	lines += ['%s = %s' % kv for kv in settings]
-	names = ([sourcetype_stanza(target)] if sourcetype_field else []) + [t.stanza for t in field_map.transforms]
+	if field_map.rules == RULES_LOOKUP:
+		lines[1] = '# generated rule reading one lookup row per template. Search-time: renamed to the add-on\'s sourcetype.'
+		names = ([sourcetype_stanza(target)] if sourcetype_field else []) + [lookup_eval_stanza(target)]
+	else:
+		names = ([sourcetype_stanza(target)] if sourcetype_field else []) + [t.stanza for t in field_map.transforms]
 	if field_map.forms:
 		names.append(eval_stanza(target))
 	lines.append('TRANSFORMS-%s = %s' % (target['transforms_class'], ', '.join(names)))
@@ -1107,8 +1453,15 @@ def props_text(target, field_map, settings, search_hash=True, sourcetype_field=S
 
 
 def transforms_text(field_map, search_hash=True, target=None, sourcetype_field=SOURCETYPE_FIELD):
-	stanzas = ['[%s]\nREGEX = %s\nFORMAT = %s\nWRITE_META = true\n' % (t.stanza, t.regex, t.format)
-		for t in field_map.transforms]
+	if field_map.rules == RULES_LOOKUP:
+		stanzas = ['# The template rows, read by the rule below at index time (lookups/%s).\n[%s]\nfilename = %s\n'
+			'case_sensitive_match = true\n' % (lookup_file_name(target), lookup_stanza(target), lookup_file_name(target)),
+			'# Every compact event: its template\'s row gives the fields, written to _meta. The same for every\n'
+			'# template, so adding one changes only the lookup file.\n[%s]\nINGEST_EVAL = %s\n' % (
+				lookup_eval_stanza(target), lookup_eval_text(lookup_stanza(target)))]
+	else:
+		stanzas = ['[%s]\nREGEX = %s\nFORMAT = %s\nWRITE_META = true\n' % (t.stanza, t.regex, t.format)
+			for t in field_map.transforms]
 	if sourcetype_field and target:
 		stanzas.insert(0, '# Every event of %s, for tenx-events.\n[%s]\nREGEX = .\nFORMAT = %s::"%s"\nWRITE_META = true\n' % (
 			target['sourcetype'], sourcetype_stanza(target), sourcetype_field, target['sourcetype']))
@@ -1117,7 +1470,8 @@ def transforms_text(field_map, search_hash=True, target=None, sourcetype_field=S
 			'# built from the tenx_fmf_* and tenx_fmv_* fields the transforms above write, which it then removes.\n'
 			'# Last in the TRANSFORMS- list.\n[%s]\nINGEST_EVAL = %s\n' % (eval_stanza(target), ingest_eval_text(field_map)))
 	header = ('# Generated by tenx_field_map.py from the app\'s template records: one index-time transform per '
-		'template.\n\n')
+		'template.\n\n') if field_map.rules != RULES_LOOKUP else (
+		'# Generated by tenx_field_map.py: one index-time rule for every template of the sourcetype.\n\n')
 	text = header + '\n'.join(stanzas)
 	if search_hash:
 		text += ('\n# Search-time: tenx-hash-vars-extraction (tenx-for-splunk) with the leading "~" required.\n'
@@ -1139,14 +1493,19 @@ def app_conf_text(target):
 		% (target['sourcetype'], target['app_name']))
 
 
-def write_app(out_dir, target, field_map, settings, search_hash=True, sourcetype_field=SOURCETYPE_FIELD):
+def write_app(out_dir, target, field_map, settings, search_hash=True, sourcetype_field=SOURCETYPE_FIELD,
+		lookup_bytes=None):
 	for sub in ('default', 'metadata'):
 		os.makedirs(os.path.join(out_dir, sub), exist_ok=True)
 
 	# transforms.conf before props.conf: an instance that reads the folder between the two writes
 	# finds every transform the old props.conf names. Each file is written through a temporary file
 	# and a rename, and a file whose content would not change is left as it is.
-	files = collections.OrderedDict([
+	files = collections.OrderedDict()
+	if field_map.rules == RULES_LOOKUP:
+		# First: the rule must never run without its file (a missing file drops compact events).
+		files[os.path.join('lookups', lookup_file_name(target))] = lookup_bytes
+	files.update([
 		(os.path.join('default', 'transforms.conf'), transforms_text(field_map, search_hash, target, sourcetype_field)),
 		(os.path.join('default', 'props.conf'), props_text(target, field_map, settings, search_hash, sourcetype_field)),
 		(os.path.join('default', 'app.conf'), app_conf_text(target)),
@@ -1158,7 +1517,7 @@ def write_app(out_dir, target, field_map, settings, search_hash=True, sourcetype
 	sizes = {}
 	for rel, text in files.items():
 		write_if_changed(os.path.join(out_dir, rel), text)
-		sizes[rel] = len(text.encode('utf-8'))
+		sizes[rel] = len(text) if isinstance(text, bytes) else len(text.encode('utf-8'))
 	return sizes
 
 
@@ -1276,7 +1635,10 @@ def verify(templates, field_map, encoded_path, raw_path, raw_split=None, out=sys
 		if transform is None:
 			no_transform += 1
 			continue
-		written_pairs = apply_transform(transform, line, field_map.forms)
+		if field_map.rules == RULES_LOOKUP:
+			written_pairs = apply_lookup_row(transform, line)
+		else:
+			written_pairs = apply_transform(transform, line, field_map.forms)
 		if written_pairs is None:
 			no_match += 1
 			continue
@@ -1339,11 +1701,16 @@ def verify(templates, field_map, encoded_path, raw_path, raw_split=None, out=sys
 # * gen --cap-file first rewrites the file without the listed hashes that no longer have a transform,
 #   then writes the app, then writes <cap file>.pending, the list as it should be once the app is
 #   active. gen never adds a hash to the cap file itself.
-# * activate restarts the instance that parses the data when the pending list adds templates (a
-#   conf reload does not reach a stream that is already flowing, see below), reads the app's
-#   transforms and props back from that instance over REST, and only when every stanza equals the
-#   generated one renames the pending list over the cap file. gen --splunkd runs it right after
-#   writing the app, for an app written in place on that instance.
+# * activate (--rules lookup only) checks that the instance holds the app's static rule, then proves
+#   that each template the pending list adds gets its fields from the instance: it sends one compact
+#   event per such template, of the template's own shape with placeholder values, on one probe stream
+#   (host tenx-fm-probe, source tenx:fm:probe, the compact sourcetype, into --probe-index) through the
+#   management port's receivers/simple endpoint, and searches for them. The stream carries an event
+#   before the probes in every run, so it is a stream that is already sending. A template whose probe
+#   event was indexed with tenx_mapped joins the cap file; the others stay pending, and activate repeats
+#   the probes every --poll seconds until --timeout. Nothing is restarted or reloaded: the instance
+#   rereads the lookup file on its own (limits.conf ingest_lookup_refresh_period_secs, default 60 s).
+#   gen --splunkd runs it right after writing the app, for an app written in place on that instance.
 #
 # Rows: `"<hash>",true`, the hash as the engine writes it (outer spaces kept), always quoted (a hash
 # can start with "#", the CSV comment character, or hold a space), sorted. A row whose value does not
@@ -1355,14 +1722,16 @@ def verify(templates, field_map, encoded_path, raw_path, raw_split=None, out=sys
 
 CAP_HEADER = 'pattern_hash,value\n'
 CAP_PENDING_SUFFIX = '.pending'
-# Measured on Splunk Enterprise 10.4.3, one instance, with one compact event of the template sent
-# after each step: a transform stanza written to the app takes effect for a new input stream after
-# POST conf-transforms/_reload and conf-props/_reload, but a stream (host, source and sourcetype) that
-# already carried events before the reload keeps the configuration it started with: 0 of 9 events of
-# such a stream got the new transform over 3 minutes, also after reloading the HEC input, and a
-# forwarder's stream carries events all day. After a restart every stream uses the new
-# configuration. So activate restarts the instance when the pending list adds templates.
-RESTART_ENDPOINT = '/services/server/control/restart'
+# Per-template transforms (--rules transforms) are not activated: on Splunk Enterprise 10.4.3 a
+# transform stanza added to the app takes effect after POST conf-transforms/_reload and
+# conf-props/_reload only for an input stream (host, source and sourcetype) that starts afterwards; a
+# stream that already carried events keeps the configuration it started with (0 of 9 events over 3
+# minutes, also after reloading the HEC input), and so does a changed stanza that the stream already
+# applies (0 of 22). Only a restart reaches such a stream.
+PROBE_HOST = 'tenx-fm-probe'
+PROBE_SOURCE = 'tenx:fm:probe'
+# A hash no template has: the event that opens the probe stream gets no fields.
+HEARTBEAT_LINE = '~tenx-fm-heartbeat,probe'
 
 
 def cap_hashes(field_map, templates):
@@ -1399,11 +1768,12 @@ def write_if_changed(path, text):
 	Writes text to path through a temporary file in the same folder and a rename. Returns False,
 	writing nothing, when the file already holds exactly this text.
 	"""
+	binary = isinstance(text, bytes)
 	try:
-		with open(path, encoding='utf-8', newline='') as f:
+		with (open(path, 'rb') if binary else open(path, encoding='utf-8', newline='')) as f:
 			if f.read() == text:
 				return False
-	except (IOError, OSError):
+	except (IOError, OSError, UnicodeDecodeError):
 		pass
 	folder = os.path.dirname(os.path.abspath(path))
 	os.makedirs(folder, exist_ok=True)
@@ -1417,7 +1787,7 @@ def write_if_changed(path, text):
 		mode = 0o666 & ~umask
 	fd, tmp = tempfile.mkstemp(prefix='.%s.' % os.path.basename(path), suffix='.tmp', dir=folder)
 	try:
-		with os.fdopen(fd, 'w', encoding='utf-8', newline='') as f:
+		with (os.fdopen(fd, 'wb') if binary else os.fdopen(fd, 'w', encoding='utf-8', newline='')) as f:
 			f.write(text)
 			f.flush()
 			os.fsync(f.fileno())
@@ -1478,6 +1848,21 @@ class Splunkd(object):
 			body = res.read()
 		return json.loads(body) if body.strip() else {}
 
+	def send(self, lines, index, host, source, sourcetype):
+		"""Raw lines into the parsing pipeline through receivers/simple, one event per line (the compact
+		sourcetype breaks on line ends)."""
+		q = urllib.parse.urlencode({'index': index, 'host': host, 'source': source, 'sourcetype': sourcetype})
+		req = urllib.request.Request(self.url + '/services/receivers/simple?' + q, data=('\n'.join(lines) + '\n').encode('utf-8'),
+			method='POST', headers=self.headers)
+		with urllib.request.urlopen(req, context=self.ctx, timeout=120) as res:
+			res.read()
+
+	def search(self, spl):
+		"""Rows of a one-shot search over all time."""
+		res = self.call('POST', '/services/search/jobs', {'search': spl, 'exec_mode': 'oneshot', 'count': 0,
+			'earliest_time': '0', 'latest_time': '+10y'})
+		return res.get('results', [])
+
 	def stanzas(self, app, conf):
 		"""The stanzas of <conf>.conf that app holds, as the instance reads them now: name -> settings."""
 		res = self.call('GET', '/servicesNS/nobody/%s/configs/conf-%s' % (urllib.parse.quote(app), conf),
@@ -1517,48 +1902,102 @@ def not_installed(splunkd, app_dir, app_name):
 	return differ
 
 
-def wait_for(splunkd, seconds=600):
-	"""After a restart: True once the management port answers again."""
-	deadline = time.time() + seconds
-	time.sleep(10)
-	while time.time() < deadline:
-		try:
-			splunkd.call('GET', '/services/server/info')
-			return True
-		except Exception:
-			time.sleep(5)
-	return False
+def lookup_app(app_dir):
+	"""(compact sourcetype, lookup file path) of an app gen wrote with --rules lookup, or None."""
+	props = read_conf(os.path.join(app_dir, 'default', 'props.conf'))
+	transforms = read_conf(os.path.join(app_dir, 'default', 'transforms.conf'))
+	for name, settings in props.items():
+		if 'rename' not in settings:
+			continue
+		for k, v in settings.items():
+			if not k.startswith('TRANSFORMS-'):
+				continue
+			for stanza in (x.strip() for x in v.split(',')):
+				if stanza.endswith('_fields_eval') and 'INGEST_EVAL' in transforms.get(stanza, {}):
+					table = transforms.get(stanza[:-len('_eval')], {}).get('filename')
+					if table:
+						return name, os.path.join(app_dir, 'lookups', table)
+	return None
 
 
-def activate(app_dir, cap_file, splunkd, app_name=None, out=sys.stdout):
+def probe_line(written_hash, row, now):
+	"""A compact line of the template's shape: value 0 the time now (19 digits) when it is the
+	timestamp, every other value the word probe."""
+	n = int(row['n'])
+	values = [('%d000000000' % now) if (k == 0 and row['e'] == '1') else 'probe' for k in range(n)]
+	return '~%s,%s' % (written_hash, ','.join(values))
+
+
+def probe_results(splunkd, index, sourcetype, since):
+	"""hash -> True when a probe event of that hash indexed since `since` has tenx_mapped."""
+	rows = splunkd.search('search index="%s" host="%s" source="%s" _index_earliest=%d | eval tenx_fm_probe_h=trim('
+		'replace(_raw, "^~([^,]*).*$", "\\1")), tenx_fm_probe_m=if(isnull(%s), 0, 1) | stats max(tenx_fm_probe_m) as m '
+		'by tenx_fm_probe_h' % (index, PROBE_HOST, PROBE_SOURCE, int(since), MARK_FIELD))
+	return dict((r['tenx_fm_probe_h'], r.get('m') == '1') for r in rows)
+
+
+def activate(app_dir, cap_file, splunkd, app_name=None, probe_index=None, timeout=300, poll=10, out=sys.stdout,
+		clock=time.time, sleep=time.sleep):
 	"""
-	When the pending list adds templates, restarts the instance; then checks that it holds the app as
-	generated, and only then renames the pending list over the cap file. Returns 0, or 1 with the cap
-	file left as it was.
+	Lists in the cap file each template the pending list adds once a probe event of it, sent on the
+	probe stream, is indexed with its fields; removals take effect at once. Never restarts or reloads
+	anything. Returns 0 when the cap file equals the pending list, 1 otherwise (the pending list kept).
 	"""
 	pending = cap_file + CAP_PENDING_SUFFIX
 	if not os.path.exists(pending):
 		out.write('activate: nothing pending (%s)\n' % pending)
 		return 0
 	app_name = app_name or os.path.basename(os.path.abspath(app_dir))
-	before, _ = read_cap(cap_file)
+	layout = lookup_app(app_dir)
+	if layout is None:
+		out.write('activate: app %s has per-template transforms, which reach a running stream only after a restart; '
+			'generate it with --rules lookup; cap file left as it was\n' % app_name)
+		return 1
+	sourcetype, table = layout
+	before, kept = read_cap(cap_file)
 	after, _ = read_cap(pending)
-	restarted = bool(after - before)
-	if restarted:
-		splunkd.call('POST', RESTART_ENDPOINT)
-		if not wait_for(splunkd):
-			out.write('activate: the instance did not come back after the restart; cap file left as it was\n')
-			return 1
+	added = sorted(after - before)
 	differ = not_installed(splunkd, app_dir, app_name)
 	if differ:
 		out.write('activate: the instance does not hold app %s as generated (%d stanzas, first %s); '
 			'cap file left as it was\n' % (app_name, len(differ), differ[0]))
 		return 1
-	os.replace(pending, cap_file)
-	out.write('activate: app %s %schecked; %s lists %d templates (%d added, %d removed)\n'
-		% (app_name, 'restarted and ' if restarted else '', cap_file, len(after), len(after - before),
+	confirmed = set()
+	if added:
+		if not probe_index:
+			out.write('activate: --probe-index is needed to prove new templates; cap file left as it was\n')
+			return 1
+		rows = read_lookup_file(table)
+		start = clock()
+		splunkd.send([HEARTBEAT_LINE], probe_index, PROBE_HOST, PROBE_SOURCE, sourcetype)
+		probes = 0
+		while True:
+			todo = [h for h in added if h not in confirmed and h.strip() in rows]
+			if not todo:
+				break
+			# Until the instance has read the new file, one template stands for all of them.
+			batch = todo if confirmed else todo[:1]
+			splunkd.send([probe_line(h, rows[h.strip()], int(clock())) for h in batch], probe_index, PROBE_HOST, PROBE_SOURCE,
+				sourcetype)
+			probes += len(batch)
+			sleep(poll)
+			seen = probe_results(splunkd, probe_index, sourcetype, start - 1)
+			confirmed |= set(h for h in todo if seen.get(h.strip()))
+			if clock() - start > timeout:
+				break
+		missing = [h for h in added if h not in confirmed]
+		out.write('activate: %d of %d new templates indexed with their fields on the probe stream (%d probe events, '
+			'%.0f s)%s\n' % (len(confirmed), len(added), probes, clock() - start,
+				'' if not missing else '; not yet: %s' % ', '.join(repr(h) for h in missing[:5])))
+	now = (before & after) | confirmed
+	if now == after:
+		os.replace(pending, cap_file)
+		out.write('activate: %s lists %d templates (%d added, %d removed)\n' % (cap_file, len(after), len(confirmed),
 			len(before - after)))
-	return 0
+		return 0
+	write_if_changed(cap_file, cap_text(now, kept))
+	out.write('activate: %s lists %d templates; %d still pending\n' % (cap_file, len(now), len(after - now)))
+	return 1
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1584,7 +2023,7 @@ def _build(args):
 		keep=keep, refused=refused, mixed_names=args.mixed_names,
 		reserved_names=args.reserved_names, reserved_prefix=args.reserved_prefix,
 		trim_values={'auto': None, 'on': True, 'off': False}[args.trim_values],
-		mark=None if args.mark == 'none' else args.mark, eval_values=args.eval_values == 'on')
+		mark=None if args.mark == 'none' else args.mark, eval_values=args.eval_values == 'on', rules=args.rules)
 	return target, templates, field_map
 
 
@@ -1630,6 +2069,10 @@ def build_parser():
 				'indexed fields of an event that has it from being extracted a second time' % MARK_FIELD)
 		p.add_argument('--mixed-names', action='store_true',
 			help='write names that join text and values (NOT CHECKED on Splunk; off by default)')
+		p.add_argument('--rules', choices=(RULES_TRANSFORMS, RULES_LOOKUP), default=RULES_TRANSFORMS,
+			help='transforms: one index-time transform per template (default); lookup: one static rule per sourcetype '
+				'and one row per template in lookups/<prefix>_fields.csv.gz, so adding a template changes only that '
+				'file, which Splunk rereads without a restart (needed for --cap-file)')
 		if mode == 'gen':
 			p.add_argument('--out', required=True, help='the app folder to write')
 			p.add_argument('--report', help='report path (default: <out>_report.json)')
@@ -1639,6 +2082,10 @@ def build_parser():
 			p.add_argument('--sourcetype-field', default=SOURCETYPE_FIELD,
 				help='indexed field every event of the compact sourcetype gets as <field>::"<sourcetype>", which '
 					'tenx-events names so that `tx` finds these events (default %s; none: not written)' % SOURCETYPE_FIELD)
+			p.add_argument('--lookup-max-bytes', type=int, default=LOOKUP_DEFAULT_MAX_BYTES,
+				help='with --rules lookup, refuse to write a lookup file larger than this (default %d; Splunk drops '
+					'compact events when the file passes limits.conf ingest_max_memtable_bytes, default 10485760)'
+					% LOOKUP_DEFAULT_MAX_BYTES)
 			p.add_argument('--cap-file', help='the Receiver\'s compact cap file (compactReceiverLookupFile, keyed on '
 				'templateHash): drop listed templates that lost their transform, and write <cap file>.pending, '
 				'which activate makes the cap file once the app is active where the data is parsed')
@@ -1648,8 +2095,8 @@ def build_parser():
 			p.add_argument('--raw', required=True)
 			p.add_argument('--raw-split', help='regex between raw events (default: the reader\'s)')
 
-	p = sub.add_parser('activate', help='restart the parsing instance when templates are added, check it holds the app, '
-		'then list them')
+	p = sub.add_parser('activate', help='prove on a probe stream that the parsing instance writes the fields of the '
+		'templates the pending list adds, then list them; nothing is restarted')
 	p.add_argument('--app', required=True, help='the app folder gen wrote, as installed on the instance')
 	p.add_argument('--app-name', help='the app\'s name on the instance (default: the folder name)')
 	p.add_argument('--cap-file', required=True)
@@ -1662,6 +2109,11 @@ def _splunkd_args(p, required):
 		help='management URL of the instance that parses the data, e.g. https://127.0.0.1:8089; with gen, '
 			'activate runs right after the app is written (the app folder is on that instance), and restarts it '
 			'when templates are added')
+	p.add_argument('--probe-index',
+		help='index for the probe events activate sends (one small event per new template); keep it out of data '
+			'model and detection index lists')
+	p.add_argument('--timeout', type=float, default=300, help='seconds activate keeps probing (default 300)')
+	p.add_argument('--poll', type=float, default=10, help='seconds between probe rounds (default 10)')
 	p.add_argument('--splunkd-auth-env', default='TENX_SPLUNKD_AUTH',
 		help='environment variable holding user:password (default TENX_SPLUNKD_AUTH)')
 	p.add_argument('--splunkd-token-env', default='TENX_SPLUNKD_TOKEN',
@@ -1678,7 +2130,7 @@ def _splunkd(args):
 def main(argv=None):
 	args = build_parser().parse_args(argv)
 	if args.mode == 'activate':
-		return activate(args.app, args.cap_file, _splunkd(args), args.app_name)
+		return activate(args.app, args.cap_file, _splunkd(args), args.app_name, args.probe_index, args.timeout, args.poll)
 
 	target, templates, field_map = _build(args)
 
@@ -1688,11 +2140,23 @@ def main(argv=None):
 
 	settings, not_copied = parsing_settings(args.app_props)
 	sourcetype_field = None if args.sourcetype_field == 'none' else args.sourcetype_field
+	if args.cap_file and args.rules != RULES_LOOKUP:
+		sys.stderr.write('gen: --cap-file needs --rules lookup (per-template transforms reach a running stream only '
+			'after a restart)\n')
+		return 2
+	lookup_bytes = None
+	if args.rules == RULES_LOOKUP:
+		rows = lookup_rows(field_map, templates)
+		lookup_bytes = lookup_file_bytes(rows)
+		if len(lookup_bytes) > args.lookup_max_bytes:
+			sys.stderr.write('gen: the lookup file would be %d bytes, over --lookup-max-bytes %d; nothing written\n'
+				% (len(lookup_bytes), args.lookup_max_bytes))
+			return 2
 	cap = None
 	if args.cap_file:
 		hashes = cap_hashes(field_map, templates)
 		cap = cap_before_app(args.cap_file, hashes)
-	sizes = write_app(args.out, target, field_map, settings, args.search_hash == 'on', sourcetype_field)
+	sizes = write_app(args.out, target, field_map, settings, args.search_hash == 'on', sourcetype_field, lookup_bytes)
 	if args.cap_file:
 		cap['pending_file_written'] = cap_after_app(args.cap_file, hashes)
 	report = field_map.report()
@@ -1701,6 +2165,10 @@ def main(argv=None):
 	report['settings_copied_from_tenx_encoded'] = [k for k, _ in settings]
 	report['settings_not_copied'] = not_copied
 	report['file_bytes'] = sizes
+	report['rules'] = args.rules
+	if lookup_bytes is not None:
+		report['lookup_rows'] = len(rows)
+		report['lookup_csv_bytes'] = sum(len(','.join(r)) + 1 for r in rows)
 	report['target'] = target
 	report['sourcetype_field'] = sourcetype_field
 	report_path = args.report or args.out.rstrip(os.sep) + '_report.json'
@@ -1717,7 +2185,7 @@ def main(argv=None):
 	if cap is not None:
 		sys.stdout.write('compact cap: %s\n' % json.dumps(cap))
 		if args.splunkd:
-			return activate(args.out, args.cap_file, _splunkd(args))
+			return activate(args.out, args.cap_file, _splunkd(args), None, args.probe_index, args.timeout, args.poll)
 	return 0
 
 
