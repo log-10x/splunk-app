@@ -10,12 +10,18 @@ own search text, and this module
 2. parses it as Splunk search terms: quoted phrases (with backslash escapes), parentheses,
    NOT, OR and AND with Splunk's precedence (NOT, then OR, then the implied AND), field
    comparisons, field IN (...), TERM() and CASE(), subsearches;
-3. builds the prefilter. A word or phrase is cut into pieces at anything that is not a letter
-   or a digit; each piece must appear in the compact event as a value (TERM(piece)) or be
-   carried by the event's template (TERM(<token of the template's hash>)). A piece is not
-   used when a rendered timestamp could print it, when it holds a character outside a-z and
-   0-9, or when more than MAX_TEMPLATES templates carry it. A field comparison, a NOT and a
-   subsearch place no restriction. An OR with any unrestricted branch places none.
+3. builds the prefilter. A word or phrase is cut into pieces at the characters Splunk breaks
+   indexed text at (SEGMENT_BREAKERS, the same set the search rewrite uses) and at white space;
+   each piece must appear in the compact event as a value (TERM(piece)) or be carried by the
+   event's template (TERM(<token of the template's hash>)). A piece is not used when a rendered
+   timestamp could print it, when it holds a character outside a-z and 0-9, or when more than
+   MAX_TEMPLATES templates carry it. A character that is neither a letter, a digit nor a breaker
+   stays in its piece, so the piece is not used: Splunk indexes PROGRA~1 (a short name in a
+   Windows path) as one term, and TERM(progra) would miss it. Inside a phrase a backslash
+   escapes only a quote or a backslash; any other backslash is kept and breaks the phrase into
+   pieces there, so "C:\\Program Files\\Google" gives c, program, files and google. A field
+   comparison, a NOT and a subsearch place no restriction. An OR with any unrestricted branch
+   places none.
 4. reads an IPv4 address in a word or phrase as a whole. Every part of the address, one- and
    two-digit parts included, must be a term of the compact event:
    (TERM(<part>) OR TERM(<address>)). Where the engine stored the address cut, each part is a
@@ -47,6 +53,9 @@ TIMESTAMP_PIECE = re.compile(
 	r"jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|january|february|march|april|june|july|august|"
 	r"september|october|november|december|mon|tue|wed|thu|fri|sat|sun|monday|tuesday|wednesday|"
 	r"thursday|friday|saturday|sunday|am|pm|utc|gmt)$")
+# Splunk's default segment breakers, major and minor, as single characters; '*' is left out, as a
+# wildcard of the search it stays in its piece. The same set as tenx_search_builder.SEGMENT_BREAKERS.
+SEGMENT_BREAKERS = frozenset("[]<>(){}|!;,'\"\n\r\t &?+/:=@.-$#%\\_")
 FIELD_TERM = re.compile(r"^([A-Za-z0-9_.:@{}\-]+)(!=|<=|>=|=|<|>)(.*)$", re.S)
 # An IPv4 address in a search word, cut the way the engine's ipv4SingleToken option cuts it: four
 # parts of 1 to 3 digits joined by single dots, the first not right after a letter or digit or
@@ -116,6 +125,9 @@ def tokenize(text):
 			j, buf = i + 1, []
 			while j < n:
 				if text[j] == "\\" and j + 1 < n:
+					# \" and \\ stand for the character; any other backslash is text
+					if text[j + 1] not in '"\\':
+						buf.append(text[j])
 					buf.append(text[j + 1])
 					j += 2
 					continue
@@ -257,9 +269,12 @@ class Parser(object):
 
 
 def pieces_of(text):
+	"""The pieces of a word or phrase, lowercased: the runs between Splunk's segment breakers and
+	white space. A run that holds another character than a letter, a digit or '*' (PROGRA~1) is one
+	term to Splunk and stays one piece, which usable() then rejects."""
 	pieces, buf = [], []
 	for ch in text.lower():
-		if ch.isalnum() or ch == "*":
+		if ch not in SEGMENT_BREAKERS and not ch.isspace():
 			buf.append(ch)
 		elif buf:
 			pieces.append("".join(buf))
