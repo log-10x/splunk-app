@@ -119,6 +119,12 @@ class ResolvedState(Enum):
 # breakers together, as single characters. '*' is a major breaker for the indexer but a live
 # wildcard in a search term, so it stays attached to its piece. The multi-character majors
 # ('--' and the %XX escapes) are covered by their single characters.
+# The events the rewrite keeps from its own extract and spath when the search replays: the
+# replayed ones (tenx_rst), and the ones that arrived whole and that Splunk read under the
+# sourcetype whose rules they need, which the replay leaves as read (tenx_replay_builder.AS_IS).
+# Those steps on such an event added every field an extraction with MV_ADD gives a second time.
+REPLAY_HELD = 'isnotnull(tenx_rst) OR isnotnull(%s)' % tenx_replay_builder.AS_IS
+
 SEGMENT_BREAKERS = frozenset("[]<>(){}|!;,'\"\n\r\t &?+/:=@.-$#%\\_")
 
 # A piece that matches more templates than this does not get its own ("piece" OR <hashes>)
@@ -1123,12 +1129,13 @@ class TenxSearchCommand(TenxSplCommand):
 			# Nothing to replay: the suffix without any replay step.
 			return (" | " + tenx_util.splunk_inflate_macro(self.debug)
 					+ " | extract | spath | fields - tenx_hash, tenx_var_0, tenx_vars")
+		held = REPLAY_HELD
 		return (" | eval tenx_compact_raw=_raw | " + tenx_util.splunk_inflate_macro(self.debug)
 				+ " | eval tenx_hide_others=1 | " + replay + " | fields - tenx_hide_others"
-				+ " | eval tenx_h_raw=if(isnotnull(tenx_rst), _raw, null()), tenx_h_st=if(isnotnull(tenx_rst), sourcetype, null()),"
-				+ " tenx_h_src=if(isnotnull(tenx_rst), source, null()), tenx_h_host=if(isnotnull(tenx_rst), host, null())"
-				+ " | eval _raw=if(isnotnull(tenx_rst), \"\", _raw), sourcetype=if(isnotnull(tenx_rst), \"tenx_replayed\", sourcetype),"
-				+ " source=if(isnotnull(tenx_rst), \"tenx_replayed\", source), host=if(isnotnull(tenx_rst), \"tenx_replayed\", host)"
+				+ " | eval tenx_h_raw=if(%s, _raw, null()), tenx_h_st=if(%s, sourcetype, null()),"
+				  " tenx_h_src=if(%s, source, null()), tenx_h_host=if(%s, host, null())" % ((held,) * 4)
+				+ " | eval _raw=if(%s, \"\", _raw), sourcetype=if(%s, \"tenx_replayed\", sourcetype),"
+				  " source=if(%s, \"tenx_replayed\", source), host=if(%s, \"tenx_replayed\", host)" % ((held,) * 4)
 				+ " | extract | spath | fields - tenx_hash, tenx_var_0, tenx_vars")
 
 	def replay_steps(self):
@@ -1148,7 +1155,8 @@ class TenxSearchCommand(TenxSplCommand):
 		"""Gives a replayed event back its text, sourcetype, source and host (see inflate_suffix)."""
 		return (" | eval _raw=coalesce(tenx_h_raw, _raw), sourcetype=coalesce(tenx_h_st, sourcetype),"
 				" source=coalesce(tenx_h_src, source), host=coalesce(tenx_h_host, host)"
-				" | fields - tenx_h_raw, tenx_h_st, tenx_h_src, tenx_h_host, tenx_compact_raw, tenx_rst")
+				" | fields - tenx_h_raw, tenx_h_st, tenx_h_src, tenx_h_host, tenx_compact_raw, tenx_rst, "
+				+ tenx_replay_builder.AS_IS)
 
 	def field_extraction(self):
 		"""The generic key=value pass that field_search() describes, without the filter."""

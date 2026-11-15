@@ -293,7 +293,9 @@ class TestBuild:
 		assert 'tag=if(isnull(tenx_rst), tenx_rk_tag, mvsort(mvdedup(tenx_rk_all)))' in spl
 		assert 'foreach tenx_rk_tag::* ' in spl
 		# tenx_rst is left for the caller: the search rewrite reads it after the macro.
-		assert spl.endswith('fields - tenx_rk_*] | fields - tenx_go*')
+		assert spl.endswith('fields - tenx_rk_*] | foreach tenx_gox* fieldstr="@@TENXF@@" matchstr="@@TENXM@@" '
+							'[eval tenx_asis=if(isnotnull(tenx_hide_others) AND isnotnull(tenx_gox), 1, tenx_asis)] | '
+							'fields - tenx_go*')
 
 	def test_the_clearing_step_keeps_default_and_indexed_fields(self):
 		# The clearing step names the fields that rules applying to the compact text can set
