@@ -223,7 +223,10 @@ class TestClearingSafeNames:
 		read_time = [stanza('tenx_encoded', **{'EVAL-a{b}': '1', "EVAL-o'brien": '1', 'EVAL-q"x': '1', 'EVAL-fine': '1'})]
 		r = build(read_time + [stanza('st', **{'EVAL-y': '"st"'})], [('st', 's', 'h')])
 		spl = r.spl()
-		assert 'foreach * ' not in spl and 'a{b}' not in spl and "o'brien" not in spl and 'q"x' not in spl
+		assert 'a{b}' not in spl and "o'brien" not in spl and 'q"x' not in spl
+		# the one `foreach *` is the clearing of events that arrived whole, which takes no name into eval
+		whole = next(s for s in r.steps if s.startswith('foreach tenx_gow* '))
+		assert spl.count('foreach * ') == 1 and 'foreach * ' in whole
 		assert "fine=if(isnotnull(tenx_rst), null(), 'fine')" in spl
 		assert len([w for w in r.warnings if 'not cleared on replayed events' in w]) == 3
 		# an event that carries such names as indexed fields (chosen by the sender) runs through

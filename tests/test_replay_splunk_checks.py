@@ -136,9 +136,26 @@ class TestMacroDryRun:
 		r = b.build([stanza('a:st', **{'EVAL-x': '1'}), stanza('b:st', **{'EVAL-y': '2'})],
 					[('a:st', 's', 'h'), ('b:st', 's', 'h')])
 		spl = b.macro_dry_run(r)
-		assert spl.startswith('| makeresults count=3 | streamstats count AS tenx_n | eval tenx_sourcetype=case(')
+		assert spl.startswith('| makeresults count=5 | streamstats count AS tenx_n | eval tenx_sourcetype=case(')
 		assert 'tenx_n==1, "a:st", tenx_n==2, "b:st", true(), null()' in spl
-		assert 'tenx_hide_others=1 | ' + r.spl() + ' | stats count' in spl
+		# two events of the first sourcetype that arrived whole: read as the compact sourcetype, and as itself
+		assert ('| eval tenx_sourcetype=if(tenx_n>3, "a:st", tenx_sourcetype), tenx_compact_raw=if(tenx_n>3, '
+				'"tenx dry run whole", tenx_compact_raw), _raw=if(tenx_n>3, "tenx dry run whole", _raw), '
+				'sourcetype=if(tenx_n==5, "a:st", sourcetype) | ' + r.spl() + ' | stats count') in spl
+		assert 'tenx_hide_others=1 | ' in spl
+
+	def test_the_dry_run_events_reach_every_whole_event_block(self):
+		from support.spl_model import Model
+		r = b.build([stanza('a:st', **{'EVAL-x': '1'})], [('a:st', 's', 'h')])
+		seen = []
+		model = Model(commands={'extract': lambda e, _: seen.append(dict(e)), 'typer': lambda e, _: None,
+								'tags': lambda e, _: None, 'stats count': lambda e, _: None})
+		events = [{'tenx_n': n} for n in (1, 2, 3, 4)]
+		head = b._dry_events(['a:st']).split(' | ', 2)[2]
+		out = model.run(head + ' | ' + r.spl(), events)
+		marks = [(e.get('tenx_gox'), e.get('tenx_gow')) for e in seen]
+		assert marks == [(None, None), (None, None), (None, 1), (1, None)]
+		assert 'x' in out[0] and 'x' in out[2] and 'x' not in out[3]
 
 
 CHILD = r'''

@@ -119,18 +119,48 @@ KIND_RANK = {'source': 0, 'host': 1, 'sourcetype': 2, 'default': 3}
 HIDE = 'tenx_hide_others'
 PLACEHOLDER = 'tenx_hidden'
 
+# Events that arrive whole: the sender passed the line through as it was (log10x-format S4.1: a
+# line that does not begin with "~" is not encoded), so tenx-inflate leaves its text as it is and
+# Splunk has already read that text under the event's sourcetype. Two cases, by that sourcetype:
+# AS_READ   it is the sourcetype a raw event of the original sourcetype is searched under (a
+#           field map renames its compact sourcetype to the original, rename = in props.conf):
+#           Splunk has applied exactly the original's search-time rules, so the event is left as
+#           Splunk read it, and kept out of the replay's `extract`, which would add every field a
+#           transform with MV_ADD extracts a second time (Splunk Enterprise 10.4.3, Windows
+#           Security XML, 570 whole events of 662: 95 of 183 fields differed from raw, EventID
+#           ["4670", "4670"]).
+# WHOLE     it is the compact sourcetype (tenx_encoded): Splunk extracted the text with that
+#           sourcetype's rules ([default]'s automatic JSON and key=value extraction, cut at
+#           limits.conf [kv] maxchars), whose field names come from the data. The event is
+#           replayed like an expanded one, and every field it was read with is cleared first,
+#           except the kept ones (see whole_clearing_steps()).
+AS_READ = 'tenx_gox'
+WHOLE = 'tenx_gow'
 
-def extract_steps():
+
+def extract_steps(as_read=False):
 	"""
 	`extract`, with the events that are not replayed hidden from it when the caller set HIDE.
 	In `txf` (no HIDE) this is the plain `extract` that `tx` runs after `fields - _kv`.
+
+	as_read: also hide the events marked AS_READ (whole events Splunk read under the sourcetype
+	whose rules they need) when HIDE is not set; with HIDE they are hidden already, as events
+	that are not replayed.
 	"""
 	held = ('tenx_hk_raw', '_raw'), ('tenx_hk_st', 'sourcetype'), ('tenx_hk_src', 'source'), ('tenx_hk_host', 'host')
 	hide = ['eval ' + ', '.join('%s=if(isnull(%s), %s, null())' % (h, RST, f) for h, f in held),
 			'eval _raw=if(isnull(%s), "", _raw), ' % RST + ', '.join(
 				'%s=if(isnull(%s), "%s", %s)' % (f, RST, PLACEHOLDER, f) for _, f in held[1:])]
 	unhide = ['eval ' + ', '.join('%s=coalesce(%s, %s)' % (f, h, f) for h, f in held), 'fields - tenx_hk_*']
-	return [block(HIDE, hide), 'extract', block(HIDE, unhide)]
+	if not as_read:
+		return [block(HIDE, hide), 'extract', block(HIDE, unhide)]
+	cond = 'isnotnull(%s) AND isnull(%s)' % (AS_READ, HIDE)
+	kept = ('tenx_hx_raw', '_raw'), ('tenx_hx_st', 'sourcetype'), ('tenx_hx_src', 'source'), ('tenx_hx_host', 'host')
+	hide_read = ['eval ' + ', '.join('%s=if(%s, %s, null())' % (h, cond, f) for h, f in kept),
+				 'eval _raw=if(%s, "", _raw), ' % cond + ', '.join(
+					 '%s=if(%s, "%s", %s)' % (f, cond, PLACEHOLDER, f) for _, f in kept[1:])]
+	unhide_read = ['eval ' + ', '.join('%s=coalesce(%s, %s)' % (f, h, f) for h, f in kept), 'fields - tenx_hx_*']
+	return [block(HIDE, hide), block(AS_READ, hide_read), 'extract', block(AS_READ, unhide_read), block(HIDE, unhide)]
 
 
 ALIAS_KEY = re.compile(r'^FIELDALIAS-(.+)$')
@@ -842,6 +872,39 @@ def clearing_steps(names, keep_rx, warnings, compact=False, cleared_on=None):
 	return steps
 
 
+def whole_clearing_steps(keep_rx, cleared_on, originals):
+	"""
+	The step that clears, on the events marked WHOLE only, every field Splunk set when it read
+	their text under the compact sourcetype, whatever its name: the read fields of such an event
+	take their names from the data (JSON paths such as findings{}.name), so they cannot be listed,
+	and eval cannot write a name holding a brace (see field_lhs()). For each field name of the chunk
+	the field is renamed to a working name, cleared there on WHOLE events, and renamed back (rename
+	takes a name as written, braces included), so every other event keeps it unchanged. The kept
+	fields are those of clearing_steps(): `keep_rx`, and a name of `cleared_on` on the events of
+	the original sourcetypes whose compact events carry it as an indexed field (every sourcetype not
+	listed for it, and one the macro does not cover).
+
+	Measured on Splunk Enterprise 10.4.3: a field named with a double quote cannot be put into the
+	body (foreach reports "Failed to parse templatized search for field" and the search goes on
+	with that field as it was).
+	"""
+	kept = ['match("<<FIELD>>", %s)' % spl_string(keep_rx)]
+	extra = {}
+	for name, only in sorted(cleared_on.items()):
+		for st in originals:
+			if st not in only:
+				extra.setdefault(st, []).append(name)
+	orig = 'mvindex(%s,0)' % CARRIER_FIELD
+	for st, names in sorted(extra.items()):
+		kept.append('(%s==%s AND match("<<FIELD>>", %s))' % (orig, spl_string(st), spl_string(
+			'^(%s)$' % '|'.join(re.escape(n) for n in names))))
+	if cleared_on:
+		kept.append('(NOT (%s) AND match("<<FIELD>>", %s))' % (' OR '.join('%s==%s' % (orig, spl_string(st))
+			for st in originals), spl_string('^(%s)$' % '|'.join(re.escape(n) for n in sorted(cleared_on)))))
+	return [block(WHOLE, ['foreach * [rename "<<FIELD>>" AS tenx_wf | eval tenx_wf=if(isnotnull(%s) AND NOT (%s), '
+						  'null(), tenx_wf) | rename tenx_wf AS "<<FIELD>>"]' % (WHOLE, ' OR '.join(kept))])]
+
+
 def masking_rules(stanzas, transforms=None):
 	"""
 	The index-time rules among `stanzas` that change an event's text: every SEDCMD- key, and every
@@ -1029,10 +1092,17 @@ def build(stanzas, present, lookup_fields=None, keep_fields=(), all_shared=True,
 	which = ''
 	if only:
 		which = ' AND (%s)' % ' OR '.join('mvindex(%s,0)==%s' % (CARRIER_FIELD, spl_string(st)) for st in originals)
+	# Expanded events, and events that arrived whole (text that does not begin with "~"). A compact
+	# event whose template could not be applied keeps its compact text and is not replayed.
 	steps.append('eval %s=if(isnotnull(%s) AND coalesce(tenx_expand_refused,"")=="" AND '
-		'(isnull(%s) OR _raw!=%s)%s, mvindex(%s,0), null())' % (RST, CARRIER_FIELD, COMPACT_RAW, COMPACT_RAW, which,
-																CARRIER_FIELD))
+		'(isnull(%s) OR _raw!=%s OR substr(%s,1,1)!="~")%s, mvindex(%s,0), null())' % (
+			RST, CARRIER_FIELD, COMPACT_RAW, COMPACT_RAW, COMPACT_RAW, which, CARRIER_FIELD))
 	steps.extend(eff_steps)
+	# A whole event read under the sourcetype whose rules it needs is left as read (AS_READ); one
+	# read under another sourcetype is replayed with every field it was read with cleared (WHOLE).
+	steps.append('eval %s=if(isnotnull(%s) AND _raw==%s AND sourcetype==%s, 1, null()), %s=if(isnotnull(%s) AND '
+				 '_raw==%s AND sourcetype!=%s, 1, null())' % (AS_READ, RST, COMPACT_RAW, RST, WHOLE, RST, COMPACT_RAW, RST))
+	steps.append('eval %s=if(isnotnull(%s), null(), %s)' % (RST, AS_READ, RST))
 	steps.append('eval %s=if(isnotnull(%s),1,null()), ' % (ANY, RST) + ', '.join(
 		'%s=if(%s==%s,1,null())' % (flags[st], RST, spl_string(st)) for st in sourcetypes))
 	# Clear what Splunk set on the unexpanded text, re-type, and drop the _kv mark on these events
@@ -1046,11 +1116,12 @@ def build(stanzas, present, lookup_fields=None, keep_fields=(), all_shared=True,
 	if dynamic:
 		replay.warnings.append('some fields set when compact events are read take their names from the data '
 							   'and are not cleared on replayed events')
+	steps.extend(whole_clearing_steps(keep_rx, cleared_on, originals))
 	steps.append(block(ANY, clearing_steps(names, keep_rx, replay.warnings, compact=seen is not None,
 											cleared_on=cleared_on) + [
 		'eval sourcetype=coalesce(%s, sourcetype)' % RST,
 		'eval _kv=if(isnotnull(%s), null(), _kv)' % RST]))
-	steps.extend(extract_steps())
+	steps.extend(extract_steps(as_read=True))
 
 	stats = {}
 	steps.extend(_rules(chosen, flags, lookup_fields, replay.warnings, stats, rejected, bad_lookups, replay.rules))
@@ -1829,38 +1900,45 @@ def lookup_problems(definitions, table_files, collections):
 	return out
 
 
-def macro_dry_run(replay):
+def _dry_events(sts):
 	"""
-	A search that runs the whole generated definition on one made-up event per original
-	sourcetype, one without tenx_sourcetype, and the rewrite's hide flag on, so every block of
-	the macro runs. tenxreplay writes the macro only when this runs cleanly.
+	The made-up events of a dry run: one expanded event per original sourcetype in `sts`, one
+	without tenx_sourcetype, and, when there is a sourcetype, two events of the first that arrived
+	whole, one read under the compact sourcetype and one under that sourcetype itself, so the
+	blocks for whole events run too. The rewrite's hide flag is on.
 	"""
-	sts = sorted(replay.per_sourcetype)
 	n = len(sts) + 1
 	which = ', '.join('tenx_n==%d, %s' % (i + 1, spl_string(st)) for i, st in enumerate(sts))
-	return ('| makeresults count=%d | streamstats count AS tenx_n | eval tenx_sourcetype=case(%s, true(), null()), '
+	head = ('| makeresults count=%d | streamstats count AS tenx_n | eval tenx_sourcetype=case(%s, true(), null()), '
 			'tenx_compact_raw="tenx dry run compact", _raw="tenx dry run", sourcetype="tenx_encoded", '
-			'source="tenx_dry_run", host="tenx_dry_run", %s=1 | %s | stats count'
-			% (n, which or 'false(), null()', HIDE, replay.spl()))
+			'source="tenx_dry_run", host="tenx_dry_run", %s=1' % (n + 2 if sts else n, which or 'false(), null()', HIDE))
+	if sts:
+		head += (' | eval tenx_sourcetype=if(tenx_n>%d, %s, tenx_sourcetype), tenx_compact_raw=if(tenx_n>%d, '
+				 '"tenx dry run whole", tenx_compact_raw), _raw=if(tenx_n>%d, "tenx dry run whole", _raw), '
+				 'sourcetype=if(tenx_n==%d, %s, sourcetype)' % (n, spl_string(sts[0]), n, n, n + 2, spl_string(sts[0])))
+	return head
+
+
+def macro_dry_run(replay):
+	"""
+	A search that runs the whole generated definition on the made-up events of _dry_events(), so
+	every block of the macro runs. tenxreplay writes the macro only when this runs cleanly.
+	"""
+	return '%s | %s | stats count' % (_dry_events(sorted(replay.per_sourcetype)), replay.spl())
 
 
 def units_dry_run(units):
 	"""
 	A search that runs the given units ({sourcetype: Replay}) composed as the search rewrite
 	composes them (compose_units(), with the rewrite's hide flag on), then `tenx-replay-tags`, on
-	one made-up event per sourcetype and one without tenx_sourcetype, so every block of every
-	unit runs.
+	the made-up events of _dry_events(), so every block of every unit runs.
 	"""
 	sts = sorted(units)
-	which = ', '.join('tenx_n==%d, %s' % (i + 1, spl_string(st)) for i, st in enumerate(sts))
 	parts = [units[sts[0]].spl()]
 	for st in sts[1:]:
 		parts += ['eval tenx_rprev=%s' % RST, units[st].spl(), 'eval %s=coalesce(%s, tenx_rprev)' % (RST, RST)]
 	parts += ['fields - tenx_rprev'] + list(TAGS_STEPS)
-	return ('| makeresults count=%d | streamstats count AS tenx_n | eval tenx_sourcetype=case(%s, true(), null()), '
-			'tenx_compact_raw="tenx dry run compact", _raw="tenx dry run", sourcetype="tenx_encoded", '
-			'source="tenx_dry_run", host="tenx_dry_run", %s=1 | %s | stats count'
-			% (len(sts) + 1, which or 'false(), null()', HIDE, ' | '.join(parts)))
+	return '%s | %s | stats count' % (_dry_events(sts), ' | '.join(parts))
 
 
 def failing_units(units, run, limit=262144):

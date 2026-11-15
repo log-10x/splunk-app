@@ -4,8 +4,9 @@ an event rather than what its text looks like.
 
 It runs a list of events (dicts) through a pipeline string. It knows only what the replay macro,
 the `tx` macro and the search rewrite use: eval (if, case, coalesce, isnull, isnotnull, null,
-true, mvindex, match, len, lower, mvappend, mvdedup, mvsort; ==, !=, AND, OR, NOT), fields -, foreach,
-and stand-ins for extract, spath, lookup, typer and tags supplied by the test.
+true, mvindex, match, len, lower, substr, mvappend, mvdedup, mvsort; ==, !=, AND, OR, NOT), fields -, foreach,
+rename (one literal name to another, on every event that has it), and stand-ins for extract, spath,
+lookup, typer and tags supplied by the test.
 
 Keys starting with two underscores belong to the test, not to the event: no command sees them.
 
@@ -212,6 +213,11 @@ def evaluate(node, event):
 			return None if vals[0] is None else len(str(vals[0]))
 		if name == 'lower':
 			return None if vals[0] is None else str(vals[0]).lower()
+		if name == 'substr':
+			if vals[0] is None:
+				return None
+			text, start = str(vals[0]), int(vals[1]) - 1
+			return text[start:] if len(vals) < 3 else text[start:start + int(vals[2])]
 		if name == 'match':
 			return None if vals[0] is None else re.search(vals[1], str(vals[0])) is not None
 		if name == 'mvappend':
@@ -309,6 +315,17 @@ class Model(object):
 			return
 		if word == 'lookup':
 			self.lookup(rest, events)
+			return
+		if word == 'rename':
+			m = re.match(r'^("(?:[^"\\]|\\.)*"|\S+)\s+AS\s+("(?:[^"\\]|\\.)*"|\S+)$', rest, re.S)
+			if not m:
+				raise Unsupported(step)
+			old_name, new_name = [n[1:-1] if n.startswith('"') else n for n in m.groups()]
+			if '*' in old_name or '*' in new_name:
+				raise Unsupported('wildcard rename %r' % step)
+			for event in events:
+				if old_name in event:
+					event[new_name] = event.pop(old_name)
 			return
 		fn = self.commands.get(step) or self.commands.get(word)
 		if fn is None:
