@@ -101,6 +101,8 @@ TIME_FORMS = (
 	# zone offsets: +0000, -04:00
 	re.compile(r"[-+](?:[01]\d|2[0-3]):?[0-5]\d(?![0-9])"),
 )
+FIELD_NAME = re.compile(r"^[A-Za-z0-9_.:@{}\-]+$")
+OPERATOR = re.compile(r"^(?:!=|<=|>=|=|<|>)")
 # An IPv4 address in a search word, cut the way the engine's ipv4SingleToken option cuts it: four
 # parts of 1 to 3 digits joined by single dots, the first not right after a letter or digit or
 # after a digit and a dot, the last not followed by a letter or digit or by a dot and a digit.
@@ -309,6 +311,19 @@ class Parser(object):
 					values.append(None)
 			self._take()
 			return ("in", value, values)
+		if FIELD_NAME.match(value) and following[0] == "word" and value not in ("AND", "OR", "NOT"):
+			# A comparison written with spaces: `eventName = DeleteTrail`, `userAgent !=console.amazonaws.com`,
+			# `src_ip != "x"`. Splunk reads these as field comparisons; read as words, the field name would be
+			# required in the compact event, where it is template text.
+			op = OPERATOR.match(following[1])
+			if op:
+				self._take()
+				rest = following[1][op.end():]
+				if not rest and self._peek()[0] in ("word", "phrase"):
+					kind_, rest = self._take()
+					if kind_ == "phrase":
+						rest = '"' + rest.replace('\\', '\\\\').replace('"', '\\"') + '"'
+				value = value + op.group(0) + rest
 		match = FIELD_TERM.match(value)
 		if match and match.group(1):
 			if match.group(1).lower() in TIME_FIELDS:

@@ -31,6 +31,10 @@ import tenx_field_map as fm
 M = fm.MARK
 
 
+TPL_CT = '{"eventTime": "$(yyyy-MM-dd\'T\'HH:mm:ss\'Z\')", "eventType": "$", "eventName": "$"}'
+TPL_FGT = '<$>date=$$$ time=$(HH:mm:ss) devname="$" type="traffic"'
+
+
 def tpl(key, parts, terminator, ts='%H:%M:%S', part_0='', unsafe='', pattern='', written=None):
 	return fm.Template(key=key, written_hash=written or key, parts=parts, part_0=part_0, terminator=terminator,
 		timestamp_format=ts, expand_unsafe=unsafe, pattern=pattern)
@@ -279,6 +283,35 @@ class TestKeyValueReader:
 # -------------------------------------------------------------------------------------------
 # The field map, the app and verify on small inputs
 
+class TestDelimsReader:
+	def test_pairs_split_on_space_and_comma_outside_quotes(self):
+		r = fm.DelimsReader()
+		assert r.pairs('date=2026-11-13 time=10:00:00 msg="a b, c" x=1,y=2 user=""') == [
+			('date', '2026-11-13'), ('time', '10:00:00'), ('msg', 'a b, c'), ('x', '1'), ('y', '2'), ('user', '')]
+
+	def test_a_syslog_priority_before_the_first_key_is_not_part_of_its_name(self):
+		# Splunk Enterprise 10.4.3, DELIMS with KV_MODE = none: "<190>date=..." gave date on 62 of 62 events.
+		r = fm.DelimsReader()
+		assert r.pairs('<190>date=2026-11-13 devname="fw"') == [('date', '2026-11-13'), ('devname', 'fw')]
+		assert r.pairs('<' + M % 0 + '>date=' + M % 1) == [('date', M % 1)]
+
+	def test_other_characters_of_a_name_become_underscores_and_markers_stay(self):
+		r = fm.DelimsReader()
+		assert r.pairs('a-b=1 dev' + M % 2 + 'x=' + M % 3) == [('a_b', '1'), ('dev' + M % 2 + 'x', M % 3)]
+
+	def test_the_first_value_of_a_key_is_kept(self):
+		# The same Splunk: tz="UTC-5:00" ... tz=-0500 gave tz "UTC-5:00".
+		assert fm.DelimsReader().pairs('tz="UTC-5:00" n=1 tz=-0500') == [('tz', 'UTC-5:00'), ('n', '1')]
+
+	def test_gen_takes_the_reader(self, tmp_path):
+		records = tmp_path / 'templates.json'
+		records.write_text(json.dumps({'templateHash': 'k1', 'template': TPL_FGT}) + '\n')
+		assert fm.main(['gen', '--rules', 'lookup', '--records', str(records), '--reader', 'delims', '--sourcetype', 'tenx_fgt',
+			'--rename', 'fortigate_traffic', '--out', str(tmp_path / 'fm')]) == 0
+		row = fm.read_lookup_file(str(tmp_path / 'fm' / 'lookups' / 'tenx_fgt_fields.csv.gz'))['k1']['f']
+		assert row.startswith('date::"') and ' devname::"' in row and ' type::"traffic"' in row
+
+
 class TestFieldMap:
 	def test_skips_are_counted_and_named(self):
 		t = tpl('h', ['time=__TENX_TS__ user=', ' msg="say \\"', '" path=', ' n='], '2',
@@ -325,6 +358,42 @@ class TestFieldMap:
 		f = fm.FieldMap({'h': t}, fm.KeyValueReader(), 'p', reserved_names='prefix', reserved_prefix='x_')
 		assert f.transforms[0].format == 'time::"$1" x_eventType::"$2"'
 		assert f.report()['reserved_field_names']['action'] == 'written as x_<name>'
+
+	def test_reserved_names_restored_at_search_time(self, tmp_path):
+		# Splunk Enterprise 10.4.3 returned the indexed field eventType of 14,791 mapped CloudTrail events
+		# as extracted_eventType, and the AWS add-on's FIELDALIAS eventType AS app found nothing.
+		records = tmp_path / 'templates.json'
+		records.write_text(json.dumps({'templateHash': 'k1', 'template': TPL_CT}) + '\n', encoding='utf-8')
+		out = tmp_path / 'fm_ct'
+		assert fm.main(['gen', '--rules', 'lookup', '--records', str(records), '--reader', 'json', '--sourcetype', 'tenx_ct',
+			'--rename', 'aws:cloudtrail', '--reserved-names', 'restore', '--out', str(out)]) == 0
+		props = (out / 'default' / 'props.conf').read_text()
+		assert props.endswith('[aws:cloudtrail]\nREPORT-tenx_fm_hash_vars = tenx_fm_hash_vars\n'
+			'# Search-time: each name Splunk does not keep for an indexed field, given back from extracted_<name>.\n'
+			'REPORT-tenx_fm_restore = tenx_fm_restore_eventType\n')
+		transforms = (out / 'default' / 'transforms.conf').read_text()
+		assert ('[tenx_fm_restore_eventType]\nSOURCE_KEY = extracted_eventType\nREGEX = ^([\\s\\S]*)$\n'
+			'FORMAT = eventType::$1\n') in transforms
+		rows = fm.read_lookup_file(str(out / 'lookups' / 'tenx_ct_fields.csv.gz'))
+		assert 'extracted_eventType::' in rows['k1']['f'] and ' eventType::' not in rows['k1']['f']
+		report = json.loads((tmp_path / 'fm_ct_report.json').read_text())
+		assert report['reserved_field_names']['action'] == 'written as extracted_<name>, given back as <name> at search time'
+
+	def test_reserved_names_restore_without_the_search_hash(self):
+		t = tpl('h', ['time=__TENX_TS__ eventType='], '')
+		f = fm.FieldMap({'h': t}, fm.KeyValueReader(), 'p', reserved_names='restore', reserved_prefix='x_')
+		assert f.transforms[0].format == 'time::"$1" x_eventType::"$2"'
+		target = {'sourcetype': 'tenx_p', 'rename': 'p:st', 'transforms_class': 'p', 'transform_prefix': 'p', 'description': 'd'}
+		props = fm.props_text(target, f, [], search_hash=False)
+		assert props.endswith('[p:st]\n# Search-time: each name Splunk does not keep for an indexed field, given back from '
+			'x_<name>.\nREPORT-tenx_fm_restore = tenx_fm_restore_eventType\n')
+		assert 'SOURCE_KEY = x_eventType' in fm.transforms_text(f, search_hash=False, target=target, sourcetype_field=None)
+
+	def test_no_restore_stanza_when_nothing_collides(self):
+		t = tpl('h', ['time=__TENX_TS__ user='], '')
+		f = fm.FieldMap({'h': t}, fm.KeyValueReader(), 'p', reserved_names='restore')
+		target = {'sourcetype': 'tenx_p', 'rename': 'p:st', 'transforms_class': 'p', 'transform_prefix': 'p', 'description': 'd'}
+		assert 'restore' not in fm.props_text(target, f, []) and 'restore' not in fm.transforms_text(f, target=target)
 
 	def test_timestamp_values_can_be_left_out(self):
 		t = tpl('h', ['time=__TENX_TS__ user='], '')

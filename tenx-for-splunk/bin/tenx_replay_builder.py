@@ -74,9 +74,23 @@ same search on raw events when the app it runs from holds app-only or private ru
 replayed sourcetypes, sources or hosts, or itself defines a setting another app also defines.
 Lookups have the same rule (lookup_problems()).
 
+Which sourcetype's rules: the one Splunk would have searched the raw event under
+-------------------------------------------------------------------------------
+The sender's tenx_sourcetype is the sourcetype the event arrived under. Two rules of that sourcetype
+decide which sourcetype's search-time rules a raw event gets, and the replay follows both
+(effective_sourcetypes()):
+* index-time rewrites: a TRANSFORMS- transform with DEST_KEY = MetaData:Sourcetype and SOURCE_KEY
+  _raw. Splunk applies it while it parses the raw text, which a compact event does not carry, so the
+  replay applies its REGEX and FORMAT to the expanded text. The FortiGate add-on routes its input
+  sourcetype fgt_log this way, to fortigate_traffic, fortigate_utm, fortigate_event or
+  fortigate_anomaly by the event's devid and type.
+* `rename = <target>`, then applied to that result: the target's search-time rules run, and the
+  event reads as the target (props.conf.spec: renamed data "only uses the search-time configuration
+  for the target sourcetype"). The FortiGate add-on renames fgt_traffic to fortigate_traffic.
+
 Not covered (reported as warnings): index-time fields of the original sourcetype
-(INDEXED_EXTRACTIONS, TRANSFORMS), KV_MODE multi, `rename`, lookups whose definition this app
-cannot see.
+(INDEXED_EXTRACTIONS, TRANSFORMS that write fields), KV_MODE multi, a sourcetype rewrite that reads
+a field other than _raw, lookups whose definition this app cannot see.
 """
 import re
 
@@ -835,6 +849,88 @@ def masking_rules(stanzas, transforms=None):
 	return sorted(found)
 
 
+SOURCETYPE_DEST = 'MetaData:Sourcetype'
+RST0 = 'tenx_rst0'
+
+
+def sourcetype_rewrites(stanza, transforms):
+	"""
+	[(regex, format value)] of the index-time transforms of a sourcetype stanza that set the
+	sourcetype from the raw text (DEST_KEY = MetaData:Sourcetype, SOURCE_KEY _raw), in the order
+	Splunk runs them: TRANSFORMS- classes in ASCII order, the names of a class in the order listed.
+	A rewrite that reads another key is returned as (None, name), for a warning.
+	"""
+	out = []
+	for key in sorted(k for k in stanza.settings if k.startswith('TRANSFORMS-')):
+		for name in (n.strip() for n in str(stanza.settings[key] or '').split(',') if n.strip()):
+			t = (transforms or {}).get(name) or {}
+			if str(t.get('DEST_KEY', '')).strip() != SOURCETYPE_DEST:
+				continue
+			fmt = str(t.get('FORMAT', '')).strip()
+			regex = str(t.get('REGEX', '') or '')
+			if str(t.get('SOURCE_KEY', '_raw') or '_raw').strip() != '_raw' or not regex or not fmt.startswith('sourcetype::'):
+				out.append((None, name))
+				continue
+			out.append((regex, fmt[len('sourcetype::'):]))
+	return out
+
+
+def _format_targets(value, names):
+	"""The sourcetype names a rewrite's FORMAT value can produce: itself, or the stanza names its pattern matches."""
+	if '$' not in value:
+		return [value]
+	rx = re.compile('^' + ''.join('.+' if re.fullmatch(r'\$\d+', part) else re.escape(part)
+									  for part in re.split(r'(\$\d+)', value) if part) + '$')
+	return sorted(n for n in names if rx.match(n))
+
+
+def _format_expr(regex, value):
+	"""The eval expression for a rewrite's new sourcetype: FORMAT's $<n> read from the first match of REGEX."""
+	if '$' not in value:
+		return spl_string(value)
+	replacement = re.sub(r'\$(\d+)', r'\\\1', value.replace('\\', '\\\\'))
+	return 'replace(_raw, %s, %s)' % (spl_string('(?s)^.*?(?:' + regex + ').*$'), spl_string(replacement))
+
+
+def effective_sourcetypes(stanzas, transforms, sourcetypes):
+	"""
+	(eval steps, {original sourcetype: [effective sourcetypes]}, warnings): the steps turn tenx_rst
+	from the sourcetype an event arrived under into the one whose search-time rules a raw event gets
+	(see "Which sourcetype's rules" above). Without rewrites or renames, no step and each sourcetype
+	is its own.
+	"""
+	by_name = dict((s.name, s) for s in stanzas if s.kind == 'sourcetype')
+	steps, effective, warnings = [], {}, []
+	renames = {}
+	for st in sourcetypes:
+		own = by_name.get(st)
+		cands = [st]
+		for regex, value in (sourcetype_rewrites(own, transforms) if own is not None else []):
+			if regex is None:
+				warnings.append('the sourcetype rewrite %s of %s does not read _raw and is not replayed' % (value, st))
+				continue
+			if RST0 not in ''.join(steps):
+				steps.append('eval %s=%s' % (RST0, RST))
+			steps.append('eval %s=if(%s==%s AND match(_raw, %s), %s, %s)' % (
+				RST, RST0, spl_string(st), spl_string(regex), _format_expr(regex, value), RST))
+			cands += _format_targets(value, by_name)
+		final = []
+		for c in cands:
+			target = str((by_name[c].settings.get('rename', '') if c in by_name else '') or '').strip()
+			if target and usable_sourcetype(target):
+				renames[c] = target
+				final.append(target)
+			else:
+				final.append(c)
+		effective[st] = sorted(set(final))
+	if renames:
+		steps.append('eval %s=case(%s, true(), %s)' % (RST, ', '.join('%s==%s, %s' % (RST, spl_string(a), spl_string(b))
+			for a, b in sorted(renames.items())), RST))
+	if any(step.startswith('eval %s=' % RST0) for step in steps):
+		steps.append('fields - %s' % RST0)
+	return steps, effective, warnings
+
+
 def build(stanzas, present, lookup_fields=None, keep_fields=(), all_shared=True, rejected=None, bad_lookups=None,
 		  transforms=None, only=False, seen=None, with_tags=True):
 	"""
@@ -872,13 +968,21 @@ def build(stanzas, present, lookup_fields=None, keep_fields=(), all_shared=True,
 			replay.steps.append('eval %s=null()' % RST)
 		replay.steps.extend(UNCHANGED)
 		return replay
+	originals = sorted(set(p[0] for p in present))
+	eff_steps, effective, eff_warnings = effective_sourcetypes(stanzas, transforms, originals)
+	replay.warnings.extend(eff_warnings)
+	eff_present = []
+	for p in present:
+		for e in effective[p[0]]:
+			if (e,) + tuple(p[1:]) not in eff_present:
+				eff_present.append((e,) + tuple(p[1:]))
 	chosen = []
-	for s in select_stanzas(stanzas, present, all_shared, seen):
+	for s in select_stanzas(stanzas, eff_present, all_shared, seen):
 		if safe_text(s.name):
 			chosen.append(s)
 		else:
 			replay.warnings.append('props stanza %r is not written into the macro' % s.name)
-	sourcetypes = sorted(set(p[0] for p in present))
+	sourcetypes = sorted(set(p[0] for p in eff_present))
 	flags = dict((st, 'tenx_go%dz' % (n + 1)) for n, st in enumerate(sourcetypes))
 
 	keep_fields = [f for f in keep_fields if safe_text(f)]
@@ -888,10 +992,11 @@ def build(stanzas, present, lookup_fields=None, keep_fields=(), all_shared=True,
 	steps = replay.steps
 	which = ''
 	if only:
-		which = ' AND (%s)' % ' OR '.join('mvindex(%s,0)==%s' % (CARRIER_FIELD, spl_string(st)) for st in sourcetypes)
+		which = ' AND (%s)' % ' OR '.join('mvindex(%s,0)==%s' % (CARRIER_FIELD, spl_string(st)) for st in originals)
 	steps.append('eval %s=if(isnotnull(%s) AND coalesce(tenx_expand_refused,"")=="" AND '
 		'(isnull(%s) OR _raw!=%s)%s, mvindex(%s,0), null())' % (RST, CARRIER_FIELD, COMPACT_RAW, COMPACT_RAW, which,
 																CARRIER_FIELD))
+	steps.extend(eff_steps)
 	steps.append('eval %s=if(isnotnull(%s),1,null()), ' % (ANY, RST) + ', '.join(
 		'%s=if(%s==%s,1,null())' % (flags[st], RST, spl_string(st)) for st in sourcetypes))
 	# Clear what Splunk set on the unexpanded text, re-type, and drop the _kv mark on these events
@@ -914,10 +1019,11 @@ def build(stanzas, present, lookup_fields=None, keep_fields=(), all_shared=True,
 	steps.extend(_rules(chosen, flags, lookup_fields, replay.warnings, stats, rejected, bad_lookups, replay.rules))
 
 	info = replay.per_sourcetype
-	for st in sourcetypes:
+	for st in originals:
+		effs = effective[st]
 		srcs = set(p[1] for p in present if p[0] == st)
 		hsts = set(p[2] for p in present if p[0] == st)
-		applies = [s for s in chosen if s.kind == 'default' or (s.kind == 'sourcetype' and s.name == st)
+		applies = [s for s in chosen if s.kind == 'default' or (s.kind == 'sourcetype' and s.name in effs)
 				   or (seen is not None and s.kind in ('source', 'host'))
 				   or (s.kind == 'source' and any(s.matches(v) is not False for v in srcs))
 				   or (s.kind == 'host' and any(s.matches(v) is not False for v in hsts))]
@@ -932,18 +1038,21 @@ def build(stanzas, present, lookup_fields=None, keep_fields=(), all_shared=True,
 		info[st] = {'stanzas': [s.name for s in applies], 'aliases': counts['aliases'],
 					'calculated': counts['calculated'], 'lookups': counts['lookups'],
 					'computed': sorted(counts['computed']), 'aliased': sorted(counts['aliased']),
-					'warnings': [], 'sources': sorted(srcs), 'flag': flags[st]}
+					'warnings': [], 'sources': sorted(srcs), 'flag': ','.join(flags[e] for e in effs)}
+		if effs != [st]:
+			info[st]['replayed_as'] = effs
 		own = next((s for s in stanzas if s.kind == 'sourcetype' and s.name == st), None)
-		settings = own.settings if own is not None else {}
 		if own is None:
 			info[st]['warnings'].append('no props stanza for this sourcetype')
-		kv = str(settings.get('KV_MODE', 'auto')).strip().lower()
-		if kv.startswith('multi'):
-			info[st]['warnings'].append('KV_MODE %s is not replayed' % kv)
+		for e in effs:
+			eff = next((s for s in stanzas if s.kind == 'sourcetype' and s.name == e), None)
+			settings = eff.settings if eff is not None else {}
+			kv = str(settings.get('KV_MODE', 'auto')).strip().lower()
+			if kv.startswith('multi'):
+				info[st]['warnings'].append('KV_MODE %s is not replayed' % kv)
+		settings = own.settings if own is not None else {}
 		if str(settings.get('INDEXED_EXTRACTIONS', '') or '').strip():
 			info[st]['warnings'].append('INDEXED_EXTRACTIONS fields are index-time and are not replayed')
-		if str(settings.get('rename', '') or '').strip():
-			info[st]['warnings'].append('rename = %s is not replayed' % settings.get('rename'))
 		# Index-time rules: every stanza that matches the sourcetype, a recorded source or host,
 		# whether or not it has a search-time rule the replay chose.
 		info[st]['masking'] = masking_rules([s for s in stanzas if (s.kind == 'sourcetype' and s.name == st)
