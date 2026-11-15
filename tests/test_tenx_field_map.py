@@ -771,7 +771,70 @@ class TestLookupRules:
 		assert text.startswith('$pd:tenx_fm_row$=if(substr(_raw, 1, 1)=="~", lookup("tenx_fw_fields", ')
 		# every intermediate value is a pd: key; only _meta is written
 		assert [e.split('=', 1)[0] for e in re.split(r', (?=\$pd:tenx_fm_\w+\$=|_meta=)', text)] == \
-			['$pd:tenx_fm_%s$' % k for k in ('row', 'f', 't', 'e', 'x', 'm')] + ['_meta']
+			['$pd:tenx_fm_%s$' % k for k in ('row', 'f', 't', 'n', 'ok', 'e', 'x', 'm')] + ['_meta'] + \
+			['$pd:tenx_fm_why$'] * 2 + ['_meta']
+
+	def test_the_rule_builds_a_regex_only_from_a_row_it_can_use(self):
+		text = fm.lookup_eval_text('tenx_fw_fields')
+		# a recipe of name::value pairs and a value count of at most 240 in digits; anything else is bad_row
+		assert '$pd:tenx_fm_ok$=if(isnotnull($pd:tenx_fm_f$) AND isnotnull($pd:tenx_fm_n$), if(match($pd:tenx_fm_f$, "::") ' \
+			'AND match($pd:tenx_fm_n$, "^[0-9]{1,3}$"), if(tonumber($pd:tenx_fm_n$) <= 240, 1, 0), 0), 0)' in text
+		assert '$pd:tenx_fm_x$=if($pd:tenx_fm_ok$ == 1, _raw . ' in text
+		assert 'tonumber(json_extract(' not in text
+
+	def test_a_compact_event_without_fields_gets_the_reason(self):
+		text = fm.lookup_eval_text('tenx_fw_fields')
+		assert '$pd:tenx_fm_why$=case(substr(_raw, 1, 1)!="~", null(), isnull($pd:tenx_fm_f$) AND isnull($pd:tenx_fm_n$), ' \
+			'"no_row", $pd:tenx_fm_ok$ != 1, "bad_row", isnull($pd:tenx_fm_m$) OR $pd:tenx_fm_m$==$pd:tenx_fm_x$, "no_match")' in text
+		# the floor copy holds only FLOOR_HASH: finding it means the template rows were not read
+		assert 'lookup("tenx_fw_fields", json_object("hash", "tenx-fm-floor"), json_array("n"))' in text
+		assert text.endswith('_meta=if(isnull($pd:tenx_fm_why$), _meta, coalesce(_meta, "") . " tenx_unmapped::" . '
+			'$pd:tenx_fm_why$)')
+
+	def test_the_fields_reach_an_event_that_has_no_indexed_field_yet(self):
+		# _meta is null on an HEC event without "fields" when no earlier rule wrote one (Splunk 10.4.3:
+		# without coalesce(), 0 of 2 such events got their fields; with it, 2 of 2)
+		text = fm.lookup_eval_text('tenx_fw_fields')
+		assert '_meta=if(isnull($pd:tenx_fm_m$) OR $pd:tenx_fm_m$==$pd:tenx_fm_x$, _meta, coalesce(_meta, "") . " " . ' \
+			'$pd:tenx_fm_m$)' in text
+		assert ' _meta . ' not in text.replace('coalesce(_meta, "") . ', '')
+
+	def test_the_floor_app_holds_the_definition_and_one_row(self, tmp_path):
+		_, a = self.gen(tmp_path, [('k1', 'user=$ n=1')], 'fm_fw')
+		floor = tmp_path / 'fm_fw_floor'
+		assert sorted(['fm_fw', 'fm_fw_floor'])[0] == 'fm_fw'
+		app_def = fm.read_conf(str(a / 'default' / 'transforms.conf'))['tenx_fw_fields']
+		assert fm.read_conf(str(floor / 'default' / 'transforms.conf')) == {'tenx_fw_fields': app_def}
+		assert fm.read_lookup_file(str(floor / 'lookups' / 'tenx_fw_fields.csv.gz')) == {
+			fm.FLOOR_HASH: {'hash': fm.FLOOR_HASH, 'n': '0', 'e': '0', 't': '', 'f': ''}}
+		assert read(str(floor / 'metadata' / 'default.meta')) == '[]\nexport = system\n'
+		assert sorted(os.listdir(str(floor))) == ['default', 'lookups', 'metadata']
+
+	def test_the_floor_app_does_not_change_when_templates_are_added(self, tmp_path):
+		self.gen(tmp_path, [('k1', 'user=$ n=1')], 'fm_fw')
+		floor = tmp_path / 'fm_fw_floor'
+		files = [str(floor / rel) for rel in ('lookups/tenx_fw_fields.csv.gz', 'default/transforms.conf', 'default/app.conf',
+			'metadata/default.meta')]
+		for f in files:
+			os.utime(f, (1000000000, 1000000000))
+		before = [open(f, 'rb').read() for f in files]
+		self.gen(tmp_path, [('k1', 'user=$ n=1'), ('k2', 'src=$')], 'fm_fw')
+		assert [open(f, 'rb').read() for f in files] == before
+		assert all(os.stat(f).st_mtime == 1000000000 for f in files)
+
+	def test_the_app_ships_an_unscheduled_search_for_events_without_fields(self):
+		conf = fm.read_conf(os.path.join(os.path.dirname(fm.default_app_props()), 'savedsearches.conf'))
+		ss = conf['Field Map Events Without Fields']
+		assert ss['enableSched'] == '0' and ss['counttype'] == 'number of events' and ss['relation'] == 'greater than'
+		assert ss['search'].startswith('| tstats count where index=* %s=* NOT host=%s by index sourcetype %s' % (
+			fm.UNMAPPED_FIELD, fm.PROBE_HOST, fm.UNMAPPED_FIELD))
+		assert '"processor=regexreplacement" "Runtime exception"' in ss['search'] and ss['search'].endswith('| where count > 0')
+
+	def test_no_floor_app_with_floor_off_or_per_template_transforms(self, tmp_path):
+		self.gen(tmp_path, [('k1', 'user=$')], 'fm_fw', '--floor', 'off')
+		generate(tmp_path, 'fm_tr', ['--records', self.records(tmp_path, [('k1', 'user=$')]), '--reader', 'kv',
+			'--sourcetype', 'tenx_fw', '--rename', 'fw:traffic'])
+		assert not os.path.exists(str(tmp_path / 'fm_fw_floor')) and not os.path.exists(str(tmp_path / 'fm_tr_floor'))
 
 	def test_the_rule_cuts_its_regex_from_a_constant_without_escapes(self):
 		# an escape would change the constant's length once SPL reads the string
@@ -847,6 +910,10 @@ class FakeSplunkd(object):
 		import urllib.parse as up
 		self.on_disk, self.app_name, self.cap_file = on_disk, app_name, cap_file
 		self.calls, self.events, self.rows = [], [], set()
+		# drop: probe events are not indexed (a lookup that throws); floor: the instance holds the floor app
+		self.drop, self.floor = False, True
+		# hec_unmapped: events sent through HEC are parsed where the app is not installed (no fields)
+		self.hec_unmapped = False
 		self.loaded = on_disk if loaded else None
 		if loaded:
 			self.refresh()
@@ -868,20 +935,33 @@ class FakeSplunkd(object):
 				data = self.rfile.read(int(self.headers.get('Content-Length') or 0)).decode('utf-8')
 				path, _, query = self.path.partition('?')
 				outer.calls.append(('POST', path, read(outer.cap_file) if os.path.exists(outer.cap_file) else None))
-				if path == '/services/receivers/simple':
+				if path == '/services/collector/event':
+					for line in data.splitlines():
+						e = json.loads(line)
+						h = e['event'][1:].split(',', 1)[0].strip()
+						if not outer.drop:
+							outer.events.append(dict(index=e['index'], host=e['host'], source=e['source'], sourcetype=e['sourcetype'],
+								raw=e['event'], hash=h, mapped=h in outer.rows and not outer.hec_unmapped, t=time.time(), via='hec'))
+					self._send({'text': 'Success', 'code': 0})
+				elif path == '/services/receivers/simple':
 					q = dict(up.parse_qsl(query))
 					for line in data.splitlines():
+						if outer.drop:
+							continue
 						h = line[1:].split(',', 1)[0].strip()
 						outer.events.append(dict(q, raw=line, hash=h, mapped=h in outer.rows, t=time.time()))
 					self._send({})
 				elif path == '/services/search/jobs':
 					m = dict(up.parse_qsl(data))
 					assert m['exec_mode'] == 'oneshot' and 'host="%s"' % fm.PROBE_HOST in m['search']
-					res = {}
+					res, why = {}, {}
 					for e in outer.events:
 						if e['host'] == fm.PROBE_HOST and e['source'] == fm.PROBE_SOURCE:
 							res[e['hash']] = max(res.get(e['hash'], 0), int(e['mapped']))
-					self._send({'results': [{'tenx_fm_probe_h': h, 'm': str(v)} for h, v in res.items()]})
+							if not e['mapped']:
+								why.setdefault(e['hash'], set()).add(fm.WHY_NO_ROW)
+					self._send({'results': [dict({'tenx_fm_probe_h': h, 'm': str(v)}, **({'w': sorted(why[h])} if h in why else {}))
+						for h, v in res.items()]})
 				else:
 					self._send({})
 
@@ -891,9 +971,12 @@ class FakeSplunkd(object):
 				entries = []
 				if '/conf-' in path and outer.loaded:
 					conf = path.rsplit('/conf-', 1)[1]
-					entries = [{'name': n, 'content': dict((k, '1' if v == 'true' else v) for k, v in c.items()),
-						'acl': {'app': outer.app_name}} for n, c in
-						fm.read_conf(os.path.join(outer.loaded, 'default', conf + '.conf')).items()]
+					app = up.unquote(path.split('/servicesNS/nobody/', 1)[1].split('/', 1)[0])
+					folder = outer.loaded if app == outer.app_name else (fm.floor_dir(outer.loaded)
+						if app == outer.app_name + fm.FLOOR_SUFFIX and outer.floor else None)
+					if folder:
+						entries = [{'name': n, 'content': dict((k, '1' if v == 'true' else v) for k, v in c.items()),
+							'acl': {'app': app}} for n, c in fm.read_conf(os.path.join(folder, 'default', conf + '.conf')).items()]
 				self._send({'entry': entries})
 
 		self.server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
@@ -1098,6 +1181,136 @@ class TestCapFile:
 			fake.close()
 		assert fake.posts()[0][2] == 'pattern_hash,value\n'
 		assert read(str(cap)) == 'pattern_hash,value\n"k1",true\n'
+
+	def test_activate_needs_the_floor_app_on_the_instance(self, tmp_path):
+		cap = tmp_path / 'compact-cap.csv'
+		assert self.gen(tmp_path, ['k1'], cap) == 0
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		fake.floor = False
+		try:
+			rc, out = self.activate(tmp_path, cap, fake)
+		finally:
+			fake.close()
+		assert rc == 1 and 'floor app fm_fw_floor' in out and fake.events == []
+		assert read(str(cap)) == 'pattern_hash,value\n'
+
+	def listed(self, tmp_path, hashes, kept=''):
+		cap = tmp_path / 'compact-cap.csv'
+		assert self.gen(tmp_path, hashes, cap) == 0
+		cap.write_text(fm.cap_text(set(hashes)) + kept, encoding='utf-8')
+		os.remove(str(cap) + '.pending')
+		return cap
+
+	def check(self, tmp_path, cap, fake, **kw):
+		out = io.StringIO()
+		kw.setdefault('probe_index', 'probes')
+		clock = iter(range(0, 100000, 5))
+		rc = fm.check(str(tmp_path / 'fm_fw'), str(cap), fm.Splunkd(fake.url), out=out, sleep=lambda s: None,
+			clock=lambda: next(clock), **kw)
+		return rc, out.getvalue()
+
+	def test_check_changes_nothing_while_probes_have_their_fields(self, tmp_path):
+		cap = self.listed(tmp_path, ['k1', 'k2'])
+		before = read(str(cap))
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		try:
+			rc, out = self.check(tmp_path, cap, fake, sample=2)
+		finally:
+			fake.close()
+		assert rc == 0 and read(str(cap)) == before and not os.path.exists(str(cap) + '.pending')
+		assert sorted(e['hash'] for e in fake.events) == ['k1', 'k2'] and 'all indexed with their fields' in out
+		assert set(c[1] for c in fake.posts()) == {'/services/receivers/simple', '/services/search/jobs'}
+
+	def test_check_empties_the_list_when_a_probe_comes_back_without_fields(self, tmp_path):
+		cap = self.listed(tmp_path, ['k1', 'k2'], '"keep",false\n')
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		fake.rows = set()
+		try:
+			rc, out = self.check(tmp_path, cap, fake)
+		finally:
+			fake.close()
+		# the rows that are not `true` stay; every listed template waits for activate
+		assert rc == 1 and read(str(cap)) == 'pattern_hash,value\n"keep",false\n'
+		assert read(str(cap) + '.pending') == 'pattern_hash,value\n"k1",true\n"k2",true\n"keep",false\n'
+		assert 'without its fields (tenx_unmapped=no_row)' in out
+
+	def test_check_empties_the_list_when_a_probe_is_not_indexed(self, tmp_path):
+		cap = self.listed(tmp_path, ['k1'])
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		fake.drop = True
+		try:
+			rc, out = self.check(tmp_path, cap, fake, timeout=20, poll=5)
+		finally:
+			fake.close()
+		assert rc == 1 and read(str(cap)) == 'pattern_hash,value\n' and '1 of 1 probes not indexed within 20 s' in out
+		assert read(str(cap) + '.pending') == 'pattern_hash,value\n"k1",true\n'
+
+	def test_after_check_activate_lists_the_templates_again_once_they_have_fields(self, tmp_path):
+		cap = self.listed(tmp_path, ['k1', 'k2'])
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		try:
+			fake.drop = True
+			assert self.check(tmp_path, cap, fake, timeout=20, poll=5)[0] == 1
+			assert self.activate(tmp_path, cap, fake, timeout=0)[0] == 1 and read(str(cap)) == 'pattern_hash,value\n'
+			fake.drop = False
+			clock = iter(range(0, 1000, 10))
+			rc, _ = self.activate(tmp_path, cap, fake, timeout=25, clock=lambda: next(clock))
+		finally:
+			fake.close()
+		assert rc == 0 and read(str(cap)) == 'pattern_hash,value\n"k1",true\n"k2",true\n'
+		assert not os.path.exists(str(cap) + '.pending')
+
+	def test_check_withdraws_at_once_when_the_lookup_file_is_missing(self, tmp_path):
+		cap = self.listed(tmp_path, ['k1'])
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		os.remove(str(tmp_path / 'fm_fw' / 'lookups' / 'tenx_fw_fields.csv.gz'))
+		try:
+			rc, out = self.check(tmp_path, cap, fake)
+		finally:
+			fake.close()
+		assert rc == 1 and fake.posts() == [] and 'is missing' in out and read(str(cap)) == 'pattern_hash,value\n'
+
+	def test_the_list_activate_restores_is_a_newer_file_than_the_one_check_emptied(self, tmp_path):
+		# the Receiver rereads its cap file when the file's time changes
+		cap = self.listed(tmp_path, ['k1'])
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		try:
+			fake.drop = True
+			assert self.check(tmp_path, cap, fake, timeout=20, poll=5)[0] == 1
+			os.utime(str(cap), (1000000000, 1000000000))
+			os.utime(str(cap) + '.pending', (1000000000, 1000000000))
+			fake.drop = False
+			assert self.activate(tmp_path, cap, fake, timeout=0)[0] == 0
+		finally:
+			fake.close()
+		assert read(str(cap)) == 'pattern_hash,value\n"k1",true\n' and os.stat(str(cap)).st_mtime > 1000000001
+		assert not os.path.exists(str(cap) + '.pending')
+
+	def test_probes_can_take_the_path_of_the_data(self, tmp_path):
+		cap = tmp_path / 'compact-cap.csv'
+		assert self.gen(tmp_path, ['k1'], cap) == 0
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		# the management port's instance holds the app, the instance behind HEC parses without it
+		fake.hec_unmapped = True
+		out = io.StringIO()
+		try:
+			rc = fm.activate(str(tmp_path / 'fm_fw'), str(cap), fm.Splunkd(fake.url, hec_url=fake.url, hec_token='t'), out=out,
+				sleep=lambda s: None, probe_index='probes', timeout=0)
+		finally:
+			fake.close()
+		assert rc == 1 and read(str(cap)) == 'pattern_hash,value\n'
+		assert fake.events and all(e.get('via') == 'hec' for e in fake.events)
+		assert '/services/receivers/simple' not in set(c[1] for c in fake.posts())
+
+	def test_check_with_nothing_listed_sends_nothing(self, tmp_path):
+		cap = tmp_path / 'compact-cap.csv'
+		assert self.gen(tmp_path, ['k1'], cap) == 0
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		try:
+			rc, out = self.check(tmp_path, cap, fake)
+		finally:
+			fake.close()
+		assert rc == 0 and fake.posts() == [] and 'nothing listed' in out
 
 	def test_without_the_option_nothing_changes(self, tmp_path):
 		records = self.records(tmp_path, ['k1'])
