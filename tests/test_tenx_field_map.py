@@ -1193,6 +1193,8 @@ class TestCapFile:
 		cap = tmp_path / 'compact-cap.csv'
 		cap.write_text('pattern_hash,value\n"gone",true\n"k1",true\n"keep",false:0:audit\n"k2",false\n',
 			encoding='utf-8')
+		# the first run takes the listed rows of its own templates (gone and k1); the second no longer has gone
+		assert self.gen(tmp_path, ['gone', 'k1', 'k2', 'k3'], cap) == 0
 		assert self.gen(tmp_path, ['k1', 'k2', 'k3'], cap) == 0
 		# k1 stays, gone is dropped, k3 waits, k2 stays whole because its row says so, keep is kept
 		assert read(str(cap)) == 'pattern_hash,value\n"k1",true\n"k2",false\n"keep",false:0:audit\n'
@@ -1281,6 +1283,7 @@ class TestCapFile:
 	def test_removals_need_no_probe(self, tmp_path):
 		cap = tmp_path / 'compact-cap.csv'
 		cap.write_text('pattern_hash,value\n"gone",true\n"k1",true\n', encoding='utf-8')
+		assert self.gen(tmp_path, ['gone', 'k1'], cap) == 0
 		assert self.gen(tmp_path, ['k1'], cap) == 0
 		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
 		try:
@@ -1574,14 +1577,13 @@ class TestCapFile:
 			case = tmp_path / ('c%d_%d' % (len(rows), sample))
 			os.makedirs(str(case))
 			cap = case / 'compact-cap.csv'
-			assert self.gen(case, rows or ['k0'], cap) == 0
-			if not rows:
-				# the file emptied to its header
-				table = str(case / 'fm_fw' / 'lookups' / 'tenx_fw_fields.csv.gz')
-				with gzip.open(table, 'rt', encoding='utf-8') as f:
-					header = f.readline()
-				with gzip.open(table, 'wt', encoding='utf-8') as f:
-					f.write(header)
+			assert self.gen(case, ['k1', 'k2'], cap) == 0
+			# the map's lookup file keeps the rows of `rows` only (emptied to its header when none)
+			table = str(case / 'fm_fw' / 'lookups' / 'tenx_fw_fields.csv.gz')
+			with gzip.open(table, 'rt', encoding='utf-8') as f:
+				lines = f.readlines()
+			with gzip.open(table, 'wt', encoding='utf-8') as f:
+				f.write(''.join(lines[:1] + [l for l in lines[1:] if l.split(',', 1)[0] in rows]))
 			cap.write_text(fm.cap_text({'k1', 'k2'}), encoding='utf-8')
 			os.remove(str(cap) + '.pending')
 			fake = FakeSplunkd(str(case / 'fm_fw'), 'fm_fw', str(cap))
@@ -1612,6 +1614,147 @@ class TestCapFile:
 		assert fm.main(['activate', '--app', str(tmp_path), '--cap-file', str(tmp_path / 'c.csv'), '--splunkd',
 			'https://127.0.0.1:1', '--check-timeout', '7']) == 0
 		assert seen == {'check_timeout': 7.0}
+
+	# Several field maps on one cap file
+
+	HAND = 'zz-hand,false:0:audit\n'
+
+	def gen_map(self, tmp_path, app, hashes, cap):
+		rec = tmp_path / ('%s.json' % app)
+		rec.write_text(''.join(json.dumps({'templateHash': h, 'template': 'time=$(HH:mm:ss) user=$ n=%d' % i}) + '\n'
+			for i, h in enumerate(hashes)), encoding='utf-8')
+		return fm.main(['gen', '--rules', 'lookup', '--records', str(rec), '--reader', 'kv', '--sourcetype', 'tenx_' + app,
+			'--rename', 'fw:traffic', '--out', str(tmp_path / app), '--cap-file', str(cap)])
+
+	def activate_map(self, tmp_path, app, cap, rows=None):
+		fake = FakeSplunkd(str(tmp_path / app), app, str(cap))
+		if rows is not None:
+			fake.rows = set(rows)
+		out = io.StringIO()
+		clock = self.Clock()
+		fake.now = clock
+		try:
+			rc = fm.activate(str(tmp_path / app), str(cap), fm.Splunkd(fake.url), out=out, clock=clock, sleep=clock.sleep,
+				probe_index='probes', timeout=300, poll=10)
+		finally:
+			fake.close()
+		return rc, out.getvalue()
+
+	def check_map(self, tmp_path, app, cap, rows=None):
+		fake = FakeSplunkd(str(tmp_path / app), app, str(cap))
+		if rows is not None:
+			fake.rows = set(rows)
+		out = io.StringIO()
+		clock = iter(range(0, 100000, 5))
+		try:
+			rc = fm.check(str(tmp_path / app), str(cap), fm.Splunkd(fake.url), out=out, sleep=lambda s: None,
+				clock=lambda: next(clock), probe_index='probes', sample=2)
+		finally:
+			fake.close()
+		return rc, out.getvalue()
+
+	def three_maps(self, tmp_path):
+		cap = tmp_path / 'compact-cap.csv'
+		cap.write_text('pattern_hash,value\n# kept by hand\n' + self.HAND, encoding='utf-8')
+		maps = {'fm_w': ['w1', 'w2'], 'fm_ct': ['c1', 'c2'], 'fm_fgt': ['f1', 'f2']}
+		for app, hashes in maps.items():
+			assert self.gen_map(tmp_path, app, hashes, cap) == 0
+		for app in maps:
+			assert self.activate_map(tmp_path, app, cap)[0] == 0
+		return cap, maps
+
+	def test_three_maps_share_one_cap_file(self, tmp_path):
+		cap, maps = self.three_maps(tmp_path)
+		listed, _ = fm.read_cap(str(cap))
+		assert listed == {'w1', 'w2', 'c1', 'c2', 'f1', 'f2'} and not os.path.exists(str(cap) + '.pending')
+		# the lines no map owns are as written, and every map's rows are the tool's own
+		assert '# kept by hand\n' in read(str(cap)) and self.HAND in read(str(cap))
+		owners = json.loads((tmp_path / 'compact-cap.csv.owners.json').read_text())['maps']
+		assert dict((a, m['owned']) for a, m in owners.items()) == dict((a, sorted(h)) for a, h in maps.items())
+		# gen of one map again changes nothing of the others
+		assert self.gen_map(tmp_path, 'fm_ct', ['c1', 'c3'], cap) == 0
+		listed, _ = fm.read_cap(str(cap))
+		assert listed == {'w1', 'w2', 'c1', 'f1', 'f2'}
+		assert read(str(cap) + '.pending').count('true') == 6 and '"c3",true' in read(str(cap) + '.pending')
+
+	def test_check_failing_for_one_map_withdraws_its_rows_only(self, tmp_path):
+		cap, maps = self.three_maps(tmp_path)
+		rc, out = self.check_map(tmp_path, 'fm_ct', cap, rows=set())
+		listed, _ = fm.read_cap(str(cap))
+		assert rc == 1 and listed == {'w1', 'w2', 'f1', 'f2'} and 'none of its 2 templates' in out
+		assert '# kept by hand\n' in read(str(cap)) and self.HAND in read(str(cap))
+		pending, _ = fm.read_cap(str(cap) + '.pending')
+		assert {'c1', 'c2'} <= pending
+		# the other maps' checks still pass and list nothing new
+		assert self.check_map(tmp_path, 'fm_w', cap)[0] == 0 and self.check_map(tmp_path, 'fm_fgt', cap)[0] == 0
+		# activate of the failed map lists only its own templates again
+		assert self.activate_map(tmp_path, 'fm_ct', cap)[0] == 0
+		listed, _ = fm.read_cap(str(cap))
+		assert listed == {'w1', 'w2', 'c1', 'c2', 'f1', 'f2'} and not os.path.exists(str(cap) + '.pending')
+
+	def test_activate_of_one_map_lists_only_its_proven_templates(self, tmp_path):
+		cap = tmp_path / 'compact-cap.csv'
+		assert self.gen_map(tmp_path, 'fm_w', ['w1', 'w2'], cap) == 0
+		assert self.gen_map(tmp_path, 'fm_ct', ['c1'], cap) == 0
+		# fm_w's instance has w1's row only
+		rc, _ = self.activate_map(tmp_path, 'fm_w', cap, rows={'w1'})
+		listed, _ = fm.read_cap(str(cap))
+		assert rc == 1 and listed == {'w1'}
+		assert self.activate_map(tmp_path, 'fm_ct', cap)[0] == 0
+		listed, _ = fm.read_cap(str(cap))
+		assert listed == {'w1', 'c1'} and os.path.exists(str(cap) + '.pending')
+
+	def test_a_hash_two_maps_carry_is_listed_while_every_owner_has_proven_it(self, tmp_path):
+		cap = tmp_path / 'compact-cap.csv'
+		assert self.gen_map(tmp_path, 'fm_a', ['h', 'a1'], cap) == 0
+		assert self.activate_map(tmp_path, 'fm_a', cap)[0] == 0
+		assert fm.read_cap(str(cap))[0] == {'h', 'a1'}
+		# a second map that carries h: h goes whole until that map has proven it too
+		assert self.gen_map(tmp_path, 'fm_b', ['h', 'b1'], cap) == 0
+		assert fm.read_cap(str(cap))[0] == {'a1'}
+		rc, out = self.activate_map(tmp_path, 'fm_b', cap)
+		assert rc == 0 and fm.read_cap(str(cap))[0] == {'h', 'a1', 'b1'}
+		# one owner's check failing withdraws h with that owner's rows; the other owner's rows stay
+		assert self.check_map(tmp_path, 'fm_a', cap, rows=set())[0] == 1
+		assert fm.read_cap(str(cap))[0] == {'b1'}
+		assert self.activate_map(tmp_path, 'fm_a', cap)[0] == 0
+		assert fm.read_cap(str(cap))[0] == {'h', 'a1', 'b1'}
+		# a map that stops carrying h leaves it listed for the other owner
+		assert self.gen_map(tmp_path, 'fm_a', ['a1'], cap) == 0
+		assert fm.read_cap(str(cap))[0] == {'h', 'a1', 'b1'}
+
+	def test_two_withdrawals_for_different_maps_at_once_keep_both(self, tmp_path, monkeypatch):
+		import threading
+		cap, maps = self.three_maps(tmp_path)
+		real = fm.cap_lines
+
+		def slow(path):
+			got = real(path)
+			time.sleep(0.2)
+			return got
+		monkeypatch.setattr(fm, 'cap_lines', slow)
+		runs = [threading.Thread(target=fm.withdraw, args=(str(cap), 'test', io.StringIO(), app)) for app in ('fm_w', 'fm_ct')]
+		for t in runs:
+			t.start()
+		for t in runs:
+			t.join()
+		assert fm.read_cap(str(cap))[0] == {'f1', 'f2'}
+		assert {'w1', 'w2', 'c1', 'c2'} <= fm.read_cap(str(cap) + '.pending')[0]
+
+	def test_a_cap_file_written_before_is_taken_row_by_row(self, tmp_path):
+		# one map's cap file of the earlier tool, no owners file: listed rows of two kinds and a hand row
+		cap = tmp_path / 'compact-cap.csv'
+		before = 'pattern_hash,value\n"c1",true\n"w1",true\n' + self.HAND
+		cap.write_text(before, encoding='utf-8')
+		assert self.gen_map(tmp_path, 'fm_w', ['w1', 'w2'], cap) == 0
+		# fm_w takes w1 and leaves c1 and the hand row as they were
+		assert read(str(cap)) == before
+		owners = json.loads((tmp_path / 'compact-cap.csv.owners.json').read_text())['maps']
+		assert owners == {'fm_w': {'owned': ['w1', 'w2'], 'proven': ['w1']}}
+		assert self.gen_map(tmp_path, 'fm_ct', ['c1'], cap) == 0
+		assert fm.read_cap(str(cap))[0] == {'c1', 'w1'}
+		assert self.check_map(tmp_path, 'fm_ct', cap, rows=set())[0] == 1
+		assert fm.read_cap(str(cap))[0] == {'w1'} and self.HAND in read(str(cap))
 
 	def test_without_the_option_nothing_changes(self, tmp_path):
 		records = self.records(tmp_path, ['k1'])

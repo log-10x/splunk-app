@@ -127,6 +127,7 @@ import argparse
 import base64
 import collections
 import configparser
+import contextlib
 import csv
 import datetime
 import hashlib
@@ -2328,24 +2329,151 @@ def write_if_changed(path, text):
 	return True
 
 
-def cap_before_app(path, hashes):
-	"""
-	Before the app is written: the cap file without the listed hashes that have no transform any
-	more (created with its header alone when absent). Returns a summary for the report.
-	"""
-	listed, kept = read_cap(path)
-	kept_hashes = set(h for h, _ in kept)
-	now = (listed & hashes) - kept_hashes
-	written = write_if_changed(path, cap_text(now, kept))
-	return collections.OrderedDict([('cap_file', path), ('listed_before', len(listed)),
-		('removed', len(listed - hashes)), ('listed_now', len(now)), ('cap_file_written', written),
-		('waiting_for_activation', len(hashes - kept_hashes - now)), ('rows_kept_as_written', len(kept))])
+# Several field maps can share one cap file (one Receiver for Windows, CloudTrail and every FortiGate type):
+# each command changes only the rows of its own map and leaves every other line of the cap file and of its
+# .pending companion as written, including rows no map owns (a list kept by hand). Which map owns which
+# hashes is kept beside the cap file in <cap file>.owners.json, keyed by the map's app name (--app-name, or
+# the app folder's name), because a map must see the other owners to leave a hash they carry: "not in my
+# templates" says nothing about whose a row is. A hash two maps carry is listed only while every owning map
+# has proven it (its row reaches the compact events of both sourcetypes): activate by one owner lists it once
+# each owner has proven it, and check failing for one owner withdraws it. Every read and write of the cap
+# file, its .pending file and owners.json happens under an exclusive lock on <cap file>.lock and re-reads
+# the files inside it, so two runs for different maps (two scheduled checks) do not lose each other's
+# changes. A cap file without an owners.json (one map, written before) keeps working: a map's first run
+# adopts the listed rows in its own template set that no other map owns, and leaves the rest.
+CAP_OWNERS_SUFFIX = '.owners.json'
+CAP_LOCK_SUFFIX = '.lock'
 
 
-def cap_after_app(path, hashes):
-	"""After the app is written: the pending list, every template with a transform."""
-	_, kept = read_cap(path)
-	return write_if_changed(path + CAP_PENDING_SUFFIX, cap_text(hashes, kept))
+@contextlib.contextmanager
+def cap_lock(cap_file):
+	"""An exclusive lock on <cap file>.lock for one read-modify-write of the cap files."""
+	folder = os.path.dirname(os.path.abspath(cap_file))
+	os.makedirs(folder, exist_ok=True)
+	f = open(cap_file + CAP_LOCK_SUFFIX, 'a+')
+	try:
+		try:
+			import fcntl
+			fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+		except ImportError:
+			import msvcrt
+			f.seek(0)
+			msvcrt.locking(f.fileno(), msvcrt.LK_LOCK, 1)
+		yield
+	finally:
+		f.close()
+
+
+def load_owners(cap_file):
+	"""app name -> {'owned': set of hashes, 'proven': set of hashes} from <cap file>.owners.json."""
+	try:
+		with open(cap_file + CAP_OWNERS_SUFFIX, encoding='utf-8') as f:
+			data = json.load(f)
+	except (IOError, OSError, ValueError):
+		return {}
+	return dict((app, {'owned': set(m.get('owned', ())), 'proven': set(m.get('proven', ()))})
+		for app, m in data.get('maps', {}).items())
+
+
+def save_owners(cap_file, maps):
+	text = json.dumps({'maps': dict((app, {'owned': sorted(m['owned']), 'proven': sorted(m['proven'])})
+		for app, m in sorted(maps.items()))}, indent=1, sort_keys=True) + '\n'
+	return write_if_changed(cap_file + CAP_OWNERS_SUFFIX, text)
+
+
+def cap_lines(path):
+	"""(header line, [(hash, value, line as written)]) of a cap file; every line is kept as it was."""
+	try:
+		with open(path, encoding='utf-8', newline='') as f:
+			lines = f.read().splitlines(True)
+	except (IOError, OSError):
+		return CAP_HEADER, []
+	if not lines:
+		return CAP_HEADER, []
+	rows = []
+	for line in lines[1:]:
+		parsed = next(csv.reader([line.rstrip('\r\n')]), [])
+		rows.append((parsed[0] if parsed else '', parsed[1] if len(parsed) > 1 else '',
+			line if line.endswith('\n') else line + '\n'))
+	return lines[0] if lines[0].endswith('\n') else lines[0] + '\n', rows
+
+
+def cap_rewrite(path, decide, base=None):
+	"""
+	Writes path (from the lines of base, default path itself) with the listed (true) row of each hash in
+	decide present when decide[hash] is True and absent when False. A row that does not start with true is
+	never changed and wins. Every other line stays as written; rows are sorted as cap_text sorts them.
+	"""
+	header, rows = cap_lines(base or path)
+	out = [r for r in rows if not (r[0] in decide and r[1].startswith('true'))]
+	present = set(r[0] for r in out)
+	out += [(h, 'true', '"%s",true\n' % h.replace('"', '""')) for h, v in decide.items() if v and h not in present]
+	out.sort(key=lambda r: (r[0], r[1]))
+	return write_if_changed(path, header + ''.join(r[2] for r in out))
+
+
+def _others(maps, app):
+	return set().union(*[m['owned'] for a, m in maps.items() if a != app]) if maps else set()
+
+
+def _all_proven(maps, h, app=None, confirmed=()):
+	"""True when every map that owns h has proven it (app's proof counted from confirmed as well)."""
+	owners = [a for a, m in maps.items() if h in m['owned']]
+	return all(h in maps[a]['proven'] or (a == app and h in confirmed) for a in owners)
+
+
+def _shared(maps, h):
+	return sum(1 for m in maps.values() if h in m['owned']) > 1
+
+
+def cap_before_app(path, hashes, app):
+	"""
+	Before the app is written: the cap file without app's listed hashes that have no transform any more,
+	and without a hash app newly shares with another map until app has proven it (created with its header
+	alone when absent). Returns (a summary for the report, the hashes app no longer owns).
+	"""
+	with cap_lock(path):
+		maps = load_owners(path)
+		listed, kept = read_cap(path)
+		kept_hashes = set(h for h, _ in kept)
+		mine = maps.get(app, {'owned': set(), 'proven': set()})
+		adopted = (listed & hashes) - _others(maps, app) - mine['owned']
+		before = listed & (mine['owned'] | adopted)
+		removed = mine['owned'] - hashes
+		maps[app] = {'owned': set(hashes), 'proven': (mine['proven'] | adopted | before) & hashes}
+		decide = {}
+		for h in removed:
+			if not any(h in m['owned'] for m in maps.values()):
+				decide[h] = False
+		for h in hashes:
+			if _shared(maps, h) and h in listed:
+				decide[h] = _all_proven(maps, h)
+		written = cap_rewrite(path, decide) if decide or not os.path.exists(path) else False
+		save_owners(path, maps)
+		listed_now, _ = read_cap(path)
+		now = listed_now & hashes
+	return collections.OrderedDict([('cap_file', path), ('listed_before', len(before)),
+		('removed', len((before - hashes) - listed_now)), ('listed_now', len(now)), ('cap_file_written', written),
+		('waiting_for_activation', len(hashes - kept_hashes - now)), ('rows_kept_as_written', len(kept))]), removed
+
+
+def cap_after_app(path, hashes, app, removed=()):
+	"""After the app is written: app's rows in the pending list, every template with a transform."""
+	with cap_lock(path):
+		maps = load_owners(path)
+		pending = path + CAP_PENDING_SUFFIX
+		decide = dict((h, True) for h in hashes)
+		for h in removed:
+			if not any(h in m['owned'] for m in maps.values()):
+				decide[h] = False
+		return cap_rewrite(pending, decide, base=pending if os.path.exists(pending) else path)
+
+
+def owned_by(cap_file, app):
+	"""The hashes app owns in cap_file, or None when owners.json does not name it (a cap file written
+	before, owned by one map: every row is that map's)."""
+	m = load_owners(cap_file).get(app)
+	return None if m is None else m['owned']
 
 
 class Splunkd(object):
@@ -2583,6 +2711,9 @@ def activate(app_dir, cap_file, splunkd, app_name=None, probe_index=None, timeou
 	sourcetype, table = layout
 	before, kept = read_cap(cap_file)
 	after, _ = read_cap(pending)
+	owned = owned_by(cap_file, app_name)
+	if owned is not None:
+		before, after = before & owned, after & owned
 	added = sorted(after - before)
 	differ = not_installed(splunkd, app_dir, app_name)
 	if differ:
@@ -2651,17 +2782,29 @@ def activate(app_dir, cap_file, splunkd, app_name=None, probe_index=None, timeou
 				'' if not missing else '; not yet: %s' % ', '.join(repr(h) for h in missing[:5])))
 		if away:
 			out.write('activate: did not answer in at least one round, so left out of those rounds: %s\n' % ', '.join(sorted(away)))
-	now = (before & after) | confirmed
-	if now == after:
+	with cap_lock(cap_file):
+		maps = load_owners(cap_file)
+		if app_name in maps:
+			maps[app_name]['proven'] |= confirmed
+		decide = dict((h, False) for h in before - after if not (maps and _shared(maps, h)))
+		decide.update((h, _all_proven(maps, h) if maps and _shared(maps, h) else True) for h in confirmed)
 		# Written anew rather than renamed: the pending file can be as old as the cap file it replaces (check
 		# writes both at once), and the Receiver sees a change by the file's time.
-		write_if_changed(cap_file, open(pending, encoding='utf-8', newline='').read())
-		os.remove(pending)
-		out.write('activate: %s lists %d templates (%d added, %d removed)\n' % (cap_file, len(after), len(confirmed),
-			len(before - after)))
+		cap_rewrite(cap_file, decide)
+		if maps:
+			save_owners(cap_file, maps)
+		listed, _ = read_cap(cap_file)
+		now = (listed & owned) if owned is not None else listed
+		waiting = set(h for h in confirmed if h not in listed)
+		done = (now | waiting) >= after
+		if done and cap_lines(cap_file) == cap_lines(pending):
+			os.remove(pending)
+	if done:
+		out.write('activate: %s lists %d templates (%d added, %d removed)%s\n' % (cap_file, len(after - waiting),
+			len(confirmed - waiting), len(before - after), '' if not waiting else '; %d proven here wait for another map that '
+			'carries them' % len(waiting)))
 		return 0
-	write_if_changed(cap_file, cap_text(now, kept))
-	out.write('activate: %s lists %d templates; %d still pending\n' % (cap_file, len(now), len(after - now)))
+	out.write('activate: %s lists %d templates; %d still pending\n' % (cap_file, len(now & after), len(after - now)))
 	return 1
 
 
@@ -2679,11 +2822,14 @@ def check(app_dir, cap_file, splunkd, app_name=None, probe_index=None, sample=1,
 	nothing is checked and check returns 2 without changing the list.
 	"""
 	import random
+	app_name = app_name or os.path.basename(os.path.abspath(app_dir))
 	listed, kept = read_cap(cap_file)
+	owned = owned_by(cap_file, app_name)
+	if owned is not None:
+		listed = listed & owned
 	if not listed:
 		out.write('check: nothing listed (%s)\n' % cap_file)
 		return 0
-	app_name = app_name or os.path.basename(os.path.abspath(app_dir))
 	layout = lookup_app(app_dir)
 	if layout is None or not probe_index:
 		out.write('check: needs an app generated with --rules lookup and --probe-index; cap file left as it was\n')
@@ -2691,7 +2837,7 @@ def check(app_dir, cap_file, splunkd, app_name=None, probe_index=None, sample=1,
 	sourcetype, table = layout
 	if not os.path.exists(table):
 		# Splunk keeps the rows it read until its next refresh, then fails on every compact event: withdraw now.
-		withdraw(cap_file, 'the lookup file %s is missing' % table, out)
+		withdraw(cap_file, 'the lookup file %s is missing' % table, out, app_name)
 		return 1
 	rows = read_lookup_file(table)
 	without = sorted(h for h in listed if h.strip() not in rows)
@@ -2727,17 +2873,25 @@ def check(app_dir, cap_file, splunkd, app_name=None, probe_index=None, sample=1,
 				why = '%d of %d probes not indexed within %.0f s%s' % (len(late), len(pairs), timeout,
 					'' if up == [None] else ' (%s)' % ', '.join(sorted(set(late))))
 				break
-	withdraw(cap_file, why, out)
+	withdraw(cap_file, why, out, app_name)
 	return 1
 
 
-def withdraw(cap_file, why, out=sys.stdout):
-	"""The cap file keeps only its rows that do not start with true; every listed template is left pending."""
-	listed, kept = read_cap(cap_file)
+def withdraw(cap_file, why, out=sys.stdout, app_name=None):
+	"""The listed rows of app_name's map leave the cap file (every listed row when owners.json does not
+	name the map) and stay pending until activate proves them again; every other row is left as written."""
 	pending = cap_file + CAP_PENDING_SUFFIX
-	waiting, _ = read_cap(pending)
-	write_if_changed(pending, cap_text(listed | waiting, kept))
-	write_if_changed(cap_file, cap_text((), kept))
+	with cap_lock(cap_file):
+		maps = load_owners(cap_file)
+		listed, _ = read_cap(cap_file)
+		if app_name in maps:
+			listed &= maps[app_name]['owned']
+			maps[app_name]['proven'] -= listed
+		decide = dict((h, True) for h in listed)
+		cap_rewrite(pending, decide, base=pending if os.path.exists(pending) else cap_file)
+		cap_rewrite(cap_file, dict((h, False) for h in listed))
+		if app_name in maps:
+			save_owners(cap_file, maps)
 	out.write('check: %s; %s now lists none of its %d templates, which stay pending until activate proves them again\n' % (
 		why, cap_file, len(listed)))
 
@@ -2944,14 +3098,15 @@ def main(argv=None):
 	cap = None
 	if args.cap_file:
 		hashes = cap_hashes(field_map, templates)
-		cap = cap_before_app(args.cap_file, hashes)
+		owner = args.app_name or os.path.basename(os.path.abspath(args.out))
+		cap, removed = cap_before_app(args.cap_file, hashes, owner)
 	sizes = {}
 	if args.rules == RULES_LOOKUP and args.floor == 'on':
 		# First, so the definition and a file of its name exist before the rule that reads them.
 		sizes.update(write_floor_app(args.out, target))
 	sizes.update(write_app(args.out, target, field_map, settings, args.search_hash == 'on', sourcetype_field, lookup_bytes))
 	if args.cap_file:
-		cap['pending_file_written'] = cap_after_app(args.cap_file, hashes)
+		cap['pending_file_written'] = cap_after_app(args.cap_file, hashes, owner, removed)
 	report = field_map.report()
 	if cap is not None:
 		report['compact_cap'] = cap
