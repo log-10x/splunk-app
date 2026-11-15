@@ -41,8 +41,17 @@ TX_SHIPPED = ('`tenx-events` [| tenxprefilter] | `tenx-inflate` | fields - _kv |
 # The one step `tx` and `txf` add before their final search: the template lookup gives
 # tenx_expand_refused an empty value on every event it expands, and only a refused event keeps it.
 REFUSED_STEP = ' | eval tenx_expand_refused=if(len(tenx_expand_refused)>0, tenx_expand_refused, null())'
-# [tx] now
-TX_DEFINITION = TX_SHIPPED.replace(' | search *', REFUSED_STEP + ' | search *')
+# [tx] now: the same, with the field-map guard around `extract` and REFUSED_STEP before the final
+# search (see TestTxIsTheShippedMacro)
+TX_DEFINITION = ('`tenx-events` [| tenxprefilter] | `tenx-inflate` | `tenx-mapped-hide` | fields - _kv | extract | '
+				 '`tenx-mapped-restore` | fields - tenx_hash, tenx_var_0, tenx_vars' + REFUSED_STEP + ' | search *')
+GUARD_CALLS = (' | `tenx-mapped-hide`', ' | `tenx-mapped-restore`')
+
+
+def without_guard(definition):
+	for call in GUARD_CALLS:
+		definition = definition.replace(call, '')
+	return definition
 
 
 def macros():
@@ -62,6 +71,15 @@ def stanza_text(text, name):
 	while end < len(lines) and lines[end] and not lines[end].startswith('['):
 		end += 1
 	return '\n'.join(lines[start:end])
+
+
+def mapped_guard_macros():
+	"""tenx-mapped-hide and tenx-mapped-restore as macros.conf defines them, for the SPL model."""
+	import configparser
+	import os
+	conf = configparser.RawConfigParser(strict=False)
+	conf.read(os.path.join(os.path.dirname(__file__), '..', 'tenx-for-splunk', 'default', 'macros.conf'))
+	return dict((n, conf.get(n, 'definition')) for n in ('tenx-mapped-hide', 'tenx-mapped-restore'))
 
 
 class TestTheRefusedStep:
@@ -86,13 +104,16 @@ class TestTheRefusedStep:
 
 class TestTxIsTheShippedMacro:
 	"""
-	`tx` is the shipped macro with one step added before its final search, REFUSED_STEP, which
-	removes the empty tenx_expand_refused the template lookup leaves on every expanded event.
-	TestTheRefusedStep runs it on a refused, an expanded and an unknown template's event.
+	`tx` is the shipped macro with one addition: tenx-mapped-hide before its `extract` and
+	tenx-mapped-restore after it, for events indexed with a field map (tenx_mapped). Each is a
+	foreach over tenx_mapped*, which runs only on a chunk of results holding such an event, and
+	each eval is guarded per event; TestTheMappedGuard runs both on events with and without it.
+	And REFUSED_STEP before its final search, which removes the empty tenx_expand_refused the
+	template lookup leaves on every expanded event (TestTheRefusedStep).
 	"""
 	def test_the_definition(self):
 		assert macros().get('tx', 'definition') == TX_DEFINITION
-		assert TX_DEFINITION.replace(REFUSED_STEP, '') == TX_SHIPPED
+		assert without_guard(TX_DEFINITION).replace(REFUSED_STEP, '') == TX_SHIPPED
 
 	def test_every_other_shipped_stanza_is_unchanged_character_for_character(self):
 		try:
@@ -105,7 +126,8 @@ class TestTxIsTheShippedMacro:
 		ours = open(MACROS, encoding='utf-8').read()
 		shipped = configparser.RawConfigParser(strict=False)
 		shipped.read_string(base.stdout)
-		assert macros().get('tx', 'definition').replace(REFUSED_STEP, '') == shipped.get('tx', 'definition')
+		assert macros().get('tx', 'definition') != shipped.get('tx', 'definition')
+		assert without_guard(macros().get('tx', 'definition')).replace(REFUSED_STEP, '') == shipped.get('tx', 'definition')
 		# every other stanza shipped at e12ec4e is unchanged, its comments included
 		for name in shipped.sections():
 			if name != 'tx':
@@ -116,14 +138,19 @@ class TestTxIsTheShippedMacro:
 
 	def test_txf_is_tx_with_the_replay(self):
 		conf = macros()
-		head = '`tenx-events` [| tenxprefilter] | eval tenx_compact_raw=_raw | `tenx-inflate` | fields - _kv | '
-		tail = ' | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars' + REFUSED_STEP + ' | search *'
+		head = ('`tenx-events` [| tenxprefilter] | eval tenx_compact_raw=_raw | `tenx-inflate` | fields - _kv | '
+				'`tenx-mapped-hide` | ')
+		tail = (' | `tenx-mapped-restore` | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars'
+				+ REFUSED_STEP + ' | search *')
 		assert conf.get('txf', 'definition') == head + '`tenx-replay`' + tail
 		# Splunk Enterprise 10.4.3 refuses a colon in a macro name, so txf(1) computes the unit's
 		# name with md5() in eval; on 10.4.3, md5 in eval equals hashlib's for the five names tried
 		assert conf.get('txf(1)', 'iseval') == '1'
 		assert conf.get('txf(1)', 'definition') == ('"' + head + '`tenx-replay-u" . substr(md5("$st$"), 1, 12) . '
 													 '"` | `tenx-replay-tags`' + tail + '"')
+		assert without_guard(conf.get('txf', 'definition')) == (
+			'`tenx-events` [| tenxprefilter] | eval tenx_compact_raw=_raw | `tenx-inflate` | fields - _kv | '
+			'`tenx-replay` | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars' + REFUSED_STEP + ' | search *')
 		assert conf.get('txf(1)', 'args') == 'st'
 		assert conf.get('txf(1)', 'validation') == 'match(st, "^[A-Za-z0-9_.:/-]+$")'
 		assert conf.get('txf(1)', 'errormsg')
@@ -318,7 +345,7 @@ def model(**macros_):
 	return Model(commands={'extract': extract, 'typer': typer, 'tags': lambda e, _: None,
 						   'spath': lambda e, _: None, 'extract kvdelim="=" pairdelim=" "': lambda e, _: None,
 						   'inflatemodel': lambda e, _: e.__setitem__('_raw', e['__exp'])},
-				 lookups=TABLES, macros=dict({'tenx-inflate': 'inflatemodel'}, **macros_))
+				 lookups=TABLES, macros=dict(dict({'tenx-inflate': 'inflatemodel'}, **mapped_guard_macros()), **macros_))
 
 
 def compact(st=None, source='/var/app/a.log', host='web-1', **text_fields):
@@ -363,6 +390,63 @@ def run_txf(replay, evs):
 
 def run_tx(evs):
 	return [visible(e) for e in model().run(PLAIN_TX, evs)]
+
+
+def mapped(**indexed):
+	"""An event indexed with a field map: renamed to its original sourcetype, its fields indexed,
+	tenx_mapped set. Splunk's extract on its expanded text would add each field again."""
+	e = {'_raw': '~h,4625', '__exp': '<Event>4625</Event>', 'sourcetype': 'XmlWinEventLog', 'source': 'XmlWinEventLog:Security',
+		 'host': 'dc01', '_kv': 1, 'tenx_hash': 'h', 'tenx_var_0': '4625', 'tenx_mapped': '1',
+		 '__text_fields': dict((k, v + ' (again)') for k, v in indexed.items())}
+	e.update(indexed)
+	return e
+
+
+TX_STEPS = '`tenx-inflate` | `tenx-mapped-hide` | fields - _kv | extract | `tenx-mapped-restore` | fields - tenx_hash, tenx_var_0, tenx_vars'
+
+
+class TestTheMappedGuard:
+	"""tenx-mapped-hide and tenx-mapped-restore, as `tx` runs them around its extract."""
+
+	def test_a_mapped_event_keeps_exactly_its_indexed_fields_and_gets_its_text(self):
+		out = model().run(TX_STEPS, [mapped(EventID='4625', Computer='dc01')])[0]
+		want = dict(mapped(EventID='4625', Computer='dc01'), _raw='<Event>4625</Event>')
+		for gone in ('_kv', 'tenx_hash', 'tenx_var_0'):
+			del want[gone]
+		assert visible(out) == visible(want)
+		assert out['EventID'] == '4625' and out['Computer'] == 'dc01'
+		assert (out['_raw'], out['sourcetype'], out['source'], out['host']) == (
+			'<Event>4625</Event>', 'XmlWinEventLog', 'XmlWinEventLog:Security', 'dc01')
+		assert not [k for k in out if k.startswith('tenx_fm_')]
+
+	def test_events_without_the_mark_get_the_shipped_steps_in_a_mixed_chunk(self):
+		plain = events()
+		together = model().run(TX_STEPS, [mapped(EventID='4625')] + events())[1:]
+		alone = model().run(PLAIN_TX, plain)
+		assert [visible(e) for e in together] == [visible(e) for e in alone]
+
+	def test_without_a_mapped_event_the_guard_runs_nothing(self):
+		assert run_tx(events()) == [visible(e) for e in model().run(TX_STEPS, events())]
+
+	def test_txf_leaves_a_mapped_event_that_carries_its_sourcetype_as_tx_does(self):
+		# A forwarder that sets tenx_sourcetype sets it on mapped events too. The replay must not
+		# run on them: their fields are indexed, and the replay would clear and recompute its
+		# fields from the hidden event (Splunk Enterprise 10.4.3, 662 mapped Windows events carrying
+		# tenx_sourcetype: 86 of 186 fields differed from raw through txf, among them action, dest,
+		# user and eventtype; 0 differ through tx).
+		def ev():
+			e = mapped(dept='eng', x='X', user='u9')
+			e.update(sourcetype='app:kv', tenx_sourcetype='app:kv')
+			return e
+		guarded = TXF % '`tenx-mapped-hide` | %s | `tenx-mapped-restore`'
+		for replay in ('`tenx-replay`', '`%s` | `tenx-replay-tags`' % b.unit_macro('app:kv')):
+			m = model(**dict({'tenx-replay': full_macro(), 'tenx-replay-tags': ' | '.join(b.TAGS_STEPS)},
+							 **dict((b.unit_macro(st), u) for st, u in units().items())))
+			out = [visible(e) for e in m.run(guarded % replay, [ev()] + events())]
+			want = [visible(e) for e in model().run(TX_STEPS, [ev()])]
+			assert out[0] == want[0], replay
+			# and the other events of the chunk get what txf gives them without a mapped event
+			assert out[1:] == run_txf(replay, events())
 
 
 class TestTxfOfOneSourcetype:

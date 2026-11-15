@@ -49,13 +49,16 @@ def spath(event, _):
 		event['Event.System.' + tag] = val
 
 
+from test_replay_units import mapped_guard_macros
+
+
 def model(definition):
 	return Model(
 		commands={'extract': extract, 'spath': spath, 'extract kvdelim="=" pairdelim=" "': lambda e, _: kv_pairs(e),
 				  'inflatemodel': lambda e, _: e.__setitem__('_raw', e['__exp']),
 				  'typer': lambda e, _: e.__setitem__('eventtype', 'et_%s' % e.get('sourcetype')),
 				  'tags': lambda e, _: None},
-		macros={'tenx-inflate': 'inflatemodel', 'tenx-replay': definition})
+		macros=dict({'tenx-inflate': 'inflatemodel', 'tenx-replay': definition}, **mapped_guard_macros()))
 
 
 def compact(raw, exp, carrier=None, **read_time):
