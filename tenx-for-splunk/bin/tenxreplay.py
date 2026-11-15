@@ -17,8 +17,8 @@ configuration (see tenx_replay_builder.py for the rules and their order):
 2. the props stanzas this app can see, as merged by Splunk, and the [default] stanza;
 3. the lookup definitions this app can see, with their fields;
 4. the indexed fields of the compact events, which the replay keeps when it clears the fields
-   Splunk set on the unexpanded event (fields.conf INDEXED = true, and the fields of a sample of
-   compact events that tstats can count).
+   Splunk set on the unexpanded event (fields.conf INDEXED = true on every event, and the fields
+   of a sample of compact events that tstats can count, per original sourcetype).
 
 What the written replay already covers stays covered (see tenx_replay_builder.keep_covered and
 coverage), so a sourcetype that stopped sending keeps its replay for searches over its older
@@ -161,21 +161,45 @@ class TenxReplayCommand(GeneratingCommand):
 			self._rest(self._ns('configs/conf-transforms?count=0')).get('entry', []))
 
 	def _indexed_fields(self, earliest, latest):
-		names = set()
+		"""
+		(every indexed field name of the compact events, the names declared indexed,
+		{original sourcetype: the indexed fields of its compact events}).
+
+		The first is what the prefilter must not narrow on (builder.fields_not_in_text): fields.conf
+		INDEXED = true, and the fields of a sample of compact events that tstats can count over all
+		compact events. The replay's clearing step keeps the second on every replayed event and the
+		third per original sourcetype (builder.build keep_by_sourcetype), counted over the events the
+		replay works on: those carrying tenx_sourcetype and not indexed with a field map (tenx_mapped,
+		which tenx-mapped-hide keeps out of the replay). An indexed field one sender writes for one
+		sourcetype (a field map's app on FortiGate events) is then no reason to keep the field of the
+		same name that Splunk set on another sourcetype's compact events when it read them.
+		"""
+		declared = set()
 		for entry in self._rest(self._ns('configs/conf-fields?count=0')).get('entry', []):
 			if str(entry.get('content', {}).get('INDEXED', '')).strip().lower() in ('1', 'true'):
-				names.add(entry['name'])
+				declared.add(entry['name'])
+		names = set(declared)
+		by_sourcetype = {}
 		rows = self._oneshot('search `tenx-events` | head %d | fieldsummary | fields field' % SAMPLE_EVENTS, earliest, latest)
 		candidates = sorted(set(r.get('field') for r in rows if r.get('field')) - set(builder.DEFAULT_KEEP))
 		candidates = [c for c in candidates if not c.startswith(('_', 'tenx_', 'date_')) and '"' not in c]
 		if candidates:
-			counts = self._oneshot('| tstats %s where `tenx-events`' % ', '.join(
-				'dc("%s") as f%d' % (c, n) for n, c in enumerate(candidates)), earliest, latest)
+			funcs = ', '.join('dc("%s") as f%d' % (c, n) for n, c in enumerate(candidates))
+			counts = self._oneshot('| tstats %s where `tenx-events`' % funcs, earliest, latest)
 			row = counts[0] if counts else {}
 			names.update(c for n, c in enumerate(candidates) if str(row.get('f%d' % n, '0')) not in ('0', ''))
-		# Splunk's own fields.conf lists its default fields; those are kept anyway.
-		return sorted(n for n in names if n not in builder.DEFAULT_KEEP and '*' not in n and '::' not in n
-					  and not n.startswith(('_', 'tenx_', 'date_')))
+			for row in self._oneshot('| tstats %s where `tenx-events` NOT %s=* by %s' % (
+					funcs, builder.MAPPED_FIELD, builder.CARRIER_FIELD), earliest, latest):
+				st = row.get(builder.CARRIER_FIELD)
+				if st:
+					by_sourcetype.setdefault(st, set()).update(
+						c for n, c in enumerate(candidates) if str(row.get('f%d' % n, '0')) not in ('0', ''))
+
+		def usable(found):
+			# Splunk's own fields.conf lists its default fields; those are kept anyway.
+			return sorted(n for n in found if n not in builder.DEFAULT_KEEP and '*' not in n and '::' not in n
+						  and not n.startswith(('_', 'tenx_', 'date_')))
+		return usable(names), usable(declared), dict((st, usable(found)) for st, found in by_sourcetype.items())
 
 	def _indexed_value_false(self):
 		"""
@@ -530,7 +554,7 @@ class TenxReplayCommand(GeneratingCommand):
 			nocarrier = builder.nocarrier_value(self._compact_indexes(earliest, latest), carrier_ix)
 			stanzas = self._stanzas()
 			lookups = self._lookup_fields()
-			keep = self._indexed_fields(earliest, latest)
+			keep_all, keep, keep_by_st = self._indexed_fields(earliest, latest)
 			not_raw = self._indexed_value_false()
 			transforms = self._transforms()
 		except Exception as e:
@@ -538,7 +562,8 @@ class TenxReplayCommand(GeneratingCommand):
 			self.error_exit(e, "tenxreplay: could not read the instance's configuration (%s); nothing was written." % e)
 			return
 		last_seen = builder.last_seen_of(present, covered, now)
-		replay = builder.build_capped(stanzas, present, lookups, keep, settings, last_seen, transforms=transforms)
+		replay = builder.build_capped(stanzas, present, lookups, keep, settings, last_seen, transforms=transforms,
+									  keep_by_sourcetype=keep_by_st)
 		units, failed = {}, set()
 		if replay.per_sourcetype:
 			# Check every rule against this Splunk before writing, so one rule it cannot run
@@ -546,15 +571,17 @@ class TenxReplayCommand(GeneratingCommand):
 			try:
 				bad_lookups = self._lookup_problems()
 				replay = builder.build_capped(stanzas, present, lookups, keep, settings, last_seen,
-											  bad_lookups=bad_lookups, transforms=transforms)
+											  bad_lookups=bad_lookups, transforms=transforms, keep_by_sourcetype=keep_by_st)
 				units = builder.build_units(stanzas, cov, replay.per_sourcetype, lookups, keep, settings,
-											bad_lookups=bad_lookups, transforms=transforms)
+											bad_lookups=bad_lookups, transforms=transforms, keep_by_sourcetype=keep_by_st)
 				rejected = builder.failing_rules(builder.all_rules(replay, units), self._dry_run)
 				if rejected:
 					replay = builder.build_capped(stanzas, present, lookups, keep, settings, last_seen,
-												  rejected=rejected, bad_lookups=bad_lookups, transforms=transforms)
+												  rejected=rejected, bad_lookups=bad_lookups, transforms=transforms,
+												  keep_by_sourcetype=keep_by_st)
 					units = builder.build_units(stanzas, cov, replay.per_sourcetype, lookups, keep, settings,
-												rejected=rejected, bad_lookups=bad_lookups, transforms=transforms)
+												rejected=rejected, bad_lookups=bad_lookups, transforms=transforms,
+												keep_by_sourcetype=keep_by_st)
 				error = self._dry_run(builder.macro_dry_run(replay))
 				bad_units = {} if error else builder.failing_units(units, self._dry_run, settings['replay_max_macro_chars'] or 262144)
 			except Exception as e:
@@ -587,7 +614,7 @@ class TenxReplayCommand(GeneratingCommand):
 			if info.get('masking'):
 				self.logger.warning("tenxreplay: original sourcetype %s is masked at index time (%s); its compact events "
 									"hold those values unmasked", st, ', '.join(info['masking']))
-		not_in_text = builder.fields_not_in_text(stanzas, transforms, lookups, keep, not_raw)
+		not_in_text = builder.fields_not_in_text(stanzas, transforms, lookups, keep_all, not_raw)
 		written = []
 		if self.apply:
 			try:
@@ -615,7 +642,7 @@ class TenxReplayCommand(GeneratingCommand):
 				'computed_fields': info['computed'],
 				'masked_at_index_time': info.get('masking', []),
 				'warnings': info['warnings'] + replay.warnings,
-				'kept_indexed_fields': keep,
+				'kept_indexed_fields': sorted(set(keep) | set(keep_by_st.get(st, ()))),
 				'fields_not_in_text': len(not_in_text),
 				'macro_chars': len(replay.spl()),
 				'unit': builder.unit_macro(st),

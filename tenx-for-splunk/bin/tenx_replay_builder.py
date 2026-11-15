@@ -21,7 +21,8 @@ per-sourcetype units instead, see the notes above unit_macro()):
    that was not expanded, is left exactly as `tx` leaves it.
 2. The search-time fields Splunk set on the unexpanded event are cleared (they came from rules
    keyed on the compact text: on Windows Security data, app=win:unknown on 142 of 662 events).
-   Splunk's default fields, tenx_* fields and the indexed fields of the compact events are kept.
+   Splunk's default fields, tenx_* fields and the indexed fields that the compact events of the
+   event's original sourcetype carry are kept.
    eval cannot write a field whose name holds a brace (it reads the braces as a field naming the
    target), so the macro must run before anything that makes such fields: spath, or JSON and XML
    extraction. Both callers run it right after tenx-inflate.
@@ -95,6 +96,9 @@ a field other than _raw, lookups whose definition this app cannot see.
 import re
 
 CARRIER_FIELD = 'tenx_sourcetype'
+# Written by every transform of a field map (tenx_field_map.py MARK_FIELD); tenx-mapped-hide keeps
+# an event that carries it out of the replay.
+MAPPED_FIELD = 'tenx_mapped'
 RST = 'tenx_rst'
 COMPACT_RAW = 'tenx_compact_raw'
 
@@ -794,7 +798,7 @@ def read_time_names(stanzas, transforms=None, lookup_fields=None):
 	return names, dynamic
 
 
-def clearing_steps(names, keep_rx, warnings, compact=False):
+def clearing_steps(names, keep_rx, warnings, compact=False, cleared_on=None):
 	"""
 	The steps that remove from a replayed event the fields Splunk set when it read the compact
 	text, leaving every other event as it is. Each name is written out (no `foreach *`, which
@@ -806,8 +810,14 @@ def clearing_steps(names, keep_rx, warnings, compact=False):
 	once in one `foreach <name> <name> ... [eval "<<FIELD>>"=...]` instead of one eval assignment
 	each, a third of the characters. foreach takes each listed name as a pattern without a
 	wildcard, so it evaluates only those fields; the other names keep the eval form.
+
+	cleared_on: {name: [original sourcetypes]} for a name that the compact events of some original
+	sourcetypes carry as an indexed field and those of others do not. It is cleared only on the
+	replayed events of the listed sourcetypes (their first tenx_sourcetype value), and kept on
+	every other event.
 	"""
 	keep = re.compile(keep_rx)
+	cleared_on = cleared_on or {}
 	parts, listed = [], []
 	for name in sorted(names):
 		if keep.match(name):
@@ -817,7 +827,11 @@ def clearing_steps(names, keep_rx, warnings, compact=False):
 		except ReplayError as e:
 			warnings.append('a field set when compact events are read is not cleared on replayed events: %s' % e)
 			continue
-		if compact and PLAIN_NAME.match(name):
+		only = cleared_on.get(name)
+		if only:
+			parts.append('%s=if(isnotnull(%s) AND (%s), null(), %s)' % (lhs, RST, ' OR '.join(
+				'mvindex(%s,0)==%s' % (CARRIER_FIELD, spl_string(st)) for st in sorted(only)), ref))
+		elif compact and PLAIN_NAME.match(name):
 			listed.append(name)
 		else:
 			parts.append('%s=if(isnotnull(%s), null(), %s)' % (lhs, RST, ref))
@@ -932,7 +946,7 @@ def effective_sourcetypes(stanzas, transforms, sourcetypes):
 
 
 def build(stanzas, present, lookup_fields=None, keep_fields=(), all_shared=True, rejected=None, bad_lookups=None,
-		  transforms=None, only=False, seen=None, with_tags=True):
+		  transforms=None, only=False, seen=None, with_tags=True, keep_by_sourcetype=None):
 	"""
 	Build the replay pipeline.
 
@@ -940,7 +954,16 @@ def build(stanzas, present, lookup_fields=None, keep_fields=(), all_shared=True,
 	present        [(original sourcetype, source, host)] seen in the compact events.
 	lookup_fields  {lookup definition name: [its fields]} for the lookups this app can see; a
 	               lookup missing from it is skipped with a warning. None skips the check.
-	keep_fields    indexed fields of the compact events, kept through the clearing step.
+	keep_fields    indexed fields kept through the clearing step on every replayed event. Without
+	               keep_by_sourcetype: the indexed fields of all compact events.
+	keep_by_sourcetype
+	               {original sourcetype: the indexed fields its compact events carry}. A name is
+	               kept on the events of the sourcetypes whose compact events carry it, and cleared
+	               on the events of the others present (see clearing_steps()); a sourcetype missing
+	               from it keeps every name listed for any. Indexed fields are
+	               set per event by whoever sent it, so one sourcetype's (a field map writing app
+	               as an indexed field on FortiGate events) say nothing about another's (app set
+	               when a Windows compact event is read).
 	only           replay only the events whose original sourcetype is in `present`; every other
 	               event is left as `tx` leaves it (a unit, see build_unit()).
 	seen           {'sources': ..., 'hosts': ...} recorded for the sourcetype (see coverage()):
@@ -987,6 +1010,19 @@ def build(stanzas, present, lookup_fields=None, keep_fields=(), all_shared=True,
 
 	keep_fields = [f for f in keep_fields if safe_text(f)]
 	names = list(DEFAULT_KEEP) + [f for f in keep_fields if f not in DEFAULT_KEEP]
+	cleared_on = {}
+	if keep_by_sourcetype is not None:
+		# A sourcetype with no entry was not counted (no compact event of it in the time range the
+		# caller looked at): it keeps every name that any counted sourcetype keeps, as when one
+		# list served every sourcetype.
+		known = dict((st, set(f for f in keep_by_sourcetype[st] if safe_text(f)))
+					 for st in originals if keep_by_sourcetype.get(st) is not None)
+		union = set().union(*known.values()) if known else set()
+		by_st = dict((st, known.get(st, union)) for st in originals)
+		everywhere = set.intersection(*by_st.values()) if by_st else set()
+		names += sorted(everywhere - set(names))
+		for name in set().union(*by_st.values()) - everywhere:
+			cleared_on[name] = sorted(st for st in originals if name not in by_st[st])
 	keep_rx = '^(%s)$' % '|'.join(list(KEEP_PATTERNS) + [re.escape(f) for f in names])
 
 	steps = replay.steps
@@ -1010,7 +1046,8 @@ def build(stanzas, present, lookup_fields=None, keep_fields=(), all_shared=True,
 	if dynamic:
 		replay.warnings.append('some fields set when compact events are read take their names from the data '
 							   'and are not cleared on replayed events')
-	steps.append(block(ANY, clearing_steps(names, keep_rx, replay.warnings, compact=seen is not None) + [
+	steps.append(block(ANY, clearing_steps(names, keep_rx, replay.warnings, compact=seen is not None,
+											cleared_on=cleared_on) + [
 		'eval sourcetype=coalesce(%s, sourcetype)' % RST,
 		'eval _kv=if(isnotnull(%s), null(), _kv)' % RST]))
 	steps.extend(extract_steps())
@@ -1398,14 +1435,15 @@ def uncovered_values(rows, covered):
 
 
 def build_unit(stanzas, sourcetype, seen, lookup_fields=None, keep_fields=(), rejected=None, bad_lookups=None,
-			   transforms=None, limit=0):
+			   transforms=None, limit=0, keep_by_sourcetype=None):
 	"""
 	The unit of one original sourcetype (see the notes above unit_macro()). `seen` is its entry of
 	coverage(). Past `limit` characters (replay_max_macro_chars) the unit replays nothing, with a
-	warning: then its events are handled as `tx` handles them.
+	warning: then its events are handled as `tx` handles them. keep_by_sourcetype as in build():
+	the unit keeps `keep_fields` and the indexed fields of this sourcetype's compact events.
 	"""
 	unit = build(stanzas, [(sourcetype, '', '')], lookup_fields, keep_fields, False, rejected, bad_lookups, transforms,
-				 only=True, seen=seen, with_tags=False)
+				 only=True, seen=seen, with_tags=False, keep_by_sourcetype=keep_by_sourcetype)
 	if limit and len(unit.spl()) > limit:
 		cut = build(stanzas, [], only=True)
 		cut.warnings.append('the unit of %r (%d characters) is over replay_max_macro_chars = %d and replays nothing'
@@ -1415,12 +1453,12 @@ def build_unit(stanzas, sourcetype, seen, lookup_fields=None, keep_fields=(), re
 
 
 def build_units(stanzas, cov, sourcetypes, lookup_fields=None, keep_fields=(), settings=None, rejected=None,
-				bad_lookups=None, transforms=None):
+				bad_lookups=None, transforms=None, keep_by_sourcetype=None):
 	"""{original sourcetype: its unit} for each of `sourcetypes` (those the `tenx-replay` macro covers)."""
 	settings = settings or DEFAULT_SETTINGS
 	return dict((st, build_unit(stanzas, st, cov.get(st) or {'sources': set(), 'hosts': set(), 'indexes': set()},
 								lookup_fields, keep_fields, rejected, bad_lookups, transforms,
-								settings['replay_max_macro_chars'])) for st in sorted(sourcetypes))
+								settings['replay_max_macro_chars'], keep_by_sourcetype)) for st in sorted(sourcetypes))
 
 
 def all_rules(replay, units):
@@ -1647,7 +1685,7 @@ def _listed(names, n=20):
 
 
 def build_capped(stanzas, present, lookup_fields=None, keep_fields=(), settings=None, last_seen=None,
-				 rejected=None, bad_lookups=None, transforms=None):
+				 rejected=None, bad_lookups=None, transforms=None, keep_by_sourcetype=None):
 	"""
 	build(), held to replay_max_sourcetypes and replay_max_macro_chars. Past the sourcetype cap
 	the least busy sourcetypes are left out. Past the size cap, first the source and host
@@ -1671,7 +1709,7 @@ def build_capped(stanzas, present, lookup_fields=None, keep_fields=(), settings=
 	def attempt(names, all_shared):
 		keep = set(names)
 		return build(stanzas, [p for p in present if p[0] in keep], lookup_fields, keep_fields, all_shared,
-					 rejected, bad_lookups, transforms)
+					 rejected, bad_lookups, transforms, keep_by_sourcetype=keep_by_sourcetype)
 
 	replay = attempt(ranked, True)
 	limit = settings['replay_max_macro_chars']
@@ -1691,7 +1729,8 @@ def build_capped(stanzas, present, lookup_fields=None, keep_fields=(), settings=
 			notes.append('the rules of [default], source:: and host:: stanzas alone are over replay_max_macro_chars; '
 						 'the shipped macro is written and nothing is replayed')
 			dropped = ranked_sourcetypes(present, last_seen)
-			replay = build(stanzas, [], lookup_fields, keep_fields, transforms=transforms)
+			replay = build(stanzas, [], lookup_fields, keep_fields, transforms=transforms,
+						   keep_by_sourcetype=keep_by_sourcetype)
 	replay.warnings[:0] = notes
 	replay.dropped = dropped
 	return replay
