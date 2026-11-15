@@ -1819,7 +1819,8 @@ def verify(templates, field_map, encoded_path, raw_path, raw_split=None, out=sys
 #   management port's receivers/simple endpoint, and searches for them. The stream carries an event
 #   before the probes in every run, so it is a stream that is already sending. A template whose probe
 #   event was indexed with tenx_mapped joins the cap file; the others stay pending, and activate repeats
-#   the probes every --poll seconds until --timeout. Nothing is restarted or reloaded: the instance
+#   the probes every --poll seconds until --timeout (by default the instance's lookup refresh period plus
+#   three --poll). Nothing is restarted or reloaded: the instance
 #   rereads the lookup file on its own (limits.conf ingest_lookup_refresh_period_secs, default 60 s;
 #   activate reads the instance's value over REST). A probe that is indexed without its fields before
 #   then is expected (the instance still holds the earlier file); one indexed later than that period plus
@@ -1857,6 +1858,8 @@ PROBE_SOURCE = 'tenx:fm:probe'
 HEARTBEAT_LINE = '~tenx-fm-heartbeat,probe'
 # limits.conf [lookup] ingest_lookup_refresh_period_secs as shipped; activate reads the instance's own value.
 LOOKUP_REFRESH_DEFAULT = 60
+# Without --timeout, activate probes for the refresh period plus this many --poll rounds.
+ACTIVATE_TIMEOUT_POLLS = 3
 
 
 def cap_hashes(field_map, templates):
@@ -2096,7 +2099,7 @@ def lookup_refresh_secs(splunkd):
 	return float(LOOKUP_REFRESH_DEFAULT), False
 
 
-def activate(app_dir, cap_file, splunkd, app_name=None, probe_index=None, timeout=300, poll=10, out=sys.stdout,
+def activate(app_dir, cap_file, splunkd, app_name=None, probe_index=None, timeout=None, poll=10, out=sys.stdout,
 		clock=time.time, sleep=time.sleep, check_timeout=60, rng=None):
 	"""
 	Lists in the cap file each template the pending list adds once a probe event of it, sent on the
@@ -2108,7 +2111,8 @@ def activate(app_dir, cap_file, splunkd, app_name=None, probe_index=None, timeou
 	probe comes back without its fields or does not come back, check withdraws the list and activate
 	returns 1 at once. A new template whose probe, indexed once the instance must have reread the lookup
 	file (ingest_lookup_refresh_period_secs plus one poll after the start), has no fields stays pending
-	and is not probed again in this run.
+	and is not probed again in this run. timeout None: the refresh period plus three polls, so a run ends
+	about two rounds after every probe was parsed with the installed file.
 	"""
 	pending = cap_file + CAP_PENDING_SUFFIX
 	if not os.path.exists(pending):
@@ -2141,6 +2145,8 @@ def activate(app_dir, cap_file, splunkd, app_name=None, probe_index=None, timeou
 			return 1
 		rows = read_lookup_file(table)
 		refresh, read_from_instance = lookup_refresh_secs(splunkd)
+		if timeout is None:
+			timeout = refresh + ACTIVATE_TIMEOUT_POLLS * poll
 		start = clock()
 		# A probe indexed from this time on was parsed with the file that was installed when activate started.
 		settled = start + refresh + poll
@@ -2181,8 +2187,8 @@ def activate(app_dir, cap_file, splunkd, app_name=None, probe_index=None, timeou
 				break
 		missing = [h for h in added if h not in confirmed and h not in failed]
 		out.write('activate: %d of %d new templates indexed with their fields on the probe stream (%d probe events, '
-			'%d checks, %.0f s, lookup refresh %.0f s%s)%s%s\n' % (len(confirmed), len(added), probes, checks, clock() - start,
-				refresh, '' if read_from_instance else ', the default: not read from the instance',
+			'%d checks, %.0f s of at most %.0f, lookup refresh %.0f s%s)%s%s\n' % (len(confirmed), len(added), probes, checks,
+				clock() - start, timeout, refresh, '' if read_from_instance else ', the default: not read from the instance',
 				'' if not failed else '; without their fields after the file was read: %s' % ', '.join(
 					'%r (%s=%s)' % (h, UNMAPPED_FIELD, ','.join(failed[h]) or 'none') for h in sorted(failed)[:5]),
 				'' if not missing else '; not yet: %s' % ', '.join(repr(h) for h in missing[:5])))
@@ -2383,7 +2389,8 @@ def build_parser():
 	return ap
 
 
-def _splunkd_args(p, required, timeout=300, timeout_help='seconds activate keeps probing (default 300)'):
+def _splunkd_args(p, required, timeout=None, timeout_help='seconds activate keeps probing (default: the instance\'s '
+		'ingest_lookup_refresh_period_secs plus three --poll, 90 s with the defaults)'):
 	p.add_argument('--splunkd', required=required,
 		help='management URL of the instance that parses the data, e.g. https://127.0.0.1:8089; with gen, '
 			'activate runs right after the app is written (the app folder is on that instance)')
