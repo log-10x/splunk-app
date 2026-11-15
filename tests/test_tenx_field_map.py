@@ -714,3 +714,200 @@ class TestWhatTxNeeds:
 	def test_the_mark_is_not_a_field_of_the_event(self):
 		t = fm.Transform('h1', 's', r'^~ *h1 *,([^,]*),([^,]*)$', 'EventID::"$1" Computer::"$2" tenx_mapped::"1"', 2, 2)
 		assert fm.apply_transform(t, '~h1,4625,dc01') == [('EventID', '4625'), ('Computer', 'dc01')]
+
+
+# -------------------------------------------------------------------------------------------
+# The Receiver's compact cap file
+
+class FakeSplunkd(object):
+	"""
+	A management port in a thread, holding a loaded configuration as Splunk 10.4.3 does: GET
+	.../configs/conf-<conf> returns the stanzas of the folder loaded last (none at first), booleans as
+	digits; a POST (server/control/restart) loads the folder on disk. Every call is
+	recorded with the cap file's text at that moment.
+	"""
+
+	def __init__(self, on_disk, app_name, cap_file, loaded=None):
+		import http.server
+		import threading
+		self.on_disk, self.app_name, self.cap_file, self.loaded = on_disk, app_name, cap_file, loaded
+		self.calls = []
+		outer = self
+
+		class Handler(http.server.BaseHTTPRequestHandler):
+			def log_message(self, *a):
+				pass
+
+			def _send(self, obj):
+				body = json.dumps(obj).encode('utf-8')
+				self.send_response(200)
+				self.send_header('Content-Type', 'application/json')
+				self.send_header('Content-Length', str(len(body)))
+				self.end_headers()
+				self.wfile.write(body)
+
+			def do_POST(self):
+				self.rfile.read(int(self.headers.get('Content-Length') or 0))
+				path = self.path.split('?')[0]
+				outer.calls.append(('POST', path, read(outer.cap_file)))
+				outer.loaded = outer.on_disk
+				self._send({})
+
+			def do_GET(self):
+				path = self.path.split('?')[0]
+				outer.calls.append(('GET', path, None))
+				entries = []
+				if '/conf-' in path and outer.loaded:
+					conf = path.rsplit('/conf-', 1)[1]
+					# REST returns a boolean setting as a digit
+					entries = [{'name': n, 'content': dict((k, '1' if v == 'true' else v) for k, v in c.items()),
+						'acl': {'app': outer.app_name}} for n, c in
+						fm.read_conf(os.path.join(outer.loaded, 'default', conf + '.conf')).items()]
+				self._send({'entry': entries})
+
+		self.server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
+		self.url = 'http://127.0.0.1:%d' % self.server.server_address[1]
+		threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+	def posts(self):
+		return [c for c in self.calls if c[0] == 'POST']
+
+	def close(self):
+		self.server.shutdown()
+		self.server.server_close()
+
+
+class TestCapFile:
+	def records(self, tmp_path, hashes):
+		p = tmp_path / 'templates.json'
+		p.write_text(''.join(json.dumps({'templateHash': h, 'template': 'time=$(HH:mm:ss) user=$ n=%d' % i}) + '\n'
+			for i, h in enumerate(hashes)), encoding='utf-8')
+		return str(p)
+
+	def gen(self, tmp_path, hashes, cap, *extra):
+		return fm.main(['gen', '--records', self.records(tmp_path, hashes), '--reader', 'kv', '--sourcetype',
+			'tenx_fw', '--rename', 'fw:traffic', '--out', str(tmp_path / 'fm_fw'), '--cap-file', str(cap)] + list(extra))
+
+	def test_rows_quote_every_hash_keep_outer_spaces_and_sort(self):
+		assert fm.cap_text({'b', '#a b ', 'x"y'}, [('c', 'false')]) == \
+			'pattern_hash,value\n"#a b ",true\n"b",true\n"c",false\n"x""y",true\n'
+
+	def test_the_engine_reads_the_rows_back(self, tmp_path):
+		import csv
+		p = tmp_path / 'cap.csv'
+		p.write_text(fm.cap_text({'#a b ', 'x"y', ' lead'}), encoding='utf-8')
+		with open(str(p), encoding='utf-8', newline='') as f:
+			assert sorted(r[0] for r in list(csv.reader(f))[1:]) == [' lead', '#a b ', 'x"y']
+
+	def test_gen_writes_only_the_header_and_a_pending_list(self, tmp_path):
+		cap = tmp_path / 'policy' / 'compact-cap.csv'
+		assert self.gen(tmp_path, ['k1 ', 'k2'], cap) == 0
+		assert read(str(cap)) == 'pattern_hash,value\n'
+		assert read(str(cap) + '.pending') == 'pattern_hash,value\n"k1 ",true\n"k2",true\n'
+		report = json.loads((tmp_path / 'fm_fw_report.json').read_text())
+		assert report['compact_cap']['waiting_for_activation'] == 2 and report['compact_cap']['listed_now'] == 0
+
+	def test_gen_drops_templates_without_a_transform_and_never_adds(self, tmp_path):
+		cap = tmp_path / 'compact-cap.csv'
+		cap.write_text('pattern_hash,value\n"gone",true\n"k1",true\n"keep",false:0:audit\n"k2",false\n',
+			encoding='utf-8')
+		assert self.gen(tmp_path, ['k1', 'k2', 'k3'], cap) == 0
+		# k1 stays, gone is dropped, k3 waits, k2 stays whole because its row says so, keep is kept
+		assert read(str(cap)) == 'pattern_hash,value\n"k1",true\n"k2",false\n"keep",false:0:audit\n'
+		assert read(str(cap) + '.pending') == \
+			'pattern_hash,value\n"k1",true\n"k2",false\n"k3",true\n"keep",false:0:audit\n'
+
+	def test_an_unchanged_list_is_not_rewritten(self, tmp_path):
+		cap = tmp_path / 'compact-cap.csv'
+		cap.write_text('pattern_hash,value\n"k1",true\n', encoding='utf-8')
+		os.utime(str(cap), (1000000000, 1000000000))
+		assert fm.write_if_changed(str(cap), 'pattern_hash,value\n"k1",true\n') is False
+		assert os.stat(str(cap)).st_mtime == 1000000000
+		assert fm.write_if_changed(str(cap), 'pattern_hash,value\n') is True
+		assert read(str(cap)) == 'pattern_hash,value\n' and os.listdir(str(tmp_path)) == ['compact-cap.csv']
+
+	def test_a_rewritten_file_keeps_its_mode_and_a_new_one_gets_the_usual_mode(self, tmp_path):
+		umask = os.umask(0o022)
+		try:
+			fresh, old = tmp_path / 'new.conf', tmp_path / 'old.conf'
+			old.write_text('a', encoding='utf-8')
+			os.chmod(str(old), 0o640)
+			fm.write_if_changed(str(fresh), 'x')
+			fm.write_if_changed(str(old), 'b')
+		finally:
+			os.umask(umask)
+		assert os.stat(str(fresh)).st_mode & 0o777 == 0o644 and os.stat(str(old)).st_mode & 0o777 == 0o640
+
+	def test_rest_returns_booleans_as_digits(self):
+		assert fm._same_setting('WRITE_META', 'true', '1') and fm._same_setting('FORMAT', 'a::"1"', 'a::"1" ')
+		assert not fm._same_setting('WRITE_META', 'true', '0') and not fm._same_setting('FORMAT', 'a', 'b')
+
+	def test_kv_rows_give_the_hash_as_written(self, tmp_path):
+		p = tmp_path / 'kv.json'
+		p.write_text(json.dumps([{'_key': 'h', 'pattern_hash': ' h', 'pattern_parts': ['a=__TENX_TS__ b='],
+			'pattern_terminator': '', 'part_0': '', 'timestamp_format': '%H', 'expand_unsafe': ''}]))
+		[t] = fm.load_templates(str(p))
+		assert t.key == 'h' and t.written_hash == ' h'
+
+	def test_activate_restarts_checks_then_lists(self, tmp_path, monkeypatch):
+		cap = tmp_path / 'compact-cap.csv'
+		assert self.gen(tmp_path, ['k1', 'k2'], cap) == 0
+		app = str(tmp_path / 'fm_fw')
+		fake = FakeSplunkd(app, 'fm_fw', str(cap))
+		monkeypatch.setattr(fm.time, 'sleep', lambda s: None)
+		try:
+			assert fm.activate(app, str(cap), fm.Splunkd(fake.url), out=io.StringIO()) == 0
+		finally:
+			fake.close()
+		# the restart came first, while the cap file still listed nothing; then the check
+		assert fake.posts() == [('POST', fm.RESTART_ENDPOINT, 'pattern_hash,value\n')]
+		assert [c[1].rsplit('/', 1)[1] for c in fake.calls if c[0] == 'GET'][-2:] == ['conf-transforms', 'conf-props']
+		assert read(str(cap)) == 'pattern_hash,value\n"k1",true\n"k2",true\n'
+		assert not os.path.exists(str(cap) + '.pending')
+
+	def test_no_restart_when_nothing_is_added(self, tmp_path):
+		cap = tmp_path / 'compact-cap.csv'
+		cap.write_text('pattern_hash,value\n"gone",true\n"k1",true\n', encoding='utf-8')
+		assert self.gen(tmp_path, ['k1'], cap) == 0
+		app = str(tmp_path / 'fm_fw')
+		fake = FakeSplunkd(app, 'fm_fw', str(cap), loaded=app)
+		try:
+			assert fm.activate(app, str(cap), fm.Splunkd(fake.url), out=io.StringIO()) == 0
+		finally:
+			fake.close()
+		assert fake.posts() == [] and read(str(cap)) == 'pattern_hash,value\n"k1",true\n'
+
+	def test_activate_leaves_the_list_when_the_instance_does_not_load_the_app(self, tmp_path, monkeypatch):
+		cap = tmp_path / 'compact-cap.csv'
+		assert self.gen(tmp_path, ['k1', 'k2'], cap) == 0
+		# the instance's folder holds the app of an earlier run, with k1 only
+		os.makedirs(str(tmp_path / 'old'))
+		assert self.gen(tmp_path / 'old', ['k1'], tmp_path / 'old' / 'cap.csv') == 0
+		fake = FakeSplunkd(str(tmp_path / 'old' / 'fm_fw'), 'fm_fw', str(cap))
+		monkeypatch.setattr(fm.time, 'sleep', lambda s: None)
+		try:
+			out = io.StringIO()
+			assert fm.activate(str(tmp_path / 'fm_fw'), str(cap), fm.Splunkd(fake.url), out=out) == 1
+		finally:
+			fake.close()
+		assert 'does not hold app fm_fw' in out.getvalue()
+		assert read(str(cap)) == 'pattern_hash,value\n'
+		assert os.path.exists(str(cap) + '.pending')
+
+	def test_gen_with_splunkd_activates_the_app_it_wrote(self, tmp_path, monkeypatch):
+		cap = tmp_path / 'compact-cap.csv'
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		monkeypatch.setenv('TENX_SPLUNKD_AUTH', 'admin:x')
+		monkeypatch.setattr(fm.time, 'sleep', lambda s: None)
+		try:
+			assert self.gen(tmp_path, ['k1'], cap, '--splunkd', fake.url) == 0
+		finally:
+			fake.close()
+		assert fake.posts()[0][2] == 'pattern_hash,value\n'
+		assert read(str(cap)) == 'pattern_hash,value\n"k1",true\n'
+
+	def test_without_the_option_nothing_changes(self, tmp_path):
+		records = self.records(tmp_path, ['k1'])
+		generate(tmp_path, 'a', ['--records', records, '--reader', 'kv', '--sourcetype', 'tenx_fw', '--rename', 'fw:traffic'])
+		report = json.loads((tmp_path / 'a_report.json').read_text())
+		assert 'compact_cap' not in report and sorted(os.listdir(str(tmp_path))) == ['a', 'a_report.json', 'templates.json']
