@@ -153,7 +153,7 @@ Repository name: `log-10x/splunk-app`. Repository URL: https://github.com/log-10
 
 | Field | Value |
 |---|---|
-| Version | 1.1.7, read from the package |
+| Version | 1.1.8, read from the package |
 | Splunk platform compatibility | Splunk Enterprise 9.4, 10.0, 10.2, 10.4, 10.6 |
 | CIM | None |
 
@@ -163,7 +163,7 @@ templates are stored; it is checked on 9.4.15, 10.4.3 and 10.6.0.5, on a fresh i
 upgrade over 1.1.3. 1.1.5 changes the compact sourcetype's event time and the expansion macro; it is
 checked on 9.4.15, 10.4.3 and 10.6.0.5, each a fresh install. 1.1.6 adds the `tx` macro and
 its command and replicates the template collection; it is checked on 10.4.3 as an upgrade over
-1.1.5, and on 9.4.15 and 10.6.0.5 as a fresh install. 1.1.7 changes how fields and dates come out of an expanded event; it is checked on 10.4.3 as an upgrade over 1.1.6, and on 9.4.15 and 10.6.0.5 as a fresh install. Splunk
+1.1.5, and on 9.4.15 and 10.6.0.5 as a fresh install. 1.1.7 changes how fields and dates come out of an expanded event; it is checked on 10.4.3 as an upgrade over 1.1.6, and on 9.4.15 and 10.6.0.5 as a fresh install. 1.1.8 changes when template records are stored and how a template whose hash contains `*` is selected; it is checked on 10.4.3 as an upgrade over 1.1.7. Splunk
 ships on-premises releases every other minor, so 10.1 and 10.3 exist only on Splunk Cloud
 Platform, where compatibility is set by cloud vetting after upload rather than selected here.
 Splunkbase requires a release to run on every version it names.
@@ -171,6 +171,12 @@ Splunkbase requires a release to run on every version it names.
 **Release notes**
 
 Paste the block for the version being uploaded. Splunkbase keeps notes per release.
+
+1.1.8:
+
+> - Templates are stored whatever time their records carry. A template record takes the time it is indexed, and the Consume KV search selects records by index time. Records sent with the time of an older event, as Fluent Bit's `splunk` output sends them, are stored on the next run, and their events expand.
+> - `tx`, `| tx`, `tenxsearch`, dashboards and compiled alerts select every event of a template whose hash contains `*`, also when the search compares a field such as `host=` or `sourcetype=`.
+> - After upgrading, run `index=tenx_dml sourcetype=tenx_dml_raw_json earliest=0 | sendalert tenx_dml_to_kv` once, so that templates whose records arrived with an older time are stored.
 
 1.1.7:
 
@@ -227,6 +233,10 @@ Paste the block for the version being uploaded. Splunkbase keeps notes per relea
 
 | Check | Result |
 |---|---|
+| 1.1.8 unit tests | 410 passed, among them the index time of template records, the Consume KV window, and the term that selects a template whose hash contains `*` |
+| 1.1.8 as packaged on Splunk 10.4.3, upgraded in place over 1.1.7 with `splunk install app`; 200 template records per set with April 2022 event times, one compact event per template | records sent through the HEC event endpoint and through a file input: the first scheduled Consume KV run stored 200 of 200 of each set and all 200 events of each expand through `tx`; records indexed before the upgrade are stored by the search above with `earliest=0` (200 of 200); `license_usage.log` counts each set at exactly its record length (14,584 and 14,579 bytes) |
+| 1.1.8 template selection on Splunk 10.4.3: Windows Security, CloudTrail, key=value and JSON events, 17,011 compact events and 2,419 templates on each of two indexes, against the same lines indexed raw | 16 searches for words of the templates whose hash contains `*`, each through `tx` with and without `host=`, `\| tx`, `tenxsearch`, a dashboard and a compiled alert: 96 of 96 return the raw count; the term the dictionary search computes equals the app's own for all 14,512 templates in the instance (1,846 with `*`) |
+| 1.1.8 as packaged on Splunk 10.4.3, the same events and 8,700 more through the OpenTelemetry Collector | every event through `tx` expands to its raw line (17,011 of 17,011 on each index, 8,700 of 8,700 through the Collector); 26 searches of words, phrases, wildcards, key=value and JSON fields and IPv4 addresses return the raw count through `tx`, `\| tx`, `tenxsearch`, a dashboard and a compiled alert on each index; three `TERM()` searches return through `tx` and are refused with a message by `\| tx`, `tenxsearch` and the dashboard |
 | 1.1.7 unit tests | 397 passed, among them each of the 1.1.7 changes: the field extraction and the highlight in `tx`, unpadded date letters, epoch timestamps, and refreshing a stored template whose derived fields changed |
 | 1.1.7 as packaged on Splunk 10.4.3, upgraded in place over 1.1.6; nine log shapes (Apache, Proxifier, Kubernetes JSON, Java with stack traces, key=value application logs, BSD syslog, CSV, Windows event text, and lines with `$`, `/`, `~`, quotes, Unicode, tabs, leading zeros, UUIDs and 8 KB values), each encoded by edge-10x 1.1.142 and indexed raw beside its compact form | every line expands back as it was; the fields of every single-line event equal Splunk's own on the raw line (21,804 events); 25 of 25 key=value field searches and 155 of 162 word, value, phrase, OR, NOT and wildcard searches return the raw lines exactly, the other 7 differing only where lines are grouped into one event or a number sits inside a timestamp; one run of the template load after the upgrade rewrites the records stored by 1.1.6 |
 | 1.1.7 as packaged, fresh install on Splunk 9.4.15 and on 10.6.0.5; eight of the same log shapes | every line expands back as it was; fields equal Splunk's on 10,825 events; 11 of 11 field searches as raw; `status=600` on key=value text found; no search highlights every event; the risky-command check, the Search app, both stops, an unpadded syslog day and an epoch timestamp as on 10.4.3 |
@@ -268,7 +278,7 @@ From the repository root:
 rm -rf /tmp/sbpkg && mkdir -p /tmp/sbpkg
 rsync -a --exclude 'local/' --exclude '__pycache__/' --exclude '*.pyc' --exclude '*.pyo' --exclude '.*' \
   tenx-for-splunk/ /tmp/sbpkg/tenx-for-splunk/
-cd /tmp/sbpkg && COPYFILE_DISABLE=1 tar --format ustar -czf tenx-for-splunk-1.1.7.tar.gz tenx-for-splunk
+cd /tmp/sbpkg && COPYFILE_DISABLE=1 tar --format ustar -czf tenx-for-splunk-1.1.8.tar.gz tenx-for-splunk
 ```
 
 ## Submitting
