@@ -23,6 +23,19 @@ own search text, and this module
    tx-inflate prints it again, so no digit of such a form is a term of the compact event: the
    936 of "20:11:45.936" is three digits, which the first test alone kept, and the search found
    none of the events that hold it.
+4. reads an IPv4 address in a word or phrase as a whole. Every part of the address, one- and
+   two-digit parts included, must be a term of the compact event:
+   (TERM(<part>) OR TERM(<address>)). Where the engine stored the address cut, each part is a
+   value of its own, so TERM(<part>) holds. Where it stored the address as one value (its
+   ipv4SingleToken option), TERM(<address>) holds, and so does TERM(<part>), because Splunk
+   indexes the pieces between minor breakers too (observed on Splunk Enterprise 10.4.3). An
+   index holding both forms is therefore searched correctly, and no template lookup is needed.
+   A prefix of three whole parts and a wildcard, 10.0.1.*, requires those parts the same way,
+   TERM(<part>) each.
+   Two exceptions, both from the format: a first part of 1 is not required, because "-1"
+   before a dot stays template text (FORMAT_SPEC S2.2); and an address printed by a timestamp
+   slot whose format has dots is not covered, the same limit the piece rule above has for a
+   three-digit piece.
 
 Anything the prefilter leaves unrestricted is still applied, exactly, by the search that
 follows `tx` on the expanded text. The prefilter only selects which compact events to expand,
@@ -60,6 +73,17 @@ TIME_FORMS = (
 	# zone offsets: +0000, -04:00
 	re.compile(r"[-+](?:[01]\d|2[0-3]):?[0-5]\d(?![0-9])"),
 )
+# An IPv4 address in a search word, cut the way the engine's ipv4SingleToken option cuts it: four
+# parts of 1 to 3 digits joined by single dots, the first not right after a letter or digit or
+# after a digit and a dot, the last not followed by a letter or digit or by a dot and a digit.
+# Each part must also be 255 or less (checked in addresses_of). A wildcard next to the first or
+# the last part makes that part a fragment of a longer number (*10.0.1.14 matches 110.0.1.14,
+# 10.0.2.1* matches 10.0.2.14), so neither is read as an address.
+ADDRESS = re.compile(r"(?<![0-9A-Za-z*])(?<![0-9]\.)([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})"
+					 r"(?![0-9A-Za-z*])(?!\.[0-9])")
+# Three whole parts of an address and a wildcard for the fourth: 10.0.1.* or 10.0.1.1*. Shorter
+# prefixes (10.0.*) are left to the piece rule: two dotted numbers are as likely a date or a time.
+ADDRESS_PREFIX = re.compile(r"(?<![0-9A-Za-z*])(?<![0-9]\.)((?:[0-9]{1,3}\.){3})[0-9]{0,2}\*")
 
 
 class Unparsed(Exception):
@@ -302,11 +326,42 @@ def usable(piece):
 	return bool(re.fullmatch(r"[a-z0-9*]+", piece)) and piece.strip("*") != "" and not TIMESTAMP_PIECE.match(piece)
 
 
+def addresses_of(text):
+	"""The IPv4 addresses written in a word or phrase, in order, without repeats."""
+	found = []
+	for match in ADDRESS.finditer(text):
+		if all(int(part) <= 255 for part in match.groups()) and match.group(0) not in found:
+			found.append(match.group(0))
+	return found
+
+
+def address_parts(address):
+	"""The parts of an address that must be terms of the event, in order, without repeats. A first
+	part of 1 is left out: after a "-" it is the literal -1 of the template (FORMAT_SPEC S2.2)."""
+	parts = address.lower().split(".")
+	return list(dict.fromkeys(p for i, p in enumerate(parts) if not (i == 0 and p == "1")))
+
+
+def prefix_parts(text):
+	"""The whole parts of each address prefix written with a wildcard (10.0.1.*), in order, without
+	repeats, as address_parts gives them. Text that is a whole address has none."""
+	found = []
+	for match in ADDRESS_PREFIX.finditer(text):
+		parts = match.group(1).rstrip(".").split(".")
+		if all(int(part) <= 255 for part in parts):
+			for part in address_parts(".".join(parts)):
+				if part not in found:
+					found.append(part)
+	return found
+
+
 def lookup_pieces(node, found=None):
-	"""Every usable piece the prefilter would look up in the template dictionary."""
+	"""Every usable piece the prefilter would look up in the template dictionary. The parts of an
+	address are not looked up: a part is digits only, so never template text (FORMAT_SPEC S3.2)."""
 	found = set() if found is None else found
 	if node[0] == "text":
-		found.update(p for p in pieces_outside_times(node[1]) if usable(p))
+		in_address = {p for a in addresses_of(node[1]) for p in pieces_of(a)} | set(prefix_parts(node[1]))
+		found.update(p for p in pieces_outside_times(node[1]) if usable(p) and p not in in_address)
 	elif node[0] in ("and", "or"):
 		for child in node[1]:
 			lookup_pieces(child, found)
@@ -321,13 +376,19 @@ def prefilter(node, dictionary):
 	kind = node[0]
 	if kind == "text":
 		clauses = []
+		addresses = addresses_of(node[1])
+		prefixed = [p for p in prefix_parts(node[1]) if p not in {q for a in addresses for q in address_parts(a)}]
+		in_address = {p for a in addresses for p in pieces_of(a)} | set(prefixed)
 		for piece in pieces_outside_times(node[1]):
-			if not usable(piece):
+			if not usable(piece) or piece in in_address:
 				continue
 			count, terms = dictionary.get(piece, (0, []))
 			if count > MAX_TEMPLATES:
 				continue
 			clauses.append("(TERM(%s) OR %s)" % (piece, " OR ".join(terms)) if terms else "TERM(%s)" % piece)
+		for address in addresses:
+			clauses.extend("(TERM(%s) OR TERM(%s))" % (part, address) for part in address_parts(address))
+		clauses.extend("TERM(%s)" % part for part in prefixed)
 		return "(" + " AND ".join(clauses) + ")" if clauses else None
 	if kind == "and":
 		clauses = [c for c in (prefilter(child, dictionary) for child in node[1]) if c is not None]

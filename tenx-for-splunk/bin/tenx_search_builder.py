@@ -105,6 +105,7 @@ import tenx_util
 import tenx_prefilter_parser
 import tenx_spl_parser
 import tenx_search_manager
+import tenx_prefilter_parser
 
 
 class ResolvedState(Enum):
@@ -118,6 +119,9 @@ class ResolvedState(Enum):
 # breakers together, as single characters. '*' is a major breaker for the indexer but a live
 # wildcard in a search term, so it stays attached to its piece. The multi-character majors
 # ('--' and the %XX escapes) are covered by their single characters.
+# A search term written as TERM(<x>) or CASE(<x>).
+TERM_CALL = re.compile(r'^(TERM|CASE)\((.*)\)$', re.S)
+
 SEGMENT_BREAKERS = frozenset("[]<>(){}|!;,'\"\n\r\t &?+/:=@.-$#%\\_")
 
 # A piece that matches more templates than this does not get its own ("piece" OR <hashes>)
@@ -716,12 +720,25 @@ class TenxSearchCommand(TenxSplCommand):
 		A piece that could be text printed from a timestamp is left unrestricted too: the
 		compact event holds the timestamp as epoch digits and the template holds only its
 		format, so the printed date and time are in neither, and are found after expansion.
+
+		The parts of an IPv4 address, and of a prefix of three parts and a wildcard (10.0.1.*),
+		are required in the raw without a dictionary lookup, as the `tx` prefilter does
+		(tenx_prefilter_parser.addresses_of, address_parts, prefix_parts): a part is digits only,
+		so never template text (FORMAT_SPEC S3.2), and a term of the compact event whether the
+		engine stored the address cut or whole (observed on Splunk Enterprise 10.4.3). A first
+		part of 1 is still looked up, since "-1" before a dot is template text.
 		"""
 		pieces = []
 		printed = set()
+		address_parts = set()
 
 		for word in tenx_util.strip_string(term_text).split():
 			printed |= timestamp_text_pieces(word, self._timestamp_text_patterns())
+
+			for address in tenx_prefilter_parser.addresses_of(word):
+				address_parts.update(tenx_prefilter_parser.address_parts(address))
+
+			address_parts.update(tenx_prefilter_parser.prefix_parts(word))
 
 			for piece in split_pieces(word):
 				if piece not in pieces:
@@ -737,6 +754,10 @@ class TenxSearchCommand(TenxSplCommand):
 		for piece in pieces:
 			if piece in printed:
 				self.timestamp_text = True
+				continue
+
+			if piece in address_parts:
+				conjuncts.append(quoted_term(piece))
 				continue
 
 			hashes, truncated = self._probe(piece)
@@ -785,7 +806,11 @@ class TenxSearchCommand(TenxSplCommand):
 		rule_type = node.rule_type
 
 		if rule_type == 'index_expression':
-			return self._term_prefilter(node.text)
+			# TERM(x) and CASE(x) match x as written (a whole indexed term, or with its case);
+			# the prefilter requires x's pieces, which every event matching either holds. The
+			# search after expansion applies TERM() or CASE() itself (original_search_terms).
+			call = TERM_CALL.match(node.text)
+			return self._term_prefilter(call.group(2) if call else node.text)
 
 		if rule_type in ('not_logical_expression', 'field_modifier', 'search_modifier'):
 			return None

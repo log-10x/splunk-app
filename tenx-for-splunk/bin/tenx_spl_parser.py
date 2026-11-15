@@ -100,7 +100,7 @@ spl_grammar = Grammar(
 	t_logical_expression	= search_modifier / field_modifier / index_expression
 
 	not_logical_expression	= "NOT" WS+ unary_expression
-	index_expression		= (STR_CHAR+ / Q_STRING)
+	index_expression		= ((("TERM" / "CASE") "(" STR_CHAR+ ")") / STR_CHAR+ / Q_STRING)
 
 	field_modifier			= (field_cmp / field_in_list)
 

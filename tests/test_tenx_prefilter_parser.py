@@ -122,9 +122,10 @@ class TestPrefilter:
 	def test_a_value_no_template_carries(self):
 		assert plan("a05b2981")[0] == "(TERM(a05b2981))"
 
-	def test_an_ip_is_its_pieces(self):
+	def test_an_ip_is_not_looked_up_in_the_dictionary(self):
+		# Its parts are digits only, so never template text; TestWholeAddress has the clause.
 		reader = p.Parser(p.tokenize("10.100.153.189"))
-		assert p.lookup_pieces(reader.parse()) == {"100", "153", "189"}
+		assert p.lookup_pieces(reader.parse()) == set()
 
 	def test_lowercase_or_is_a_word(self):
 		pf = plan("error or warn")[0]
@@ -270,5 +271,92 @@ class TestDigitsOfAWrittenDateOrTime:
 	def test_numbers_beside_a_colon_or_dots_that_are_no_date_or_time_still_narrow(self):
 		# a port after an address, and the parts of an address, are not a time or a date
 		assert "TERM(8443)" in plan("10.0.1.14:8443")[0]
-		assert plan("192.168.33.161")[0] == "(TERM(192) AND TERM(168) AND TERM(161))"
+		assert plan("192.168.33.161")[0] == (
+			"((TERM(192) OR TERM(192.168.33.161)) AND (TERM(168) OR TERM(192.168.33.161))"
+			" AND (TERM(33) OR TERM(192.168.33.161)) AND (TERM(161) OR TERM(192.168.33.161)))")
 		assert "TERM(1234)" in plan("job:1234")[0]
+
+
+class TestWholeAddress:
+	"""
+	An IPv4 address requires each of its parts as a term, or the whole address as one term. Cut
+	(four values) or whole (one value, ipv4SingleToken), the event holds those terms, so an index
+	holding both forms is searched correctly. Compared on Splunk Enterprise 10.4.3 against the
+	same searches on raw events, on indexes holding the cut form, the one-value form and both.
+	"""
+
+	def test_short_parts_narrow(self):
+		# Every piece of 10.0.1.14 has one or two digits, which the piece rule alone leaves unused.
+		assert plan("10.0.1.14")[0] == (
+			"((TERM(10) OR TERM(10.0.1.14)) AND (TERM(0) OR TERM(10.0.1.14))"
+			" AND (TERM(1) OR TERM(10.0.1.14)) AND (TERM(14) OR TERM(10.0.1.14)))")
+
+	def test_term_and_quotes_read_as_the_address(self):
+		want = plan("10.0.1.14")[0]
+		assert plan("TERM(10.0.1.14)")[0] == want and plan('"10.0.1.14"')[0] == want
+
+	def test_a_field_comparison_still_places_no_restriction(self):
+		assert plan("IpAddress=10.0.1.14")[0] is None
+
+	def test_three_digit_parts_need_no_dictionary(self):
+		assert plan("192.168.33.161")[0] == (
+			"((TERM(192) OR TERM(192.168.33.161)) AND (TERM(168) OR TERM(192.168.33.161))"
+			" AND (TERM(33) OR TERM(192.168.33.161)) AND (TERM(161) OR TERM(192.168.33.161)))")
+
+	def test_a_port_is_a_piece_of_its_own(self):
+		pf = plan("10.0.1.14:8443")[0]
+		assert pf.startswith("(TERM(8443) AND (TERM(10) OR TERM(10.0.1.14))")
+		reader = p.Parser(p.tokenize("10.0.1.14:8443"))
+		assert p.lookup_pieces(reader.parse()) == {"8443"}
+
+	def test_repeated_parts_once(self):
+		assert plan("0.0.0.0")[0] == "((TERM(0) OR TERM(0.0.0.0)))"
+		assert plan("10.0.0.1")[0] == (
+			"((TERM(10) OR TERM(10.0.0.1)) AND (TERM(0) OR TERM(10.0.0.1)) AND (TERM(1) OR TERM(10.0.0.1)))")
+
+	def test_a_first_part_of_one_is_not_required(self):
+		# After a "-", the engine keeps "-1" as template text (FORMAT_SPEC S2.2).
+		assert p.address_parts("1.2.3.4") == ["2", "3", "4"]
+		assert p.address_parts("1.1.1.1") == ["1"]
+		assert p.address_parts("10.1.1.1") == ["10", "1"]
+
+	def test_what_the_engine_keeps_cut_is_not_an_address(self):
+		for text in ("1.2.3.4.5", "5.1.2.3.4x", "256.1.1.1", "1.2.3.1234", "10.0.1.14abc", "v1.2.3.4", "3.14", "1.2.3"):
+			assert p.addresses_of(text) == [], text
+		assert plan("1.2.3.4.5")[0] is None
+
+	def test_addresses_the_engine_takes_whole(self):
+		assert p.addresses_of("x.1.2.3.4") == ["1.2.3.4"]
+		assert p.addresses_of("10.0.0.0/8 to 010.000.1.1, 10.0.0.0/8") == ["10.0.0.0", "010.000.1.1"]
+		assert p.addresses_of("range 10.0.0.1-10.0.0.255.") == ["10.0.0.1", "10.0.0.255"]
+
+	def test_a_wildcard_next_to_an_address_makes_it_a_fragment(self):
+		# 10.0.2.1* matches 10.0.2.14 and *10.0.1.14 matches 110.0.1.14: requiring the part 1, or
+		# the part 10, would miss them.
+		assert p.addresses_of("10.0.2.1*") == [] and p.addresses_of("*10.0.1.14") == []
+		assert plan("10.0.2.1*")[0] == "(TERM(1*) AND TERM(10) AND TERM(0) AND TERM(2))"
+		assert "TERM(10)" not in plan("*10.0.1.14")[0]
+
+	def test_a_prefix_of_three_parts_requires_them(self):
+		assert plan("10.0.1.*")[0] == "(TERM(10) AND TERM(0) AND TERM(1))"
+		assert plan("10.0.1.14*")[0] == "(TERM(14*) AND TERM(10) AND TERM(0) AND TERM(1))"
+		assert p.prefix_parts("1.2.3.*") == ["2", "3"]
+		reader = p.Parser(p.tokenize("10.0.1.*"))
+		assert p.lookup_pieces(reader.parse()) == set()
+
+	def test_shorter_prefixes_keep_the_piece_rules(self):
+		# Two dotted numbers are as likely a date or a time a timestamp slot prints.
+		assert p.prefix_parts("10.0.*") == [] and p.prefix_parts("192.168.*") == []
+		assert plan("10.0.*")[0] is None
+		assert plan("192.168.*")[0] == "(TERM(192) AND TERM(168))"
+		assert p.prefix_parts("256.0.1.*") == [] and p.prefix_parts("x10.0.1.*") == []
+
+	def test_negated_or_ored_with_nothing(self):
+		assert plan("NOT 10.0.1.14")[0] is None
+		assert plan("10.0.1.14 OR NOT x")[0] is None
+		assert plan("10.0.1.14 OR 0.0.0.0")[0] == (
+			"(((TERM(10) OR TERM(10.0.1.14)) AND (TERM(0) OR TERM(10.0.1.14)) AND (TERM(1) OR TERM(10.0.1.14))"
+			" AND (TERM(14) OR TERM(10.0.1.14))) OR ((TERM(0) OR TERM(0.0.0.0))))")
+
+	def test_other_words_keep_their_dictionary_clause(self):
+		assert plan("kafka 10.0.1.14")[0].startswith("(((TERM(kafka) OR TERM(~k1))) AND ((TERM(10) OR TERM(10.0.1.14))")
