@@ -111,6 +111,7 @@ Usage
     tenx_field_map.py verify --records ... --target ... --encoded <encoded.log> --raw <raw.log>
     tenx_field_map.py gen --rules lookup ... --cap-file <compact cap file> [--splunkd <management URL> --probe-index <index>]
     tenx_field_map.py activate --app <app dir> --cap-file <compact cap file> --splunkd <management URL> --probe-index <index>
+    tenx_field_map.py check --app <app dir> --cap-file <compact cap file> --splunkd <management URL> --probe-index <index>
 
 `--rules lookup` writes one static index-time rule per compact sourcetype and one row per template in
 lookups/<prefix>_fields.csv.gz, so a template added later changes only that file, which Splunk rereads
@@ -241,6 +242,16 @@ LOOKUP_COLUMNS = ('hash', 'n', 'e', 't', 'f')
 # lookup() fails at index time and Splunk drops the event (see "Lookup rules").
 LOOKUP_DEFAULT_MAX_BYTES = 10000000
 REFUSED_TOO_MANY = "more values than the lookup rule takes (%d)"
+# The indexed field a compact event gets when the lookup rule writes none of its fields, and its values:
+# no row for the hash; a row the rule cannot use; a line that does not have the row's values; and the
+# floor copy of the file answered, so the rows were not read (see "Lookup failures").
+UNMAPPED_FIELD = 'tenx_unmapped'
+WHY_NO_ROW = 'no_row'
+WHY_BAD_ROW = 'bad_row'
+WHY_NO_MATCH = 'no_match'
+WHY_NO_TABLE = 'no_table'
+# The one row of the floor copy, a hash no template has.
+FLOOR_HASH = 'tenx-fm-floor'
 
 WINDOWS_WILDCARD_FIELDS = ('object_file_path', 'object_path', 'object_file_name', 'ObjectName', 'ObjectType',
 	'process_path', 'process_name', 'ProcessName', 'file_path', 'file_name')
@@ -871,11 +882,56 @@ Transform = collections.namedtuple('Transform', 'key stanza regex format fields 
 # value reads back as a space, as for an INGEST_EVAL field.
 #
 # If the lookup file is missing, or larger than limits.conf ingest_max_memtable_bytes (default
-# 10485760), lookup() fails at index time and Splunk drops the event (10.4.3: "Runtime exception in
-# pipeline=typing processor=regexreplacement error='Invalid function argument'", 0 of 6 and 0 of 22
-# events indexed). The rule calls lookup() for compact events only, so whole events are kept; the file
-# is gzipped (the limit counts the file: 20,001 rows of 27.8 MB as a 0.63 MB .csv.gz worked), written
-# by a rename so it always exists, and gen refuses to write one over --lookup-max-bytes.
+# 10485760), lookup() fails at index time and Splunk drops the event (10.4.3: 0 of 6 and 0 of 22 events
+# indexed; see "Lookup failures"). The rule calls lookup() for compact events only, so whole events are
+# kept, and the file is gzipped (the limit counts the file: 20,001 rows of 27.8 MB as a 0.63 MB .csv.gz
+# worked).
+
+# ---------------------------------------------------------------------------------------------
+# Lookup failures
+#
+# lookup() at index time throws when the table it names cannot be read, and Splunk then drops the event
+# ("Runtime exception in pipeline=typing processor=regexreplacement", "Uncaught exception in pipeline
+# execution (regexreplacement) - getting next event"). Nothing in the rule can catch it: coalesce() does
+# not, a rule earlier in the list does not keep the event, RULESET- drops it the same way, and a table
+# name that is not a literal does not compile ("Error compiling INGEST_EVAL expression ... Invalid
+# function argument"; the rule is then skipped). Splunk Enterprise 10.4.3, two compact and one whole
+# event per case, the rule as generated before the floor and the marker, and as generated now:
+#
+#   dropped: no file; no definition (the name is then read as a file name); a file only in default/; a
+#     file splunkd cannot read (mode 000); a file named .csv.gz that is not gzip; a header without the
+#     column `hash`. The same with a floor copy in another app, except the first two.
+#   kept, no fields (the rule as generated now marks them): a header alone or an empty file (no_row); a
+#     row with two columns, a value count that is not a number or over 240, an empty recipe, two rows for
+#     one hash (bad_row; max_matches = 1 does not change it); a line with fewer values (no_match);
+#     the hash not in the file (no_row).
+#   kept, with fields: half of the gzip file (the rows before the cut are read); a file whose metadata
+#     gives no one read access.
+#
+# A file deleted while Splunk holds its table: events keep their fields until the next refresh
+# (ingest_lookup_refresh_period_secs), then one of three, seen on four deletions: every event fails and is
+# dropped (a table read once: 27 of 27 events over 82 s, until the file was back); the table reads as
+# empty (a table whose file had been put back before: 37 of 37 kept, no_row; and a probe event, no_row);
+# or the table keeps the rows it read (a table rewritten six times by renames: probe events kept their
+# fields for the 150 s the file was missing). Once the file is back, the table reads as empty until the
+# next refresh (13 events, 39 s), then rows again. A file overwritten in place with half its gzip bytes kept
+# giving rows. ingest_max_memtable_bytes (limits.conf [lookup]) is one value for the whole instance; no
+# lookup definition setting changes it for one table.
+#
+# So the generated files guard what they can, and the cap file covers the rest:
+# * the rule builds its regex only from a row it can use, and gives a compact event it writes no
+#   fields for the indexed field tenx_unmapped with the reason: no_row, bad_row, no_match, or no_table
+#   when the floor copy answered;
+# * the floor app (<app>_floor, --floor on) holds the lookup definition and a file of the same name with
+#   the one row FLOOR_HASH. Splunk reads a lookup file from the first app, in app folder name order,
+#   that holds one (measured with three apps: a file only in another app is read; "a_x" before "b_x" before
+#   "b_x_floor"), so the floor is read only when the field map app has no file, or no definition, when
+#   Splunk opens the table. It is not read for a table Splunk already holds;
+# * gen writes the file through a rename, never over --lookup-max-bytes, and before the rule;
+# * check (see "The engine's compact cap file") probes listed templates and empties the cap file as soon
+#   as a probe event comes back without its fields or does not come back, so the Receiver sends them whole
+#   (measured with a check every 10 s: the Receiver read the empty list 19 s after the file was replaced by
+#   one with no rows, and 24 s after it was deleted).
 
 def lookup_stanza(target):
 	return '%s_fields' % target['transform_prefix']
@@ -979,9 +1035,10 @@ def lookup_ts_supported(fmt):
 
 def lookup_eval_text(lookup_def):
 	"""The static INGEST_EVAL of --rules lookup (see "Lookup rules"). Every intermediate value sits in a
-	pd: key, which is not indexed."""
-	row, f, t, e, x, m = ('$pd:tenx_fm_%s$' % k for k in ('row', 'f', 't', 'e', 'x', 'm'))
-	n = 'tonumber(json_extract(%s, "n"))' % row
+	pd: key, which is not indexed. A compact event the rule writes no fields for gets UNMAPPED_FIELD with
+	the reason (see "Lookup failures")."""
+	row, f, t, e, x, m, nt, ok, why = ('$pd:tenx_fm_%s$' % k for k in ('row', 'f', 't', 'e', 'x', 'm', 'n', 'ok', 'why'))
+	n = 'tonumber(%s)' % nt
 	sec = 'tonumber(substr(%s, 1, 10))' % e
 	sod = '(%s - floor(%s / 86400) * 86400)' % (sec, sec)
 	noon = '(%s - %s + 43200)' % (sec, sod)
@@ -1007,15 +1064,29 @@ def lookup_eval_text(lookup_def):
 	regex = '"^~[^,[:cntrl:]]*" . substr("%s", 1, %d * %s) . if(%s == 0, ",?", "") . "[|]([^|[:cntrl:]]*)[|]%s$"' % (
 		LOOKUP_VALUE_GROUP * LOOKUP_MAX_VALUES, len(LOOKUP_VALUE_GROUP), n, n, '([^|])' * len(LOOKUP_TAIL))
 	tail = '"|0123456789" . urldecode("%5C%09%0A%0D")'
+	compact = 'substr(_raw, 1, 1)=="~"'
 	exprs = [
-		'%s=if(substr(_raw, 1, 1)=="~", lookup("%s", json_object("hash", trim(replace(_raw, "(?s)^~([^,]*).*$", "\\1"))), '
-		'json_array("n", "t", "f")), null())' % (row, lookup_def),
+		'%s=if(%s, lookup("%s", json_object("hash", trim(replace(_raw, "(?s)^~([^,]*).*$", "\\1"))), '
+		'json_array("n", "t", "f")), null())' % (row, compact, lookup_def),
 		'%s=json_extract(%s, "f")' % (f, row),
 		'%s=json_extract(%s, "t")' % (t, row),
+		'%s=json_extract(%s, "n")' % (nt, row),
+		# A row the rule can use: a recipe of name::value pairs, and a value count of at most LOOKUP_MAX_VALUES in digits. Any
+		# other row (a cut line, a column missing, two rows for one hash) builds no regex, so replace() never
+		# gets a regex it cannot compile.
+		'%s=if(isnotnull(%s) AND isnotnull(%s), if(match(%s, "::") AND match(%s, "^[0-9]{1,3}$"), if(%s <= %d, 1, 0), 0), 0)' % (
+			ok, f, nt, f, nt, n, LOOKUP_MAX_VALUES),
 		'%s=if(len(%s) > 0, replace(_raw, "^~[^,]*,([^,|]*).*$", "\\1"), "")' % (e, t),
-		'%s=if(isnull(%s), null(), _raw . "|" . %s . %s)' % (x, f, ts, tail),
+		'%s=if(%s == 1, _raw . "|" . %s . %s, null())' % (x, ok, ts, tail),
 		'%s=if(isnull(%s), null(), replace(%s, %s, %s))' % (m, x, x, regex, f),
-		'_meta=if(isnull(%s) OR %s==%s, _meta, _meta . " " . %s)' % (m, m, x, m),
+		# _meta is null on an event no earlier rule gave an indexed field (an HEC event without "fields").
+		'_meta=if(isnull(%s) OR %s==%s, _meta, coalesce(_meta, "") . " " . %s)' % (m, m, x, m),
+		'%s=case(%s, null(), isnull(%s) AND isnull(%s), "%s", %s != 1, "%s", isnull(%s) OR %s==%s, "%s")' % (
+			why, compact.replace('==', '!='), f, nt, WHY_NO_ROW, ok, WHY_BAD_ROW, m, m, x, WHY_NO_MATCH),
+		# No row: the floor copy of the file, which holds only FLOOR_HASH, says the rows are missing as a whole.
+		'%s=if(%s=="%s", if(isnull(json_extract(lookup("%s", json_object("hash", "%s"), json_array("n")), "n")), "%s", "%s"), %s)' % (
+			why, why, WHY_NO_ROW, lookup_def, FLOOR_HASH, WHY_NO_ROW, WHY_NO_TABLE, why),
+		'_meta=if(isnull(%s), _meta, coalesce(_meta, "") . " %s::" . %s)' % (why, UNMAPPED_FIELD, why),
 	]
 	return ', '.join(exprs)
 
@@ -1521,6 +1592,45 @@ def write_app(out_dir, target, field_map, settings, search_hash=True, sourcetype
 	return sizes
 
 
+FLOOR_SUFFIX = '_floor'
+
+
+def floor_dir(out_dir):
+	"""The floor app's folder: beside the app, its name the app's name followed by _floor, so it sorts after it."""
+	return os.path.abspath(out_dir).rstrip(os.sep) + FLOOR_SUFFIX
+
+
+def floor_file_bytes():
+	"""The floor copy of the lookup file: the header and the one row FLOOR_HASH, which no template has."""
+	return lookup_file_bytes([(FLOOR_HASH, '0', '0', '', '')])
+
+
+def write_floor_app(out_dir, target):
+	"""
+	The floor app (see "Lookup failures"): the lookup definition and a lookup file of the same name holding only
+	FLOOR_HASH. It never changes when templates are added. Returns the sizes of the files.
+	"""
+	d = floor_dir(out_dir)
+	name = os.path.basename(d)
+	files = collections.OrderedDict([
+		(os.path.join('lookups', lookup_file_name(target)), floor_file_bytes()),
+		(os.path.join('default', 'transforms.conf'), '# Generated by tenx_field_map.py: the floor copy of the lookup the '
+			'index-time rule of %s reads.\n# Splunk reads it only when the app %s has no file of this name; the rule then '
+			'marks\n# every compact event %s::%s instead of failing on it.\n[%s]\nfilename = %s\ncase_sensitive_match = true\n'
+			% (target['sourcetype'], os.path.basename(os.path.abspath(out_dir)), UNMAPPED_FIELD, WHY_NO_TABLE,
+				lookup_stanza(target), lookup_file_name(target))),
+		(os.path.join('default', 'app.conf'), '# Generated by tenx_field_map.py. Install it wherever %s is installed.\n'
+			'[install]\nstate = enabled\n[ui]\nis_visible = false\nlabel = %s\n[launcher]\nversion = 0.0.1\n'
+			% (os.path.basename(os.path.abspath(out_dir)), name)),
+		(os.path.join('metadata', 'default.meta'), '[]\nexport = system\n'),
+	])
+	sizes = {}
+	for rel, data in files.items():
+		write_if_changed(os.path.join(d, rel), data)
+		sizes[os.path.join(name, rel)] = len(data) if isinstance(data, bytes) else len(data.encode('utf-8'))
+	return sizes
+
+
 # ---------------------------------------------------------------------------------------------
 # verify
 
@@ -1711,6 +1821,11 @@ def verify(templates, field_map, encoded_path, raw_path, raw_split=None, out=sys
 #   the probes every --poll seconds until --timeout. Nothing is restarted or reloaded: the instance
 #   rereads the lookup file on its own (limits.conf ingest_lookup_refresh_period_secs, default 60 s).
 #   gen --splunkd runs it right after writing the app, for an app written in place on that instance.
+# * check proves the converse for templates already listed: it sends probe events of a few listed
+#   templates on the same probe stream, and when one of them is indexed without its fields, or is not
+#   indexed within --check-timeout (an index-time error drops an event), it empties the list at once
+#   (rows that do not start with `true` are kept) and leaves every listed template pending, so the
+#   Receiver sends them whole until activate has proven them again. The loop runs it on every turn.
 #
 # Rows: `"<hash>",true`, the hash as the engine writes it (outer spaces kept), always quoted (a hash
 # can start with "#", the CSV comment character, or hold a space), sorted. A row whose value does not
@@ -1823,8 +1938,9 @@ def cap_after_app(path, hashes):
 class Splunkd(object):
 	"""The management port of the instance that parses the data (REST, JSON)."""
 
-	def __init__(self, url, auth=None, token=None, tls_verify=True):
+	def __init__(self, url, auth=None, token=None, tls_verify=True, hec_url=None, hec_token=None):
 		self.url = url.rstrip('/')
+		self.hec_url, self.hec_token = (hec_url or '').rstrip('/'), hec_token
 		self.headers = {}
 		if token:
 			self.headers['Authorization'] = 'Splunk %s' % token
@@ -1849,8 +1965,17 @@ class Splunkd(object):
 		return json.loads(body) if body.strip() else {}
 
 	def send(self, lines, index, host, source, sourcetype):
-		"""Raw lines into the parsing pipeline through receivers/simple, one event per line (the compact
-		sourcetype breaks on line ends)."""
+		"""Raw lines into the parsing pipeline, one event per line: through HTTP Event Collector when hec_url
+		is set (the path compact events take from the Receiver, so the probe is parsed where they are), else
+		through the management port's receivers/simple (the compact sourcetype breaks on line ends)."""
+		if self.hec_url:
+			body = '\n'.join(json.dumps({'event': l, 'index': index, 'host': host, 'source': source, 'sourcetype': sourcetype})
+				for l in lines).encode('utf-8')
+			req = urllib.request.Request(self.hec_url + '/services/collector/event', data=body, method='POST',
+				headers={'Authorization': 'Splunk %s' % self.hec_token})
+			with urllib.request.urlopen(req, context=self.ctx, timeout=120) as res:
+				res.read()
+			return
 		q = urllib.parse.urlencode({'index': index, 'host': host, 'source': source, 'sourcetype': sourcetype})
 		req = urllib.request.Request(self.url + '/services/receivers/simple?' + q, data=('\n'.join(lines) + '\n').encode('utf-8'),
 			method='POST', headers=self.headers)
@@ -1928,12 +2053,23 @@ def probe_line(written_hash, row, now):
 	return '~%s,%s' % (written_hash, ','.join(values))
 
 
+def probe_states(splunkd, index, sourcetype, since):
+	"""hash -> (True when a probe event of that hash indexed since `since` has tenx_mapped, the reasons
+	tenx_unmapped gives on the others)."""
+	rows = splunkd.search('search index="%s" host="%s" source="%s" _index_earliest=%d | eval tenx_fm_probe_h=trim('
+		'replace(_raw, "^~([^,]*).*$", "\\1")), tenx_fm_probe_m=if(isnull(%s), 0, 1), tenx_fm_probe_w=%s | stats '
+		'max(tenx_fm_probe_m) as m values(tenx_fm_probe_w) as w by tenx_fm_probe_h' % (index, PROBE_HOST, PROBE_SOURCE,
+			int(since), MARK_FIELD, UNMAPPED_FIELD))
+	states = {}
+	for r in rows:
+		w = r.get('w') or []
+		states[r['tenx_fm_probe_h']] = (r.get('m') == '1', sorted(w if isinstance(w, list) else [w]))
+	return states
+
+
 def probe_results(splunkd, index, sourcetype, since):
 	"""hash -> True when a probe event of that hash indexed since `since` has tenx_mapped."""
-	rows = splunkd.search('search index="%s" host="%s" source="%s" _index_earliest=%d | eval tenx_fm_probe_h=trim('
-		'replace(_raw, "^~([^,]*).*$", "\\1")), tenx_fm_probe_m=if(isnull(%s), 0, 1) | stats max(tenx_fm_probe_m) as m '
-		'by tenx_fm_probe_h' % (index, PROBE_HOST, PROBE_SOURCE, int(since), MARK_FIELD))
-	return dict((r['tenx_fm_probe_h'], r.get('m') == '1') for r in rows)
+	return dict((h, v[0]) for h, v in probe_states(splunkd, index, sourcetype, since).items())
 
 
 def activate(app_dir, cap_file, splunkd, app_name=None, probe_index=None, timeout=300, poll=10, out=sys.stdout,
@@ -1961,6 +2097,11 @@ def activate(app_dir, cap_file, splunkd, app_name=None, probe_index=None, timeou
 	if differ:
 		out.write('activate: the instance does not hold app %s as generated (%d stanzas, first %s); '
 			'cap file left as it was\n' % (app_name, len(differ), differ[0]))
+		return 1
+	floor = floor_dir(app_dir)
+	if added and os.path.isdir(floor) and not_installed(splunkd, floor, app_name + FLOOR_SUFFIX):
+		out.write('activate: the instance does not hold the floor app %s, without which a missing lookup file drops compact '
+			'events; cap file left as it was\n' % (app_name + FLOOR_SUFFIX))
 		return 1
 	confirmed = set()
 	if added:
@@ -1991,13 +2132,79 @@ def activate(app_dir, cap_file, splunkd, app_name=None, probe_index=None, timeou
 				'' if not missing else '; not yet: %s' % ', '.join(repr(h) for h in missing[:5])))
 	now = (before & after) | confirmed
 	if now == after:
-		os.replace(pending, cap_file)
+		# Written anew rather than renamed: the pending file can be as old as the cap file it replaces (check
+		# writes both at once), and the Receiver sees a change by the file's time.
+		write_if_changed(cap_file, open(pending, encoding='utf-8', newline='').read())
+		os.remove(pending)
 		out.write('activate: %s lists %d templates (%d added, %d removed)\n' % (cap_file, len(after), len(confirmed),
 			len(before - after)))
 		return 0
 	write_if_changed(cap_file, cap_text(now, kept))
 	out.write('activate: %s lists %d templates; %d still pending\n' % (cap_file, len(now), len(after - now)))
 	return 1
+
+
+def check(app_dir, cap_file, splunkd, app_name=None, probe_index=None, sample=1, timeout=60, poll=10, out=sys.stdout,
+		clock=time.time, sleep=time.sleep, rng=None):
+	"""
+	Probes `sample` listed templates, chosen at random. When every probe is indexed with its fields, returns 0 and
+	changes nothing. When one is indexed without them or is not indexed within `timeout` seconds, the cap
+	file keeps only its rows that do not start with true, every listed template is left pending
+	(<cap file>.pending, merged with a pending list already there), and returns 1: the Receiver sends
+	those templates whole until activate proves them again.
+	"""
+	import random
+	listed, kept = read_cap(cap_file)
+	if not listed:
+		out.write('check: nothing listed (%s)\n' % cap_file)
+		return 0
+	app_name = app_name or os.path.basename(os.path.abspath(app_dir))
+	layout = lookup_app(app_dir)
+	if layout is None or not probe_index:
+		out.write('check: needs an app generated with --rules lookup and --probe-index; cap file left as it was\n')
+		return 2
+	sourcetype, table = layout
+	if not os.path.exists(table):
+		# Splunk keeps the rows it read until its next refresh, then fails on every compact event: withdraw now.
+		withdraw(cap_file, 'the lookup file %s is missing' % table, out)
+		return 1
+	rows = read_lookup_file(table)
+	probed = sorted((rng or random.Random()).sample(sorted(h for h in listed if h.strip() in rows), min(sample, len(listed))))
+	why = None
+	if len(probed) < min(sample, len(listed)):
+		why = 'a listed template has no row in %s' % table
+	else:
+		start = clock()
+		splunkd.send([probe_line(h, rows[h.strip()], int(clock())) for h in probed], probe_index, PROBE_HOST, PROBE_SOURCE,
+			sourcetype)
+		while True:
+			sleep(poll)
+			states = probe_states(splunkd, probe_index, sourcetype, start - 1)
+			got = [states.get(h.strip()) for h in probed]
+			bad = [(h, g[1]) for h, g in zip(probed, got) if g is not None and not g[0]]
+			if bad:
+				why = 'probe of %r indexed without its fields (%s=%s)' % (bad[0][0], UNMAPPED_FIELD, ','.join(bad[0][1]) or 'none')
+				break
+			if all(got):
+				out.write('check: %d of %d listed templates probed, all indexed with their fields (%.0f s)\n' % (
+					len(probed), len(listed), clock() - start))
+				return 0
+			if clock() - start > timeout:
+				why = '%d of %d probes not indexed within %.0f s' % (sum(1 for g in got if g is None), len(probed), timeout)
+				break
+	withdraw(cap_file, why, out)
+	return 1
+
+
+def withdraw(cap_file, why, out=sys.stdout):
+	"""The cap file keeps only its rows that do not start with true; every listed template is left pending."""
+	listed, kept = read_cap(cap_file)
+	pending = cap_file + CAP_PENDING_SUFFIX
+	waiting, _ = read_cap(pending)
+	write_if_changed(pending, cap_text(listed | waiting, kept))
+	write_if_changed(cap_file, cap_text((), kept))
+	out.write('check: %s; %s now lists none of its %d templates, which stay pending until activate proves them again\n' % (
+		why, cap_file, len(listed)))
 
 
 # ---------------------------------------------------------------------------------------------
@@ -2086,6 +2293,10 @@ def build_parser():
 				help='with --rules lookup, refuse to write a lookup file larger than this (default %d; Splunk drops '
 					'compact events when the file passes limits.conf ingest_max_memtable_bytes, default 10485760)'
 					% LOOKUP_DEFAULT_MAX_BYTES)
+			p.add_argument('--floor', choices=('on', 'off'), default='on',
+				help='with --rules lookup, also write the floor app <out>_floor (default on): the lookup definition and a '
+					'file of the same name holding one row, which Splunk reads when the app\'s own file is missing, so the rule '
+					'marks compact events %s::%s instead of dropping them' % (UNMAPPED_FIELD, WHY_NO_TABLE))
 			p.add_argument('--cap-file', help='the Receiver\'s compact cap file (compactReceiverLookupFile, keyed on '
 				'templateHash): drop listed templates that lost their transform, and write <cap file>.pending, '
 				'which activate makes the cap file once the app is active where the data is parsed')
@@ -2101,36 +2312,53 @@ def build_parser():
 	p.add_argument('--app-name', help='the app\'s name on the instance (default: the folder name)')
 	p.add_argument('--cap-file', required=True)
 	_splunkd_args(p, required=True)
+
+	p = sub.add_parser('check', help='probe a few listed templates; when one is indexed without its fields or not at all, '
+		'list none of them until activate has proven them again')
+	p.add_argument('--app', required=True, help='the app folder gen wrote, as installed on the instance')
+	p.add_argument('--app-name', help='the app\'s name on the instance (default: the folder name)')
+	p.add_argument('--cap-file', required=True)
+	p.add_argument('--sample', type=int, default=1, help='listed templates probed per run, chosen at random (default 1)')
+	_splunkd_args(p, required=True, timeout=60, timeout_help='seconds check waits for its probe events (default 60)')
 	return ap
 
 
-def _splunkd_args(p, required):
+def _splunkd_args(p, required, timeout=300, timeout_help='seconds activate keeps probing (default 300)'):
 	p.add_argument('--splunkd', required=required,
 		help='management URL of the instance that parses the data, e.g. https://127.0.0.1:8089; with gen, '
-			'activate runs right after the app is written (the app folder is on that instance), and restarts it '
-			'when templates are added')
+			'activate runs right after the app is written (the app folder is on that instance)')
 	p.add_argument('--probe-index',
 		help='index for the probe events activate sends (one small event per new template); keep it out of data '
 			'model and detection index lists')
-	p.add_argument('--timeout', type=float, default=300, help='seconds activate keeps probing (default 300)')
+	p.add_argument('--timeout', type=float, default=timeout, help=timeout_help)
 	p.add_argument('--poll', type=float, default=10, help='seconds between probe rounds (default 10)')
 	p.add_argument('--splunkd-auth-env', default='TENX_SPLUNKD_AUTH',
 		help='environment variable holding user:password (default TENX_SPLUNKD_AUTH)')
 	p.add_argument('--splunkd-token-env', default='TENX_SPLUNKD_TOKEN',
 		help='environment variable holding a session key, used instead of user:password (default TENX_SPLUNKD_TOKEN)')
+	p.add_argument('--probe-hec',
+		help='HTTP Event Collector URL to send the probe events to, e.g. https://indexer:8088: the endpoint the Receiver '
+			'sends to, so a probe is parsed where the compact events are (default: the --splunkd management port, '
+			'which parses them on that instance)')
+	p.add_argument('--probe-hec-token-env', default='TENX_PROBE_HEC_TOKEN',
+		help='environment variable holding the HEC token for --probe-hec (default TENX_PROBE_HEC_TOKEN)')
 	p.add_argument('--tls-verify', choices=('on', 'off'), default='on',
 		help='off: accept the instance\'s certificate without checking it (a self-signed management port)')
 
 
 def _splunkd(args):
 	return Splunkd(args.splunkd, auth=os.environ.get(args.splunkd_auth_env),
-		token=os.environ.get(args.splunkd_token_env), tls_verify=args.tls_verify == 'on')
+		token=os.environ.get(args.splunkd_token_env), tls_verify=args.tls_verify == 'on', hec_url=args.probe_hec,
+		hec_token=os.environ.get(args.probe_hec_token_env))
 
 
 def main(argv=None):
 	args = build_parser().parse_args(argv)
 	if args.mode == 'activate':
 		return activate(args.app, args.cap_file, _splunkd(args), args.app_name, args.probe_index, args.timeout, args.poll)
+	if args.mode == 'check':
+		return check(args.app, args.cap_file, _splunkd(args), args.app_name, args.probe_index, args.sample, args.timeout,
+			args.poll)
 
 	target, templates, field_map = _build(args)
 
@@ -2156,7 +2384,11 @@ def main(argv=None):
 	if args.cap_file:
 		hashes = cap_hashes(field_map, templates)
 		cap = cap_before_app(args.cap_file, hashes)
-	sizes = write_app(args.out, target, field_map, settings, args.search_hash == 'on', sourcetype_field, lookup_bytes)
+	sizes = {}
+	if args.rules == RULES_LOOKUP and args.floor == 'on':
+		# First, so the definition and a file of its name exist before the rule that reads them.
+		sizes.update(write_floor_app(args.out, target))
+	sizes.update(write_app(args.out, target, field_map, settings, args.search_hash == 'on', sourcetype_field, lookup_bytes))
 	if args.cap_file:
 		cap['pending_file_written'] = cap_after_app(args.cap_file, hashes)
 	report = field_map.report()
@@ -2182,6 +2414,9 @@ def main(argv=None):
 		sys.stdout.write('for tx: add %s::%s to the tenx-events macro, for example\n'
 			'    index=* (sourcetype::tenx_encoded OR %s::%s)\n' % (sourcetype_field, target['sourcetype'], sourcetype_field,
 			target['sourcetype']))
+	if args.rules == RULES_LOOKUP and args.floor == 'on':
+		sys.stdout.write('floor app: %s; install it wherever %s is installed\n' % (floor_dir(args.out),
+			os.path.basename(os.path.abspath(args.out))))
 	if cap is not None:
 		sys.stdout.write('compact cap: %s\n' % json.dumps(cap))
 		if args.splunkd:
