@@ -130,6 +130,7 @@ import configparser
 import csv
 import datetime
 import hashlib
+import io
 import json
 import os
 import re
@@ -2178,13 +2179,20 @@ def verify(templates, field_map, encoded_path, raw_path, raw_split=None, out=sys
 #   before the probes in every run, so it is a stream that is already sending. A template whose probe
 #   event was indexed with tenx_mapped joins the cap file; the others stay pending, and activate repeats
 #   the probes every --poll seconds until --timeout. Nothing is restarted or reloaded: the instance
-#   rereads the lookup file on its own (limits.conf ingest_lookup_refresh_period_secs, default 60 s).
-#   gen --splunkd runs it right after writing the app, for an app written in place on that instance.
-# * check proves the converse for templates already listed: it sends probe events of a few listed
-#   templates on the same probe stream, and when one of them is indexed without its fields, or is not
-#   indexed within --check-timeout (an index-time error drops an event), it empties the list at once
-#   (rows that do not start with `true` are kept) and leaves every listed template pending, so the
-#   Receiver sends them whole until activate has proven them again. The loop runs it on every turn.
+#   rereads the lookup file on its own (limits.conf ingest_lookup_refresh_period_secs, default 60 s;
+#   activate reads the instance's value over REST). A probe that is indexed without its fields before
+#   then is expected (the instance still holds the earlier file); one indexed later than that period plus
+#   one --poll after activate started means the row does not work, and that template stays pending and is
+#   not probed again in this run. gen --splunkd runs activate right after writing the app, for an app
+#   written in place on that instance.
+# * check proves the converse for templates already listed: it fails at once when a listed template
+#   has no row in the app's lookup file, else it sends probe events of a few listed templates on the
+#   same probe stream, and when one of them is indexed without its fields, or is not indexed within its
+#   --timeout (an index-time error drops an event), it empties the list at once (rows that do not start
+#   with `true` are kept) and leaves every listed template pending, so the Receiver sends them whole
+#   until activate has proven them again. The loop runs it on every turn, and activate runs it on every
+#   probe round (--check-timeout), so activating new templates never holds up the check of the listed
+#   ones: a lookup that stops giving rows while activate waits is found within one round.
 #
 # Rows: `"<hash>",true`, the hash as the engine writes it (outer spaces kept), always quoted (a hash
 # can start with "#", the CSV comment character, or hold a space), sorted. A row whose value does not
@@ -2206,6 +2214,8 @@ PROBE_HOST = 'tenx-fm-probe'
 PROBE_SOURCE = 'tenx:fm:probe'
 # A hash no template has: the event that opens the probe stream gets no fields.
 HEARTBEAT_LINE = '~tenx-fm-heartbeat,probe'
+# limits.conf [lookup] ingest_lookup_refresh_period_secs as shipped; activate reads the instance's own value.
+LOOKUP_REFRESH_DEFAULT = 60
 
 
 def cap_hashes(field_map, templates):
@@ -2431,12 +2441,33 @@ def probe_results(splunkd, index, sourcetype, since):
 	return dict((h, v[0]) for h, v in probe_states(splunkd, index, sourcetype, since).items())
 
 
+def lookup_refresh_secs(splunkd):
+	"""(seconds, True) from the instance's limits.conf [lookup] ingest_lookup_refresh_period_secs, or
+	(LOOKUP_REFRESH_DEFAULT, False) when it cannot be read."""
+	try:
+		res = splunkd.call('GET', '/services/configs/conf-limits/lookup')
+		for e in res.get('entry', []):
+			v = e.get('content', {}).get('ingest_lookup_refresh_period_secs')
+			if v not in (None, ''):
+				return float(v), True
+	except Exception:
+		pass
+	return float(LOOKUP_REFRESH_DEFAULT), False
+
+
 def activate(app_dir, cap_file, splunkd, app_name=None, probe_index=None, timeout=300, poll=10, out=sys.stdout,
-		clock=time.time, sleep=time.sleep):
+		clock=time.time, sleep=time.sleep, check_timeout=60, rng=None):
 	"""
 	Lists in the cap file each template the pending list adds once a probe event of it, sent on the
 	probe stream, is indexed with its fields; removals take effect at once. Never restarts or reloads
 	anything. Returns 0 when the cap file equals the pending list, 1 otherwise (the pending list kept).
+
+	While it waits, every probe round also runs check on one listed template (check_timeout is check's
+	timeout), so a loop that runs activate is never longer than one round without a check: when that
+	probe comes back without its fields or does not come back, check withdraws the list and activate
+	returns 1 at once. A new template whose probe, indexed once the instance must have reread the lookup
+	file (ingest_lookup_refresh_period_secs plus one poll after the start), has no fields stays pending
+	and is not probed again in this run.
 	"""
 	pending = cap_file + CAP_PENDING_SUFFIX
 	if not os.path.exists(pending):
@@ -2462,32 +2493,57 @@ def activate(app_dir, cap_file, splunkd, app_name=None, probe_index=None, timeou
 		out.write('activate: the instance does not hold the floor app %s, without which a missing lookup file drops compact '
 			'events; cap file left as it was\n' % (app_name + FLOOR_SUFFIX))
 		return 1
-	confirmed = set()
+	confirmed, failed = set(), {}
 	if added:
 		if not probe_index:
 			out.write('activate: --probe-index is needed to prove new templates; cap file left as it was\n')
 			return 1
 		rows = read_lookup_file(table)
+		refresh, read_from_instance = lookup_refresh_secs(splunkd)
 		start = clock()
+		# A probe indexed from this time on was parsed with the file that was installed when activate started.
+		settled = start + refresh + poll
 		splunkd.send([HEARTBEAT_LINE], probe_index, PROBE_HOST, PROBE_SOURCE, sourcetype)
-		probes = 0
+		probes, checks = 0, 0
 		while True:
-			todo = [h for h in added if h not in confirmed and h.strip() in rows]
+			todo = [h for h in added if h not in confirmed and h not in failed and h.strip() in rows]
 			if not todo:
 				break
-			# Until the instance has read the new file, one template stands for all of them.
+			now = clock()
+			# Until one template has its fields, one stands for all of them (after the refresh period, the
+			# next one once it has failed), so a lookup that gives no rows costs one probe a round.
 			batch = todo if confirmed else todo[:1]
-			splunkd.send([probe_line(h, rows[h.strip()], int(clock())) for h in batch], probe_index, PROBE_HOST, PROBE_SOURCE,
+			splunkd.send([probe_line(h, rows[h.strip()], int(now)) for h in batch], probe_index, PROBE_HOST, PROBE_SOURCE,
 				sourcetype)
 			probes += len(batch)
-			sleep(poll)
-			seen = probe_results(splunkd, probe_index, sourcetype, start - 1)
-			confirmed |= set(h for h in todo if seen.get(h.strip()))
-			if clock() - start > timeout:
+			if before:
+				# check's probe of a listed template, in place of the wait for this round's probes.
+				held = io.StringIO()
+				checks += 1
+				if check(app_dir, cap_file, splunkd, app_name, probe_index, 1, check_timeout, poll, held, clock, sleep, rng):
+					out.write(held.getvalue())
+					out.write('activate: stopped after %.0f s, the list withdrawn by check; %d of %d new templates '
+						'had their fields; all stay pending\n' % (clock() - start, len(confirmed), len(added)))
+					return 1
+			else:
+				sleep(poll)
+			seen = probe_states(splunkd, probe_index, sourcetype, start - 1)
+			confirmed |= set(h for h in todo if seen.get(h.strip(), (False,))[0])
+			now = clock()
+			if now >= settled:
+				late = probe_states(splunkd, probe_index, sourcetype, settled)
+				for h in todo:
+					got = late.get(h.strip())
+					if h not in confirmed and got is not None and not got[0]:
+						failed[h] = got[1]
+			if now - start > timeout:
 				break
-		missing = [h for h in added if h not in confirmed]
+		missing = [h for h in added if h not in confirmed and h not in failed]
 		out.write('activate: %d of %d new templates indexed with their fields on the probe stream (%d probe events, '
-			'%.0f s)%s\n' % (len(confirmed), len(added), probes, clock() - start,
+			'%d checks, %.0f s, lookup refresh %.0f s%s)%s%s\n' % (len(confirmed), len(added), probes, checks, clock() - start,
+				refresh, '' if read_from_instance else ', the default: not read from the instance',
+				'' if not failed else '; without their fields after the file was read: %s' % ', '.join(
+					'%r (%s=%s)' % (h, UNMAPPED_FIELD, ','.join(failed[h]) or 'none') for h in sorted(failed)[:5]),
 				'' if not missing else '; not yet: %s' % ', '.join(repr(h) for h in missing[:5])))
 	now = (before & after) | confirmed
 	if now == after:
@@ -2528,11 +2584,12 @@ def check(app_dir, cap_file, splunkd, app_name=None, probe_index=None, sample=1,
 		withdraw(cap_file, 'the lookup file %s is missing' % table, out)
 		return 1
 	rows = read_lookup_file(table)
-	probed = sorted((rng or random.Random()).sample(sorted(h for h in listed if h.strip() in rows), min(sample, len(listed))))
+	without = sorted(h for h in listed if h.strip() not in rows)
 	why = None
-	if len(probed) < min(sample, len(listed)):
-		why = 'a listed template has no row in %s' % table
+	if without:
+		why = '%d listed templates have no row in %s (first %r)' % (len(without), table, without[0])
 	else:
+		probed = sorted((rng or random.Random()).sample(sorted(listed), min(sample, len(listed))))
 		start = clock()
 		splunkd.send([probe_line(h, rows[h.strip()], int(clock())) for h in probed], probe_index, PROBE_HOST, PROBE_SOURCE,
 			sourcetype)
@@ -2684,6 +2741,9 @@ def build_parser():
 	p.add_argument('--app', required=True, help='the app folder gen wrote, as installed on the instance')
 	p.add_argument('--app-name', help='the app\'s name on the instance (default: the folder name)')
 	p.add_argument('--cap-file', required=True)
+	p.add_argument('--check-timeout', type=float, default=60,
+		help='seconds each round waits for the probe of a listed template it sends, as check does (default 60); when '
+			'that probe is indexed without its fields or not in time, the list is withdrawn and activate stops')
 	_splunkd_args(p, required=True)
 
 	p = sub.add_parser('check', help='probe a few listed templates; when one is indexed without its fields or not at all, '
@@ -2728,7 +2788,8 @@ def _splunkd(args):
 def main(argv=None):
 	args = build_parser().parse_args(argv)
 	if args.mode == 'activate':
-		return activate(args.app, args.cap_file, _splunkd(args), args.app_name, args.probe_index, args.timeout, args.poll)
+		return activate(args.app, args.cap_file, _splunkd(args), args.app_name, args.probe_index, args.timeout, args.poll,
+			check_timeout=args.check_timeout)
 	if args.mode == 'check':
 		return check(args.app, args.cap_file, _splunkd(args), args.app_name, args.probe_index, args.sample, args.timeout,
 			args.poll)
