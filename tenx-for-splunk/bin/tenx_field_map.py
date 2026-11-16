@@ -3583,11 +3583,14 @@ def check_unmapped(cap_file, splunkd, sourcetype, clock, out):
 	"""
 	Counts the compact events of `sourcetype` indexed without their fields since the previous check (from the cap
 	file's own time the first time) and returns 0 when there are none, else 1:
-	* reason no_row only: templates the lookup has no row for arrived compact, so the Receiver compacts templates
-	  the cap file does not list (receiverOptimize true in its arguments, or another map's cap file). Taking the
-	  listed templates off the list would not stop that, so the list is left as it is.
-	* any other reason (no_match, bad_row, no_table): events of listed templates lose their fields, so the list is
-	  emptied, as when a probe comes back without its fields.
+	* no_row: templates the lookup has no row for arrived compact, so the Receiver compacts templates the cap file
+	  does not list (receiverOptimize true in its arguments, or another map's cap file). Taking the listed
+	  templates off the list would not stop that.
+	* no_match: an event of a listed template has values its row does not take (a value holding a line feed), while
+	  the probe of the same run had its fields: a matter of those events, not of the list.
+	  For these two the list is left as it is.
+	* bad_row, no_table: the row or the whole lookup file fails, for every event of the templates concerned, so the
+	  list is emptied, as when a probe comes back without its fields.
 	"""
 	state = cap_file + CAP_CHECKED_SUFFIX
 	try:
@@ -3602,13 +3605,16 @@ def check_unmapped(cap_file, splunkd, sourcetype, clock, out):
 		return 0
 	what = '%d compact events of %s were indexed without their fields since %s (%s)' % (sum(got.values()), sourcetype,
 		time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(since)), ', '.join('%s %d' % kv for kv in sorted(got.items())))
-	if set(got) == {WHY_NO_ROW}:
-		out.write('check: %s: templates the cap file does not list arrive compact, so the Receiver compacts them '
-			'(receiverOptimize true in its arguments, or another map\'s cap file); the cap file is left as it was\n' % what)
-	elif not read_cap(cap_file)[0]:
-		out.write('check: %s; the cap file lists no template\n' % what)
-	else:
+	if set(got) - {WHY_NO_ROW, WHY_NO_MATCH} and read_cap(cap_file)[0]:
 		withdraw(cap_file, what, out)
+		return 1
+	causes = []
+	if WHY_NO_ROW in got:
+		causes.append('templates the cap file does not list arrive compact, so the Receiver compacts them '
+			'(receiverOptimize true in its arguments, or another map\'s cap file)')
+	if WHY_NO_MATCH in got:
+		causes.append('events of listed templates hold values their row does not take (a value with a line feed)')
+	out.write('check: %s: %s; the cap file is left as it was\n' % (what, '; '.join(causes) or 'the cap file lists no template'))
 	return 1
 
 

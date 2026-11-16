@@ -627,12 +627,17 @@ FIRST_FILES = ['--mark', 'none', '--search-hash', 'off', '--sourcetype-field', '
 TAUTH = ('data', 't3', 'win_security_auth_change', 'splunk')
 
 
+def as_first_files(text):
+	# ADD_EXTRA_TIME_FIELDS is copied from [tenx_encoded], which set it after the first files were made.
+	return ''.join(l for l in text.splitlines(True) if not l.startswith('ADD_EXTRA_TIME_FIELDS ='))
+
+
 @needs_samples
 class TestGoldenWindows:
 	def test_662_event_sample_equals_the_first_files(self, tmp_path):
 		out = generate(tmp_path, 'b2', ['--records', sample('data', 'b2_kv_rows.json'), '--target', 'windows-security',
 			'--stanza-names', 'hash', '--hash-match', 'exact', '--trim-values', 'off'] + FIRST_FILES)
-		assert read(str(out / 'default' / 'props.conf')) == read(sample('conf', 'b2', 'props.conf'))
+		assert as_first_files(read(str(out / 'default' / 'props.conf'))) == read(sample('conf', 'b2', 'props.conf'))
 		assert read(str(out / 'default' / 'transforms.conf')).split('\n', 1)[1] == \
 			read(sample('conf', 'b2', 'transforms.conf')).split('\n', 1)[1]
 		golden = json.load(open(sample('conf', 'b2', 'gen_report.json')))
@@ -643,7 +648,7 @@ class TestGoldenWindows:
 		out = generate(tmp_path, 'b2_4663', ['--records', sample('data', 'b2_kv_rows_all.json'),
 			'--only-hashes-in', sample(*T4663 + ('templates.json',)), '--target', 'windows-security',
 			'--sourcetype', 'tenx_win4663'] + FIRST_FILES)
-		assert read(str(out / 'default' / 'props.conf')) == read(sample('conf', 'b2_4663', 'props.conf'))
+		assert as_first_files(read(str(out / 'default' / 'props.conf'))) == read(sample('conf', 'b2_4663', 'props.conf'))
 		assert read(str(out / 'default' / 'transforms.conf')).split('\n', 1)[1] == \
 			read(sample('conf', 'b2_4663', 'transforms.conf')).split('\n', 1)[1]
 
@@ -1468,8 +1473,23 @@ class TestCapFile:
 		assert 'check: 3 compact events of tenx_fw were indexed without their fields since 1970-01-01T00:00:00Z (no_row 3)' in out
 		assert 'receiverOptimize true' in out and 'the cap file is left as it was' in out
 
-	def test_check_empties_the_list_when_listed_templates_arrive_without_fields(self, tmp_path):
+	def test_check_empties_the_list_when_rows_of_listed_templates_fail(self, tmp_path):
 		cap = self.listed(tmp_path, ['k1', 'k2'])
+		self.counted_from_zero(cap)
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		self.compact(fake, 'k1', 1, why='bad_row')
+		self.compact(fake, 'x', 1)
+		try:
+			rc, out = self.check(tmp_path, cap, fake, sample=2)
+		finally:
+			fake.close()
+		assert rc == 1 and fm.read_cap(str(cap))[0] == set() and fm.read_cap(str(cap) + '.pending')[0] == {'k1', 'k2'}
+		assert '2 compact events of tenx_fw were indexed without their fields since' in out and '(bad_row 1, no_row 1)' in out
+
+	def test_check_keeps_the_list_when_values_of_some_events_do_not_match(self, tmp_path):
+		# a value holding a line feed: no_match on that event, while the probe of the same template has its fields
+		cap = self.listed(tmp_path, ['k1', 'k2'])
+		before = read(str(cap))
 		self.counted_from_zero(cap)
 		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
 		self.compact(fake, 'k1', 1, why='no_match')
@@ -1478,8 +1498,10 @@ class TestCapFile:
 			rc, out = self.check(tmp_path, cap, fake, sample=2)
 		finally:
 			fake.close()
-		assert rc == 1 and fm.read_cap(str(cap))[0] == set() and fm.read_cap(str(cap) + '.pending')[0] == {'k1', 'k2'}
-		assert '2 compact events of tenx_fw were indexed without their fields since' in out and '(no_match 1, no_row 1)' in out
+		assert rc == 1 and read(str(cap)) == before and not os.path.exists(str(cap) + '.pending')
+		assert '(no_match 1, no_row 1): templates the cap file does not list arrive compact' in out
+		assert 'events of listed templates hold values their row does not take (a value with a line feed); ' \
+			'the cap file is left as it was' in out
 
 	def test_the_next_check_counts_only_what_was_indexed_since(self, tmp_path):
 		cap = self.listed(tmp_path, ['k1'])
