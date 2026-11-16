@@ -130,7 +130,7 @@ BEFORE_MACRO = frozenset(('index', 'host', 'source', 'splunk_server')) | TIME_FI
 # Fields compact events carry as the raw events do (measured: stats and tstats by host and source equal).
 SAME_ON_COMPACT = frozenset(('index', 'host', 'source', 'splunk_server', '_time', '_indextime')) | TIME_FIELDS
 METADATA = SAME_ON_COMPACT | frozenset(('sourcetype', 'eventtype', 'tag'))
-MACROS_OF_THE_APP = re.compile(r'`(?:tx|txf|txf\([^`()]*\)|tenx-inflate|tenx-inflate-debug)`')
+MACROS_OF_THE_APP = re.compile(r'`(?:tx|txf|txf\([^`()]*\)|tenx-inflate|tenx-inflate-debug|tenx-events|tenx-templates)`')
 APP_COMMANDS = frozenset(('tx', 'tenxsearch'))
 DATA_MODEL_COMMANDS = frozenset(('datamodel', 'pivot'))
 # Generating commands that read no indexed event.
@@ -140,6 +140,9 @@ NO_EVENTS = frozenset(('inputlookup', 'makeresults', 'rest', 'mstats', 'mcatalog
 INDEX_METADATA = frozenset(('metadata', 'eventcount', 'dbinspect', 'walklex', 'typeahead'))
 OTHER_SEARCH = frozenset(('savedsearch', 'loadjob'))
 SUBSEARCH_ONLY = frozenset(('multisearch', 'union', 'set'))
+# Commands a subsearch may start with, written without the pipe.
+GENERATING = NO_EVENTS | INDEX_METADATA | OTHER_SEARCH | SUBSEARCH_ONLY | DATA_MODEL_COMMANDS | frozenset((
+	'tstats', 'from', 'tx', 'tenxsearch', 'inputintelligence', 'ldapsearch', 'dbxquery'))
 TRANSFORMING = frozenset(('stats', 'chart', 'timechart', 'top', 'rare', 'contingency', 'xyseries', 'tstats', 'sistats',
 	'sitimechart', 'sichart', 'sitop', 'sirare', 'geostats', 'pivot', 'associate', 'correlate', 'fieldsummary',
 	'transpose', 'mstats'))
@@ -494,7 +497,10 @@ def classify(search, move, kind='report', expanded=None):
 	if 'map' in names:
 		return Result(NOT_CLASSIFIED, ['It runs `map`, whose searches are built from results.'])
 	for sub in subsearches(text):
-		inner = classify(sub, move, kind)
+		inner = classify(sub if sub.startswith('|') or command_name(sub) not in GENERATING else '| ' + sub, move, kind)
+		if inner.verdict == NOT_CLASSIFIED:
+			return Result(NOT_CLASSIFIED, ['A subsearch could not be classified (%s): [%s]' % (inner.reason.rstrip('.'),
+				sub[:120])])
 		if inner.verdict != NOT_AFFECTED:
 			return Result(NOT_CLASSIFIED, ['A subsearch reads data that moves: [%s]' % sub[:120]])
 	first = parts[0]
@@ -1113,22 +1119,33 @@ def _http_message(e):
 # -------------------------------------------------------------------------------------------
 # The report
 
-def full_search(item):
+def full_search(item, seen=None):
 	"""A dashboard search with the base searches it post-processes in front of it."""
 	if item.base is None:
 		return item.search
-	base = full_search(item.base)
-	if base is None or item.search is None or base.startswith('!') or item.search.startswith('!'):
-		return '!It post-processes a base search that could not be read.'
+	seen = set() if seen is None else seen
+	if id(item) in seen:
+		return '!Its base searches form a loop.'
+	seen.add(id(item))
+	base = full_search(item.base, seen)
+	if base is not None and base.startswith('!'):
+		return '!It post-processes base search %s: %s' % (item.base.sid or item.base.name, base[1:])
+	if item.search is not None and item.search.startswith('!'):
+		return item.search
+	if base is None or item.search is None:
+		return '!It post-processes a base search that has no search text.'
 	post = item.search.strip()
 	post = post[1:].strip() if post.startswith('|') else post
 	return base.rstrip() + (' | ' + post if post else '')
 
 
 POST_PROCESS = 'It post-processes base search %s'
+APP = 'tenx-for-splunk'
 
 
 def classify_item(source, item, move):
+	if item.app == APP:
+		return Result(UNCHANGED, ['It is a search of this app, written for compact events.'])
 	text = full_search(item)
 	if text is None:
 		return Result(NOT_CLASSIFIED, ['It has no search text.'])
@@ -1153,25 +1170,39 @@ def run(source, move):
 				item.result = Result(NOT_CLASSIFIED, [item.ref[1:]])
 			elif item.ref in by_name:
 				r = by_name[item.ref].result
-				item.result = Result(r.verdict, ['It runs saved search "%s": %s' % (item.ref, r.reason)])
+				item.result = Result(r.verdict, ['It runs saved search "%s": %s' % (item.ref, r.reason)], r.edit)
+				item.search = by_name[item.ref].search
+				if item.post:
+					item.result = None
 			else:
 				item.result = Result(NOT_CLASSIFIED, ['It runs saved search "%s", which was not read.' % item.ref])
 	for item in dashboards:
-		if item.result is None and not item.post:
-			item.result = classify_item(source, item, move)
-	for item in dashboards:
-		if item.result is None:
-			found = [p.result for p in item.post] + ([classify_item(source, item, move)] if item.base else [])
-			item.result = worst(found)
-			item.result.reasons = [r for r in item.result.reasons if not r.startswith(POST_PROCESS % '')]
-			item.result.reasons.insert(0, 'It is the base search of %d post-process search%s; the verdict is the worst '
-				'of theirs.' % (len(item.post), '' if len(item.post) == 1 else 'es'))
-			needs = [p.result.verdict for p in item.post]
-			if any(v in (NEEDS_TX, NEEDS_TXF, LIMIT) for v in needs) and item.base is None:
-				own = classify_item(source, item, move)
-				macro = 'txf' if (NEEDS_TXF in needs or own.verdict == NEEDS_TXF or 'txf' in own.edit) else 'tx'
-				item.result.edit = edit_with_macro(item.search, macro) or ''
+		_base_result(source, item, move)
 	return saved + dashboards
+
+
+def _base_result(source, item, move):
+	"""The result of a dashboard search, its post-processes first: a base search takes the worst of theirs."""
+	if item.result is not None:
+		return item.result
+	if not item.post:
+		item.result = classify_item(source, item, move)
+		return item.result
+	item.result = Result(NOT_CLASSIFIED, ['Its post-process searches form a loop.'])
+	found = [_base_result(source, p, move) for p in item.post] + ([classify_item(source, item, move)] if item.base else [])
+	result = worst(found)
+	result.reasons = [x for x in result.reasons if not x.startswith(POST_PROCESS % '')]
+	result.reasons.insert(0, 'It is the base search of %d post-process search%s; the verdict is the worst of theirs.' % (
+		len(item.post), '' if len(item.post) == 1 else 'es'))
+	needs = [p.result.verdict for p in item.post]
+	if item.base is None and any(v in (NEEDS_TX, NEEDS_TXF, LIMIT) for v in needs):
+		own = classify_item(source, item, move)
+		macro = 'txf' if (NEEDS_TXF in needs or own.verdict == NEEDS_TXF or 'txf' in own.edit) else 'tx'
+		result.edit = edit_with_macro(item.search, macro) or ''
+	elif item.base is not None:
+		result.edit = ''
+	item.result = result
+	return result
 
 
 def summary(items):

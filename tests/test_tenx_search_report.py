@@ -310,6 +310,11 @@ class TestOtherVerdicts:
 	def test_subsearch_of_other_data_does_not_count(self):
 		assert verdict('index=wineventlog x | append [search index=main y]').verdict == r.NEEDS_TXF
 
+	def test_subsearch_starting_with_a_generating_command_without_a_pipe(self):
+		assert verdict('index=main x | append [rest /services/server/info | fields a]').verdict == r.NOT_AFFECTED
+		res = verdict('index=main x | append [savedsearch other]')
+		assert res.verdict == r.NOT_CLASSIFIED and 'could not be classified' in res.reason
+
 	def test_index_metadata_commands(self):
 		assert verdict('| metadata type=hosts index=main').verdict == r.NOT_AFFECTED
 		assert verdict('| metadata type=hosts index=wineventlog').verdict == r.NOT_CLASSIFIED
@@ -491,6 +496,42 @@ class TestDashboards:
 		got = r.dashboard_items('d', 'a', 'o', '<dashboard><row>')
 		assert r.run(FakeSource([], got), NOMAP)[0].result.verdict == r.NOT_CLASSIFIED
 		assert r.dashboard_items('v', 'a', 'o', '<view><module/></view>') == []
+
+	def test_chained_post_process_and_a_loop(self):
+		xml = """<dashboard><label>c</label>
+		  <search id="a"><query>index=wineventlog EventCode=4624</query></search>
+		  <row><panel><table><search id="b" base="a"><query>| fields user</query></search></table></panel>
+		  <panel><table><search base="b"><query>| stats count by user</query></search></table></panel>
+		  <panel><table><search id="x" base="y"><query>| head 1</query></search></table></panel>
+		  <panel><table><search id="y" base="x"><query>| head 2</query></search></table></panel></row></dashboard>"""
+		got = r.run(FakeSource([], r.dashboard_items('c', 'a', 'o', xml)), NOMAP)
+		res = dict((i.sid or i.name, i.result) for i in got)
+		assert res['a'].verdict == r.NEEDS_TXF and res['a'].edit == 'index=wineventlog `txf` EventCode=4624'
+		assert res['b'].verdict == r.NEEDS_TXF and res['b'].edit == ''
+		last = [i for i in got if i.sid is None][0]
+		assert last.result.edit == 'index=wineventlog `txf` EventCode=4624 | fields user | stats count by user'
+		assert res['x'].verdict == r.NOT_CLASSIFIED and res['y'].verdict == r.NOT_CLASSIFIED
+
+	def test_post_process_of_a_saved_search_base(self):
+		xml = """<dashboard><label>c</label><search id="a" ref="s1"></search>
+		  <row><panel><table><search base="a"><query>| stats count by user</query></search></table></panel></row></dashboard>"""
+		saved = [r.Item('s1', 'app', 'nobody', 'report', 'index=wineventlog EventCode=4624')]
+		got = r.run(FakeSource(saved, r.dashboard_items('c', 'app', 'o', xml)), MAP)
+		post = [i for i in got if i.base is not None][0]
+		assert post.result.verdict == r.UNCHANGED
+		assert r._shown(post) == 'index=wineventlog EventCode=4624 | stats count by user'
+
+	def test_post_process_of_a_base_with_a_missing_token_says_why(self):
+		xml = """<dashboard><label>c</label><search id="a"><query>index=wineventlog $f$</query></search>
+		  <row><panel><table><search base="a"><query>| stats count</query></search></table></panel></row></dashboard>"""
+		got = r.run(FakeSource([], r.dashboard_items('c', 'app', 'o', xml)), MAP)
+		post = [i for i in got if i.base is not None][0]
+		assert post.result.verdict == r.NOT_CLASSIFIED and '$f$' in post.result.reason
+
+	def test_objects_of_this_app_are_unchanged(self):
+		saved = [r.Item('Consume KV', 'tenx-for-splunk', 'nobody', 'alert', '| tstats count where index=* by sourcetype')]
+		assert r.run(FakeSource(saved, []), NOMAP)[0].result.verdict == r.UNCHANGED
+		assert verdict('`tenx-events` | stats count', NOMAP).verdict == r.UNCHANGED
 
 	def test_tokens(self):
 		assert r.substitute('index=w x=$a$ | stats count', {}) == 'index=w x=tenx_token_value | stats count'
