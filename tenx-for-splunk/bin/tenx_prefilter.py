@@ -17,6 +17,11 @@ words are applied to the expanded text: slower, never fewer results. It stops wi
 instead where the search would silently miss events: a time modifier after `tx`, an unquoted
 comma after `tx`, and a sourcetype= term naming an original sourcetype, which the compact events
 carry in tenx_sourcetype (they are indexed as the compact sourcetype).
+
+`tx` and `txf` call it a second time right before their final search (`after=t`): it returns the
+eval that keeps the events a wildcard inside a word (Se*Privilege) matches as a base search on the
+index matches it, since the final search, after a pipe, matches such a word as its prefix alone
+(tenx_prefilter_parser.wildcard_filter).
 """
 import json
 import os
@@ -33,7 +38,7 @@ apphome = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.join(apphome, 'bin'))
 sys.path.append(os.path.join(apphome, 'lib'))
 
-from splunklib.searchcommands import dispatch, Configuration, GeneratingCommand
+from splunklib.searchcommands import dispatch, Configuration, GeneratingCommand, Option, validators
 
 import tenx_prefilter_parser as parser
 
@@ -49,6 +54,12 @@ SUBSEARCH_SID = re.compile(r"^subsearch_(.+)_\d+\.\d+$")
 
 @Configuration()
 class TenxPrefilterCommand(GeneratingCommand):
+
+	# The second call the `tx` and `txf` macros make, right before their final search
+	# (`eval [| tenxprefilter after=t] | search tenx_keep=1`): the eval that keeps the events a
+	# wildcard inside a word matches as a base search on the index would match them
+	# (tenx_prefilter_parser.wildcard_filter). No check and no template lookup runs in it.
+	after = Option(require=False, validate=validators.Boolean(), default=False)
 
 	def _rest(self, path, data=None):
 		info = self._metadata.searchinfo
@@ -114,7 +125,22 @@ class TenxPrefilterCommand(GeneratingCommand):
 		names = [n.strip() for n in str(entry.get("fields_not_in_text", "") or "").split(",") if n.strip()]
 		return parser.text_field_predicate(names)
 
+	def _after_filter(self):
+		"""The eval for `after=t`: tenx_keep=1 on every event unless a wildcard word needs a filter."""
+		keep_all = parser.WILD_STEP_FIELD + "=1"
+		try:
+			text = self._search_text()
+			return (parser.wildcard_filter(text) if text is not None else None) or keep_all
+		except Exception as e:
+			self.logger.warning("tx: the wildcard filter could not be built: %s", e)
+			self.write_warning("tx: could not read the words after tx for a wildcard inside a word; such a word is "
+							   "matched as its prefix alone.")
+			return keep_all
+
 	def generate(self):
+		if self.after:
+			yield {"search": self._after_filter()}
+			return
 		try:
 			text = self._search_text()
 		except Exception as e:

@@ -188,6 +188,8 @@ class Tokens(list):
 	def __init__(self):
 		list.__init__(self)
 		self.glued = set()
+		# (start, end) of each token in the text it was read from
+		self.spans = []
 
 
 def macro_call(search):
@@ -334,10 +336,12 @@ def tokenize(text):
 				buf.append(text[j])
 				j += 1
 			tokens.append(("phrase", "".join(buf)))
+			tokens.spans.append((i, j))
 			i = j
 			continue
 		if c in "()":
 			tokens.append((c, c))
+			tokens.spans.append((i, i + 1))
 			i += 1
 			continue
 		if c == "[":
@@ -356,6 +360,7 @@ def tokenize(text):
 						break
 				j += 1
 			tokens.append(("subsearch", ""))
+			tokens.spans.append((i, j))
 			i = j
 			continue
 		j, buf = i, []
@@ -376,6 +381,7 @@ def tokenize(text):
 			buf.append(text[j])
 			j += 1
 		tokens.append(("word", "".join(buf)))
+		tokens.spans.append((i, j))
 		i = j
 	return tokens
 
@@ -387,6 +393,8 @@ class Parser(object):
 		self.tokens, self.i = tokens, 0
 		self.time_modifier = False
 		self.unquoted_comma = False
+		# id() of each ("text", ...) node made from one word or phrase token -> that token's index
+		self.text_at = {}
 
 	def _peek(self, k=0):
 		return self.tokens[self.i + k] if self.i + k < len(self.tokens) else (None, None)
@@ -491,7 +499,9 @@ class Parser(object):
 				# with certainty, so it places no restriction.
 				self._take()
 				return ("unknown", value)
-			return ("text", value)
+			node = ("text", value)
+			self.text_at[id(node)] = self.i - 1
+			return node
 		if kind != "word":
 			raise Unparsed("unexpected %s" % kind)
 		if value in ("AND", "OR", "IN"):
@@ -572,7 +582,9 @@ class Parser(object):
 			return ("unknown", value)
 		if "," in value:
 			self.unquoted_comma = True
-		return ("text", value)
+		node = ("text", value)
+		self.text_at[id(node)] = self.i - 1
+		return node
 
 
 def unquote(value):
@@ -971,3 +983,115 @@ def dictionary_from_rows(rows):
 		terms = [terms] if isinstance(terms, str) else list(terms)
 		dictionary[row["piece"]] = (int(row.get("n") or 0), terms)
 	return dictionary
+
+
+# A wildcard inside a word after `tx` (Splunk Enterprise 10.4.3). `tx` applies the words after it in
+# a `search` after a pipe that Splunk cannot fold into the base search, and there a word with a `*`
+# after its first character (Se*Privilege, le*FO, S*P*e) is matched as its prefix alone: any term
+# starting with "se" (Windows 662 sample: 662 events, the base search on the raw events 3; Se*Zzz
+# also 662). In a base search the same word is matched against the event's terms: the whole word,
+# case-insensitively, `*` standing for any characters, against a major segment (the text between
+# two major breakers) or a minor piece (between any two breakers). A word starting with `*`, or
+# ending with its only `*`, or holding a breaker of its own (10.0*14, foo.*.com), matched after the
+# pipe as on the index on every case measured, so it is left alone.
+# The breakers of segmenters.conf [indexing] (btool on 10.4.3), the default for every sourcetype here.
+MAJOR_CHARS = "[]<>(){}|!;,'\"*\n\r \t&?+"
+MAJOR_SEQUENCES = ("%2526", "%2520", "%21", "%26", "%3B", "%7C", "%20", "%2B", "%3D", "--", "%5D", "%5B", "%3A",
+				   "%0A", "%2C", "%28", "%29")
+MINOR_CHARS = "/:=@.-$#%\\_"
+WILD_STEP_FIELD = "tenx_keep"
+
+
+def mid_wildcard(word):
+	"""Whether `word` is a word Splunk matches differently after a pipe than on the index (see above)."""
+	if not word or word[0] == "*" or "*" not in word.rstrip("*"):
+		return False
+	return not any(c in MAJOR_CHARS.replace("*", "") or c in MINOR_CHARS or c.isspace() for c in word)
+
+
+def _class(chars):
+	return "[" + "".join("\\" + c if c in "]\\^-[" else c for c in chars).replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t") + "]"
+
+
+def term_regex(word):
+	"""
+	A regular expression (PCRE, as Splunk's match() reads it, and Python's re alike) that finds `word`
+	in an event's text as a base search on the index finds it: some major segment or minor piece of
+	the text is the word, case-insensitively, each `*` standing for any characters of that term.
+	"""
+	major = _class(MAJOR_CHARS.replace("*", "") + "*")
+	seq = "|".join(re.escape(s) for s in MAJOR_SEQUENCES)
+	brk = "(?:%s|%s)" % (major, seq)
+	in_major = "(?:(?!%s)[^%s])" % (seq, _class(MAJOR_CHARS.replace("*", "") + "*")[1:-1])
+	minor = _class(MINOR_CHARS)
+	in_minor = "[^%s%s]" % (_class(MAJOR_CHARS.replace("*", "") + "*")[1:-1], minor[1:-1])
+	parts = word.split("*")
+	tail = parts[-1] != ""
+
+	def pattern(start, inner, end):
+		text = re.escape(parts[0])
+		for p in parts[1:]:
+			text += inner + "*?" + re.escape(p)
+		return start + text + (end if tail else "")
+	return "(?i)(?:%s|%s)" % (
+		pattern("(?:^|%s)" % brk, in_major, "(?=%s|$)" % brk),
+		pattern("(?:^|%s|%s)" % (brk, minor), in_minor, "(?=%s|%s|$)" % (brk, minor)))
+
+
+def _eval_string(text):
+	return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def wildcard_filter(text):
+	"""
+	The eval expression the `tx` macro runs before its final search (`eval [| tenxprefilter after=t]`,
+	then `search tenx_keep=1`): tenx_keep set on the events the words after `tx` match as a base search
+	on the index would match them, for each word mid_wildcard() names; None when there is none (or the
+	words are not read with certainty), and every event is kept. Only the words that select (not
+	under NOT) are matched with term_regex(): under NOT, Splunk's base search tests the word's prefix
+	too on the data measured (Windows 662 sample: NOT Se*Privilege 0 events on the index, as after
+	the pipe), so the search after the pipe already gives what the index gives. Where every such word
+	is one of the search's top-level AND terms, tenx_keep is their regex matches; otherwise the words
+	are evaluated with searchmatch(), each such word replaced by its regex match.
+	"""
+	tokens = tokenize(text)
+	if any(kind == "subsearch" for kind, _ in tokens):
+		return None
+	reader = Parser(tokens)
+	try:
+		tree = reader.parse()
+	except Unparsed:
+		return None
+	found = []  # (token index, top-level AND term)
+
+	def walk(node, positive, top):
+		kind = node[0]
+		if kind == "text" and positive and id(node) in reader.text_at and mid_wildcard(node[1]):
+			found.append((reader.text_at[id(node)], top))
+		elif kind == "not":
+			walk(node[1], not positive, False)
+		elif kind == "and":
+			for child in node[1]:
+				walk(child, positive, top)
+		elif kind == "or":
+			for child in node[1]:
+				walk(child, positive, False)
+	walk(tree, True, True)
+	if not found:
+		return None
+	steps, marks = [], {}
+	for n, (index, _) in enumerate(found):
+		marks[index] = "tenx_w%d" % n
+		steps.append("tenx_w%d=if(match(_raw, %s), 1, 0)" % (n, _eval_string(term_regex(tokens[index][1]))))
+	if all(top for _, top in found):
+		keep = " AND ".join("tenx_w%d=1" % n for n in range(len(found)))
+	else:
+		out, last = [], 0
+		for index in sorted(marks):
+			start, end = tokens.spans[index]
+			out.append(text[last:start] + marks[index] + "=1")
+			last = end
+		out.append(text[last:])
+		keep = "searchmatch(%s)" % _eval_string("".join(out))
+	steps.append("%s=if(%s, 1, null())" % (WILD_STEP_FIELD, keep))
+	return ", ".join(steps)
