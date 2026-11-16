@@ -612,7 +612,75 @@ on expanded events. `linecount` and `punct` are computed by Splunk from the comp
 so on expanded events they differ from the raw event's.
 
 For FortiGate, the sender sets `tenx_sourcetype` to `fortigate_traffic`, `fortigate_utm`,
-`fortigate_event` or `fortigate_anomaly` by the line's `type=`.
+`fortigate_event` or `fortigate_anomaly` by the line's `type=`. With Fluent Bit, a `rewrite_tag`
+filter gives each type its own tag before the hand-off to the Receiver, and a `modify` filter per
+type adds the field to the records that come back. Set `Emitter_Mem_Buf_Limit` on `rewrite_tag`:
+at its default of 10M, while a file is read faster than records are sent, the filter leaves
+records under their original tag, with no error, and they arrive without `tenx_sourcetype`.
+
+```
+[INPUT]
+    Name              tail
+    Path              <FortiGate log file>
+    DB                <FortiGate log file>.db
+    Tag               src.fgt
+    Read_from_Head    true
+
+[FILTER]
+    Name                   rewrite_tag
+    Match                  src.fgt
+    Rule                   $log \btype="?(traffic|utm|event|anomaly)\b src.fgt.$1 false
+    Emitter_Name           re_fgt
+    Emitter_Mem_Buf_Limit  512M
+
+[OUTPUT]
+    Name              forward
+    Match             src.*
+    Host              127.0.0.1
+    Port              24224
+    Retry_Limit       False
+
+[INPUT]
+    Name              forward
+    Listen            0.0.0.0
+    Port              24225
+    Tag_Prefix        tenx.
+
+[FILTER]
+    Name    modify
+    Match   tenx.src.fgt.traffic
+    Add     tenx_sourcetype fortigate_traffic
+
+[FILTER]
+    Name    modify
+    Match   tenx.src.fgt.utm
+    Add     tenx_sourcetype fortigate_utm
+
+[FILTER]
+    Name    modify
+    Match   tenx.src.fgt.event
+    Add     tenx_sourcetype fortigate_event
+
+[FILTER]
+    Name    modify
+    Match   tenx.src.fgt.anomaly
+    Add     tenx_sourcetype fortigate_anomaly
+
+[OUTPUT]
+    Name              splunk
+    Match             tenx.src.fgt*
+    Host              <HEC host>
+    Port              8088
+    Splunk_Token      ${HEC_TOKEN}
+    TLS               On
+    event_index       <compact index>
+    event_sourcetype  tenx_encoded
+    event_key         $log
+    event_field       tenx_sourcetype $tenx_sourcetype
+```
+
+The template records go out as in the [setup guide](https://doc.log10x.com/apps/receiver/compact/splunk/),
+with `Match tenx.tenx-template`.
 
 A compact event's `_time` is the first timestamp the Receiver found in the line. In a CloudTrail
 record that can be `userIdentity.sessionContext.attributes.creationDate`, which comes before
