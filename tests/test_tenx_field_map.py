@@ -1367,7 +1367,30 @@ class TestCapFile:
 		finally:
 			fake.close()
 		assert rc == 1 and 'does not hold app fm_fw' in out and fake.events == []
+		assert 'install the app folders as gen wrote them, whole, and run activate again' in out
 		assert read(str(cap)) == 'pattern_hash,value\n' and os.path.exists(str(cap) + '.pending')
+
+	@pytest.mark.parametrize('broken', ['not gzip', 'no hash column'])
+	def test_activate_refuses_a_lookup_file_splunk_cannot_read(self, tmp_path, broken):
+		# Splunk drops every compact event of the map, floor app or not, while the file it reads is like this
+		import gzip
+		cap = tmp_path / 'compact-cap.csv'
+		assert self.gen(tmp_path, ['k1'], cap) == 0
+		table = tmp_path / 'fm_fw' / 'lookups' / 'tenx_fw_fields.csv.gz'
+		text = gzip.open(str(table), 'rt', encoding='utf-8').read()
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		if broken == 'not gzip':
+			table.write_text(text, encoding='utf-8')
+		else:
+			with gzip.open(str(table), 'wt', encoding='utf-8') as f:
+				f.write(text.replace('hash,', 'key,', 1))
+		try:
+			rc, out = self.activate(tmp_path, cap, fake)
+		finally:
+			fake.close()
+		assert rc == 1 and fake.events == [] and read(str(cap)) == 'pattern_hash,value\n'
+		assert ('activate: the lookup file %s %s' % (table, 'cannot be read as gzip CSV' if broken == 'not gzip'
+			else 'has no hash column')) in out and 'Splunk drops the compact events of tenx_fw' in out
 
 	def test_activate_needs_a_probe_index_to_add(self, tmp_path):
 		cap = tmp_path / 'compact-cap.csv'
@@ -1564,6 +1587,17 @@ class TestCapFile:
 		finally:
 			fake.close()
 		assert rc == 1 and fake.posts() == [] and 'is missing' in out and read(str(cap)) == 'pattern_hash,value\n'
+
+	def test_check_withdraws_at_once_when_the_lookup_file_is_not_gzip(self, tmp_path):
+		cap = self.listed(tmp_path, ['k1'])
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		(tmp_path / 'fm_fw' / 'lookups' / 'tenx_fw_fields.csv.gz').write_text('hash,n\n', encoding='utf-8')
+		try:
+			rc, out = self.check(tmp_path, cap, fake)
+		finally:
+			fake.close()
+		assert rc == 1 and fake.posts() == [] and 'cannot be read as gzip CSV' in out
+		assert read(str(cap)) == 'pattern_hash,value\n' and fm.read_cap(str(cap) + '.pending')[0] == {'k1'}
 
 	def test_the_list_activate_restores_is_a_newer_file_than_the_one_check_emptied(self, tmp_path):
 		# the Receiver rereads its cap file when the file's time changes

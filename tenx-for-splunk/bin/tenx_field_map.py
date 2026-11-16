@@ -1396,6 +1396,26 @@ def lookup_file_bytes(rows, columns=LOOKUP_COLUMNS):
 	return gzip.compress(buf.getvalue().encode('utf-8'), mtime=0)
 
 
+def lookup_file_problem(path):
+	"""
+	Why the lookup file at `path` cannot be read as gen writes it, or None. While the file Splunk reads is missing,
+	cannot be read, is not gzip or has no hash column, lookup() fails in the static rule and Splunk drops every
+	compact event of the map's sourcetype, floor app or not (Splunk Enterprise 10.4.3). This reads the copy gen
+	wrote, the one installed from it.
+	"""
+	import gzip
+	if not os.path.exists(path):
+		return 'is missing'
+	try:
+		with gzip.open(path, 'rt', encoding='utf-8', newline='') as f:
+			header = next(csv.reader(f), None)
+	except (OSError, EOFError, UnicodeDecodeError, csv.Error) as e:
+		return 'cannot be read as gzip CSV (%s)' % e
+	if not header or 'hash' not in header:
+		return 'has no hash column'
+	return None
+
+
 def read_lookup_file(path):
 	"""hash -> row dict of a lookup file gen wrote."""
 	import gzip
@@ -3142,8 +3162,9 @@ class TlsVerifyError(Exception):
 	"""The certificate of a Splunk endpoint did not verify; str() is one line for the person running the tool."""
 
 	def __init__(self, url, detail):
-		Exception.__init__(self, 'the certificate of %s did not verify (%s); for an instance with Splunk\'s default '
-			'self-signed certificate, add --tls-verify off' % (url, detail))
+		Exception.__init__(self, 'the certificate of %s did not verify (%s); add --tls-ca-file with the PEM file of the '
+			'authority that signed it, or, for an instance with Splunk\'s default self-signed certificate, --tls-verify off'
+			% (url, detail))
 
 
 def _certificate_failure(e):
@@ -3171,7 +3192,7 @@ def urlopen_checked(req, context, timeout):
 class Splunkd(object):
 	"""The management port of the instance that parses the data (REST, JSON)."""
 
-	def __init__(self, url, auth=None, token=None, tls_verify=True, hec_url=None, hec_token=None):
+	def __init__(self, url, auth=None, token=None, tls_verify=True, hec_url=None, hec_token=None, ca_file=None):
 		self.url = url.rstrip('/')
 		# hec_url: one HTTP Event Collector URL, or a list with one per parsing node (each indexer's or heavy
 		# forwarder's own endpoint, not a load balancer), which activate and check then prove one by one.
@@ -3184,10 +3205,14 @@ class Splunkd(object):
 		elif auth:
 			self.headers['Authorization'] = 'Basic ' + base64.b64encode(auth.encode('utf-8')).decode('ascii')
 		self.ctx = None
-		if self.url.startswith('https') and not tls_verify:
+		if not tls_verify:
 			self.ctx = ssl.create_default_context()
 			self.ctx.check_hostname = False
 			self.ctx.verify_mode = ssl.CERT_NONE
+		elif ca_file:
+			# Certificates are checked against these authorities only, host name included (the management port and
+			# every HTTP Event Collector given).
+			self.ctx = ssl.create_default_context(cafile=ca_file)
 
 	def call(self, method, path, params=None):
 		params = dict(params or {}, output_mode='json')
@@ -3406,8 +3431,9 @@ def activate(app_dir, cap_file, splunkd, app_name=None, probe_index=None, timeou
 	added = sorted(after - before)
 	differ = not_installed(splunkd, app_dir, app_name)
 	if differ:
-		out.write('activate: the instance does not hold app %s as generated (%d stanzas, first %s); '
-			'cap file left as it was\n' % (app_name, len(differ), differ[0]))
+		out.write('activate: the instance does not hold app %s as generated (%d stanzas, first %s); install the app '
+			'folders as gen wrote them, whole, and run activate again; cap file left as it was\n' % (app_name, len(differ),
+			differ[0]))
 		return 1
 	floor = floor_dir(app_dir)
 	if added and os.path.isdir(floor) and not_installed(splunkd, floor, app_name + FLOOR_SUFFIX):
@@ -3418,6 +3444,11 @@ def activate(app_dir, cap_file, splunkd, app_name=None, probe_index=None, timeou
 	if added:
 		if not probe_index:
 			out.write('activate: --probe-index is needed to prove new templates; cap file left as it was\n')
+			return 1
+		problem = lookup_file_problem(table)
+		if problem:
+			out.write('activate: the lookup file %s %s; Splunk drops the compact events of %s while the file it reads is '
+				'like that; cap file left as it was\n' % (table, problem, sourcetype))
 			return 1
 		rows = read_lookup_file(table)
 		refresh, read_from_instance = lookup_refresh_secs(splunkd)
@@ -3521,9 +3552,10 @@ def check(app_dir, cap_file, splunkd, app_name=None, probe_index=None, sample=1,
 		out.write('check: needs an app generated with --rules lookup and --probe-index; cap file left as it was\n')
 		return 2
 	sourcetype, table = layout
-	if not os.path.exists(table):
+	problem = lookup_file_problem(table)
+	if problem:
 		# Splunk keeps the rows it read until its next refresh, then fails on every compact event: withdraw now.
-		withdraw(cap_file, 'the lookup file %s is missing' % table, out)
+		withdraw(cap_file, 'the lookup file %s %s' % (table, problem), out)
 		return 1
 	rows = read_lookup_file(table)
 	without = sorted(h for h in listed if h.strip() not in rows)
@@ -3803,12 +3835,15 @@ def _splunkd_args(p, required, timeout=None, timeout_help='seconds activate keep
 		help='environment variable holding the HEC token for --probe-hec (default TENX_PROBE_HEC_TOKEN)')
 	p.add_argument('--tls-verify', choices=('on', 'off'), default='on',
 		help='off: accept the instance\'s certificate without checking it (a self-signed management port)')
+	p.add_argument('--tls-ca-file',
+		help='PEM file of the certificate authorities that signed the certificates of --splunkd and --probe-hec; they '
+			'are checked against these instead of the system\'s, host name included')
 
 
 def _splunkd(args):
 	return Splunkd(args.splunkd, auth=os.environ.get(args.splunkd_auth_env),
 		token=os.environ.get(args.splunkd_token_env), tls_verify=args.tls_verify == 'on', hec_url=args.probe_hec,
-		hec_token=os.environ.get(args.probe_hec_token_env))
+		hec_token=os.environ.get(args.probe_hec_token_env), ca_file=args.tls_ca_file)
 
 
 def main(argv=None):
