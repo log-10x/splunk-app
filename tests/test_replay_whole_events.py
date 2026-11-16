@@ -87,12 +87,14 @@ class TestEventsThatArriveWhole:
 		out = run(evs=[e])
 		assert out[0]['sourcetype'] == 'tenx_encoded' and out[0]['app'] == 'win:unknown' and 'k' not in out[0]
 
-	def test_a_whole_event_without_tenx_sourcetype_is_handled_as_before(self):
+	def test_a_whole_event_without_tenx_sourcetype_keeps_what_it_was_read_with(self):
 		e = whole_win()
 		del e['tenx_sourcetype']
 		out = run(evs=[e])
-		# not replayed, so extract runs on it as `tx` runs it, and adds what it extracts again
-		assert out[0]['EventID'] == ['4670', '4670'] and out[0]['k'] == 'win'
+		# not replayed, and hidden from the extract (tenx-whole-hide), which would add each value again
+		assert out[0]['EventID'] == '4670' and out[0]['k'] == 'win'
+		assert (out[0]['_raw'], out[0]['sourcetype']) == (e['_raw'], e['sourcetype'])
+		assert not [k for k in out[0] if k.startswith(('tenx_wh', 'tenx_whole'))]
 
 	def test_the_search_rewrite_hides_it_once(self):
 		full = b.build(STANZAS, PRESENT, LOOKUP_FIELDS).spl()

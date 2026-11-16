@@ -122,8 +122,14 @@ class ResolvedState(Enum):
 # ('--' and the %XX escapes) are covered by their single characters.
 # After expansion: drop the _kv mark so extract runs the event's own extraction (key=value and
 # JSON), and let spath read only text that starts with "<" (XML path fields). The same steps with
-# and without a field replay.
-XML_AND_KV_STEPS = (' | fields - _kv | extract | eval tenx_xml=if(match(_raw, "^\\s*<"), _raw, null())'
+# and without a field replay. An event the sender passed whole (WHOLE_MARK) is hidden from that
+# extract, as the `tx` macro hides it (macros.conf tenx-whole-hide): Splunk extracted its fields
+# when it read it, and extract would give each JSON field a second value.
+WHOLE_MARK = 'tenx_whole=if(match(_raw, "^~"), null(), 1)'
+# With a field replay, only the whole events without tenx_sourcetype: the replay reads the others.
+WHOLE_MARK_REPLAY = 'tenx_whole=if(match(_raw, "^~") OR isnotnull(tenx_sourcetype), null(), 1)'
+XML_AND_KV_STEPS = (' | `tenx-whole-hide` | fields - _kv | extract | `tenx-whole-restore`'
+					' | eval tenx_xml=if(match(_raw, "^\\s*<"), _raw, null())'
 					' | spath input=tenx_xml | fields - tenx_xml, tenx_hash, tenx_var_0, tenx_vars')
 # The events kept from those steps when the search replays: the replayed ones (tenx_rst), and the
 # ones that arrived whole and that Splunk read under the sourcetype whose rules they need, which
@@ -1159,9 +1165,9 @@ class TenxSearchCommand(TenxSplCommand):
 		"""
 		if replay is None:
 			# Nothing to replay: the suffix without any replay step.
-			return (" | " + tenx_util.splunk_inflate_macro(self.debug) + XML_AND_KV_STEPS)
+			return (" | eval " + WHOLE_MARK + " | " + tenx_util.splunk_inflate_macro(self.debug) + XML_AND_KV_STEPS)
 		held = REPLAY_HELD
-		return (" | eval tenx_compact_raw=_raw | " + tenx_util.splunk_inflate_macro(self.debug)
+		return (" | eval tenx_compact_raw=_raw, " + WHOLE_MARK_REPLAY + " | " + tenx_util.splunk_inflate_macro(self.debug)
 				+ " | eval tenx_hide_others=1 | " + replay + " | fields - tenx_hide_others"
 				+ " | eval tenx_h_raw=if(%s, _raw, null()), tenx_h_st=if(%s, sourcetype, null()),"
 				  " tenx_h_src=if(%s, source, null()), tenx_h_host=if(%s, host, null())" % ((held,) * 4)

@@ -57,7 +57,7 @@ class TestDashboardsFindCompactEvents:
 		# A compact event is marked extracted (_kv) before expansion; without dropping the
 		# mark, extract does nothing and every field=value term on key=value text returns 0.
 		tx = conf('macros.conf').get('tx', 'definition')
-		assert '| `tenx-inflate` | `tenx-mapped-hide` | fields - _kv | extract |' in tx
+		assert '| `tenx-inflate` | `tenx-mapped-hide` | `tenx-whole-hide` | fields - _kv | extract |' in tx
 		# spath on non-JSON text invents fields, and on JSON doubles what extract finds.
 		assert 'spath' not in tx
 
@@ -65,7 +65,7 @@ class TestDashboardsFindCompactEvents:
 		macros = conf('macros.conf')
 		for name in ('txf', 'txf(1)'):
 			txf = macros.get(name, 'definition')
-			assert '| `tenx-inflate` | fields - _kv | `tenx-mapped-hide` | `tenx-replay' in txf, name
+			assert '| `tenx-inflate` | fields - _kv | `tenx-mapped-hide` | `tenx-whole-hide` | `tenx-replay' in txf, name
 			assert 'spath' not in txf, name
 		# The shipped replay is exactly the extraction `tx` runs; tenxreplay writes the rest.
 		assert macros.get('tenx-replay', 'definition').count('| extract |') == 1

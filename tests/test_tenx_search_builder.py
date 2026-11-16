@@ -17,6 +17,7 @@ must stay:
 The template store is the offline double from tests/support, whose matching is whole-token,
 like Splunk's. Each expectation quotes the live measurement it stands for.
 """
+import re
 import pytest
 
 import tenx_search_builder
@@ -85,14 +86,14 @@ def compile_search(search, **manager_kwargs):
 
 # What follows the prefilter: expand, replay the original sourcetype's fields, then the
 # rewrite's own extraction with replayed events hidden from it, and give them back.
-EXPAND_HEAD = '| eval tenx_compact_raw=_raw | `tenx-inflate` | eval tenx_hide_others=1 | `tenx-replay` | fields - tenx_hide_others | eval tenx_h_raw=if(isnotnull(tenx_rst) OR isnotnull(tenx_asis), _raw, null()), tenx_h_st=if(isnotnull(tenx_rst) OR isnotnull(tenx_asis), sourcetype, null()), tenx_h_src=if(isnotnull(tenx_rst) OR isnotnull(tenx_asis), source, null()), tenx_h_host=if(isnotnull(tenx_rst) OR isnotnull(tenx_asis), host, null()) | eval _raw=if(isnotnull(tenx_rst) OR isnotnull(tenx_asis), "", _raw), sourcetype=if(isnotnull(tenx_rst) OR isnotnull(tenx_asis), "tenx_replayed", sourcetype), source=if(isnotnull(tenx_rst) OR isnotnull(tenx_asis), "tenx_replayed", source), host=if(isnotnull(tenx_rst) OR isnotnull(tenx_asis), "tenx_replayed", host) | fields - _kv | extract | eval tenx_xml=if(match(_raw, "^\\s*<"), _raw, null()) | spath input=tenx_xml | fields - tenx_xml, tenx_hash, tenx_var_0, tenx_vars'
+EXPAND_HEAD = '| eval tenx_compact_raw=_raw, tenx_whole=if(match(_raw, "^~") OR isnotnull(tenx_sourcetype), null(), 1) | `tenx-inflate` | eval tenx_hide_others=1 | `tenx-replay` | fields - tenx_hide_others | eval tenx_h_raw=if(isnotnull(tenx_rst) OR isnotnull(tenx_asis), _raw, null()), tenx_h_st=if(isnotnull(tenx_rst) OR isnotnull(tenx_asis), sourcetype, null()), tenx_h_src=if(isnotnull(tenx_rst) OR isnotnull(tenx_asis), source, null()), tenx_h_host=if(isnotnull(tenx_rst) OR isnotnull(tenx_asis), host, null()) | eval _raw=if(isnotnull(tenx_rst) OR isnotnull(tenx_asis), "", _raw), sourcetype=if(isnotnull(tenx_rst) OR isnotnull(tenx_asis), "tenx_replayed", sourcetype), source=if(isnotnull(tenx_rst) OR isnotnull(tenx_asis), "tenx_replayed", source), host=if(isnotnull(tenx_rst) OR isnotnull(tenx_asis), "tenx_replayed", host) | `tenx-whole-hide` | fields - _kv | extract | `tenx-whole-restore` | eval tenx_xml=if(match(_raw, "^\\s*<"), _raw, null()) | spath input=tenx_xml | fields - tenx_xml, tenx_hash, tenx_var_0, tenx_vars'
 RESTORE = ' | eval _raw=coalesce(tenx_h_raw, _raw), sourcetype=coalesce(tenx_h_st, sourcetype), source=coalesce(tenx_h_src, source), host=coalesce(tenx_h_host, host) | fields - tenx_h_raw, tenx_h_st, tenx_h_src, tenx_h_host, tenx_compact_raw, tenx_rst, tenx_asis'
 EXPAND = EXPAND_HEAD + RESTORE + ' '
 
 
 def prefilter(compiled):
 	"""The text between the modifiers and the inflate macro: the compact-event prefilter."""
-	head = compiled.split('| eval tenx_compact_raw=_raw | `tenx-inflate`')[0]
+	head = re.split(r'\| eval tenx_compact_raw=_raw|\| eval tenx_whole=|\| `tenx-inflate`', compiled, maxsplit=1)[0]
 	return head.replace('| search sourcetype=tenx_encoded', '', 1).strip()
 
 

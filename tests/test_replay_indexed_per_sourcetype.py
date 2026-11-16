@@ -77,7 +77,8 @@ PRESENT = [('win', 'XmlWinEventLog:Security', 'dc01'), ('fgt', 'fgt.log', 'fw1')
 
 def model(full, units=None):
 	conf = macros_conf()
-	macros = dict((n, conf.get(n, 'definition')) for n in ('tenx-mapped-hide', 'tenx-mapped-restore'))
+	macros = dict((n, conf.get(n, 'definition')) for n in ('tenx-mapped-hide', 'tenx-mapped-restore', 'tenx-whole-hide',
+														  'tenx-whole-restore'))
 	macros.update({'tenx-inflate': 'inflatemodel', 'tenx-replay': full, 'tenx-replay-tags': ' | '.join(b.TAGS_STEPS)})
 	macros.update(units or {})
 	return Model(commands={'extract': extract, 'typer': typer, 'tags': lambda e, _: None,

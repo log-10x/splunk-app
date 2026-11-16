@@ -43,9 +43,13 @@ TX_SHIPPED = ('`tenx-events` [| tenxprefilter] | `tenx-inflate` | fields - _kv |
 REFUSED_STEP = ' | eval tenx_expand_refused=if(len(tenx_expand_refused)>0, tenx_expand_refused, null())'
 # [tx] now: the same, with the field-map guard around `extract` and REFUSED_STEP before the final
 # search (see TestTxIsTheShippedMacro)
-TX_DEFINITION = ('`tenx-events` [| tenxprefilter] | `tenx-inflate` | `tenx-mapped-hide` | fields - _kv | extract | '
+TX_DEFINITION = ('`tenx-events` [| tenxprefilter] | eval tenx_whole=if(match(_raw, "^~"), null(), 1) | `tenx-inflate` | '
+				 '`tenx-mapped-hide` | `tenx-whole-hide` | fields - _kv | extract | `tenx-whole-restore` | '
 				 '`tenx-mapped-restore` | fields - tenx_hash, tenx_var_0, tenx_vars' + REFUSED_STEP + ' | search *')
-GUARD_CALLS = (' | `tenx-mapped-hide`', ' | `tenx-mapped-restore`')
+# the field-map guard, and the whole-event guard with the marks that select its events
+GUARD_CALLS = (' | `tenx-mapped-hide`', ' | `tenx-mapped-restore`', ' | `tenx-whole-hide`', ' | `tenx-whole-restore`',
+			   ' | eval tenx_whole=if(match(_raw, "^~"), null(), 1)',
+			   ', tenx_whole=if(match(_raw, "^~") OR isnotnull(tenx_sourcetype), null(), 1)')
 
 
 def without_guard(definition):
@@ -79,7 +83,8 @@ def mapped_guard_macros():
 	import os
 	conf = configparser.RawConfigParser(strict=False)
 	conf.read(os.path.join(os.path.dirname(__file__), '..', 'tenx-for-splunk', 'default', 'macros.conf'))
-	return dict((n, conf.get(n, 'definition')) for n in ('tenx-mapped-hide', 'tenx-mapped-restore'))
+	return dict((n, conf.get(n, 'definition')) for n in ('tenx-mapped-hide', 'tenx-mapped-restore', 'tenx-whole-hide',
+														 'tenx-whole-restore'))
 
 
 class TestTheRefusedStep:
@@ -104,8 +109,9 @@ class TestTheRefusedStep:
 
 class TestTxIsTheShippedMacro:
 	"""
-	`tx` is the shipped macro with one addition: tenx-mapped-hide before its `extract` and
-	tenx-mapped-restore after it, for events indexed with a field map (tenx_mapped). Each is a
+	`tx` is the shipped macro with two additions: tenx-mapped-hide before its `extract` and
+	tenx-mapped-restore after it, for events indexed with a field map (tenx_mapped); and the same
+	for events the sender passed whole (tenx_whole, marked before the expansion). Each is a
 	foreach over tenx_mapped*, which runs only on a chunk of results holding such an event, and
 	each eval is guarded per event; TestTheMappedGuard runs both on events with and without it.
 	And REFUSED_STEP before its final search, which removes the empty tenx_expand_refused the
@@ -138,16 +144,18 @@ class TestTxIsTheShippedMacro:
 
 	def test_txf_is_tx_with_the_replay(self):
 		conf = macros()
-		head = ('`tenx-events` [| tenxprefilter] | eval tenx_compact_raw=_raw | `tenx-inflate` | fields - _kv | '
-				'`tenx-mapped-hide` | ')
-		tail = (' | `tenx-mapped-restore` | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars'
-				+ REFUSED_STEP + ' | search *')
-		assert conf.get('txf', 'definition') == head + '`tenx-replay`' + tail
+		mark = 'tenx_whole=if(match(_raw, "^~") OR isnotnull(tenx_sourcetype), null(), 1)'
+		head = ('`tenx-events` [| tenxprefilter] | eval tenx_compact_raw=_raw, %s | `tenx-inflate` | fields - _kv | '
+				'`tenx-mapped-hide` | `tenx-whole-hide` | ')
+		tail = (' | `tenx-whole-restore` | `tenx-mapped-restore` | fields - tenx_compact_raw, tenx_rst, tenx_hash, '
+				'tenx_var_0, tenx_vars' + REFUSED_STEP + ' | search *')
+		assert conf.get('txf', 'definition') == head % mark + '`tenx-replay`' + tail
 		# Splunk Enterprise 10.4.3 refuses a colon in a macro name, so txf(1) computes the unit's
 		# name with md5() in eval; on 10.4.3, md5 in eval equals hashlib's for the five names tried
 		assert conf.get('txf(1)', 'iseval') == '1'
 		assert conf.get('txf(1)', 'definition') == b.TXF_ONE_UNIT == (
-			'"' + head + '`tenx-replay-u" . substr(md5("$st$"), 1, 12) . "` | `tenx-replay-tags`' + tail + '"')
+			'"' + head % mark.replace('"', '\\"') + '`tenx-replay-u" . substr(md5("$st$"), 1, 12) . "` | `tenx-replay-tags`'
+			+ tail + '"')
 		assert without_guard(conf.get('txf', 'definition')) == (
 			'`tenx-events` [| tenxprefilter] | eval tenx_compact_raw=_raw | `tenx-inflate` | fields - _kv | '
 			'`tenx-replay` | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars' + REFUSED_STEP + ' | search *')
@@ -204,9 +212,17 @@ class TestRewriteWithoutCarrierMatchesTheBaseline:
 	(tests/support/tenx_search_builder_baseline.py) where nothing carries tenx_sourcetype.
 	"""
 
+	@staticmethod
+	def unguarded(compiled_search):
+		# the whole-event guard (TestTheWholeGuard) is the one addition to the baseline's text
+		state, text = compiled_search
+		return state, without_guard(text)
+
 	@pytest.mark.parametrize('search', SEARCHES)
 	def test_no_sourcetype_covered(self, search):
-		assert compiled(search, {}) == compiled(search, False, baseline_builder)
+		assert self.unguarded(compiled(search, {})) == compiled(search, False, baseline_builder)
+		assert '`tenx-inflate`' not in compiled(search, {})[1] or ' | `tenx-whole-hide` | fields - _kv | extract | ' \
+			'`tenx-whole-restore` | ' in compiled(search, {})[1]
 
 	@pytest.mark.parametrize('search', [s for s in SEARCHES if 'index=' in s])
 	def test_an_index_the_record_does_not_know_gets_the_full_replay(self, search):
@@ -218,7 +234,7 @@ class TestRewriteWithoutCarrierMatchesTheBaseline:
 		if 'tenx-inflate' in base_text:
 			assert '`tenx-replay`' in text
 		else:
-			assert (state, text) == (base_state, base_text)
+			assert (state, without_guard(text)) == (base_state, base_text)
 
 	def test_what_it_compares_against_is_the_baselines_shape(self):
 		state, text = compiled('sourcetype=tenx_encoded status=500 payment', False, baseline_builder)
@@ -951,3 +967,58 @@ class TestNarrowingOffMakesNoRestCall:
 			assert selects_at_least(baseline.prefilter(mtree, d), pp.prefilter(tree, d, text_field)), text
 			compared += 1
 		assert compared >= 40
+
+
+class TestTheWholeGuard:
+	"""
+	tenx-whole-hide and tenx-whole-restore, as `tx` and `txf` run them: an event the sender passed whole
+	(text that is not compact) keeps the fields Splunk read it with, which Splunk's `extract` would give a
+	second value (Splunk Enterprise 10.4.3, JSON read under tenx_encoded: 11 of 14 fields twice).
+	"""
+	@staticmethod
+	def run(steps, evs):
+		def doubling_extract(e, _):
+			# Splunk's extract on text it has read before: each field it finds gets its value again
+			if not e.get('_raw') or e.get('_kv') or e.get('sourcetype') == 'tenx_none':
+				return
+			for k, v in e.get('__read', {}).items():
+				e[k] = [e[k], v] if k in e else v
+		m = Model(commands={'extract': doubling_extract,
+							'inflatemodel': lambda e, _: e.__setitem__('_raw', e.get('__exp', e['_raw']))},
+				  macros=dict({'tenx-inflate': 'inflatemodel'}, **mapped_guard_macros()))
+		return [visible(e) for e in m.run(steps, evs)]
+
+	@staticmethod
+	def whole(**more):
+		e = {'_raw': '{"a": "1"}', 'sourcetype': 'tenx_encoded', 'source': 's', 'host': 'h', '_kv': 1, 'a': '1',
+			 '__read': {'a': '1'}}
+		e.update(more)
+		return e
+
+	@staticmethod
+	def compact():
+		return {'_raw': '~h,2', '__exp': 'a=2', 'sourcetype': 'tenx_encoded', 'source': 's', 'host': 'h', '_kv': 1,
+				'__read': {'a': '2'}}
+
+	@staticmethod
+	def tx():
+		d = macros().get('tx', 'definition')
+		head, tail = '`tenx-events` [| tenxprefilter] | ', ' | search *'
+		assert d.startswith(head) and d.endswith(tail)
+		return d[len(head):-len(tail)]
+
+	def test_tx_gives_a_whole_event_the_fields_it_was_read_with_once(self):
+		out = self.run(self.tx(), [self.whole(), self.compact()])
+		assert out[0]['a'] == '1' and out[0]['_raw'] == '{"a": "1"}'
+		assert (out[0]['sourcetype'], out[0]['source'], out[0]['host']) == ('tenx_encoded', 's', 'h')
+		assert not [k for e in out for k in e if k.startswith(('tenx_wh', 'tenx_whole'))]
+		# the compact event of the same chunk is extracted as before
+		assert out[1]['a'] == '2' and out[1]['_raw'] == 'a=2'
+		# without the guard, the value twice
+		assert self.run(without_guard(self.tx()), [self.whole()])[0]['a'] == ['1', '1']
+
+	def test_txf_marks_only_whole_events_without_their_original_sourcetype(self):
+		d = macros().get('txf', 'definition')
+		mark = d.split(' | ')[1]
+		got = self.run(mark, [self.whole(), self.whole(tenx_sourcetype='aws:cloudtrail'), self.compact()])
+		assert [e.get('tenx_whole') for e in got] == [1, None, None]

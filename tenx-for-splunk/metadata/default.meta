@@ -111,3 +111,11 @@ export = system
 [macros/tenx-mapped-restore]
 access = read : [ * ], write : [ admin, sc_admin, power ]
 export = system
+
+[macros/tenx-whole-hide]
+access = read : [ * ], write : [ admin, sc_admin, power ]
+export = system
+
+[macros/tenx-whole-restore]
+access = read : [ * ], write : [ admin, sc_admin, power ]
+export = system
