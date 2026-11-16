@@ -1434,10 +1434,13 @@ MAX_LISTED = MAX_LISTED_SOURCES
 # Enterprise 10.4.3: HTTP 400 with the message in json, csv and xml), where a command that fails
 # while the search runs gives export in json or csv an empty body. tenxreplay rewrites the
 # validation with the units it has written (txf_one_validation()); the shipped one names none.
+# Before the final search of `tx`, `txf` and txf(<sourcetype>): the filter that matches a wildcard inside a
+# word as a base search on the index matches it (tenx_prefilter_parser.wildcard_filter).
+WILD_STEP = ' | eval [| tenxprefilter after=t] | search tenx_keep=1 | fields - tenx_keep, tenx_w*'
 TXF_ONE_UNIT = ('"`tenx-events` [| tenxprefilter] | eval tenx_compact_raw=_raw | `tenx-inflate` | fields - _kv | '
 				'`tenx-mapped-hide` | `tenx-replay-u" . substr(md5("$st$"), 1, 12) . "` | `tenx-replay-tags` | '
 				'`tenx-mapped-restore` | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars | '
-				'eval tenx_expand_refused=if(len(tenx_expand_refused)>0, tenx_expand_refused, null()) | search *"')
+				'eval tenx_expand_refused=if(len(tenx_expand_refused)>0, tenx_expand_refused, null())' + WILD_STEP + ' | search *"')
 TXF_ONE = 'txf(1)'
 TXF_ONE_NAME = 'match(st, "^[A-Za-z0-9_.:/-]+$")'
 # Splunk prints it after "Encountered the following error while validating macro 'txf(<st>)': " and

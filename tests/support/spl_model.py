@@ -264,6 +264,15 @@ class Model(object):
 		raise Unsupported('macro recursion')
 
 	def step(self, step, events):
+		if step == 'eval [| tenxprefilter after=t]':
+			# The wildcard filter of the tx macros (tenx_prefilter_parser.wildcard_filter): for words
+			# without a wildcard inside them it keeps every event.
+			for event in events:
+				event['tenx_keep'] = '1'
+			return
+		if step == 'search tenx_keep=1':
+			events[:] = [e for e in events if e.get('tenx_keep') == '1']
+			return
 		word = step.split(None, 1)[0]
 		rest = step[len(word):].strip()
 		if word == 'eval':
