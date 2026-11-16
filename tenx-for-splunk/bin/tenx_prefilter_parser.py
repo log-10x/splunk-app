@@ -190,6 +190,122 @@ class Tokens(list):
 		self.glued = set()
 
 
+def macro_call(search):
+	"""(the text before the first `tx`, `txf` or `txf(...)` outside quotes, the macro call written), or None."""
+	i, n, quoted = 0, len(search), False
+	while i < n:
+		c = search[i]
+		if quoted:
+			if c == "\\":
+				i += 2
+				continue
+			if c == '"':
+				quoted = False
+		elif c == '"':
+			quoted = True
+		elif c == "`" and MACRO_CALL.match(search, i):
+			return search[:i], MACRO_CALL.match(search, i).group(0)
+		i += 1
+	return None
+
+
+def _specifiers(before, name):
+	"""The values of `name`=x and `name`::x written as search terms in `before` (quoted values
+	unquoted; a phrase, or a value inside another field's quotes, is not a term; a term under NOT,
+	or inside parentheses after NOT, is left out)."""
+	found, tokens = [], list(tokenize(before or ""))
+	negated, depth, i = [], 0, 0
+	while i < len(tokens):
+		kind, value = tokens[i]
+		if kind == "(":
+			depth += 1
+		elif kind == ")":
+			depth -= 1
+			while negated and negated[-1] > depth:
+				negated.pop()
+		elif kind == "word" and value == "NOT":
+			if i + 1 < len(tokens) and tokens[i + 1][0] == "(":
+				negated.append(depth + 1)
+			else:
+				i += 2
+				continue
+		elif kind == "word" and not negated:
+			m = FIELD_TERM.match(value)
+			if m and m.group(1).lower() == name and m.group(2) == "=":
+				found.append(unquote(m.group(3)))
+			else:
+				m = INDEXED_TERM.match(value)
+				if m and m.group(1).lower() == name:
+					found.append(unquote(m.group(2)))
+		i += 1
+	return [v for v in dict.fromkeys(found) if v]
+
+
+def named_sourcetypes(before, tree, after_counts):
+	"""
+	The sourcetypes a `tx` search names: written before the macro (sourcetype=x, sourcetype::x),
+	and, when `after_counts`, compared after it (sourcetype=x, sourcetype IN (...)), not under NOT.
+	A compact event is indexed as the compact sourcetype, and `tx` leaves that on the expanded
+	event (`txf` gives it its original sourcetype), so a search that names the ORIGINAL sourcetype
+	in those places matches none of its compact events. Wildcards are kept: the probe tells a
+	value that selects the compact sourcetype itself (tenx*, *) from one that does not (fr:*).
+	"""
+	found = _specifiers(before, "sourcetype")
+
+	def walk(node):
+		if node[0] == "field" and node[1].lower() == "sourcetype" and node[2] in ("=", "::"):
+			found.append(node[3])
+		elif node[0] == "in" and node[1].lower() == "sourcetype":
+			found.extend(v for v in node[2] if v)
+		elif node[0] in ("and", "or"):
+			for child in node[1]:
+				walk(child)
+	if after_counts and tree is not None:
+		walk(tree)
+	return [v for v in dict.fromkeys(found) if v and v.strip("*")]
+
+
+def named_indexes(before):
+	"""The index values written before the macro."""
+	return _specifiers(before, "index")
+
+
+def original_sourcetype_probe(sourcetypes, indexes):
+	"""
+	The tstats that finds compact events (not field-mapped) whose original sourcetype
+	(tenx_sourcetype) is one of `sourcetypes` while their indexed sourcetype is none of them, in
+	`indexes` (all the user searches when none), or None. Those are the events such a search
+	misses; a value that also selects the compact sourcetype (tenx_encoded, tenx*) finds none.
+	"""
+	if not sourcetypes:
+		return None
+	quote = lambda v: '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+	where = "(%s) " % " OR ".join("index=%s" % quote(i) for i in sorted(indexes)) if indexes else ""
+	return "| tstats count where %s`tenx-events` NOT tenx_mapped=* (%s) NOT (%s) by tenx_sourcetype" % (
+		where, " OR ".join("tenx_sourcetype=%s" % quote(v) for v in sorted(sourcetypes)),
+		" OR ".join("sourcetype=%s" % quote(v) for v in sorted(sourcetypes)))
+
+
+def original_sourcetype_message(rows, macro):
+	"""The message that stops a `tx` or `txf` search naming the original sourcetype of compact events (`rows` of the probe)."""
+	sts = sorted(set(r.get("tenx_sourcetype", "") for r in rows if r.get("tenx_sourcetype"))) or ["<sourcetype>"]
+	name = macro.strip("`").split("(")[0]
+	named = " and ".join("sourcetype=%s" % st for st in sts)
+	if len(sts) == 1:
+		head = ("%s: %s selects none of the compact events of that sourcetype: they are indexed as the compact "
+				"sourcetype and carry %s in the field tenx_sourcetype, so this search was not run." % (name, named, sts[0]))
+	else:
+		head = ("%s: %s select none of the compact events of those sourcetypes: they are indexed as the compact "
+				"sourcetype and carry the original one in the field tenx_sourcetype, so this search was not run."
+				% (name, named))
+	write = " OR ".join("tenx_sourcetype=%s" % st for st in sts)
+	if name == "tx":
+		return head + (" Write %s before `tx`, or use `txf`, which gives each event its original sourcetype."
+					   % (write if len(sts) == 1 else "(%s)" % write))
+	return head + (" Write %s before `%s`, or the sourcetype after it: `txf` gives each event its original sourcetype."
+				   % (write if len(sts) == 1 else "(%s)" % write, name))
+
+
 def tokenize(text):
 	tokens, i, n = Tokens(), 0, len(text)
 	space = True

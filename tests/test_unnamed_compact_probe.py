@@ -63,3 +63,97 @@ class TestACompiledAlert:
 		got = make_compiler().compile('index=main error')
 		assert got.strategy == AlertStrategy.PASSTHROUGH and not got.needs_review
 		assert got.compiled_search == 'index=main error'
+
+
+class TestTheOriginalSourcetype:
+	"""`| tx index=df sourcetype=df:kv error`: df:kv is the events' original sourcetype, carried in
+	tenx_sourcetype; the compact events are indexed as tenx_encoded, so the search, not rewritten,
+	matched none of them (0 events against 10,000 raw)."""
+
+	def test_probed_for_compact_events_carrying_it(self):
+		assert sb.compact_probe(result('index=df sourcetype=df:kv error'), make_config())[0] == (
+			'| tstats count where (index=df) (sourcetype=tenx_encoded) NOT tenx_mapped=* (tenx_sourcetype=df:kv) '
+			'by index, sourcetype, tenx_sourcetype')
+
+	def test_not_probed(self):
+		for search in ('index=df sourcetype=tenx_encoded error', 'index=df sourcetype=tenx* error',
+					   'index=df sourcetype=* error', 'index=df NOT sourcetype=df:kv error'):
+			assert sb.original_sourcetype_probe(result(search), make_config()) is None, search
+
+	def test_a_wildcard_that_misses_the_compact_sourcetype_is_probed(self):
+		assert sb.original_sourcetype_probe(result('index=df sourcetype=df:* error'), make_config()) == (
+			'| tstats count where (index=df) (sourcetype=tenx_encoded) NOT tenx_mapped=* (tenx_sourcetype=df:*) '
+			'by index, sourcetype, tenx_sourcetype')
+
+	def test_the_message(self):
+		rows = [{'index': 'df', 'sourcetype': 'tenx_encoded', 'tenx_sourcetype': 'df:kv', 'count': '10000'}]
+		assert sb.original_sourcetype_message(rows) == (
+			"10x: this search names sourcetype df:kv, which its compact events carry in the field tenx_sourcetype "
+			"(they are indexed as tenx_encoded), so it was not run: as typed it would return none of them. Write "
+			"sourcetype=tenx_encoded tenx_sourcetype=df:kv instead.")
+		rows.append({'index': 'df', 'sourcetype': 'tenx_encoded', 'tenx_sourcetype': 'df:json', 'count': '7'})
+		assert sb.original_sourcetype_message(rows) == (
+			"10x: this search names sourcetypes df:json and df:kv, which its compact events carry in the field "
+			"tenx_sourcetype (they are indexed as tenx_encoded), so it was not run: as typed it would return none of "
+			"them. Write sourcetype=tenx_encoded (tenx_sourcetype=df:json OR tenx_sourcetype=df:kv) instead.")
+
+	def test_a_compiled_alert_is_flagged(self):
+		compiler = make_compiler()
+		compiler.builder.search_manager.probe_rows = [{'index': 'df', 'sourcetype': 'tenx_encoded', 'tenx_sourcetype': 'df:kv', 'count': '5'}]
+		got = compiler.compile('index=df sourcetype=df:kv error')
+		assert got.needs_review and got.reason.startswith('this search names sourcetype df:kv')
+
+
+class TestTheMacroPath:
+	"""The same spelling through the `tx` macro: before `tx` (or `txf`) the base search selects no
+	compact event, and after `tx` the expanded event still carries the compact sourcetype (`txf`
+	gives it its original one, so after `txf` the spelling works)."""
+
+	def named(self, search):
+		import tenx_prefilter_parser as pp
+		before, macro = pp.macro_call(search)
+		tree = pp.Parser(pp.tokenize(pp.text_after_macro(search))).parse()
+		return pp.named_sourcetypes(before, tree, after_counts=(macro == '`tx`')), pp.named_indexes(before)
+
+	def test_where_the_original_sourcetype_matches_nothing(self):
+		assert self.named('index=df sourcetype=df:kv `tx` error') == (['df:kv'], ['df'])
+		assert self.named('index=df `tx` sourcetype=df:kv error') == (['df:kv'], ['df'])
+		assert self.named('index="df" sourcetype="df:kv" `txf` x') == (['df:kv'], ['df'])
+		assert self.named('index=a OR index=b sourcetype::df:kv `tx` y') == (['df:kv'], ['a', 'b'])
+		assert self.named('index=df `tx` sourcetype IN (a, b)') == (['a', 'b'], ['df'])
+		# a wildcard is probed; the probe leaves out events its sourcetype term selects (tenx* selects them all)
+		assert self.named('index=df sourcetype=df:* `tx` y') == (['df:*'], ['df'])
+
+	def test_where_it_does_not_apply(self):
+		for search in ('index=df `txf` sourcetype=df:kv', 'index=df msg="sourcetype=x" `tx` y',
+					   'index=df tenx_sourcetype=df:kv `tx` y', 'index=df NOT sourcetype=df:kv `tx` y',
+					   'index=df NOT (sourcetype=df:kv OR sourcetype=df:json) `tx` y', 'index=df sourcetype=* `tx` y',
+					   'index=df sourcetype!=df:kv `tx` y'):
+			assert self.named(search)[0] == [], search
+		assert self.named('index=df NOT (host=a) sourcetype=df:kv `tx` y')[0] == ['df:kv']
+
+	def test_the_probe_and_message(self):
+		import tenx_prefilter_parser as pp
+		assert pp.original_sourcetype_probe(['df:kv'], ['df']) == (
+			'| tstats count where (index="df") `tenx-events` NOT tenx_mapped=* (tenx_sourcetype="df:kv") '
+			'NOT (sourcetype="df:kv") by tenx_sourcetype')
+		# events the search's own sourcetype term selects (the compact sourcetype, for tenx*) are not counted
+		assert pp.original_sourcetype_probe(['tenx*', 'df:kv'], []) == (
+			'| tstats count where `tenx-events` NOT tenx_mapped=* (tenx_sourcetype="df:kv" OR tenx_sourcetype="tenx*") '
+			'NOT (sourcetype="df:kv" OR sourcetype="tenx*") by tenx_sourcetype')
+		assert pp.original_sourcetype_probe([], ['df']) is None
+		assert pp.original_sourcetype_message([{'tenx_sourcetype': 'df:kv', 'count': '3'}], '`tx`') == (
+			"tx: sourcetype=df:kv selects none of the compact events of that sourcetype: they are indexed as the "
+			"compact sourcetype and carry df:kv in the field tenx_sourcetype, so this search was not run. Write "
+			"tenx_sourcetype=df:kv before `tx`, or use `txf`, which gives each event its original sourcetype.")
+		assert pp.original_sourcetype_message([{'tenx_sourcetype': 'df:kv', 'count': '3'}], '`txf`') == (
+			"txf: sourcetype=df:kv selects none of the compact events of that sourcetype: they are indexed as the "
+			"compact sourcetype and carry df:kv in the field tenx_sourcetype, so this search was not run. Write "
+			"tenx_sourcetype=df:kv before `txf`, or the sourcetype after it: `txf` gives each event its original "
+			"sourcetype.")
+		two = [{'tenx_sourcetype': 'df:kv', 'count': '3'}, {'tenx_sourcetype': 'df:json', 'count': '1'}]
+		assert pp.original_sourcetype_message(two, '`tx`') == (
+			"tx: sourcetype=df:json and sourcetype=df:kv select none of the compact events of those sourcetypes: they "
+			"are indexed as the compact sourcetype and carry the original one in the field tenx_sourcetype, so this "
+			"search was not run. Write (tenx_sourcetype=df:json OR tenx_sourcetype=df:kv) before `tx`, or use `txf`, "
+			"which gives each event its original sourcetype.")

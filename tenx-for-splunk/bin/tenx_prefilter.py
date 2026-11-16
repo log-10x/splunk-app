@@ -67,7 +67,31 @@ class TenxPrefilterCommand(GeneratingCommand):
 		if not match:
 			return None
 		job = self._rest("/services/search/jobs/%s?output_mode=json" % urllib.parse.quote(match.group(1), safe=""))
-		return parser.text_after_macro(job["entry"][0]["content"].get("search", ""))
+		search = job["entry"][0]["content"].get("search", "")
+		self.before = parser.macro_call(search)
+		return parser.text_after_macro(search)
+
+	def _original_sourcetype_rows(self, tree):
+		"""
+		Compact events (not field-mapped) whose original sourcetype the search names where it can
+		match none of them: before `tx` or `txf`, or after `tx`. None when it names none, or when the
+		check could not run.
+		"""
+		before, macro = self.before if getattr(self, "before", None) else ("", "`tx`")
+		sourcetypes = parser.named_sourcetypes(before, tree, after_counts=(macro == "`tx`"))
+		probe = parser.original_sourcetype_probe(sourcetypes, parser.named_indexes(before))
+		if probe is None:
+			return None, macro
+		info = self._metadata.searchinfo
+		try:
+			result = self._rest(
+				"/servicesNS/%s/%s/search/jobs" % (urllib.parse.quote(info.username), APP_NAME),
+				{"search": probe, "exec_mode": "oneshot", "output_mode": "json", "count": "0",
+				 "earliest_time": str(info.earliest_time or "0"), "latest_time": str(info.latest_time or "now")})
+		except Exception as e:
+			self.logger.warning("tx: the original sourcetype check failed: %s", e)
+			return None, macro
+		return [r for r in result.get("results", []) if str(r.get("count", "0")) not in ("0", "")], macro
 
 	def _text_field(self):
 		"""
@@ -112,6 +136,9 @@ class TenxPrefilterCommand(GeneratingCommand):
 		if reader.unquoted_comma:
 			self.error_exit(RuntimeError("comma after tx"),
 				"tx: a comma after `tx` is matched literally, so this search would miss events. Remove it, or put the text in quotes.")
+		rows, macro = self._original_sourcetype_rows(tree)
+		if rows:
+			self.error_exit(RuntimeError("original sourcetype"), parser.original_sourcetype_message(rows, macro))
 		# The setting is read only when it can change the prefilter (see narrowing_matters).
 		text_field = self._text_field() if parser.narrowing_matters(tree) else None
 		dictionary = {}
