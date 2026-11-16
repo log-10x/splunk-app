@@ -833,7 +833,9 @@ has its own cap file and its own scheduled `check`.
    whose role holds the capabilities `search`, `edit_tcp` and `list_all_objects` and may search
    the probe index; `TENX_SPLUNKD_AUTH=<user>:<password>` works as well. `activate` sends one
    small probe event per new template through the HTTP Event Collector into the probe index, an
-   index to keep out of data model and detection index lists. When Splunk writes a probe's
+   index to keep out of data model and detection index lists. Probe events count against the
+   Splunk licence like any indexed event: one compact line each, 194 to 787 bytes for the Windows
+   templates and 136 to 2,576 bytes for the CloudTrail ones. When Splunk writes a probe's
    fields, that template moves from `compact-cap.csv.pending` into `compact-cap.csv`, and the
    Receiver, which rereads the file, then compacts its events. Nothing is restarted.
 
@@ -867,7 +869,9 @@ only the lookup file: copy `lookups/` of both apps over the installed ones (on a
 changes; a file put back with the time it had when Splunk last read it stays unread. A standalone
 instance or heavy forwarder rereads the file within its `ingest_lookup_refresh_period_secs` (60
 seconds by default) with no reload or restart, and a change to the lookup file alone reloads cluster
-peers without a restart. After an upgrade of this app, `gen` can also write a new static rule;
+peers without a restart. While the lookup file a parsing instance reads cannot be read by the user
+Splunk runs as, is not gzip, or has no `hash` column, Splunk drops the map's compact events, floor
+app or not, until `check` empties the list. After an upgrade of this app, `gen` can also write a new static rule;
 `activate` then refuses the map until both apps are installed again whole, as in step 5.
 
 Where several instances parse the compact events (indexer cluster peers, or several heavy
@@ -933,7 +937,9 @@ Windows EventID 4798, 5156 and 5157, `dest` is the event's Computer and `src_ip`
 not written. The add-on's XML block fields `EventData_Xml` and `System_Props_Xml` are not written.
 `vendor_privilege` and `privilege_id` carry `-` on events where the raw event has neither. A value
 that holds line breaks and tabs is written with spaces in their place. On CloudTrail,
-`responseElements.credentials.sessionToken` is not written. A template with more than 984 values
+`responseElements.credentials.sessionToken` is not written. A plain search shows a mapped field
+longer than 1,000 characters, such as a PowerShell `ScriptBlockText`, cut to its first 1,000;
+`tstats` on the field reads it whole. A template with more than 984 values
 gets no row, and its events arrive whole. An event whose compact value holds a line feed gets no
 fields and is marked `tenx_unmapped=no_match`. With `--reserved-names restore`, a mapped CloudTrail
 event carries `extracted_eventType` beside `eventType`. Mapped events carry no `date_*` fields
