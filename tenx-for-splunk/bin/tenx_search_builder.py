@@ -125,9 +125,9 @@ class ResolvedState(Enum):
 # and without a field replay. An event the sender passed whole (WHOLE_MARK) is hidden from that
 # extract, as the `tx` macro hides it (macros.conf tenx-whole-hide): Splunk extracted its fields
 # when it read it, and extract would give each JSON field a second value.
-WHOLE_MARK = 'tenx_whole=if(match(_raw, "^~"), null(), 1)'
+WHOLE_MARK = 'tenx_passed=if(match(_raw, "^~"), null(), 1)'
 # With a field replay, only the whole events without tenx_sourcetype: the replay reads the others.
-WHOLE_MARK_REPLAY = 'tenx_whole=if(match(_raw, "^~") OR isnotnull(tenx_sourcetype), null(), 1)'
+WHOLE_MARK_REPLAY = 'tenx_passed=if(match(_raw, "^~") OR isnotnull(tenx_sourcetype), null(), 1)'
 XML_AND_KV_STEPS = (' | `tenx-whole-hide` | fields - _kv | extract | `tenx-whole-restore`'
 					' | eval tenx_xml=if(match(_raw, "^\\s*<"), _raw, null())'
 					' | spath input=tenx_xml | fields - tenx_xml, tenx_hash, tenx_var_0, tenx_vars')
@@ -1224,8 +1224,19 @@ class TenxSearchCommand(TenxSplCommand):
 
 		This can happen for complex queries as we interlace data from variables (encoded events) and
 		templates (coming from the decoding against tenx_dml)
+
+		That search comes after a pipe Splunk cannot fold into the base search, where a word with a
+		wildcard inside it (Se*Privilege) is matched as its prefix alone, and TERM() or CASE() of some
+		words other than on the index. Such a word is replaced by a field the eval before it sets where
+		the event holds the word as the index does (tenx_prefilter_parser.wild_plan), so under AND, OR
+		and NOT alike the search keeps what the base search on the index keeps.
 		"""
-		return " | search " + " ".join([item.text for item in self.user_search_terms])
+		import tenx_prefilter_parser
+		terms = " ".join([item.text for item in self.user_search_terms])
+		plan = tenx_prefilter_parser.wild_plan(terms)
+		if plan:
+			return " | eval %s | search %s | fields - %s*" % (plan[0], plan[1], tenx_prefilter_parser.WILD_FIELD)
+		return " | search " + terms
 
 	def resolved(self):
 		"""

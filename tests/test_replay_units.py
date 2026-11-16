@@ -41,15 +41,17 @@ TX_SHIPPED = ('`tenx-events` [| tenxprefilter] | `tenx-inflate` | fields - _kv |
 # The one step `tx` and `txf` add before their final search: the template lookup gives
 # tenx_expand_refused an empty value on every event it expands, and only a refused event keeps it.
 REFUSED_STEP = ' | eval tenx_expand_refused=if(len(tenx_expand_refused)>0, tenx_expand_refused, null())'
+# Then the wildcard filter (b.WILD_STEP): a word with a wildcard inside it matched as a base search on the
+# index matches it, not as its prefix alone (test_wildcard_inside_a_word.py).
 # [tx] now: the same, with the field-map guard around `extract` and REFUSED_STEP before the final
 # search (see TestTxIsTheShippedMacro)
-TX_DEFINITION = ('`tenx-events` [| tenxprefilter] | eval tenx_whole=if(match(_raw, "^~"), null(), 1) | `tenx-inflate` | '
+TX_DEFINITION = ('`tenx-events` [| tenxprefilter] | eval tenx_passed=if(match(_raw, "^~"), null(), 1) | `tenx-inflate` | '
 				 '`tenx-mapped-hide` | `tenx-whole-hide` | fields - _kv | extract | `tenx-whole-restore` | '
-				 '`tenx-mapped-restore` | fields - tenx_hash, tenx_var_0, tenx_vars' + REFUSED_STEP + ' | search *')
+				 '`tenx-mapped-restore` | fields - tenx_hash, tenx_var_0, tenx_vars' + REFUSED_STEP + b.WILD_STEP + ' | search *')
 # the field-map guard, and the whole-event guard with the marks that select its events
 GUARD_CALLS = (' | `tenx-mapped-hide`', ' | `tenx-mapped-restore`', ' | `tenx-whole-hide`', ' | `tenx-whole-restore`',
-			   ' | eval tenx_whole=if(match(_raw, "^~"), null(), 1)',
-			   ', tenx_whole=if(match(_raw, "^~") OR isnotnull(tenx_sourcetype), null(), 1)')
+			   ' | eval tenx_passed=if(match(_raw, "^~"), null(), 1)',
+			   ', tenx_passed=if(match(_raw, "^~") OR isnotnull(tenx_sourcetype), null(), 1)')
 
 
 def without_guard(definition):
@@ -111,7 +113,7 @@ class TestTxIsTheShippedMacro:
 	"""
 	`tx` is the shipped macro with two additions: tenx-mapped-hide before its `extract` and
 	tenx-mapped-restore after it, for events indexed with a field map (tenx_mapped); and the same
-	for events the sender passed whole (tenx_whole, marked before the expansion). Each is a
+	for events the sender passed whole (tenx_passed, marked before the expansion). Each is a
 	foreach over tenx_mapped*, which runs only on a chunk of results holding such an event, and
 	each eval is guarded per event; TestTheMappedGuard runs both on events with and without it.
 	And REFUSED_STEP before its final search, which removes the empty tenx_expand_refused the
@@ -119,7 +121,7 @@ class TestTxIsTheShippedMacro:
 	"""
 	def test_the_definition(self):
 		assert macros().get('tx', 'definition') == TX_DEFINITION
-		assert without_guard(TX_DEFINITION).replace(REFUSED_STEP, '') == TX_SHIPPED
+		assert without_guard(TX_DEFINITION).replace(REFUSED_STEP, '').replace(b.WILD_STEP, '') == TX_SHIPPED
 
 	def test_every_other_shipped_stanza_is_unchanged_character_for_character(self):
 		try:
@@ -133,7 +135,8 @@ class TestTxIsTheShippedMacro:
 		shipped = configparser.RawConfigParser(strict=False)
 		shipped.read_string(base.stdout)
 		assert macros().get('tx', 'definition') != shipped.get('tx', 'definition')
-		assert without_guard(macros().get('tx', 'definition')).replace(REFUSED_STEP, '') == shipped.get('tx', 'definition')
+		assert without_guard(macros().get('tx', 'definition')).replace(REFUSED_STEP, '').replace(b.WILD_STEP, '') == (
+			shipped.get('tx', 'definition'))
 		# every other stanza shipped at e12ec4e is unchanged, its comments included
 		for name in shipped.sections():
 			if name != 'tx':
@@ -144,11 +147,11 @@ class TestTxIsTheShippedMacro:
 
 	def test_txf_is_tx_with_the_replay(self):
 		conf = macros()
-		mark = 'tenx_whole=if(match(_raw, "^~") OR isnotnull(tenx_sourcetype), null(), 1)'
+		mark = 'tenx_passed=if(match(_raw, "^~") OR isnotnull(tenx_sourcetype), null(), 1)'
 		head = ('`tenx-events` [| tenxprefilter] | eval tenx_compact_raw=_raw, %s | `tenx-inflate` | fields - _kv | '
 				'`tenx-mapped-hide` | `tenx-whole-hide` | ')
 		tail = (' | `tenx-whole-restore` | `tenx-mapped-restore` | fields - tenx_compact_raw, tenx_rst, tenx_hash, '
-				'tenx_var_0, tenx_vars' + REFUSED_STEP + ' | search *')
+				'tenx_var_0, tenx_vars' + REFUSED_STEP + b.WILD_STEP + ' | search *')
 		assert conf.get('txf', 'definition') == head % mark + '`tenx-replay`' + tail
 		# Splunk Enterprise 10.4.3 refuses a colon in a macro name, so txf(1) computes the unit's
 		# name with md5() in eval; on 10.4.3, md5 in eval equals hashlib's for the five names tried
@@ -158,7 +161,8 @@ class TestTxIsTheShippedMacro:
 			+ tail + '"')
 		assert without_guard(conf.get('txf', 'definition')) == (
 			'`tenx-events` [| tenxprefilter] | eval tenx_compact_raw=_raw | `tenx-inflate` | fields - _kv | '
-			'`tenx-replay` | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars' + REFUSED_STEP + ' | search *')
+			'`tenx-replay` | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars' + REFUSED_STEP + b.WILD_STEP +
+			' | search *')
 		assert conf.get('txf(1)', 'args') == 'st'
 		# shipped, the validation names no unit; tenxreplay writes the units it has written into it
 		assert conf.get('txf(1)', 'validation') == b.txf_one_validation([]) == (
@@ -1011,7 +1015,7 @@ class TestTheWholeGuard:
 		out = self.run(self.tx(), [self.whole(), self.compact()])
 		assert out[0]['a'] == '1' and out[0]['_raw'] == '{"a": "1"}'
 		assert (out[0]['sourcetype'], out[0]['source'], out[0]['host']) == ('tenx_encoded', 's', 'h')
-		assert not [k for e in out for k in e if k.startswith(('tenx_wh', 'tenx_whole'))]
+		assert not [k for e in out for k in e if k.startswith('tenx_passed')]
 		# the compact event of the same chunk is extracted as before
 		assert out[1]['a'] == '2' and out[1]['_raw'] == 'a=2'
 		# without the guard, the value twice
@@ -1021,4 +1025,4 @@ class TestTheWholeGuard:
 		d = macros().get('txf', 'definition')
 		mark = d.split(' | ')[1]
 		got = self.run(mark, [self.whole(), self.whole(tenx_sourcetype='aws:cloudtrail'), self.compact()])
-		assert [e.get('tenx_whole') for e in got] == [1, None, None]
+		assert [e.get('tenx_passed') for e in got] == [1, None, None]

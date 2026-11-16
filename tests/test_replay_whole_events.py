@@ -94,7 +94,7 @@ class TestEventsThatArriveWhole:
 		# not replayed, and hidden from the extract (tenx-whole-hide), which would add each value again
 		assert out[0]['EventID'] == '4670' and out[0]['k'] == 'win'
 		assert (out[0]['_raw'], out[0]['sourcetype']) == (e['_raw'], e['sourcetype'])
-		assert not [k for k in out[0] if k.startswith(('tenx_wh', 'tenx_whole'))]
+		assert not [k for k in out[0] if k.startswith('tenx_passed')]
 
 	def test_the_search_rewrite_hides_it_once(self):
 		full = b.build(STANZAS, PRESENT, LOOKUP_FIELDS).spl()

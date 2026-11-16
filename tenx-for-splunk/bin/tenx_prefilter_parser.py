@@ -188,6 +188,8 @@ class Tokens(list):
 	def __init__(self):
 		list.__init__(self)
 		self.glued = set()
+		# (start, end) of each token in the text it was read from
+		self.spans = []
 
 
 def macro_call(search):
@@ -341,10 +343,12 @@ def tokenize(text):
 				buf.append(text[j])
 				j += 1
 			tokens.append(("phrase", "".join(buf)))
+			tokens.spans.append((i, j))
 			i = j
 			continue
 		if c in "()":
 			tokens.append((c, c))
+			tokens.spans.append((i, i + 1))
 			i += 1
 			continue
 		if c == "[":
@@ -363,6 +367,7 @@ def tokenize(text):
 						break
 				j += 1
 			tokens.append(("subsearch", ""))
+			tokens.spans.append((i, j))
 			i = j
 			continue
 		j, buf = i, []
@@ -383,6 +388,7 @@ def tokenize(text):
 			buf.append(text[j])
 			j += 1
 		tokens.append(("word", "".join(buf)))
+		tokens.spans.append((i, j))
 		i = j
 	return tokens
 
@@ -394,6 +400,10 @@ class Parser(object):
 		self.tokens, self.i = tokens, 0
 		self.time_modifier = False
 		self.unquoted_comma = False
+		# id() of each ("text", ...) node made from one word or phrase token -> that token's index
+		self.text_at = {}
+		# id() of each TERM() or CASE() node -> (TERM or CASE, its one word or None, first token, last token)
+		self.call_at = {}
 
 	def _peek(self, k=0):
 		return self.tokens[self.i + k] if self.i + k < len(self.tokens) else (None, None)
@@ -498,27 +508,34 @@ class Parser(object):
 				# with certainty, so it places no restriction.
 				self._take()
 				return ("unknown", value)
-			return ("text", value)
+			node = ("text", value)
+			self.text_at[id(node)] = self.i - 1
+			return node
 		if kind != "word":
 			raise Unparsed("unexpected %s" % kind)
 		if value in ("AND", "OR", "IN"):
 			raise Unparsed("%s where a search term should be" % value)
 		following = self._peek()
 		if value in ("TERM", "CASE") and following[0] == "(":
+			first = self.i - 1
 			self._take()
-			inner = []
+			inner, kinds = [], []
 			while self._peek()[0] not in (")", None):
 				kind_, item = self._take()
 				if kind_ not in ("word", "phrase"):
 					raise Unparsed("%s() holding %s" % (value, kind_))
 				inner.append(item)
+				kinds.append(kind_)
 			if self._take()[0] != ")":
 				raise Unparsed("%s( without its closing parenthesis" % value)
 			# `tx` applies the user's words after a pipe, where Splunk tests TERM() and CASE() against
 			# the event's text, which for some arguments differs from the same search on an index
 			# (TERM(pattern=*.log): 0 events on the index, 1,025 after a pipe, Splunk Enterprise 10.4.3).
-			# Which words every such event holds is not certain, so they place no restriction.
-			return ("unknown", "%s(%s)" % (value, " ".join(inner)))
+			# Which words every such event holds is not certain, so they place no restriction on the
+			# prefilter. wild_plan() matches some of them as the index does before the final search.
+			node = ("unknown", "%s(%s)" % (value, " ".join(inner)))
+			self.call_at[id(node)] = (value, inner[0] if kinds == ["word"] else None, first, self.i - 1)
+			return node
 		if following == ("word", "IN"):
 			self._take()
 			if self._peek()[0] != "(":
@@ -579,7 +596,9 @@ class Parser(object):
 			return ("unknown", value)
 		if "," in value:
 			self.unquoted_comma = True
-		return ("text", value)
+		node = ("text", value)
+		self.text_at[id(node)] = self.i - 1
+		return node
 
 
 def unquote(value):
@@ -978,3 +997,177 @@ def dictionary_from_rows(rows):
 		terms = [terms] if isinstance(terms, str) else list(terms)
 		dictionary[row["piece"]] = (int(row.get("n") or 0), terms)
 	return dictionary
+
+
+# A wildcard inside a word, TERM() and CASE() after `tx` (Splunk Enterprise 10.4.3). `tx` applies the
+# words after it in a `search` after a pipe that Splunk cannot fold into the base search, and there
+# some of them match other events than the same search on the index:
+# - a word with a `*` after its first character (Se*Privilege, le*FO, S*P*e) is matched as its prefix
+#   alone: any term starting with "se" (Windows 662 sample: 662 events, the base search on the raw
+#   events 3; Se*Zzz also 662). On the index the whole word is matched against the event's terms,
+#   case-insensitively, `*` standing for any characters: a major segment (the text between two major
+#   breakers) or a minor piece (between any two breakers). A word starting with `*`, or ending with its
+#   only `*`, or holding a breaker of its own (10.0*14, foo.*.com), matched after the pipe as on the
+#   index on every case measured, so it is left alone.
+# - TERM(x) on the index is a term of the event that is x (`*` as above): a major segment, or, when x
+#   holds no minor breaker, a minor piece. After the pipe x is found inside a longer term too
+#   (TERM(10.2.236.94) in client_ip=10.2.236.94: 0 on the index, 1 after the pipe). TERM() of a plain
+#   word matched alike both ways and is left alone. When x holds a major breaker, the index matched no
+#   event on default segmentation (TERM(+0000): 0) but did match on Windows events indexed under the
+#   Windows add-on (TERM(Name='SubjectLogonId'>0x331dbb</Data><Data): 18), so where such a TERM()
+#   selects events it is left to the final search; under NOT it is taken as matching nothing, which
+#   can only keep more events than the final search would.
+# - CASE(x) matched alike both ways except when x has a wildcard inside it: after the pipe, a term
+#   starting with x's prefix in its letter case; on the index, an event that holds x as the word above
+#   (any letter case) and also matches CASE(x) as after the pipe (CASE(Se*Privilege) matches
+#   "sexprivilege Seattle" and "SeQPRIVILEGE", not "SEXPRIVILEGE").
+# The breakers of segmenters.conf [indexing] (btool on 10.4.3), the default for every sourcetype here.
+MAJOR_CHARS = "[]<>(){}|!;,'\"*\n\r \t&?+"
+MAJOR_SEQUENCES = ("%2526", "%2520", "%21", "%26", "%3B", "%7C", "%20", "%2B", "%3D", "--", "%5D", "%5B", "%3A",
+				   "%0A", "%2C", "%28", "%29")
+MINOR_CHARS = "/:=@.-$#%\\_"
+# The fields wild_plan() sets on each event: tenx_w0, tenx_w1, ...
+WILD_FIELD = "tenx_w"
+
+
+def mid_wildcard(word):
+	"""Whether `word` is a word Splunk matches differently after a pipe than on the index (see above)."""
+	if not word or word[0] == "*" or "*" not in word.rstrip("*"):
+		return False
+	return not any(c in MAJOR_CHARS.replace("*", "") or c in MINOR_CHARS or c.isspace() for c in word)
+
+
+def _major_breaker(text):
+	return any(c in MAJOR_CHARS.replace("*", "") or c.isspace() for c in text) or any(s in text for s in MAJOR_SEQUENCES)
+
+
+def _class(chars):
+	return "[" + "".join("\\" + c if c in "]\\^-[" else c for c in chars).replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t") + "]"
+
+
+def term_regex(word, case=False, major_only=False):
+	"""
+	A regular expression (PCRE, as Splunk's match() reads it, and Python's re alike) that finds `word`
+	in an event's text as a base search on the index finds it: some major segment or minor piece of
+	the text is the word, case-insensitively, each `*` standing for any characters of that term (as
+	the index places the parts, see pattern()).
+	`case`: the letter case kept. `major_only`: a major segment only (TERM() of a word with a minor
+	breaker in it, which no minor piece can be).
+	"""
+	major = _class(MAJOR_CHARS.replace("*", "") + "*")
+	seq = "|".join(re.escape(s) for s in MAJOR_SEQUENCES)
+	brk = "(?:%s|%s)" % (major, seq)
+	in_major = "(?:(?!%s)[^%s])" % (seq, _class(MAJOR_CHARS.replace("*", "") + "*")[1:-1])
+	minor = _class(MINOR_CHARS)
+	in_minor = "[^%s%s]" % (_class(MAJOR_CHARS.replace("*", "") + "*")[1:-1], minor[1:-1])
+	parts = word.split("*")
+	tail = parts[-1] != ""
+
+	def pattern(start, inner, end):
+		# The index takes each part after a `*` at its first place in the rest of the term, and the last
+		# part, when the word does not end with `*`, again only after the end of each place it found
+		# that does not end the term: 19*44 matches 19.2.3.4.44 and 198/544 but not 19.2.3.444 or
+		# 198/55444 (the second 44 overlaps the first), x*ab matches xabab (Splunk Enterprise 10.4.3).
+		text = re.escape(parts[0])
+		for k, p in enumerate(parts[1:], 1):
+			if not p:
+				text += inner + "*?"
+				continue
+			first = "(?:(?!%s)%s)*%s" % (re.escape(p), inner, re.escape(p))
+			text += "(?:%s)+" % first if tail and k == len(parts) - 1 else first
+		return start + text + (end if tail else "")
+	whole = pattern("(?:^|%s)" % brk, in_major, "(?=%s|$)" % brk)
+	piece = pattern("(?:^|%s|%s)" % (brk, minor), in_minor, "(?=%s|%s|$)" % (brk, minor))
+	return ("" if case else "(?i)") + "(?:%s)" % (whole if major_only else whole + "|" + piece)
+
+
+def _eval_string(text):
+	return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _atom_test(name, word, positive=True):
+	"""
+	The eval condition that matches the atom as a base search on the index (see above), or None
+	when it matches alike after the pipe or is not read with certainty: name is None for a word or
+	a quoted word, TERM or CASE; positive is False where the atom stands under NOT.
+	"""
+	if not word:
+		return None
+	if name is None:
+		return ("match(_raw, %s)" % _eval_string(term_regex(word))) if mid_wildcard(word) else None
+	if name == "CASE":
+		return ("match(_raw, %s)" % _eval_string(term_regex(word))) if mid_wildcard(word) else None
+	if "\\" in word:
+		# Splunk applies the escape first (TERM(\resource) matched what TERM(resource) matches, 1,161 events)
+		return None
+	if _major_breaker(word):
+		return None if positive else "false()"
+	minor = any(c in MINOR_CHARS for c in word)
+	if not minor and not mid_wildcard(word):
+		return None
+	return "match(_raw, %s)" % _eval_string(term_regex(word, major_only=minor))
+
+
+def wild_plan(text):
+	"""
+	The words after `tx` (`text`) with every word that matches other events after a pipe than on
+	the index (see above) put as a field the step before computes: (eval, search), where `eval` sets
+	tenx_w0, tenx_w1, ... to 1 on the events whose text holds that word as the index does, and
+	`search` is `text` with each such word replaced by tenx_wN=1 (CASE(x) by (tenx_wN=1 CASE(x)), see
+	above). `| eval <eval> | search <search>` then keeps the events the base search on the index would
+	keep for those words, under AND, OR and NOT alike (on the index, NOT CASE() ignores the letter
+	case, so it is not the opposite of CASE(); this gives the opposite), and every other word as
+	`search` after a pipe keeps them. None when no word needs it, or when the text is not read with
+	certainty (a subsearch, a macro, parentheses that do not close).
+
+	A word written right against another word or phrase (no space) is left as it is.
+	"""
+	tokens = tokenize(text)
+	if any(kind == "subsearch" for kind, _ in tokens):
+		return None
+	reader = Parser(tokens)
+	try:
+		tree = reader.parse()
+	except Unparsed:
+		return None
+	marks, steps, edits = {}, [], []
+
+	def glued_to_text(first, last):
+		before = first in tokens.glued and tokens[first - 1][0] in ("word", "phrase")
+		after = (last + 1) in tokens.glued and tokens[last + 1][0] in ("word", "phrase")
+		return before or after
+
+	def visit(node, positive=True):
+		kind = node[0]
+		if kind in ("and", "or"):
+			for child in node[1]:
+				visit(child, positive)
+			return
+		if kind == "not":
+			visit(node[1], not positive)
+			return
+		if kind == "text" and id(node) in reader.text_at:
+			index = reader.text_at[id(node)]
+			name, word, first, last = None, node[1], index, index
+			if tokens[index][0] == "phrase" and (not word or any(c.isspace() for c in word)):
+				return
+		elif kind == "unknown" and id(node) in reader.call_at:
+			name, word, first, last = reader.call_at[id(node)]
+		else:
+			return
+		test = _atom_test(name, word, positive)
+		if test is None or glued_to_text(first, last):
+			return
+		if test not in marks:
+			marks[test] = "%s%d" % (WILD_FIELD, len(marks))
+			steps.append("%s=%s" % (marks[test], "0" if test == "false()" else "if(%s, 1, 0)" % test))
+		start, end = tokens.spans[first][0], tokens.spans[last][1]
+		edits.append((start, end, "(%s=1 %s)" % (marks[test], text[start:end]) if name == "CASE" else marks[test] + "=1"))
+
+	visit(tree)
+	if not edits:
+		return None
+	search = text
+	for start, end, mark in sorted(edits, reverse=True):
+		search = search[:start] + mark + search[end:]
+	return ", ".join(steps), search.strip()
