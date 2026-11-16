@@ -1010,10 +1010,13 @@ def dictionary_from_rows(rows):
 #   only `*`, or holding a breaker of its own (10.0*14, foo.*.com), matched after the pipe as on the
 #   index on every case measured, so it is left alone.
 # - TERM(x) on the index is a term of the event that is x (`*` as above): a major segment, or, when x
-#   holds no minor breaker, a minor piece; when x holds a major breaker no event has it
-#   (TERM(+0000): 0 events). After the pipe x is found inside a longer term too (TERM(10.2.236.94)
-#   in client_ip=10.2.236.94: 0 on the index, 1 after the pipe). TERM() of a plain word matched
-#   alike both ways and is left alone.
+#   holds no minor breaker, a minor piece. After the pipe x is found inside a longer term too
+#   (TERM(10.2.236.94) in client_ip=10.2.236.94: 0 on the index, 1 after the pipe). TERM() of a plain
+#   word matched alike both ways and is left alone. When x holds a major breaker, the index matched no
+#   event on default segmentation (TERM(+0000): 0) but did match on Windows events indexed under the
+#   Windows add-on (TERM(Name='SubjectLogonId'>0x331dbb</Data><Data): 18), so where such a TERM()
+#   selects events it is left to the final search; under NOT it is taken as matching nothing, which
+#   can only keep more events than the final search would.
 # - CASE(x) matched alike both ways except when x has a wildcard inside it: after the pipe, a term
 #   starting with x's prefix in its letter case; on the index, an event that holds x as the word above
 #   (any letter case) and also matches CASE(x) as after the pipe (CASE(Se*Privilege) matches
@@ -1073,11 +1076,11 @@ def _eval_string(text):
 	return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def _atom_test(name, word):
+def _atom_test(name, word, positive=True):
 	"""
 	The eval condition that matches the atom as a base search on the index (see above), or None
 	when it matches alike after the pipe or is not read with certainty: name is None for a word or
-	a quoted word, TERM or CASE.
+	a quoted word, TERM or CASE; positive is False where the atom stands under NOT.
 	"""
 	if not word:
 		return None
@@ -1086,7 +1089,7 @@ def _atom_test(name, word):
 	if name == "CASE":
 		return ("match(_raw, %s)" % _eval_string(term_regex(word))) if mid_wildcard(word) else None
 	if _major_breaker(word):
-		return "false()"
+		return None if positive else "false()"
 	minor = any(c in MINOR_CHARS for c in word)
 	if not minor and not mid_wildcard(word):
 		return None
@@ -1122,14 +1125,14 @@ def wild_plan(text):
 		after = (last + 1) in tokens.glued and tokens[last + 1][0] in ("word", "phrase")
 		return before or after
 
-	def visit(node):
+	def visit(node, positive=True):
 		kind = node[0]
 		if kind in ("and", "or"):
 			for child in node[1]:
-				visit(child)
+				visit(child, positive)
 			return
 		if kind == "not":
-			visit(node[1])
+			visit(node[1], not positive)
 			return
 		if kind == "text" and id(node) in reader.text_at:
 			index = reader.text_at[id(node)]
@@ -1140,7 +1143,7 @@ def wild_plan(text):
 			name, word, first, last = reader.call_at[id(node)]
 		else:
 			return
-		test = _atom_test(name, word)
+		test = _atom_test(name, word, positive)
 		if test is None or glued_to_text(first, last):
 			return
 		if test not in marks:

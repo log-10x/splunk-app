@@ -25,6 +25,8 @@ from wildcard_measured import EVENTS, MEASURED
 from wildcard_plan_measured import TC_EVENTS, TERM_CASE, WORDS as PLAN_WORDS
 
 APP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tenx-for-splunk')
+# TERM() of a word with a major breaker where it selects events: left to the final search (see TestOnTheIndex)
+MAJOR_TERM = {'TERM(+0000)', 'TERM(Se--Privilege)', 'TERM(SeX%20Privilege)', 'TERM(x=Y;z=W)'}
 # NOT CASE() on the index (see TestOnTheIndex)
 NOT_CASE = {'NOT CASE(root)', 'NOT CASE(Root)', 'NOT CASE(Se*Privilege)', 'NOT CASE(se*privilege)', 'NOT (CASE(root) OR TERM(0000))'}
 
@@ -110,8 +112,12 @@ class TestThePlan:
 		assert plan[1] == 'tenx_w0=1 OR tenx_w0=1 NOT tenx_w0=1' and plan[0].count('match(_raw') == 1
 
 	def test_term(self):
-		# a major breaker: no event holds the term (TERM(+0000): 0 on the index)
+		# a major breaker: on default segmentation no event holds the term (TERM(+0000): 0 on the index), but on
+		# Windows events under the Windows add-on some did; under NOT it is taken as matching nothing (more events
+		# than the final search, never fewer), elsewhere it is left to the final search
 		assert p.wild_plan('NOT TERM(+0000)') == ('tenx_w0=0', 'NOT tenx_w0=1')
+		assert p.wild_plan('TERM(+0000)') is None and p.wild_plan('NOT NOT TERM(+0000)') is None
+		assert p.wild_plan('TERM(+0000) OR NOT TERM(+0000)')[1] == 'TERM(+0000) OR NOT tenx_w0=1'
 		# a minor breaker: a whole major segment only
 		plan = p.wild_plan('TERM(10.2.236.94) OR x')
 		assert plan[1] == 'tenx_w0=1 OR x' and regex_of(plan, 'tenx_w0') == p.term_regex('10.2.236.94', major_only=True)
@@ -189,11 +195,16 @@ class TestOnTheIndex:
 			# not the opposite of CASE(x); the plan gives the opposite: more events, never fewer
 			assert set(rewrite) > set(base)
 			return
+		if word in MAJOR_TERM:
+			# on default segmentation the index holds no such term (0 events), but on Windows events indexed under
+			# the Windows add-on it matched some; the final search after the pipe finds the text: more, never fewer
+			assert set(rewrite) > set(base) and search is None
+			return
 		assert rewrite == base
 
 	@pytest.mark.parametrize("word, base, pipe, search, digest, rewrite, macro", ROWS)
 	def test_the_macros_keep_it_except_under_not(self, word, base, pipe, search, digest, rewrite, macro):
-		if word in NOT_CASE:
+		if word in NOT_CASE or word in MAJOR_TERM:
 			assert set(macro) > set(base)
 		elif 'NOT ' in word and search is not None:
 			# the final search after the pipe still excludes on the prefix (or on TERM() found inside a longer
@@ -204,15 +215,13 @@ class TestOnTheIndex:
 
 	def test_the_tables_cover_term_and_case(self):
 		planned = [r for r in TERM_CASE if r[3] is not None]
-		assert len(TERM_CASE) == 78 and len(planned) >= 50 and len(PLAN_WORDS) == 96
+		assert len(TERM_CASE) == 78 and len(planned) >= 45 and len(PLAN_WORDS) == 96
 		# TERM() of a word with a breaker, alone: the regular expression itself gives the index's events
 		for word, base, pipe, search, digest, rewrite, macro in TERM_CASE:
 			m = re.fullmatch(r'TERM\(([^ ()"]+)\)', word)
 			if m and search == 'tenx_w0=1':
 				x = m.group(1)
-				if p._major_breaker(x):
-					assert base == [] and p.wild_plan(word)[0] == 'tenx_w0=0', word
-					continue
+				assert not p._major_breaker(x), word
 				rx = re.compile(p.term_regex(x, major_only=any(c in p.MINOR_CHARS for c in x)))
 				assert [n for n, e in enumerate(EVENTS + TC_EVENTS) if rx.search(e)] == base, word
 

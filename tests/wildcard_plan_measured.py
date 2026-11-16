@@ -2,7 +2,8 @@
 Measured on Splunk Enterprise 10.4.3 (index fr_wb, sourcetype without props, so segmenters.conf [indexing]): each word
 on the index (`index=fr_wb <word>`), after a pipe (`index=fr_wb | extract | search <word>`, as `tx` applied it before),
 through its plan as the search rewrite writes it (`| extract | eval <eval> | search <search>`) and as the tx macros
-apply it (the same, then `| search <word>`). The plan is wild_plan(word); `digest` is the first 12 hex digits of the
+apply it (the same, then `| search <word>`); for a word with no plan both are the search after the pipe. The plan is
+wild_plan(word); `digest` is the first 12 hex digits of the
 sha1 of its eval, so a changed regular expression shows as a plan that was not measured. Events: EVENTS of
 wildcard_measured.py (0 to 39), then TC_EVENTS (40 on). The index held ten more events written by other checks;
 they are left out here.
@@ -76,7 +77,7 @@ TERM_CASE = [
 	('Se*Privilege NOT TERM(x=Y)', [0, 1, 8, 10, 15, 17, 18, 27, 28, 29, 30, 33, 34, 35, 39, 59, 60, 61, 62, 63, 64, 65], [0, 1, 2, 3, 5, 8, 10, 12, 13, 14, 15, 16, 17, 18, 22, 23, 24, 25, 26, 27, 28, 29, 30, 33, 34, 35, 36, 37, 39, 57, 58, 59, 60, 61, 62, 63, 64, 65], 'tenx_w0=1 NOT tenx_w1=1', 'e61b68757f43', [0, 1, 8, 10, 15, 17, 18, 27, 28, 29, 30, 33, 34, 35, 39, 59, 60, 61, 62, 63, 64, 65], [0, 1, 8, 10, 15, 17, 18, 27, 28, 29, 30, 33, 34, 35, 39, 59, 60, 61, 62, 63, 64, 65]),
 	('TERM(*.log)', [47, 50], [47, 50], 'tenx_w0=1', '995ad0c5ead7', [47, 50], [47, 50]),
 	('TERM(*:445)', [6, 55], [6, 55], 'tenx_w0=1', '887ab4bbbe2e', [6, 55], [6, 55]),
-	('TERM(+0000)', [], [41, 42], 'tenx_w0=1', '5865ee609098', [], []),
+	('TERM(+0000)', [], [41, 42], None, None, [41, 42], [41, 42]),
 	('TERM(-x)', [51], [51], 'tenx_w0=1', 'a5835a167b47', [51], [51]),
 	('TERM(.log)', [50], [47, 50], 'tenx_w0=1', 'fd8202f424a7', [50], [50]),
 	('TERM(0000)', [41, 42], [41, 42], None, None, [41, 42], [41, 42]),
@@ -92,10 +93,10 @@ TERM_CASE = [
 	('TERM(Root)', [44, 45, 46], [44, 45, 46], None, None, [44, 45, 46], [44, 45, 46]),
 	('TERM(Se*)', [0, 1, 2, 3, 5, 8, 10, 12, 13, 14, 15, 16, 17, 18, 22, 23, 24, 25, 26, 27, 28, 29, 30, 33, 34, 35, 36, 37, 39, 57, 58, 59, 60, 61, 62, 63, 64, 65], [0, 1, 2, 3, 5, 8, 10, 12, 13, 14, 15, 16, 17, 18, 22, 23, 24, 25, 26, 27, 28, 29, 30, 33, 34, 35, 36, 37, 39, 57, 58, 59, 60, 61, 62, 63, 64, 65], None, None, [0, 1, 2, 3, 5, 8, 10, 12, 13, 14, 15, 16, 17, 18, 22, 23, 24, 25, 26, 27, 28, 29, 30, 33, 34, 35, 36, 37, 39, 57, 58, 59, 60, 61, 62, 63, 64, 65], [0, 1, 2, 3, 5, 8, 10, 12, 13, 14, 15, 16, 17, 18, 22, 23, 24, 25, 26, 27, 28, 29, 30, 33, 34, 35, 36, 37, 39, 57, 58, 59, 60, 61, 62, 63, 64, 65]),
 	('TERM(Se*Privilege)', [0, 1, 8, 10, 15, 17, 18, 27, 28, 29, 30, 33, 34, 35, 39, 59, 60, 61, 62, 63, 64, 65], [0, 1, 2, 3, 5, 8, 10, 12, 13, 14, 15, 16, 17, 18, 22, 23, 24, 25, 26, 27, 28, 29, 30, 33, 34, 35, 36, 37, 39, 57, 58, 59, 60, 61, 62, 63, 64, 65], 'tenx_w0=1', '7ba290d19994', [0, 1, 8, 10, 15, 17, 18, 27, 28, 29, 30, 33, 34, 35, 39, 59, 60, 61, 62, 63, 64, 65], [0, 1, 8, 10, 15, 17, 18, 27, 28, 29, 30, 33, 34, 35, 39, 59, 60, 61, 62, 63, 64, 65]),
-	('TERM(Se--Privilege)', [], [14, 58], 'tenx_w0=1', '5865ee609098', [], []),
+	('TERM(Se--Privilege)', [], [14, 58], None, None, [14, 58], [14, 58]),
 	('TERM(Se:Privilege)', [27], [27], 'tenx_w0=1', '08740cc37c5c', [27], [27]),
 	('TERM(SeBackupPrivilege)', [0, 1], [0, 1], None, None, [0, 1], [0, 1]),
-	('TERM(SeX%20Privilege)', [], [57], 'tenx_w0=1', '5865ee609098', [], []),
+	('TERM(SeX%20Privilege)', [], [57], None, None, [57], [57]),
 	('TERM(_y)', [52], [52], 'tenx_w0=1', '6fbd68ae5fa9', [52], [52]),
 	('TERM(a.*)', [21, 48, 56], [21, 48, 56], 'tenx_w0=1', '41b77b7ae61d', [21, 48, 56], [21, 48, 56]),
 	('TERM(a.*.d)', [56], [56], 'tenx_w0=1', 'a29263798144', [56], [56]),
@@ -115,7 +116,7 @@ TERM_CASE = [
 	('TERM(root)', [44, 45, 46], [44, 45, 46], None, None, [44, 45, 46], [44, 45, 46]),
 	('TERM(root) OR TERM(INFO)', [4, 19, 21, 44, 45, 46], [4, 19, 21, 44, 45, 46], None, None, [4, 19, 21, 44, 45, 46], [4, 19, 21, 44, 45, 46]),
 	('TERM(x=Y)', [49], [49], 'tenx_w0=1', 'c898dac31c89', [49], [49]),
-	('TERM(x=Y;z=W)', [], [49], 'tenx_w0=1', '5865ee609098', [], []),
+	('TERM(x=Y;z=W)', [], [49], None, None, [49], [49]),
 ]
 
 # the same for the 96 words of wildcard_measured.MEASURED
