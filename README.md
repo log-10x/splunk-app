@@ -40,11 +40,17 @@ Scheduled alerts run server-side, where the browser hook never fires. An alert c
 Start the Receiver with four arguments for any deployment that feeds this app.
 `receiverOptimize true` makes it send events compact. The other three are options of the
 Receiver's configuration; from engine 1.1.89 they can also follow the app on the command line,
-which replaces the values the app's configuration sets:
+which replaces the values the app's configuration sets. With the published image, beside a Fluent
+Bit container:
 
 ```
-tenx run @apps/receiver receiverOptimize true varMaxRecurIndexes 0 timestampZone UTC timestampMaxPerObject 1
+docker run -d --name tenx-receiver --network container:<Fluent Bit container> log10x/edge-10x:1.1.180 \
+  @run/input/forwarder/fluentbit @apps/receiver receiverOptimize true varMaxRecurIndexes 0 \
+  timestampZone UTC timestampMaxPerObject 1
 ```
+
+The first argument names the input module for the forwarder in use, here Fluent Bit; the
+[forwarder inputs](https://doc.log10x.com/run/input/forwarder/) page lists the others.
 
 The three options live in two files of the Receiver's config folder (`$TENX_CONFIG`, mounted at
 `/etc/tenx/config` in the container image):
