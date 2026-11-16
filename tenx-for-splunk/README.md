@@ -397,16 +397,19 @@ their SPL. To cover another app's dashboards, copy the file into that app's
 
 - Time modifiers (`earliest=`, `latest=`) go before `tx`. After it they would match no
   event, so the search stops with a message saying so.
-- A comma outside quotes after `tx` is matched literally by Splunk, so the search stops with
-  a message. Remove the comma, or put the text in quotes.
+- A search word after `tx` with a comma outside quotes, such as `4625,` in `4625, 4624`, is
+  matched literally by Splunk, so the search stops with a message. Remove the comma, or put the
+  text in quotes. The commas of an `IN (...)` list do not stop it.
 - The index, the compact sourcetype, host and the forwarder's indexed fields narrow what is read when
   they come before `tx`. After it they filter the expanded events, which gives the same
   result more slowly.
 - The sourcetype before or after `tx` is the compact sourcetype (`sourcetype=tenx_encoded`); each
   event's original sourcetype is in the field `tenx_sourcetype`. To search by the original
-  sourcetype, write `tenx_sourcetype=<sourcetype>` before `tx`, or `sourcetype=<sourcetype>` after
-  `txf`, which gives each event its original sourcetype. A search that names the original
-  sourcetype in place of the compact one stops with a message saying so.
+  sourcetype, write `sourcetype=<sourcetype>` after `txf`, which gives each event its original
+  sourcetype and its add-on's fields. `tenx_sourcetype=<sourcetype>` before `tx` selects the same
+  events with only the fields Splunk extracts from the event's text, so a field an add-on defines
+  matches nothing there. A search that names the original sourcetype in place of the compact one
+  stops with a message saying so.
 - `tx` inside another subsearch (`append`, `join`) or wrapped in another macro cannot read
   its own words. It then expands every compact event in range and applies the words after,
   with a warning: the same result, more slowly.
@@ -605,7 +608,8 @@ Checked with Splunk Add-on for Microsoft Windows 12.0.0, Splunk Add-on for AWS 8
 With the Windows add-on's index-time XML profile (`XML_INDEXED_EXTRACTIONS_PIPELINE = typing`), raw
 events also carry fields Splunk indexes from the XML. `txf` gives the add-on's search-time fields,
 so three fields that depend on that indexing (`xmlns`, `vendor_privilege`, `privilege_id`) are not
-on expanded events.
+on expanded events. `linecount` and `punct` are computed by Splunk from the compact text it indexes,
+so on expanded events they differ from the raw event's.
 
 For FortiGate, the sender sets `tenx_sourcetype` to `fortigate_traffic`, `fortigate_utm`,
 `fortigate_event` or `fortigate_anomaly` by the line's `type=`.
@@ -673,6 +677,14 @@ has its own cap file and its own scheduled `check`.
 
    With the published image, the edit to the shipped `compact/config.yaml` is one: the two lines
    `fieldNames:` and `- $=yield TenXEnv.get("symbolMessageField")` become `fieldNames: [templateHash]`.
+   These lines copy the shipped file out of the image:
+
+   ```sh
+   docker create --name tenx-config log10x/edge-10x:1.1.180
+   docker cp tenx-config:/etc/tenx/config/pipelines/run/receive/compact/config.yaml compact-config.yaml
+   docker rm tenx-config
+   ```
+
    Fluent Bit and the Receiver then run as two containers that share Fluent Bit's network:
 
    ```sh
