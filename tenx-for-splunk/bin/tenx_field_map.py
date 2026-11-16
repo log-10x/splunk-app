@@ -3543,6 +3543,8 @@ def check(app_dir, cap_file, splunkd, app_name=None, probe_index=None, sample=1,
 	import random
 	listed, kept = read_cap(cap_file)
 	layout = lookup_app(app_dir)
+	if layout and check_dropped(cap_file, splunkd, layout[0], clock, out):
+		return 1
 	if not listed:
 		# Nothing to probe; a Receiver that compacts every template (receiverOptimize true) still sends
 		# compact events that have no row, so those are counted.
@@ -3596,6 +3598,68 @@ def check(app_dir, cap_file, splunkd, app_name=None, probe_index=None, sample=1,
 	return 1
 
 
+# A compact event Splunk drops because the map's index-time lookup() failed (a lookup file Splunk finds but cannot load:
+# unreadable, not gzip, no hash column) leaves one splunkd.log line per event on the node that parsed it, the event's
+# sourcetype at the end of its confkey (Splunk Enterprise 10.4.3):
+#   ERROR pipeline [... typing] - Runtime exception in  pipeline=typing processor=regexreplacement error='Invalid function
+#   argument' confkey='source::<source>|host::<host>|tenx_win|'
+DROP_SEARCH = ('search index=_internal sourcetype=splunkd "Runtime exception" "processor=regexreplacement" "%s" '
+	'_index_earliest=%d _index_latest=%d | rex "confkey=\'[^\']*\\|(?<tenx_fm_st>[^|\']+)\\|\'" '
+	'| where tenx_fm_st="%s" | stats count, min(_time) as first, max(_time) as last by host')
+
+
+def dropped_since(splunkd, sourcetype, since, until):
+	"""
+	[(node, count, first, last)] of the compact events of `sourcetype` Splunk dropped from `since` to `until` (epoch
+	seconds, index time of its own log lines) because an index-time rule failed on them, read from _internal; None when
+	the caller cannot read _internal (its role does not search it), so a count of 0 would mean nothing.
+	"""
+	if not splunkd.search('| tstats count where index=_internal earliest=-1h | where count>0'):
+		return None
+	rows = splunkd.search(DROP_SEARCH % (sourcetype, int(since), int(until), sourcetype))
+	got = []
+	for r in rows:
+		n = int(float(r.get('count') or 0))
+		if n:
+			got.append((r.get('host') or '?', n, float(r.get('first') or 0), float(r.get('last') or 0)))
+	return sorted(got)
+
+
+def check_window(cap_file, clock):
+	"""(since, until): from the previous check (from the cap file's own time the first time) to now."""
+	try:
+		with open(cap_file + CAP_CHECKED_SUFFIX, encoding='utf-8') as f:
+			since = float(f.read().strip())
+	except (IOError, OSError, ValueError):
+		since = os.path.getmtime(cap_file) if os.path.exists(cap_file) else 0
+	return since, clock()
+
+
+def check_dropped(cap_file, splunkd, sourcetype, clock, out):
+	"""
+	Counts the compact events of `sourcetype` Splunk dropped since the previous check (see DROP_SEARCH). When there
+	are any, the list is emptied (the Receiver then sends the map's events whole, and lookup() is not called on a whole
+	event), the window moves on, and it returns True. A caller that cannot read _internal is told so, and False.
+	"""
+	since, until = check_window(cap_file, clock)
+	got = dropped_since(splunkd, sourcetype, since, until)
+	if got is None:
+		out.write('check: cannot read _internal, so events Splunk dropped are not counted; give the role index _internal\n')
+		return False
+	if not got:
+		return False
+	write_if_changed(cap_file + CAP_CHECKED_SUFFIX, '%d\n' % int(until))
+	t = lambda e: time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(e))
+	what = '%d compact events of %s were dropped by Splunk since %s, its index-time lookup failing on the map\'s lookup ' \
+		'file (%s)' % (sum(n for _, n, _, _ in got), sourcetype, t(since),
+		'; '.join('%s %d, first %s, last %s' % (h, n, t(a), t(b)) for h, n, a, b in got))
+	if read_cap(cap_file)[0]:
+		withdraw(cap_file, what, out)
+	else:
+		out.write('check: %s; the cap file lists no template\n' % what)
+	return True
+
+
 def unmapped_since(splunkd, sourcetype, since, until):
 	"""
 	{reason: count} of the compact events of `sourcetype` indexed without their fields (tenx_unmapped) from
@@ -3626,12 +3690,7 @@ def check_unmapped(cap_file, splunkd, sourcetype, clock, out):
 	  list is emptied, as when a probe comes back without its fields.
 	"""
 	state = cap_file + CAP_CHECKED_SUFFIX
-	try:
-		with open(state, encoding='utf-8') as f:
-			since = float(f.read().strip())
-	except (IOError, OSError, ValueError):
-		since = os.path.getmtime(cap_file) if os.path.exists(cap_file) else 0
-	until = clock()
+	since, until = check_window(cap_file, clock)
 	got = unmapped_since(splunkd, sourcetype, since, until)
 	write_if_changed(state, '%d\n' % int(until))
 	if not got:

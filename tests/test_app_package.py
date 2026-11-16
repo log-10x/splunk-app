@@ -252,6 +252,17 @@ class TestScheduledRecompile:
 		assert conf('commands.conf').get('tenxreplay', 'filename') == 'tenxreplay.py'
 		assert os.path.exists(os.path.join(APP, 'bin', 'tenxreplay.py'))
 
+	def test_events_a_field_map_lookup_drops_are_reported_on_a_schedule(self):
+		saved = conf('savedsearches.conf')
+		ss = dict(saved.items('Field Map Dropped Events'))
+		assert ss['enableSched'] == '1' and ss['cron_schedule'] == '*/5 * * * *' and ss['alert.track'] == '1'
+		assert (ss['dispatch.earliest_time'], ss['dispatch.latest_time']) == ('-5m@m', '@m')
+		# the splunkd.log line of a dropped event, held to the compact sourcetypes of field maps, by node
+		assert ss['search'].startswith('index=_internal sourcetype=splunkd "Runtime exception" "processor=regexreplacement"')
+		assert '_fields_eval' in ss['search'] and 'BY host, compact_sourcetype' in ss['search']
+		import tenx_field_map as fm
+		assert '"processor=regexreplacement"' in fm.DROP_SEARCH and 'by host' in fm.DROP_SEARCH
+
 	def test_the_conf_the_replay_writes_is_declared(self):
 		spec = open(os.path.join(APP, 'README', 'tenx_replay.conf.spec')).read()
 		for key in ('computed_fields', 'aliased_fields'):

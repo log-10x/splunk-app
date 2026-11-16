@@ -1102,6 +1102,8 @@ class FakeSplunkd(object):
 		self.drop, self.floor = False, True
 		# hec_unmapped: events sent through HEC are parsed where the app is not installed (no fields)
 		self.hec_unmapped = False
+		# splunkd.log lines of events Splunk dropped: (node, sourcetype, index time); internal: whether _internal is readable
+		self.dropped, self.internal = [], True
 		self.now, self.schedule, self.limits = time.time, [], None
 		self.loaded = on_disk if loaded else None
 		if loaded:
@@ -1142,6 +1144,21 @@ class FakeSplunkd(object):
 						h = line[1:].split(',', 1)[0].strip()
 						outer.events.append(dict(q, raw=line, hash=h, mapped=h in outer.rows, t=outer.now()))
 					self._send({})
+				elif path == '/services/search/jobs' and 'index=_internal' in dict(up.parse_qsl(data))['search']:
+					m = dict(up.parse_qsl(data))
+					if m['search'].startswith('| tstats'):
+						self._send({'results': [{'count': '42'}] if outer.internal else []})
+					else:
+						st = re.search(r'where tenx_fm_st="([^"]*)"', m['search']).group(1)
+						lo = int(re.search(r'_index_earliest=(-?\d+)', m['search']).group(1))
+						hi = int(re.search(r'_index_latest=(-?\d+)', m['search']).group(1))
+						by = {}
+						for node, dst, t in outer.dropped:
+							if dst == st and lo <= t < hi:
+								c, a, b = by.get(node, (0, t, t))
+								by[node] = (c + 1, min(a, t), max(b, t))
+						self._send({'results': [{'host': n, 'count': str(c), 'first': str(a), 'last': str(b)}
+							for n, (c, a, b) in sorted(by.items())]})
 				elif path == '/services/search/jobs' and dict(up.parse_qsl(data))['search'].startswith('| tstats'):
 					# check's count of the map's compact events indexed without their fields (not probes)
 					m = dict(up.parse_qsl(data))
@@ -1586,7 +1603,7 @@ class TestCapFile:
 			rc, out = self.check(tmp_path, cap, fake)
 		finally:
 			fake.close()
-		assert rc == 1 and fake.posts() == [] and 'is missing' in out and read(str(cap)) == 'pattern_hash,value\n'
+		assert rc == 1 and not [c for c in fake.posts() if c[1] != '/services/search/jobs'] and 'is missing' in out and read(str(cap)) == 'pattern_hash,value\n'
 
 	def test_check_withdraws_at_once_when_the_lookup_file_is_not_gzip(self, tmp_path):
 		cap = self.listed(tmp_path, ['k1'])
@@ -1596,7 +1613,7 @@ class TestCapFile:
 			rc, out = self.check(tmp_path, cap, fake)
 		finally:
 			fake.close()
-		assert rc == 1 and fake.posts() == [] and 'cannot be read as gzip CSV' in out
+		assert rc == 1 and not [c for c in fake.posts() if c[1] != '/services/search/jobs'] and 'cannot be read as gzip CSV' in out
 		assert read(str(cap)) == 'pattern_hash,value\n' and fm.read_cap(str(cap) + '.pending')[0] == {'k1'}
 
 	def test_the_list_activate_restores_is_a_newer_file_than_the_one_check_emptied(self, tmp_path):
@@ -1806,7 +1823,7 @@ class TestCapFile:
 				rc, out = self.check(case, cap, fake, sample=sample)
 			finally:
 				fake.close()
-			assert rc == 1 and fake.posts() == [] and read(str(cap)) == 'pattern_hash,value\n', out
+			assert rc == 1 and not [c for c in fake.posts() if c[1] != '/services/search/jobs'] and read(str(cap)) == 'pattern_hash,value\n', out
 			assert '%d listed templates have no row' % (2 - len(rows)) in out
 			assert read(str(cap) + '.pending') == 'pattern_hash,value\n"k1",true\n"k2",true\n'
 
@@ -2007,3 +2024,60 @@ class TestEveryParsingNode:
 		assert seen['nodes'] == ['https://idx1:8088', 'https://idx2:8088']
 		assert fm.Splunkd('https://sh:8089', hec_url='https://lb:8088').nodes == [None]
 		assert fm.Splunkd('https://sh:8089', hec_url=['https://lb:8088']).nodes == [None]
+
+
+
+class TestCheckCountsDroppedEvents:
+	"""check reads Splunk's own log for compact events dropped by the map's failing index-time lookup()."""
+
+	def setup(self, tmp_path, hashes=('k1', 'k2')):
+		t = TestCapFile()
+		cap = t.listed(tmp_path, list(hashes)) if hashes else tmp_path / 'compact-cap.csv'
+		if not hashes:
+			assert t.gen(tmp_path, ['k1'], cap) == 0
+		(tmp_path / ('compact-cap.csv' + fm.CAP_CHECKED_SUFFIX)).write_text('-100\n', encoding='utf-8')
+		return t, cap, FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+
+	def test_check_empties_the_list_and_names_the_count_the_nodes_and_the_times(self, tmp_path):
+		t, cap, fake = self.setup(tmp_path)
+		fake.dropped = [('idx1', 'tenx_fw', -50), ('idx1', 'tenx_fw', -40), ('idx2', 'tenx_fw', -45), ('idx1', 'other', -45)]
+		try:
+			rc, out = t.check(tmp_path, cap, fake, sample=2)
+		finally:
+			fake.close()
+		assert rc == 1 and fm.read_cap(str(cap))[0] == set() and fm.read_cap(str(cap) + '.pending')[0] == {'k1', 'k2'}
+		assert '3 compact events of tenx_fw were dropped by Splunk since 1969-12-31T23:58:20Z' in out
+		assert 'idx1 2, first 1969-12-31T23:59:10Z, last 1969-12-31T23:59:20Z; idx2 1' in out
+		# no probe was sent: the drops decide
+		assert fake.events == [] and '/services/receivers/simple' not in set(c[1] for c in fake.posts())
+		assert read(str(cap) + fm.CAP_CHECKED_SUFFIX).strip() == '0'
+
+	def test_the_next_check_counts_only_what_was_dropped_since(self, tmp_path):
+		t, cap, fake = self.setup(tmp_path)
+		fake.dropped = [('idx1', 'tenx_fw', -50)]
+		try:
+			first, _ = t.check(tmp_path, cap, fake, sample=2)
+			cap.write_text(fm.cap_text({'k1', 'k2'}), encoding='utf-8')
+			second, out = t.check(tmp_path, cap, fake, sample=2)
+		finally:
+			fake.close()
+		assert first == 1 and second == 0 and 'dropped' not in out
+
+	def test_with_nothing_listed_check_still_fails_on_dropped_events(self, tmp_path):
+		t, cap, fake = self.setup(tmp_path, hashes=())
+		fake.dropped = [('hf1', 'tenx_fw', -10)]
+		try:
+			rc, out = t.check(tmp_path, cap, fake)
+		finally:
+			fake.close()
+		assert rc == 1 and '1 compact events of tenx_fw were dropped by Splunk' in out and 'the cap file lists no template' in out
+
+	def test_a_role_that_cannot_read_internal_is_told(self, tmp_path):
+		t, cap, fake = self.setup(tmp_path)
+		fake.internal = False
+		fake.dropped = [('idx1', 'tenx_fw', -50)]
+		try:
+			rc, out = t.check(tmp_path, cap, fake, sample=2)
+		finally:
+			fake.close()
+		assert 'cannot read _internal' in out and rc == 0 and fm.read_cap(str(cap))[0] == {'k1', 'k2'}
