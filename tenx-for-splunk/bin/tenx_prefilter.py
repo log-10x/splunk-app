@@ -16,8 +16,7 @@ cannot parse the words, it returns `(*)`, so every compact event in range is exp
 words are applied to the expanded text: slower, never fewer results. It stops with an error
 instead where the search would silently miss events: a time modifier after `tx`, an unquoted
 comma after `tx`, and a sourcetype= term naming an original sourcetype, which the compact events
-carry in tenx_sourcetype (they are indexed as the compact sourcetype). Called by
-`txf(<sourcetype>)` for a sourcetype with no replay unit (missing_unit), it stops saying so.
+carry in tenx_sourcetype (they are indexed as the compact sourcetype).
 """
 import json
 import os
@@ -34,7 +33,7 @@ apphome = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.join(apphome, 'bin'))
 sys.path.append(os.path.join(apphome, 'lib'))
 
-from splunklib.searchcommands import dispatch, Configuration, GeneratingCommand, Option
+from splunklib.searchcommands import dispatch, Configuration, GeneratingCommand
 
 import tenx_prefilter_parser as parser
 
@@ -50,10 +49,6 @@ SUBSEARCH_SID = re.compile(r"^subsearch_(.+)_\d+\.\d+$")
 
 @Configuration()
 class TenxPrefilterCommand(GeneratingCommand):
-
-	# txf(<sourcetype>) on a sourcetype with no replay unit (tenx_replay_builder.TXF_ONE_MISSING):
-	# stop with a message saying so, instead of Splunk's "macro cannot be found".
-	missing_unit = Option(require=False, default=None)
 
 	def _rest(self, path, data=None):
 		info = self._metadata.searchinfo
@@ -120,9 +115,6 @@ class TenxPrefilterCommand(GeneratingCommand):
 		return parser.text_field_predicate(names)
 
 	def generate(self):
-		if self.missing_unit:
-			self.error_exit(RuntimeError("no replay unit"), parser.missing_unit_message(self.missing_unit))
-			return
 		try:
 			text = self._search_text()
 		except Exception as e:

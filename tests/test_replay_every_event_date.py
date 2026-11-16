@@ -5,7 +5,9 @@ and unit when they are indexed (Splunk Enterprise 10.4.3, before this change: 60
 indexed, neither rebuild wrote fr:old or fr:future, `txf(fr:old)` failed with "macro
 'tenx-replay-uc0366a933767' cannot be found" and `txf` replayed fr_mark on 0 of 60). A sourcetype
 expires only when no compact event of any date carries it, and `txf(<sourcetype>)` on one without
-a unit stops with a message saying how to write it.
+a unit stops while Splunk parses the search (the validation of txf(1)), with a message saying how
+to write it: a check there reaches every client, the REST export endpoint in json and csv included,
+where a command failing at run time gives an empty body (Splunk Enterprise 10.4.3).
 """
 import hashlib
 import json
@@ -15,44 +17,42 @@ import subprocess
 import sys
 import tempfile
 
-import tenx_prefilter_parser as pp
 import tenx_replay_builder as b
 from test_replay_units import CHILD as UNITS_CHILD, macros
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
 
-def listed_units(definition):
-	"""The unit hashes a txf(1) definition reaches, as Splunk's like() reads them."""
-	m = re.match(r'^if\(like\("\|([0-9a-f|]*)\|", "%\|" \. substr\(md5\("\$st\$"\), 1, 12\) \. "\|%"\), (.*), (.*)\)$',
-				 definition, re.S)
-	assert m, definition
-	assert m.group(2) == b.TXF_ONE_UNIT and m.group(3) == b.TXF_ONE_MISSING
-	return m.group(1).split('|')
+def listed_units(validation):
+	"""The unit hashes a txf(1) validation lets through, as Splunk's like() reads them."""
+	m = re.match(r'^match\(st, "\^\[A-Za-z0-9_\.:/-\]\+\$"\) AND like\("\|([0-9a-f|]*)\|", "%\|" \. substr\(md5\(st\), 1, 12\) \. "\|%"\)$',
+				 validation)
+	assert m, validation
+	return [h for h in m.group(1).split('|') if h]
 
 
-def reaches_unit(definition, sourcetype):
-	if definition == b.TXF_ONE_MISSING:
-		return False
-	return hashlib.md5(sourcetype.encode()).hexdigest()[:12] in listed_units(definition)
+def reaches_unit(validation, sourcetype):
+	return hashlib.md5(sourcetype.encode()).hexdigest()[:12] in listed_units(validation)
 
 
 class TestTxfOfOneSourcetype:
-	def test_it_reaches_the_units_written(self):
+	def test_its_validation_lets_through_the_units_written(self):
 		names = [b.unit_macro('fr:old'), b.unit_macro('app:kv')]
-		definition = b.txf_one_definition(names + ['tenx-replay', 'tenx-replay-st-x'])
-		assert reaches_unit(definition, 'fr:old') and reaches_unit(definition, 'app:kv')
-		assert not reaches_unit(definition, 'fr:future') and not reaches_unit(definition, 'fr:ol')
-		assert b.txf_one_definition(list(reversed(names))) == definition
+		validation = b.txf_one_validation(names + ['tenx-replay', 'tenx-replay-st-x'])
+		assert reaches_unit(validation, 'fr:old') and reaches_unit(validation, 'app:kv')
+		assert not reaches_unit(validation, 'fr:future') and not reaches_unit(validation, 'fr:ol')
+		assert b.txf_one_validation(list(reversed(names))) == validation
 
-	def test_none_written_it_stops_with_the_message(self):
-		assert b.txf_one_definition([]) == b.TXF_ONE_MISSING
-		assert macros().get('txf(1)', 'definition') == b.TXF_ONE_MISSING
-		assert b.TXF_ONE_MISSING == '"`tenx-events` [| tenxprefilter missing_unit=\\"$st$\\"] | search *"'
-		assert pp.missing_unit_message('fr:old') == (
-			"txf(fr:old): no field replay is written for sourcetype fr:old, so this search was not run. Rebuild Field "
-			"Replay writes one, within the hour, for each original sourcetype that compact events carry in the field "
-			"tenx_sourcetype; to write it now, run | tenxreplay over All time.")
+	def test_none_written_none_passes(self):
+		assert listed_units(b.txf_one_validation([])) == []
+		conf = macros()
+		assert conf.get('txf(1)', 'validation') == b.txf_one_validation([])
+		assert conf.get('txf(1)', 'errormsg') == b.TXF_ONE_ERROR == (
+			"txf takes one original sourcetype, without quotes (letters, digits and _ . : / -), that has a field "
+			"replay. Rebuild Field Replay writes one, within the hour, for each original sourcetype that compact "
+			"events carry in the field tenx_sourcetype; to write it now, run | tenxreplay over All time")
+		# the definition is the unit's, as before
+		assert conf.get('txf(1)', 'definition') == b.TXF_ONE_UNIT
 
 
 class TestIndexTime:
@@ -120,7 +120,7 @@ rows = go(fake, True)
 out['index_time'] = sorted(fake.conf)
 out['jobs'] = fake.jobs
 out['units'] = sorted(n for n in fake.macros if n.startswith(b.UNIT_PREFIX))
-out['txf_one'] = fake.macros.get('txf(1)')
+out['txf_one'] = fake.validations.get('txf(1)')
 # fr:old: not indexed lately, last seen more than replay_expire_days ago, events still there
 fake.rows = [ROWS[0], ROWS[1][:6] + (False,), ROWS[2]]
 fake.conf['fr:old']['last_seen'] = '1'
@@ -137,11 +137,11 @@ out['gone_writes'] = fake.writes
 out['gone_unit'] = fake.macros[b.unit_macro('fr:old')]
 out['no_op'] = b.no_op_unit().spl()
 # the five-minute check, after an upgrade: nothing new, txf(1) not written yet
-del fake.macros['txf(1)']
+fake.validations.pop('txf(1)', None)
 go(fake, True, only_new=True, earliest='-10m')
 out['check_writes'] = fake.writes
 out['check_jobs'] = fake.jobs
-out['check_txf_one'] = fake.macros.get('txf(1)')
+out['check_txf_one'] = fake.validations.get('txf(1)')
 # a new sourcetype in the check: the rebuild reads the lookback by index time
 fake.rows = fake.rows + [('fr:new', '/var/app/n.log', 'web-4', 1, 'fr_j', False, True)]
 go(fake, True, only_new=True, earliest='-10m')
@@ -174,8 +174,8 @@ def test_the_rebuilds_find_every_event_date_and_keep_what_still_has_events():
 	assert int(out['kept_last_seen']) > 1 and out['kept_unit'] != out['no_op']
 	# with no event left it expires: its stanza goes, its unit becomes the no-op unit
 	assert ['conf-', 'fr:old'] in out['gone_writes'] and out['gone_unit'] == out['no_op']
-	# the five-minute check writes txf(1) when it is missing, and reads by index time
-	assert out['check_writes'] == [['macro~', 'txf(1)']] and out['check_txf_one']
+	# the five-minute check writes the txf(1) validation when it is missing, and reads by index time
+	assert out['check_writes'] == [['macro~', 'txf(1)']] and reaches_unit(out['check_txf_one'], 'fr:old')
 	assert all('_index_earliest=-10m' in j[0] for j in out['check_jobs'] if 'tstats' in j[0])
 	# a new sourcetype: the rebuild reads the lookback (-7d) by index time
 	assert 'fr:new' in out['new_conf']
@@ -183,27 +183,23 @@ def test_the_rebuilds_find_every_event_date_and_keep_what_still_has_events():
 	assert all(j[1:] == ['0', 'none'] for j in out['new_jobs'])
 
 
-PREFILTER = UNITS_CHILD[:UNITS_CHILD.index('import tenxreplay')] + r'''
-import tenx_prefilter
-cmd = tenx_prefilter.TenxPrefilterCommand()
-cmd._missing_unit = 'fr:old'
-said = []
-def rest(path, data=None):
-	raise AssertionError('read %s' % path)
-def stop(e, message):
-	said.append(message)
-	raise SystemExit(0)
-cmd._rest, cmd.error_exit = rest, stop
-try:
-	list(cmd.generate())
-except SystemExit:
-	pass
-print(json.dumps(said))
+
+STALE = UNITS_CHILD[:UNITS_CHILD.index('# (sourcetype, source, host, count, index, in the 7-day lookback)')] + r'''
+fake = FakeSplunk([('app:kv', '/var/app/a.log', 'web-1', 5, 'app', True)])
+# an earlier build wrote a definition of its own into local/macros.conf
+fake.macros['txf(1)'] = 'if(like("|x|", "%|" . substr(md5("$st$"), 1, 12) . "|%"), "a", "b")'
+run(fake)
+first = [w for w in fake.writes if w[1] == 'txf(1)']
+run(fake)
+print(json.dumps({'first': first, 'again': [w for w in fake.writes if w[1] == 'txf(1)'],
+				  'definition': fake.macros['txf(1)'], 'validation': fake.validations.get('txf(1)')}))
 '''
 
 
-def test_the_prefilter_stops_with_the_message_before_reading_anything():
+def test_a_definition_an_earlier_build_wrote_is_set_back():
 	with tempfile.TemporaryDirectory() as home:
-		proc = subprocess.run([sys.executable, '-c', PREFILTER, ROOT, home], capture_output=True, text=True, timeout=60)
+		proc = subprocess.run([sys.executable, '-c', STALE, ROOT, home], capture_output=True, text=True, timeout=120)
 	assert proc.returncode == 0, proc.stderr[-3000:]
-	assert json.loads(proc.stdout.strip().splitlines()[-1]) == [pp.missing_unit_message('fr:old')]
+	out = json.loads(proc.stdout.strip().splitlines()[-1])
+	assert out['first'] == [['macro~', 'txf(1)']] and out['again'] == []
+	assert out['definition'] == b.TXF_ONE_UNIT and reaches_unit(out['validation'], 'app:kv')

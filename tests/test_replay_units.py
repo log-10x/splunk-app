@@ -146,16 +146,16 @@ class TestTxIsTheShippedMacro:
 		# Splunk Enterprise 10.4.3 refuses a colon in a macro name, so txf(1) computes the unit's
 		# name with md5() in eval; on 10.4.3, md5 in eval equals hashlib's for the five names tried
 		assert conf.get('txf(1)', 'iseval') == '1'
-		# what tenxreplay writes for a sourcetype with a unit; shipped, txf(1) names none
-		assert b.TXF_ONE_UNIT == ('"' + head + '`tenx-replay-u" . substr(md5("$st$"), 1, 12) . '
-								  '"` | `tenx-replay-tags`' + tail + '"')
-		assert conf.get('txf(1)', 'definition') == b.TXF_ONE_MISSING
+		assert conf.get('txf(1)', 'definition') == b.TXF_ONE_UNIT == (
+			'"' + head + '`tenx-replay-u" . substr(md5("$st$"), 1, 12) . "` | `tenx-replay-tags`' + tail + '"')
 		assert without_guard(conf.get('txf', 'definition')) == (
 			'`tenx-events` [| tenxprefilter] | eval tenx_compact_raw=_raw | `tenx-inflate` | fields - _kv | '
 			'`tenx-replay` | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars' + REFUSED_STEP + ' | search *')
 		assert conf.get('txf(1)', 'args') == 'st'
-		assert conf.get('txf(1)', 'validation') == 'match(st, "^[A-Za-z0-9_.:/-]+$")'
-		assert conf.get('txf(1)', 'errormsg')
+		# shipped, the validation names no unit; tenxreplay writes the units it has written into it
+		assert conf.get('txf(1)', 'validation') == b.txf_one_validation([]) == (
+			'match(st, "^[A-Za-z0-9_.:/-]+$") AND like("||", "%|" . substr(md5(st), 1, 12) . "|%")')
+		assert conf.get('txf(1)', 'errormsg') == b.TXF_ONE_ERROR
 		assert len(b.unit_macro('x')) == len(b.UNIT_PREFIX) + 12
 
 	def test_the_tags_macro_is_the_builders_text(self):
@@ -669,6 +669,7 @@ class FakeSplunk(object):
 	def __init__(self, rows):
 		self.rows = rows
 		self.macros = {'tenx-replay': 'shipped'}
+		self.validations = {}
 		self.acl = {}
 		self.conf = {}
 		self.searches = []
@@ -751,10 +752,16 @@ class FakeSplunk(object):
 				self.writes.append(('macro-', name))
 				return {}
 			if data is not None:
-				self.macros[name] = data['definition']
+				if 'validation' in data:
+					self.validations[name] = data['validation']
+				if 'definition' in data:
+					self.macros[name] = data['definition']
 				self.writes.append(('macro~', name))
 				return {}
-			return {'entry': [{'name': name, 'content': {'definition': self.macros.get(name)}}]}
+			# txf(1) is shipped (default/macros.conf): its definition is the unit's
+			default = tenxreplay.builder.TXF_ONE_UNIT if name == 'txf(1)' else None
+			return {'entry': [{'name': name, 'content': {'definition': self.macros.get(name, default),
+														 'validation': self.validations.get(name)}}]}
 		raise AssertionError('unexpected REST call %s %s' % (path, data))
 
 	def acl_of(self, name):
@@ -792,7 +799,7 @@ out['acl'] = sorted((k, v['sharing']) for k, v in fake.acl.items())
 out['conf'] = fake.conf
 out['kv_unit'] = fake.macros[tenxreplay.builder.unit_macro('app:kv')]
 out['alias'] = fake.macros.get('tenx-replay-st-app:kv')
-out['txf_one'] = fake.macros.get('txf(1)')
+out['txf_one'] = fake.validations.get('txf(1)')
 run(fake)
 out['writes_second'] = fake.writes
 # app:json stops: its stanza expires
@@ -821,8 +828,8 @@ def test_the_command_writes_units_aliases_and_what_they_cover():
 	writes = [w for w in out['writes_first'] if w[0].startswith('macro')]
 	assert writes == ([['macro-', 'tenx-replay-st-app:kv']] + [['macro+', n] for n in sorted([js, kv])]
 					  + [['macro~', 'txf(1)'], ['macro~', 'tenx-replay']])
-	# txf(<sourcetype>) reaches the two units it wrote
-	assert out['txf_one'] == b.txf_one_definition([js, kv])
+	# txf(<sourcetype>) passes validation for the two units it wrote
+	assert out['txf_one'] == b.txf_one_validation([js, kv])
 	assert out['acl'] == [[n, 'global'] for n in sorted([js, kv])]
 	assert out['alias'] is None
 	assert out['conf']['app:kv']['hosts'] == 'web-0,web-1' and out['conf']['app:kv']['indexes'] == 'app,app_old'

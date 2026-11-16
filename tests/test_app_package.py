@@ -62,20 +62,20 @@ class TestDashboardsFindCompactEvents:
 		assert 'spath' not in tx
 
 	def test_txf_reruns_splunks_field_extraction_through_the_replay(self):
-		import tenx_replay_builder
 		macros = conf('macros.conf')
-		# txf(1) as tenxreplay writes it for a sourcetype with a unit (the shipped one names none)
-		for name, txf in (('txf', macros.get('txf', 'definition')), ('txf(1)', tenx_replay_builder.TXF_ONE_UNIT)):
+		for name in ('txf', 'txf(1)'):
+			txf = macros.get(name, 'definition')
 			assert '| `tenx-inflate` | fields - _kv | `tenx-mapped-hide` | `tenx-replay' in txf, name
 			assert 'spath' not in txf, name
 		# The shipped replay is exactly the extraction `tx` runs; tenxreplay writes the rest.
 		assert macros.get('tenx-replay', 'definition').count('| extract |') == 1
+		import tenx_replay_builder
 		assert ' | '.join(tenx_replay_builder.UNCHANGED) == macros.get('tenx-replay', 'definition')
 
 	def test_txf_keeps_the_compact_text_until_the_replay_has_read_it(self):
-		import tenx_replay_builder
 		macros = conf('macros.conf')
-		for txf in (macros.get('txf', 'definition'), tenx_replay_builder.TXF_ONE_UNIT):
+		for name in ('txf', 'txf(1)'):
+			txf = macros.get(name, 'definition')
 			assert txf.index('eval tenx_compact_raw=_raw') < txf.index('`tenx-inflate`') < txf.index('`tenx-replay')
 			assert 'fields - tenx_compact_raw' in txf
 

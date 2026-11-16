@@ -971,10 +971,3 @@ def dictionary_from_rows(rows):
 		terms = [terms] if isinstance(terms, str) else list(terms)
 		dictionary[row["piece"]] = (int(row.get("n") or 0), terms)
 	return dictionary
-
-
-def missing_unit_message(sourcetype):
-	"""txf(<sourcetype>) when no replay unit is written for that sourcetype."""
-	return ("txf(%s): no field replay is written for sourcetype %s, so this search was not run. Rebuild Field Replay "
-			"writes one, within the hour, for each original sourcetype that compact events carry in the field "
-			"tenx_sourcetype; to write it now, run | tenxreplay over All time." % (sourcetype, sourcetype))

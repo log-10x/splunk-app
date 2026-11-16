@@ -1427,25 +1427,30 @@ ALIAS_NAME = re.compile(r'^[A-Za-z0-9_-]+$')
 MAX_LISTED = MAX_LISTED_SOURCES
 
 
-# `txf(<sourcetype>)` (macros.conf [txf(1)], an eval definition): the unit of that sourcetype when
-# one is written, else a search that stops with a message saying none is, instead of Splunk's
-# "macro cannot be found". tenxreplay rewrites the definition with the units it has written
-# (txf_one_definition()); the shipped one names none.
+# `txf(<sourcetype>)` (macros.conf [txf(1)]) computes the name of that sourcetype's unit in eval. Its
+# validation, checked while Splunk parses the search, also requires that a unit is written for the
+# sourcetype, so txf(<sourcetype>) without one stops with TXF_ONE_ERROR instead of Splunk's "macro
+# cannot be found". A check there reaches every client, the REST export endpoint included (Splunk
+# Enterprise 10.4.3: HTTP 400 with the message in json, csv and xml), where a command that fails
+# while the search runs gives export in json or csv an empty body. tenxreplay rewrites the
+# validation with the units it has written (txf_one_validation()); the shipped one names none.
 TXF_ONE_UNIT = ('"`tenx-events` [| tenxprefilter] | eval tenx_compact_raw=_raw | `tenx-inflate` | fields - _kv | '
 				'`tenx-mapped-hide` | `tenx-replay-u" . substr(md5("$st$"), 1, 12) . "` | `tenx-replay-tags` | '
 				'`tenx-mapped-restore` | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars | '
 				'eval tenx_expand_refused=if(len(tenx_expand_refused)>0, tenx_expand_refused, null()) | search *"')
-TXF_ONE_MISSING = '"`tenx-events` [| tenxprefilter missing_unit=\\"$st$\\"] | search *"'
 TXF_ONE = 'txf(1)'
+TXF_ONE_NAME = 'match(st, "^[A-Za-z0-9_.:/-]+$")'
+# Splunk prints it after "Encountered the following error while validating macro 'txf(<st>)': " and
+# adds the final period.
+TXF_ONE_ERROR = ('txf takes one original sourcetype, without quotes (letters, digits and _ . : / -), that has a field '
+				 'replay. Rebuild Field Replay writes one, within the hour, for each original sourcetype that compact '
+				 'events carry in the field tenx_sourcetype; to write it now, run | tenxreplay over All time')
 
 
-def txf_one_definition(unit_names):
-	"""The [txf(1)] definition for the units `unit_names` (tenx-replay-u<12 hex digits> names)."""
+def txf_one_validation(unit_names):
+	"""The [txf(1)] validation for the units `unit_names` (tenx-replay-u<12 hex digits> names)."""
 	hashes = sorted(n[len(UNIT_PREFIX):] for n in unit_names if n.startswith(UNIT_PREFIX))
-	if not hashes:
-		return TXF_ONE_MISSING
-	return 'if(like("|%s|", "%%|" . substr(md5("$st$"), 1, 12) . "|%%"), %s, %s)' % (
-		"|".join(hashes), TXF_ONE_UNIT, TXF_ONE_MISSING)
+	return '%s AND like("|%s|", "%%|" . substr(md5(st), 1, 12) . "|%%")' % (TXF_ONE_NAME, "|".join(hashes))
 
 
 def unit_macro(sourcetype):
