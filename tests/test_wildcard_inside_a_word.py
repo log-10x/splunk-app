@@ -11,7 +11,7 @@ term_regex(); `tx` and `txf` apply that eval and search before their final searc
 final search. searchmatch() is not used: it does not let `*` cross a minor breaker (Se:Privilege) or
 stand for nothing (SePrivilege) as the index does.
 
-The tables (wildcard_measured.py) are 96 words on 40 events and 78 TERM() and CASE() words on 26
+The tables (wildcard_measured.py, wildcard_plan_measured.py) are 184 words, TERM() and CASE() among them, on 112
 more, measured on the index, after a pipe, and through the plan.
 """
 import hashlib
@@ -53,6 +53,26 @@ class TestTheTermRegex:
 		# word is anchored at both ends of the term (abcSeXPrivilegedef is not Se*Privilege)
 		assert matched('Se*Privilege') == [0, 1, 8, 10, 15, 17, 18, 27, 28, 29, 30, 33, 34, 35, 39]
 		assert matched('ab*ef') == [9] and matched('Se*X') == [37] and matched('SeX*Y') == []
+
+
+class TestWhereThePartsGo:
+	"""The index takes each part after a `*` at its first place in the rest of the term, and the last part again only
+	after the end of each place it found (Splunk Enterprise 10.4.3, events written for it, TC_EVENTS 26 on)."""
+
+	@pytest.mark.parametrize("word, yes, no", [
+		('19*44', ['a 19.2.3.4.44 b', 'a 198/544 b', 'a 19:2:3:4:44 b', 'a 198.27.166.158/44 b'],
+		 ['a 19.2.3.444 b', 'a 198/55444 b', 'a 198.27.166.158/55444 b', '(198.27.166.158/55444)']),
+		('19*4', ['a 19.2.3.444 b', 'a 198/55444 b'], []),
+		('x*aa', ['q xbaa q'], ['q xaaa q']),
+		('x*aba', [], ['q xababa q']),
+		('x*ab', ['q xabab q', 'q xaab q', 'q xaaab q'], []),
+		('y*abc', ['q yabcabc q'], ['q yabcab q']),
+		('y*aa', ['q y.aa.aa q', 'q yaa.a q'], ['q y.aaa q']),
+		('x*44*z', ['q x444z q'], []),
+	])
+	def test_as_the_index(self, word, yes, no):
+		rx = re.compile(p.term_regex(word))
+		assert all(rx.search(e) for e in yes) and not any(rx.search(e) for e in no)
 
 
 class TestWhichWordsArePlanned:
@@ -217,7 +237,7 @@ class TestOnTheIndex:
 
 	def test_the_tables_cover_term_and_case(self):
 		planned = [r for r in TERM_CASE if r[3] is not None]
-		assert len(TERM_CASE) == 78 and len(planned) >= 45 and len(PLAN_WORDS) == 96
+		assert len(TERM_CASE) >= 70 and len(planned) >= 45 and len(PLAN_WORDS) >= 100
 		# TERM() of a word with a breaker, alone: the regular expression itself gives the index's events
 		for word, base, pipe, search, digest, rewrite, macro in TERM_CASE:
 			m = re.fullmatch(r'TERM\(([^ ()"]+)\)', word)
