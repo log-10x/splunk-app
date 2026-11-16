@@ -164,7 +164,7 @@ Repository name: `log-10x/splunk-app`. Repository URL: https://github.com/log-10
 | Field | Value |
 |---|---|
 | Version | 1.2.2, read from the package |
-| Splunk platform compatibility | Splunk Enterprise 9.4, 10.4, 10.6 |
+| Splunk platform compatibility | Splunk Enterprise 9.4.15, 10.0.12, 10.2.9, 10.4.3, 10.6.0.5 |
 | CIM | None |
 
 Each line is tested: 9.4.15, 10.0.10, 10.2.7 and 10.4.3, each a fresh install of 1.1.2. 1.1.3

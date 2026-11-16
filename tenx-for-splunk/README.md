@@ -430,7 +430,7 @@ their SPL. To cover another app's dashboards, copy the file into that app's
   of one event.
 
 When `tx` or `txf` stops a search, the search fails with a message. The search bar, dashboard panels
-and Jobs show it; a REST job holds it (on Splunk 10.4 and 10.6 the job also ends FAILED), and a
+and Jobs show it; a REST job holds it (on Splunk 10.0 through 10.6 the job also ends FAILED), and a
 oneshot job returns it. The REST export endpoint returns it with `output_mode=xml`; with `csv`, and
 on Splunk 10.4 and 10.6 with `json`, it returns HTTP 200 and an empty body, as Splunk does for any
 search that fails while running, so treat an empty export as a failure. A scheduled alert that stops
