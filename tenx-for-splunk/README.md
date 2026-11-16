@@ -800,10 +800,12 @@ has its own cap file and its own scheduled `check`.
    ```
 
    Add `--tls-verify off` as in step 6. `check` sends the probe of a listed template. When it comes
-   back without its fields, or is not indexed within `--timeout`, `check` empties
-   `compact-cap.csv`, and the Receiver sends every event whole until `activate` has proven the
-   templates again. Events indexed between the moment a listed template stops getting its fields
-   and that `check` are kept, marked `tenx_unmapped`, and lack their index-time fields.
+   back without its fields, or is not indexed within `--timeout`, `check` empties `compact-cap.csv`,
+   and the Receiver sends every event whole until `activate` has proven the templates again. Events
+   indexed between the moment a listed template stops getting its fields and that `check` are kept,
+   marked `tenx_unmapped`, and lack their index-time fields. After `check` empties the list, events
+   the Receiver compacts before it rereads the file, within about 10 seconds, are kept and marked
+   `tenx_unmapped`; every later event of that source arrives whole.
 
 A template that appears later arrives whole until steps 3, 4 and 6 run again. `gen` then changes
 only the lookup file: copy `lookups/` of both apps over the installed ones (on a cluster, into
@@ -867,12 +869,13 @@ same at either value.
 Checked with the Windows add-on 12.0.0, the AWS add-on 8.3.1 and CIM 8.8.0 against the same events
 indexed raw; the results are in the
 [listing's checks](https://github.com/log-10x/splunk-app/blob/main/splunkbase/LISTING.md#checks-run-on-this-package).
-These limits remain. Event types that match words of the original text, such as `err0r` in the Windows
-add-on and `aws_cloudtrail_delete_events` in the AWS add-on, do not match mapped events. On Windows
-EventID 4798, 5156 and 5157, `dest` is the event's Computer and `src_ip` and `dest_ip` are not
-written. The add-on's XML block fields `EventData_Xml` and `System_Props_Xml` are not written.
+These limits remain. Event types that match words of the original text, such as `err0r` in the
+Windows add-on and `aws_cloudtrail_delete_events` in the AWS add-on, do not match mapped events. On
+Windows EventID 4798, 5156 and 5157, `dest` is the event's Computer and `src_ip` and `dest_ip` are
+not written. The add-on's XML block fields `EventData_Xml` and `System_Props_Xml` are not written.
 `vendor_privilege` and `privilege_id` carry `-` on events where the raw event has neither. A value
-that holds line breaks is written with spaces in their place.
+that holds line breaks is written with spaces in their place. On CloudTrail,
+`responseElements.credentials.sessionToken` is not written.
 
 ## What to Install on Each Tier
 
@@ -912,8 +915,8 @@ of the Log10x documentation describes, so that they send:
    - Sourcetype: `tenx_encoded`
    - Format: `~<hash>,<var0>,<var1>,...`
 
-3. **Receiver settings** this app relies on: the arguments `varMaxRecurIndexes 0`,
-   `timestampZone UTC` and `timestampMaxPerObject 1`. The [repository README](https://github.com/log-10x/splunk-app/blob/main/README.md#receiver-side-configuration)
+3. **Receiver settings** this app relies on: the arguments `receiverOptimize true`,
+   `varMaxRecurIndexes 0`, `timestampZone UTC` and `timestampMaxPerObject 1`. The [repository README](https://github.com/log-10x/splunk-app/blob/main/README.md#receiver-side-configuration)
    explains each one.
 
 ### Step 2: Verify Template Ingestion

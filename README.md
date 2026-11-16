@@ -37,15 +37,16 @@ Scheduled alerts run server-side, where the browser hook never fires. An alert c
 
 ## Receiver-side configuration
 
-Set three options in the Receiver's configuration for any deployment that feeds this app.
-From engine 1.1.89 they can also follow the app on the command line, which replaces the
-values the app's configuration sets:
+Start the Receiver with four arguments for any deployment that feeds this app.
+`receiverOptimize true` makes it send events compact. The other three are options of the
+Receiver's configuration; from engine 1.1.89 they can also follow the app on the command line,
+which replaces the values the app's configuration sets:
 
 ```
-tenx run @apps/receiver varMaxRecurIndexes 0 timestampZone UTC timestampMaxPerObject 1
+tenx run @apps/receiver receiverOptimize true varMaxRecurIndexes 0 timestampZone UTC timestampMaxPerObject 1
 ```
 
-They live in two files of the Receiver's config folder (`$TENX_CONFIG`, mounted at
+The three options live in two files of the Receiver's config folder (`$TENX_CONFIG`, mounted at
 `/etc/tenx/config` in the container image):
 
 ```yaml
@@ -187,7 +188,7 @@ Create an index named `tenx_dml` for templates, then two HTTP Event Collector to
 
 ### Step 3: Configure the Receiver and Forwarder
 
-Set `varMaxRecurIndexes: 0`, `timestampZone: UTC` and `maxPerObject: 1` in the Receiver's configuration (see [Receiver-side configuration](#receiver-side-configuration)), and point your forwarder at both tokens: templates to `tenx_dml`, and each compact event as the message with the record's metadata as indexed fields. The [setup guide](https://doc.log10x.com/apps/receiver/compact/splunk/) has the Fluent Bit and Fluentd configuration.
+Start the Receiver with `receiverOptimize true`, `varMaxRecurIndexes 0`, `timestampZone UTC` and `timestampMaxPerObject 1` (see [Receiver-side configuration](#receiver-side-configuration)), and point your forwarder at both tokens: templates to `tenx_dml`, and each compact event as the message with the record's metadata as indexed fields. The [setup guide](https://doc.log10x.com/apps/receiver/compact/splunk/) has the Fluent Bit and Fluentd configuration.
 
 ### Step 4: Point the Dashboards at Your Index
 
