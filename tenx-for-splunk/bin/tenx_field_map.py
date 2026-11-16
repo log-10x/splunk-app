@@ -1870,6 +1870,10 @@ def read_splunk_conf(path):
 	return out
 
 
+class AddonError(ValueError):
+	"""An add-on folder that --addon cannot read."""
+
+
 def read_addon(addon_dir):
 	"""(props, transforms) of an add-on folder: default/, then local/ over it, key by key."""
 	merged = []
@@ -1880,7 +1884,7 @@ def read_addon(addon_dir):
 				out.setdefault(name, collections.OrderedDict()).update(settings)
 		merged.append(out)
 	if not merged[0]:
-		raise ValueError('no props.conf under %s (default/ or local/)' % addon_dir)
+		raise AddonError('no props.conf under %s (default/ or local/)' % addon_dir)
 	return merged[0], merged[1]
 
 
@@ -2172,19 +2176,19 @@ def text_rule_copies(props, transforms, rename, source=None, prefix='tenx_fm', s
 
 	# A block: a transform that reads _raw with REGEX <X(?:\s+[^>]+)?>(.*?)</X> and FORMAT Y::$1 writes the
 	# text of element X as field Y.
-	blocks = {}
+	# Only a field another of these transforms reads (SOURCE_KEY) is a block.
+	keys = set(_source_key(transforms.get(n, {})) for _, _, names in classes for n in names)
+	blocks, block_regex = {}, {}
 	for _, _, names in classes:
 		for tname in names:
 			t = transforms.get(tname, {})
-			fm = re.match(r'^([A-Za-z_]\w*)::\$1$', str(t.get('FORMAT', '')).strip())
-			rm = re.match(r'^(?:\(\?[a-z]+\))?<([A-Za-z_]\w*)\(\?:\\s\+\[\^>\]\+\)\?>\(\.\*\?\)<\\?/([A-Za-z_]\w*)>$',
-				str(t.get('REGEX', '')).strip())
-			if _source_key(t) == '_raw' and fm and rm and rm.group(1) == rm.group(2):
-				blocks[fm.group(1)] = rm.group(1)
+			if _source_key(t) == '_raw' and _block_of(t) and _block_of(t)[1] in keys:
+				blocks[_block_of(t)[1]] = _block_of(t)[0]
+				block_regex[_block_of(t)[1]] = _python_regex(str(t.get('REGEX', '')).strip())
 
 	report = collections.OrderedDict([('stanzas', stanzas), ('blocks', dict(blocks)), ('copied', []), ('not_copied', []),
 		('warnings', [])])
-	copies = []
+	copies, derived = [], []
 	for cls, st, names in sorted(classes, key=lambda c: c[0]):
 		for pos, tname in enumerate(names):
 			t = transforms.get(tname)
@@ -2197,10 +2201,16 @@ def text_rule_copies(props, transforms, rename, source=None, prefix='tenx_fm', s
 			entry = collections.OrderedDict([('class', cls), ('stanza', st), ('transform', tname), ('source_key', sk),
 				('writes', written_names(t))])
 			reason, items, candidates = _copy_plan(regex, fmt, sk, blocks)
-			if reason:
+			if _block_of(t):
+				reason, candidates = 'writes the whole text of element %s as %s; the map writes the items the reader reads, ' \
+					'not whole elements' % _block_of(t), ()
+			hard = reason and reason.startswith(TEXT_RULE_HARD)
+			if hard:
 				report['not_copied'].append(dict(entry, why=reason))
 				continue
-			later = [n for n in names[pos + 1:] if n in transforms and set(written_names(transforms[n])) & set(entry['writes'])]
+			# A later transform of the class that reads a field runs on a mapped event too, before the copy's class.
+			later = [n for n in names[pos + 1:] if n in transforms and set(written_names(transforms[n])) & set(entry['writes'])
+				and _source_key(transforms[n]) != '_raw' and _source_key(transforms[n]) not in blocks]
 			if later:
 				report['not_copied'].append(dict(entry, why='a later transform of its class (%s) writes the same field, '
 					'so a copy running after the class would come too late' % ', '.join(later)))
@@ -2211,6 +2221,27 @@ def text_rule_copies(props, transforms, rename, source=None, prefix='tenx_fm', s
 				report['not_copied'].append(dict(entry, why='the class %s of the add-on sorts between %s and the copy\'s '
 					'class' % (between[0], cls)))
 				continue
+			def per_template(why, covered=()):
+				# gen applies the rule to each template's text (see "Rules the copies cannot read from one field"),
+				# and the copy reads the indexed field that carries the result.
+				outputs = ([(out, int(k)) for out, _, k in re.findall(r'([^\s:"]+)::("?)\$(\d+)\2', fmt)] if fmt else
+					[(g, g) for g in re.findall(r'\(\?P?<([A-Za-z_]\w*)>', regex)])
+				rule = DerivedRule(tname, _python_regex(regex), block_regex.get(sk),
+					[(out, g, '%s%s%s_%s' % (prefix, TEXT_RULE_DERIVED, sanitize(tname), sanitize(out))) for out, g in outputs],
+					tuple(covered))
+				derived.append(rule)
+				for out, _, field in rule.outputs:
+					name = '%s%s%s_%s' % (prefix, TEXT_RULE_INFIX, sanitize(tname), sanitize(out))
+					copies.append(TextRule(st, copy_cls, name, field, '\\A([\\s\\S]*)\\z', '%s::$1' % out, tname, field,
+						'template'))
+					report['copied'].append(collections.OrderedDict([('class', cls), ('stanza', st), ('transform', tname),
+						('reads', 'the rule on each template\'s text, indexed as %s' % field), ('copy', name),
+						('writes', [out]), ('why_per_template', why)]))
+
+			if reason:
+				per_template(reason)
+				continue
+			refused_items, read_items = [], []
 			for item, copy_regex, copy_fmt, failed in candidates:
 				kind, field = item[0], item[1]
 				clash = sorted(k for k, names in XML_SYSTEM_NAMES.items() if k != kind and field in names)
@@ -2219,18 +2250,57 @@ def text_rule_copies(props, transforms, rename, source=None, prefix='tenx_fm', s
 						field, ' and '.join(clash))
 				if failed:
 					report['not_copied'].append(dict(entry, reads='%s %s' % (kind, field), why=failed))
+					refused_items.append('%s %s' % (kind, field))
 					continue
 				name = '%s%s%s' % (prefix, TEXT_RULE_INFIX, sanitize(tname))
 				if len(items) > 1:
 					name += '_' + sanitize(field)
 				copies.append(TextRule(st, copy_cls, name, field, copy_regex, copy_fmt, tname, field, kind))
+				read_items.append(field)
 				other = dict((k, c) for k, c in seen.get(field, {}).items() if k != kind or c > 1)
 				if other:
 					report['warnings'].append('%s reads %s %s, which templates also hold as %s' % (name, kind, field,
 						', '.join('%s (up to %d in one template)' % kc for kc in sorted(other.items()))))
 				report['copied'].append(collections.OrderedDict([('class', cls), ('stanza', st), ('transform', tname),
 					('reads', '%s %s' % (kind, field)), ('copy', name), ('writes', entry['writes'])]))
-	return copies, report
+			if refused_items:
+				# The items no copy reads (Data ProcessID) are covered per template, after the copies.
+				per_template('no copy reads %s' % ', '.join(refused_items), read_items)
+	# A rule that sorts earlier and writes the same field on some raw events, with no copy that reads one field: on
+	# those events the raw event has its value, and a later copy gives the field another one.
+	by_field = collections.defaultdict(list)
+	for c in copies:
+		for out in written_names(transforms[c.rule]):
+			by_field[out].append(c)
+	for out, cs in by_field.items():
+		plain = [c for c in cs if c.kind != 'template']
+		earlier = sorted(set(c.rule for c in cs if c.kind == 'template' and plain and c.cls < plain[0].cls))
+		if plain and earlier:
+			report['warnings'].append('%s: on the events where %s gives %s on the raw event and the per-template copy '
+				'cannot (its condition reads a compact value), %s gives the %s %s instead' % (out, ', '.join(earlier), out,
+					plain[0].name, plain[0].kind, plain[0].field))
+	return copies, report, derived
+
+
+# Reasons a rule gets no copy at all: the rest (not one item, not fixed text around the value) get a copy that reads
+# the field gen writes for each template the rule matches.
+TEXT_RULE_HARD = ('writes the block', 'writes the whole text', 'no REGEX', 'takes field names', 'REGEX not read',
+	'writes no field')
+TEXT_RULE_DERIVED = '_fr_'
+# covered: the fields the rule's own copies read; a template whose text the rule captures from one of them needs no
+# field of its own.
+DerivedRule = collections.namedtuple('DerivedRule', 'rule regex block outputs covered', defaults=((),))
+
+
+def _block_of(transform):
+	"""(element, field) when a transform writes the text of an XML element as a field (REGEX
+	<X(?:\\s+[^>]+)?>(.*?)</X>, FORMAT Y::$1), else None."""
+	fm = re.match(r'^([A-Za-z_]\w*)::\$1$', str(transform.get('FORMAT', '')).strip())
+	rm = re.match(r'^(?:\(\?[a-z]+\))?<([A-Za-z_]\w*)\(\?:\\s\+\[\^>\]\+\)\?>\(\.\*\?\)<\\?/([A-Za-z_]\w*)>$',
+		str(transform.get('REGEX', '')).strip())
+	if fm and rm and rm.group(1) == rm.group(2):
+		return rm.group(1), fm.group(1)
+	return None
 
 
 def _copy_plan(regex, fmt, sk, blocks):
@@ -2336,6 +2406,78 @@ def text_rule_props(copies):
 		for st, classes in out.items())
 
 
+# Rules the copies cannot read from one field
+#
+# A rule whose text is a condition on a second item ((?ms)<EventID>(5156|5157)</EventID>.*<Data Name='SourceAddress'>
+# (?<src_ip>[^<]+)</Data>) or free text cannot be copied as a rule that reads one field: a search-time rule reads one
+# field and cannot join two. For these, gen applies the rule itself to each template's text (to the block the rule
+# reads, cut by the add-on's own block rule), and when it matches, the template's row writes one more indexed field
+# per field the rule writes, <prefix>_fr_<rule>_<field>, holding the text the rule captured (template text and
+# compact values). The copy, in the class right after the rule's, reads that field. The result must not depend on the
+# values: gen applies the rule again with every value replaced by each of DERIVE_PROBES (the same value everywhere,
+# and a different one per value), and writes the field only when the rule matches every time and captures the same
+# text with the values put in. Otherwise, as when the rule does not match the template, the template's row writes
+# nothing for it, and the field is missing on its events, as it was without --addon.
+
+DERIVE_PROBES = ('x', '0', '4', '5156', '5157', '4798', '10.0.1.14', '::1', '127.0.0.1', 'a b', '-', '%%14592',
+	'C:\\Windows\\System32\\svchost.exe', 'A user account was changed.', 'Changed Attributes:\n x')
+
+
+def derive_pairs(rule, text):
+	"""The (indexed field, marked text) pairs a DerivedRule gives for a template's marked text, and whether a match
+	was dropped because its result depends on the values."""
+	src = text
+	if rule.block is not None:
+		m = re.search(rule.block, text)
+		if m is None:
+			return [], False
+		src = m.group(1)
+	m = re.search(rule.regex, src)
+	if m is None:
+		return [], False
+	got = [(field, m.group(g)) for _, g, field in rule.outputs if m.group(g) is not None]
+	for v in DERIVE_PROBES:
+		for each in (False, True):
+			def put(mm, v=v, each=each):
+				return v + mm.group(1) if each else v
+			mv = re.search(rule.regex, MARK_RE.sub(put, src))
+			if mv is None:
+				return [], True
+			for (_, g, field), (_, marked) in zip([o for o in rule.outputs if m.group(o[1]) is not None], got):
+				if mv.group(g) != MARK_RE.sub(put, marked):
+					return [], True
+	return got, False
+
+
+class TextRuleReader(object):
+	"""A reader with the pairs of derive_pairs added after its own, for the rules of "Rules the copies cannot read
+	from one field". Counts, per rule, the texts it wrote fields for and the texts it left out."""
+
+	def __init__(self, reader, rules):
+		self.reader, self.rules = reader, list(rules)
+		self.written, self.dependent = collections.Counter(), collections.Counter()
+
+	def __getattr__(self, name):
+		return getattr(self.reader, name)
+
+	def pairs(self, text):
+		out = list(self.reader.pairs(text))
+		have = set(name for name, _ in out)
+		for rule in self.rules:
+			got, dependent = derive_pairs(rule, text)
+			# A field the map writes from the same text already (UserData's SubjectUserName as Caller_User_Name), or
+			# text one of the rule's own copies reads from its field.
+			outs = dict((field, out_name) for out_name, _, field in rule.outputs)
+			got = [(f, v) for f, v in got if outs[f] not in have and not any(n in rule.covered and val.strip(TRIM_CHARS) ==
+				v.strip(TRIM_CHARS) for n, val in out)]
+			if got:
+				self.written[rule.rule] += 1
+				out.extend(got)
+			elif dependent:
+				self.dependent[rule.rule] += 1
+		return out
+
+
 def template_items(templates, reader):
 	"""{field name: {item kind: most items of that name in one template}} over the templates, for readers
 	that say which item a field comes from (XmlWindowsReader.items); {} for the others."""
@@ -2354,20 +2496,20 @@ def template_items(templates, reader):
 
 
 def addon_text_rules(addon_dir, target, templates):
-	"""(copies, report) for gen --addon: the copies of the add-on's rules that read the event's text (the
-	xml-windows reader), or, for another reader, the report of those rules with none copied."""
+	"""(copies, report, derived rules) for gen --addon: the copies of the add-on's rules that read the event's text
+	(the xml-windows reader), or, for another reader, the report of those rules with none copied."""
 	props, transforms = read_addon(addon_dir)
 	reader = READERS[target['reader']]()
-	copies, report = text_rule_copies(props, transforms, target['rename'], target.get('source'),
+	copies, report, derived = text_rule_copies(props, transforms, target['rename'], target.get('source'),
 		target['transform_prefix'], template_items(templates, reader))
 	if target['reader'] != XmlWindowsReader.name:
 		for c in report['copied']:
 			report['not_copied'].append(dict(c, why='the %s reader has no copies of rules that read the text'
 				% target['reader']))
-		copies, report['copied'] = [], []
+		copies, report['copied'], derived = [], [], []
 	report['addon'] = os.path.abspath(addon_dir)
 	report['source'] = target.get('source')
-	return copies, report
+	return copies, report, derived
 
 
 def text_rule_transforms(copies):
@@ -3428,13 +3570,23 @@ def _build(args):
 	if args.time_props or args.time_format or args.time_prefix is not None:
 		settings = read_time_settings(args.time_props, target['rename']) if args.time_props else {}
 		time_rule = make_time_rule(settings, args.time_prefix, args.time_format or (), args.time_lookahead)
-	field_map = FieldMap(templates, READERS[target['reader']](), target['transform_prefix'],
+	reader, text_rules = READERS[target['reader']](), None
+	if getattr(args, 'addon', None):
+		try:
+			copies, report, derived = addon_text_rules(args.addon, target, templates)
+		except OSError as e:
+			raise AddonError(str(e))
+		if derived:
+			reader = TextRuleReader(reader, derived)
+		text_rules = (copies, report, reader)
+	field_map = FieldMap(templates, reader, target['transform_prefix'],
 		stanza_names=args.stanza_names, hash_match=args.hash_match, timestamp_values=args.timestamp_values,
 		keep=keep, refused=refused, mixed_names=args.mixed_names,
 		reserved_names=args.reserved_names, reserved_prefix=args.reserved_prefix,
 		trim_values={'auto': None, 'on': True, 'off': False}[args.trim_values],
 		mark=None if args.mark == 'none' else args.mark, eval_values=args.eval_values == 'on', rules=args.rules,
 		time_rule=time_rule)
+	field_map.text_rules = text_rules
 	return target, templates, field_map
 
 
@@ -3597,6 +3749,9 @@ def _main(args):
 
 	try:
 		target, templates, field_map = _build(args)
+	except AddonError as e:
+		sys.stderr.write('%s: --addon: %s\n' % (args.mode, e))
+		return 2
 	except ValueError as e:
 		sys.stderr.write('%s: %s\n' % (args.mode, e))
 		return 2
@@ -3620,12 +3775,13 @@ def _main(args):
 				% (len(lookup_bytes), args.lookup_max_bytes))
 			return 2
 	text_rules, text_report = (), None
-	if args.addon:
-		try:
-			text_rules, text_report = addon_text_rules(args.addon, target, templates)
-		except (ValueError, OSError) as e:
-			sys.stderr.write('gen: --addon: %s\n' % e)
-			return 2
+	if field_map.text_rules is not None:
+		text_rules, text_report, reader = field_map.text_rules
+		if isinstance(reader, TextRuleReader):
+			for c in text_report['copied']:
+				if c['reads'].startswith('the rule on each'):
+					c['templates_written'] = reader.written.get(c['transform'], 0)
+					c['templates_left_out_value_dependent'] = reader.dependent.get(c['transform'], 0)
 	elif target['reader'] == XmlWindowsReader.name:
 		sys.stderr.write('gen: without --addon, the add-on\'s rules that read the event\'s text, not a field, give '
 			'nothing on mapped events; give --addon <the add-on\'s folder> to write copies that read the indexed fields\n')
@@ -3664,7 +3820,7 @@ def _main(args):
 	if text_report is not None:
 		summary['addon_rules_reading_text'] = collections.OrderedDict([
 			('copied', ['%s (%s): %s' % (c['transform'], c['reads'], ', '.join(c['writes'])) for c in text_report['copied']]),
-			('not_copied', len(text_report['not_copied']))])
+			('not_copied', len(text_report['not_copied'])), ('warnings', text_report['warnings'])])
 	sys.stdout.write(json.dumps(summary, indent=1) + '\nreport: %s\n' % report_path)
 	if sourcetype_field:
 		sys.stdout.write('for tx: add %s::%s to the tenx-events macro, for example\n'

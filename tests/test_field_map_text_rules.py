@@ -127,7 +127,13 @@ def addon(tmp_path):
 
 def copies_of(addon_dir, source='XmlWinEventLog:Security', seen=None):
 	props, transforms = fm.read_addon(addon_dir)
-	return fm.text_rule_copies(props, transforms, 'XmlWinEventLog', source, 'tenx_win', seen)
+	copies, report, _ = fm.text_rule_copies(props, transforms, 'XmlWinEventLog', source, 'tenx_win', seen)
+	return copies, report
+
+
+def derived_of(addon_dir):
+	props, transforms = fm.read_addon(addon_dir)
+	return fm.text_rule_copies(props, transforms, 'XmlWinEventLog', 'XmlWinEventLog:Security', 'tenx_win')[2]
 
 
 def by_rule(copies):
@@ -218,18 +224,34 @@ class TestCopies:
 	def test_rules_that_are_not_copied_say_why(self, addon):
 		copies, report = copies_of(addon)
 		names = set(c.rule for c in copies)
-		for t in ('sys_block', 'data_block', 'sys_kv', 'data_kv', 'dest_text_5156', 'account_words', 'Server_as_dest',
-				'EventID_field_as_EventCode', 'Computer_text_as_host_name'):
+		for t in ('sys_block', 'data_block', 'sys_kv', 'data_kv', 'Server_as_dest', 'EventID_field_as_EventCode',
+				'Computer_text_as_host_name'):
 			assert t not in names
-		assert why(report, 'sys_block') == ['writes the block System_Props_Xml; the map writes the fields inside it']
+		assert why(report, 'sys_block') == ['writes the whole text of element System as System_Props_Xml; the map writes '
+			'the items the reader reads, not whole elements']
 		assert why(report, 'sys_kv') == ['takes field names from the text; the map writes those fields itself']
-		# a condition on a second item (the EventID), and free text around a lazy group
-		assert 'not one item' in why(report, 'dest_text_5156')[0]
-		assert why(report, 'account_words') == ['the value is not enclosed by fixed text on both sides']
 		# a later transform of the same class writes the same field: a copy after the class would come too late
 		assert 'later transform of its class (host_name_from_field)' in why(report, 'Computer_text_as_host_name')[0]
 		# ProcessID is an attribute of every event's System block (Execution), so a Data ProcessID copy is refused
 		assert any('System block holds ProcessID as an attribute' in w for w in why(report, 'pid_from_data_block'))
+
+	def test_rules_of_more_than_one_item_get_a_copy_of_a_field_written_per_template(self, addon):
+		copies, report = copies_of(addon)
+		got = dict(((c.rule, c.kind), c) for c in copies)
+		# a condition on a second item (the EventID), and free text around a lazy group
+		c = got[('dest_text_5156', 'template')]
+		assert (c.stanza, c.cls, c.name, c.source_key, c.regex, c.format) == ('source::XmlWinEventLog:Security',
+			'0dest_only_for_5156-tenx_win', 'tenx_win_text_dest_text_5156_dest', 'tenx_win_fr_dest_text_5156_dest',
+			'\\A([\\s\\S]*)\\z', 'dest::$1')
+		assert got[('account_words', 'template')].source_key == 'tenx_win_fr_account_words_account_action'
+		entry = [x for x in report['copied'] if x['transform'] == 'dest_text_5156'][0]
+		assert 'not one item' in entry['why_per_template']
+		# the item no copy reads (Data ProcessID) is covered per template, after the copy of ProcessId
+		pid = [c for c in copies if c.rule == 'pid_from_data_block']
+		assert [(c.kind, c.source_key) for c in pid] == [('data', 'ProcessId'),
+			('template', 'tenx_win_fr_pid_from_data_block_process_id')]
+		rule = [d for d in derived_of(addon) if d.rule == 'pid_from_data_block'][0]
+		assert rule.covered == ('ProcessId',) and rule.block is not None
 		# rules that read fields are not considered at all
 		assert not why(report, 'Server_as_dest') and not why(report, 'EventID_field_as_EventCode')
 
@@ -262,18 +284,27 @@ class TestCopies:
 		# the rule reads the leading digits of a longer value; the copy, anchored at both ends, would not
 		write(str(d / 'default' / 'transforms.conf'), "[digits]\nREGEX = <Data Name='N'>(?<n>\\d+)\\D*<\\/Data>\nFORMAT =\n")
 		props, transforms = fm.read_addon(str(d))
-		copies, report = fm.text_rule_copies(props, transforms, 'X')
-		assert copies == [] and report['not_copied'][0]['why'] == 'the value is not enclosed by fixed text on both sides'
+		copies, report, _ = fm.text_rule_copies(props, transforms, 'X')
+		# no copy reading one field; a copy of a field written per template instead
+		assert [c.kind for c in copies] == ['template']
+		assert report['copied'][0]['why_per_template'] == 'the value is not enclosed by fixed text on both sides'
 		write(str(d / 'default' / 'transforms.conf'), "[digits]\nREGEX = <Data Name='N'>(?<n>[0-9]{2})<\\/Data>\n")
 		props, transforms = fm.read_addon(str(d))
-		copies, report = fm.text_rule_copies(props, transforms, 'X')
+		copies, report, _ = fm.text_rule_copies(props, transforms, 'X')
 		assert len(copies) == 1 and copies[0].regex == '\\A(?<n>[0-9]{2})\\z'
+
+	def test_an_earlier_rule_without_a_one_field_copy_is_a_warning(self, addon):
+		# dest_text_5156 sorts before dest_for_security and writes dest on 5156 events; with EventID a compact value its
+		# per-template copy cannot fire, and the Computer copy then gives those events the Computer
+		_, report = copies_of(addon)
+		assert any(w.startswith('dest: on the events where dest_text_5156 gives dest') and
+			'tenx_win_text_Computer_text_as_dest gives the element Computer instead' in w for w in report['warnings'])
 
 	def test_templates_holding_the_name_as_another_item_are_a_warning(self, addon):
 		copies, report = copies_of(addon, seen={'Computer': {'element': 1, 'data': 1}})
 		assert ('Computer_text_as_dest', 'Computer') in by_rule(copies)
-		assert report['warnings'] == ['tenx_win_text_Computer_text_as_dest reads element Computer, which templates also hold '
-			'as data (up to 1 in one template)']
+		assert 'tenx_win_text_Computer_text_as_dest reads element Computer, which templates also hold as data (up to 1 in one ' \
+			'template)' in report['warnings']
 
 
 def xml_event(computer='host1.example.local', ip='10.0.1.14', extra=''):
@@ -289,7 +320,8 @@ class TestCopiesAgainstRules:
 	@pytest.mark.parametrize('ip', ['10.0.1.14', '::1', '127.0.0.1', '-', 'fe80::1'])
 	def test_on_whole_events(self, addon, ip):
 		props, transforms = fm.read_addon(addon)
-		copies, _ = fm.text_rule_copies(props, transforms, 'XmlWinEventLog', 'XmlWinEventLog:Security', 'tenx_win')
+		copies, _, _ = fm.text_rule_copies(props, transforms, 'XmlWinEventLog', 'XmlWinEventLog:Security', 'tenx_win')
+		copies = [c for c in copies if c.kind != 'template']
 		raw = xml_event(ip=ip)
 		fields = dict((n, v.strip()) for n, v in fm.XmlWindowsReader().pairs(raw))
 		blocks = {'System_Props_Xml': re.search(r'(?ms)<System(?:\s+[^>]+)?>(.*?)</System>', raw).group(1),
@@ -305,6 +337,52 @@ class TestCopiesAgainstRules:
 			assert got == want, c.name
 
 
+def marked(text):
+	# a template's marked text: $k for compact value k
+	return re.sub(r'\$(\d+)', lambda m: fm.MARK % int(m.group(1)), text)
+
+
+class TestPerTemplate:
+	def rules(self, addon):
+		return dict((d.rule, d) for d in derived_of(addon))
+
+	def test_a_condition_in_template_text_gives_the_value_s_field(self, addon):
+		rule = self.rules(addon)['dest_text_5156']
+		text = marked("<System><EventID>5156</EventID><Computer>$1</Computer></System><EventData>"
+			"<Data Name='SourceAddress'>$2</Data><Data Name='DestAddress'>$3</Data></EventData>")
+		assert fm.derive_pairs(rule, text) == ([('tenx_win_fr_dest_text_5156_dest', fm.MARK % 3)], False)
+		# another EventID: no field; the EventID a value of the template: the condition cannot be read, no field
+		assert fm.derive_pairs(rule, text.replace('5156', '4624')) == ([], False)
+		assert fm.derive_pairs(rule, text.replace('5156', fm.MARK % 4)) == ([], False)
+
+	def test_a_result_that_depends_on_the_values_is_left_out(self, tmp_path):
+		d = tmp_path / 'TA'
+		write(str(d / 'default' / 'props.conf'), '[X]\nREPORT-a = r\n')
+		# the lookahead looks at a value: on "x" the rule does not match, on the marker it does
+		write(str(d / 'default' / 'transforms.conf'), "[r]\nREGEX = (?ms)<A>(?!x)[^<]*</A>.*<Data Name='B'>(?<b>[^<]+)</Data>\n")
+		props, transforms = fm.read_addon(str(d))
+		_, _, derived = fm.text_rule_copies(props, transforms, 'X')
+		text = marked("<A>$1</A><Data Name='B'>$2</Data>")
+		assert fm.derive_pairs(derived[0], text) == ([], True)
+		assert fm.derive_pairs(derived[0], marked("<A>y</A><Data Name='B'>$2</Data>")) == (
+			[('tenx_fm_fr_r_b', fm.MARK % 2)], False)
+
+	def test_the_reader_adds_the_fields_after_its_own_and_counts(self, addon):
+		reader = fm.TextRuleReader(fm.XmlWindowsReader(), derived_of(addon))
+		text = marked("<Event><System><EventID>5156</EventID></System><EventData><Data Name='ProcessID'>$1</Data>"
+			"<Data Name='DestAddress'>$2</Data></EventData></Event>")
+		pairs = reader.pairs(text)
+		assert pairs[:3] == fm.XmlWindowsReader().pairs(text)
+		assert ('tenx_win_fr_dest_text_5156_dest', fm.MARK % 2) in pairs
+		assert ('tenx_win_fr_pid_from_data_block_process_id', fm.MARK % 1) in pairs
+		assert reader.written['dest_text_5156'] == 1 and reader.written['pid_from_data_block'] == 1
+		# ProcessId is read by the rule's own copy: no field of its own
+		text2 = marked("<Event><System><EventID>4624</EventID></System><EventData><Data Name='ProcessId'>$1</Data>"
+			"</EventData></Event>")
+		assert not [p for p in reader.pairs(text2) if p[0].startswith('tenx_win_fr_')]
+		assert reader.name == 'xml-windows' and reader.trims_values
+
+
 class TestGenerated:
 	def records(self, tmp_path):
 		p = tmp_path / 'templates.json'
@@ -312,7 +390,7 @@ class TestGenerated:
 			"<EventID>4624</EventID><TimeCreated SystemTime='$(yyyy-MM-dd'T'HH:mm:ss.SSSSSSSSS'Z')'/>"
 			"<Execution ProcessID='$' ThreadID='$'/><Computer>$</Computer></System><EventData>"
 			"<Data Name='IpAddress'>$</Data><Data Name='ProcessId'>$</Data></EventData></Event>")
-		p.write_text(json.dumps({'templateHash': 'h1', 'template': t}) + '\n', encoding='utf-8')
+		p.write_text(json.dumps({'templateHash': 'h1', 'template': t.replace('/', '//')}) + '\n', encoding='utf-8')
 		return str(p)
 
 	def gen(self, tmp_path, *extra, out='fm_win'):
@@ -325,6 +403,22 @@ class TestGenerated:
 		finally:
 			sys.stderr = old
 		return rc, tmp_path / out, err.getvalue()
+
+	def test_a_template_the_per_template_rule_matches_gets_the_field_in_its_row(self, tmp_path, addon):
+		p = tmp_path / 'wfp.json'
+		t = ("<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System><EventID>5156</EventID>"
+			"<TimeCreated>$(HH:mm:ss)</TimeCreated><Computer>$</Computer></System><EventData><Data Name='ProcessID'>$</Data>"
+			"<Data Name='DestAddress'>$</Data></EventData></Event>")
+		# the template record writes a "/" of the text as "//"
+		p.write_text(json.dumps({'templateHash': 'w1', 'template': t.replace('/', '//')}) + '\n', encoding='utf-8')
+		out = tmp_path / 'fm_wfp'
+		assert fm.main(['gen', '--records', str(p), '--target', 'windows-security', '--rules', 'lookup', '--out', str(out),
+			'--addon', addon]) == 0
+		row = fm.read_lookup_file(str(out / 'lookups' / 'tenx_win_fields.csv.gz'))['w1']
+		assert 'tenx_win_fr_dest_text_5156_dest::' in row['f'] and 'tenx_win_fr_pid_from_data_block_process_id::' in row['f']
+		report = json.load(open(str(tmp_path / 'fm_wfp_report.json'), encoding='utf-8'))['addon_rules_reading_text']
+		c = [x for x in report['copied'] if x['transform'] == 'dest_text_5156'][0]
+		assert c['templates_written'] == 1 and c['templates_left_out_value_dependent'] == 0
 
 	def test_gen_writes_the_copies_into_props_and_transforms(self, tmp_path, addon):
 		rc, out, err = self.gen(tmp_path, '--addon', addon)
