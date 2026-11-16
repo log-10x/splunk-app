@@ -39,8 +39,8 @@ replay_max_macro_chars = <non-negative integer>
 * Default: 262144
 
 replay_expire_days = <non-negative integer>
-* An original sourcetype that no compact event has carried for this many days loses its
-  replay at the next rebuild. 0 means never.
+* An original sourcetype that no rebuild has seen for this many days, and that no compact event
+  of any date carries any longer, loses its replay at the next rebuild. 0 means never.
 * Default: 400
 
 field_narrowing = <boolean>

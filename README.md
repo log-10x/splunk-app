@@ -38,7 +38,7 @@ Scheduled alerts run server-side, where the browser hook never fires. An alert c
 ## Receiver-side configuration
 
 Set three options in the Receiver's configuration for any deployment that feeds this app.
-From engine 1.1.88 they can also follow the app on the command line, which replaces the
+From engine 1.1.89 they can also follow the app on the command line, which replaces the
 values the app's configuration sets:
 
 ```
@@ -191,7 +191,7 @@ Set `varMaxRecurIndexes: 0`, `timestampZone: UTC` and `maxPerObject: 1` in the R
 
 ### Step 4: Point the Dashboards at Your Index
 
-Set the `tenx-events` macro to your compact index under **Settings > Advanced search > Search macros**, for example `index=my_compact_index sourcetype=tenx_encoded`.
+Set the `tenx-events` macro to your compact index under **Settings > Advanced search > Search macros**, for example `index=my_compact_index sourcetype::tenx_encoded`. Every `tx` search starts with this macro too, so it uses the indexed form `sourcetype::`.
 
 ### Step 5: Load Existing Templates
 
@@ -261,6 +261,7 @@ The Analytics dashboard finds compact events through the `tenx-events` macro.
 | **Backfill KV Search** | The same template load over 30 days, for templates indexed before the app was installed |
 | **Recompile Compiled Alerts Search** | Runs `tenxrecompile` every 15 minutes |
 | **Rebuild Field Replay Searches** | Run `tenxreplay` every hour, and every five minutes for sourcetypes not yet covered |
+| **Field Map Events Without Fields Search** | Not scheduled; where a field map is installed, counts compact events indexed without their fields by index, sourcetype and reason |
 | **Analytics Dashboard** | Compression and template metrics |
 | **Diagnostics Dashboard** | Troubleshooting and verification tools |
 

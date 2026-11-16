@@ -445,6 +445,23 @@ class TestApp:
 		report = json.loads((tmp_path / 'app_report.json').read_text())
 		assert report['hashes_with_outer_spaces'] == 1 and report['templates'] == 1
 
+	def test_gen_says_so_when_no_template_gets_a_rule(self, tmp_path, capsys):
+		# Records the Windows reader finds no field in: gen still writes the app and exits 0, and says so.
+		records = tmp_path / 'templates.json'
+		records.write_text(json.dumps({'templateHash': 'k1', 'template': 'time=$(HH:mm:ss) user=$ src=$'}) + '\n')
+		assert fm.main(['gen', '--rules', 'lookup', '--records', str(records), '--target', 'windows-security',
+			'--out', str(tmp_path / 'app')]) == 0
+		err = capsys.readouterr().err
+		assert 'none of the 1 templates read got a rule (the reader found no field: 1)' in err
+		assert 'Check that --target or --reader matches these records.' in err
+
+	def test_gen_is_quiet_when_templates_get_rules(self, tmp_path, capsys):
+		records = tmp_path / 'templates.json'
+		records.write_text(json.dumps({'templateHash': 'k1', 'template': 'time=$(HH:mm:ss) user=$ src=$'}) + '\n')
+		assert fm.main(['gen', '--rules', 'lookup', '--records', str(records), '--reader', 'kv', '--sourcetype', 'tenx_fw',
+			'--rename', 'fw:traffic', '--out', str(tmp_path / 'app')]) == 0
+		assert 'got a rule' not in capsys.readouterr().err
+
 	def test_verify_counts_names_from_values_that_collide(self, tmp_path):
 		# A name that is a compact value cannot be checked when the transform is written.
 		records = tmp_path / 'templates.json'

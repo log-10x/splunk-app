@@ -2815,7 +2815,7 @@ def build_parser():
 			help='indexed field every FORMAT writes as <mark>::"1" (default %s; none: no mark). `tx` keeps the '
 				'indexed fields of an event that has it from being extracted a second time' % MARK_FIELD)
 		p.add_argument('--mixed-names', action='store_true',
-			help='write names that join text and values (NOT CHECKED on Splunk; off by default)')
+			help='write names that join text and values (checked on Splunk 10.4.3 with the CloudTrail map; off by default)')
 		p.add_argument('--rules', choices=(RULES_TRANSFORMS, RULES_LOOKUP), default=RULES_TRANSFORMS,
 			help='transforms: one index-time transform per template (default); lookup: one static rule per sourcetype '
 				'and one row per template in lookups/<prefix>_fields.csv.gz, so adding a template changes only that '
@@ -2970,6 +2970,11 @@ def main(argv=None):
 		'literal_field_names', 'templates_without_transform', 'timestamp_written_as_epoch', 'timestamp_written_as_text',
 		'written_by_ingest_eval', 'reserved_field_names'))
 	sys.stdout.write(json.dumps(summary, indent=1) + '\nreport: %s\n' % report_path)
+	if not report['templates'] and report.get('templates_selected'):
+		# Exit code unchanged: the app is still written, it just maps nothing.
+		reasons = ', '.join('%s: %d' % kv for kv in sorted(report['templates_without_transform'].items()))
+		sys.stderr.write('gen: none of the %d templates read got a rule (%s), so the app writes no field. '
+			'Check that --target or --reader matches these records.\n' % (report['templates_selected'], reasons))
 	if sourcetype_field:
 		sys.stdout.write('for tx: add %s::%s to the tenx-events macro, for example\n'
 			'    index=* (sourcetype::tenx_encoded OR %s::%s)\n' % (sourcetype_field, target['sourcetype'], sourcetype_field,

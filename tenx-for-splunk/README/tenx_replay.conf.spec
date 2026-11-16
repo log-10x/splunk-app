@@ -43,7 +43,8 @@ unit = <macro name>
 
 last_seen = <epoch seconds>
 * Start of the UTC day a rebuild last saw a compact event of this sourcetype. The replay of a
-  sourcetype not seen for replay_expire_days (tenx_config.conf) is removed.
+  sourcetype not seen for replay_expire_days (tenx_config.conf) is removed once no compact event
+  of any date carries it.
 
 [tenx:narrowing]
 fields_not_in_text = <comma-separated list>
