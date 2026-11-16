@@ -184,7 +184,7 @@ Paste the block for the version being uploaded. Splunkbase keeps notes per relea
 
 1.2.2:
 
-> - An alert compiled to native SPL finds its events when it runs. Compile again, from the Compile Alert view, each alert compiled to native SPL before this version.
+> - Alerts compiled in the Compile Alert view now fire when Splunk runs them. An alert compiled with an earlier version is rewritten by the app within 15 minutes of the upgrade, unless someone edited it since.
 > - The field map's `check` also counts the compact events of the map's sourcetype indexed without their fields since its previous run, and fails with the count and the reason; it empties the list when a row or the lookup file fails (`bad_row`, `no_table`), and leaves it for templates the list does not hold (`no_row`) and for values a row does not take (`no_match`).
 > - `activate` and `check` take `--tls-ca-file`, and refuse a lookup file that is not gzip or has no `hash` column. `gen` says when a KV store export holds no template records, such as an export that failed with "Unauthorized".
 > - Through `tx`, `txf`, `| tx`, `tenxsearch`, dashboards and compiled alerts, an event the sender passed whole without `tenx_sourcetype` keeps the fields Splunk read it with, each value once.
