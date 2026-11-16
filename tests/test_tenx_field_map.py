@@ -1562,6 +1562,28 @@ class TestCapFile:
 		assert rc == 1 and len(listed) == len(new) == 8 and '8 checks' in out
 		assert max(b - a for a, b in zip(listed, listed[1:])) == 10
 
+	def test_activate_says_when_the_instance_has_not_read_the_rows(self, tmp_path):
+		# Splunk 10.4.3 did not reread a lookup file that came back with the time it had when it was last read:
+		# every probe is then indexed without fields (no_row), and activate says why that can be
+		cap, fake, clock = self.waiting(tmp_path, [], ['k1', 'k2'])
+		fake.rows = set()
+		try:
+			rc, out = self.activate(tmp_path, cap, fake, timeout=200, poll=10, clock=clock, sleep=clock.sleep)
+		finally:
+			fake.close()
+		assert rc == 1 and read(str(cap)) == fm.cap_text(set())
+		assert 'every probe came back tenx_unmapped=no_row, so the instance has not read the rows of tenx_fw_fields.csv.gz' in out
+		assert 'stays unread until it is touched on that instance' in out
+
+	def test_no_word_on_rows_when_some_template_has_its_fields(self, tmp_path):
+		cap, fake, clock = self.waiting(tmp_path, [], ['k1', 'k2'])
+		fake.rows = {'k2'}
+		try:
+			rc, out = self.activate(tmp_path, cap, fake, timeout=200, poll=10, clock=clock, sleep=clock.sleep)
+		finally:
+			fake.close()
+		assert "'k1' (tenx_unmapped=no_row)" in out and 'has not read the rows' not in out
+
 	def test_without_rows_activate_sends_one_probe_a_round_and_lists_templates_once_rows_return(self, tmp_path):
 		added = ['k1', 'k2', 'k3', 'k4', 'k5', 'k6']
 		cap, fake, clock = self.waiting(tmp_path, [], added)

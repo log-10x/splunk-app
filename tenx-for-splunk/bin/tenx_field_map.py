@@ -35,6 +35,11 @@ while the event is indexed:
   NOT tenx_mapped::1` counts the latter. `tx` hides an event with tenx_mapped from its `extract`
   (see macros.conf [tx]): the add-on's extractions with MV_ADD would otherwise add every indexed
   field a second time.
+* with --addon, search-time copies of the add-on's rules that read the event's text (a REPORT- with no
+  SOURCE_KEY, or one reading a block such as EventData_Xml), each reading the indexed field that holds
+  the same text, in the add-on's own stanza and in a class that sorts right after the rule's class (see
+  "Add-on rules that read the event's text"). Without them the Windows add-on gives no dest, src,
+  src_ip, process_id or 4688 process fields on a mapped event.
 * fields.conf, INDEXED_VALUE = false for fields that searches match with wildcards. Splunk
   looks the words of `field="*value*"` up in the index before it reads the field, and on a
   compact event the words of template text are not in the index.
@@ -107,7 +112,7 @@ prove what Splunk does with the generated files.
 Usage
 -----
     tenx_field_map.py gen --records <kv_rows.json | templates.json> [--records ...]
-        --target windows-security | <target.json> [--sourcetype ...] [--rename ...] --out <app dir>
+        --target windows-security | <target.json> [--sourcetype ...] [--rename ...] [--addon <add-on dir>] --out <app dir>
     tenx_field_map.py verify --records ... --target ... --encoded <encoded.log> --raw <raw.log>
     tenx_field_map.py gen --rules lookup ... --cap-file <compact cap file> [--splunkd <management URL> --probe-index <index>]
     tenx_field_map.py activate --app <app dir> --cap-file <compact cap file> --splunkd <management URL> --probe-index <index>
@@ -294,6 +299,9 @@ TARGETS = {
 		'reader': 'xml-windows',
 		'sourcetype': 'tenx_win',
 		'rename': 'XmlWinEventLog',
+		# The source the compact events carry (Fluent Bit: event_source): the add-on's
+		# [source::XmlWinEventLog:Security] rules apply to them only with it.
+		'source': 'XmlWinEventLog:Security',
 		'transform_prefix': 'tenx_win',
 		'transforms_class': 'tenx_win',
 		# Fields ESCU's EventCode 4663 detections match with wildcard values.
@@ -492,14 +500,16 @@ class XmlWindowsReader(object):
 	LOGFILECLEARED = re.compile(r"(?ms)<LogFileCleared(?:\s+[^>]+)?>(.*?)<\/LogFileCleared>")
 	SUBJECT_USER_NAME = re.compile(r"(?ms)<SubjectUserName(?:\s+[^>]+)?>(.*?)<\/SubjectUserName>")
 
-	def _kv(self, body, out):
+	def _kv(self, body, out, kind='element'):
 		for m in self.KV.finditer(body):
 			opening, value, closing = m.groups()
 			if MARK_RE.fullmatch(opening) is None and opening != closing:
 				continue
-			out.append((opening, value))
+			out.append((opening, value, kind))
 
-	def pairs(self, text):
+	def read(self, text):
+		"""(name, value, kind) of every field, kind 'element', 'attribute' or 'data' (the item of the text
+		it comes from: <X>v</X>, X='v', <Data Name='X'>v</Data>)."""
 		out = []
 		for block, rx in self.BLOCKS:
 			for body in rx.findall(text):
@@ -507,16 +517,23 @@ class XmlWindowsReader(object):
 					self._kv(body, out)
 					if block == 'System':
 						for m in self.ATTR.finditer(body):
-							out.append((m.group(1), m.group(3)))
+							out.append((m.group(1), m.group(3), 'attribute'))
 				else:
 					for m in self.DATA.finditer(body):
-						out.append((m.group(1), m.group(2)))
+						out.append((m.group(1), m.group(2), 'data'))
 		for body in self.USERDATA.findall(text):
 			for cleared in self.LOGFILECLEARED.findall(body):
-				self._kv(cleared, out)
+				self._kv(cleared, out, 'userdata')
 			for m in self.SUBJECT_USER_NAME.finditer(body):
-				out.append(('Caller_User_Name', m.group(1)))
+				out.append(('Caller_User_Name', m.group(1), 'userdata'))
 		return out
+
+	def pairs(self, text):
+		return [(name, value) for name, value, _ in self.read(text)]
+
+	def items(self, text):
+		"""Counter of (name, kind) of the fields of a text whose name is not a compact value."""
+		return collections.Counter((name, kind) for name, _, kind in self.read(text) if MARK_RE.search(name) is None)
 
 
 class JsonReader(object):
@@ -1773,6 +1790,597 @@ class FieldMap(object):
 
 
 # ---------------------------------------------------------------------------------------------
+# Add-on rules that read the event's text
+#
+# Some search-time rules of an add-on read the event's text, not a field: a REPORT- transform with no
+# SOURCE_KEY (it reads _raw), or one whose SOURCE_KEY is a block of the text that another of the add-on's
+# transforms cuts out of _raw (Splunk_TA_windows 12.0.0: [eventdata_xml_block] writes EventData_Xml, and
+# [process_id_for_windows_security_from_xml__var1] reads ProcessId from EventData_Xml). On a mapped event
+# _raw is the compact text, so such a rule finds nothing, and every field it gives, with every alias,
+# calculated field, lookup and tag built on it, is missing (Splunk 10.4.3, Windows add-on 12.0.0, 662
+# Security events: dest on 612, src on 224, src_ip on 114, process_id on 257, the 4688 process fields on 36).
+#
+# With --addon, gen reads the add-on's props.conf and transforms.conf (default/, then local/ over it) and,
+# for each such rule in the stanzas that apply to the renamed events ([<rename>] and the source:: stanzas
+# matching the target's source), writes a copy that reads the same text from the field the map indexes
+# for it:
+#
+# * The rule's REGEX is cut into the text before the value, the value, and the text after it (the value is
+#   the capture group of the field the rule writes, with the lookaheads right before it). The text before
+#   and after must enclose one item that the reader writes as a field: <Data Name='X'>...</Data> (an
+#   EventData value, field X), <X>...</X> (an element, field X) or <E X='...' (an attribute, field X). A
+#   name written as a small alternation (ProcessI(d|D)) gives each of its names, and an optional part
+#   (attributes in <EventID.*?>, ".*" after the item) is read as absent. A rule whose text around the value
+#   is anything else (a condition on a second item, free text) is not copied, and the report says why.
+# * The copy is SOURCE_KEY = X, REGEX = \A<value>\z (with the rule's flags), FORMAT as the rule's with its
+#   group numbers shifted. gen checks it against the rule on synthetic events before writing it: for each
+#   of a set of values, the rule on event text holding the item and the copy on the value must give the
+#   same fields, and the rule must give nothing on the same text without the item.
+# * It runs where the rule runs: in the same stanza, in a class named <rule's class>-<prefix>. Splunk runs
+#   REPORT- classes in ASCII order of their names, and "-" sorts before every letter, digit and "_", so
+#   the copy runs right after the rule's own class (gen refuses when another class of the add-on starts
+#   with <class>-), and everything that reads the field later (later classes, aliases, calculated fields,
+#   lookups) finds it as on the raw event. On a raw event the rule has written the field when the copy
+#   runs, and the copy adds nothing: a search-time extraction keeps the value a field already has unless
+#   MV_ADD is set (transforms.conf.spec), and the copy never sets it; where the rule found nothing, the
+#   item is absent, and so is the field the copy reads. When a later transform of the same class writes
+#   the same field, the copy would run after it, so gen does not write that copy.
+#
+# Not given by a copy: a field the map does not index (the XML blocks themselves, EventData_Xml and
+# System_Props_Xml), and the fields of rules whose text is not one item (Splunk_TA_windows 12.0.0: the
+# rules that read a Data value only for EventID 5156, 5157 or 4798, and the free-text msad_* rules).
+
+TEXT_RULE_INFIX = '_text_'
+
+
+def read_splunk_conf(path):
+	"""A Splunk .conf file as stanza -> {key: value}, in file order. A value continues on the next line
+	when its line ends with a backslash; a line starting with # is a comment. A missing file is empty."""
+	out = collections.OrderedDict()
+	if not os.path.isfile(path):
+		return out
+	stanza, key, buf = 'default', None, []
+	with open(path, encoding='utf-8-sig') as f:
+		for line in f:
+			line = line.rstrip('\r\n')
+			if key is not None:
+				more = line.endswith('\\')
+				buf.append(line[:-1] if more else line)
+				if not more:
+					out.setdefault(stanza, collections.OrderedDict())[key] = '\n'.join(buf).strip()
+					key, buf = None, []
+				continue
+			text = line.strip()
+			if not text or text.startswith('#'):
+				continue
+			m = re.match(r'^\[(.*)\]$', text)
+			if m:
+				stanza = m.group(1)
+				out.setdefault(stanza, collections.OrderedDict())
+				continue
+			if '=' not in text:
+				continue
+			k, v = (x.strip() for x in text.split('=', 1))
+			if line.endswith('\\'):
+				key, buf = k, [v[:-1]]
+				continue
+			out.setdefault(stanza, collections.OrderedDict())[k] = v
+	if key is not None:
+		out.setdefault(stanza, collections.OrderedDict())[key] = '\n'.join(buf).strip()
+	return out
+
+
+def read_addon(addon_dir):
+	"""(props, transforms) of an add-on folder: default/, then local/ over it, key by key."""
+	merged = []
+	for conf in ('props', 'transforms'):
+		out = collections.OrderedDict()
+		for sub in ('default', 'local'):
+			for name, settings in read_splunk_conf(os.path.join(addon_dir, sub, conf + '.conf')).items():
+				out.setdefault(name, collections.OrderedDict()).update(settings)
+		merged.append(out)
+	if not merged[0]:
+		raise ValueError('no props.conf under %s (default/ or local/)' % addon_dir)
+	return merged[0], merged[1]
+
+
+def source_pattern_matches(pattern, source):
+	"""Whether a [source::<pattern>] stanza applies to a source: "..." is any text, "*" any text without a
+	path separator, "(", "|" and ")" group as in a regular expression, every other character is itself."""
+	out, i = [], 0
+	while i < len(pattern):
+		if pattern.startswith('...', i):
+			out.append('.*')
+			i += 3
+			continue
+		c = pattern[i]
+		out.append('[^/\\\\]*' if c == '*' else (c if c in '()|' else re.escape(c)))
+		i += 1
+	try:
+		return re.fullmatch(''.join(out), source) is not None
+	except re.error:
+		return False
+
+
+try:
+	import re._parser as _sre_parse  # Python 3.11 and later
+	import re._constants as _sre_c
+except ImportError:  # Python 3.9 and 3.10
+	import sre_parse as _sre_parse
+	import sre_constants as _sre_c
+
+_LANGUAGE_MAX = 256
+_REPEATS = tuple(x for x in (getattr(_sre_c, n, None) for n in ('MAX_REPEAT', 'MIN_REPEAT', 'POSSESSIVE_REPEAT')) if x)
+
+
+def _language(items):
+	"""The strings a parsed regex matches when each optional or repeated part takes its fewest
+	repetitions, or None when that set is not small and finite (any character, a negated class, ...)."""
+	out = ['']
+	for op, av in items:
+		if op is _sre_c.LITERAL:
+			alts = [chr(av)]
+		elif op is _sre_c.IN:
+			alts = []
+			for iop, iav in av:
+				if iop is _sre_c.LITERAL:
+					alts.append(chr(iav))
+				elif iop is _sre_c.RANGE and iav[1] - iav[0] < 16:
+					alts.extend(chr(c) for c in range(iav[0], iav[1] + 1))
+				else:
+					return None
+		elif op is _sre_c.BRANCH:
+			alts = []
+			for branch in av[1]:
+				sub = _language(branch)
+				if sub is None:
+					return None
+				alts.extend(sub)
+		elif op is _sre_c.SUBPATTERN:
+			alts = _language(av[-1])
+			if alts is None:
+				return None
+		elif op in _REPEATS:
+			low, _, sub = av
+			if low == 0:
+				continue
+			one = _language(sub)
+			if one is None or low > 3:
+				return None
+			alts = ['']
+			for _ in range(low):
+				alts = [a + b for a in alts for b in one]
+		elif op in (_sre_c.AT, _sre_c.ASSERT, _sre_c.ASSERT_NOT):
+			continue
+		else:
+			return None
+		out = [a + b for a in out for b in alts]
+		if len(out) > _LANGUAGE_MAX:
+			return None
+	return sorted(set(out))
+
+
+def regex_language(pcre):
+	"""_language of a PCRE pattern, or None."""
+	try:
+		return _language(list(_sre_parse.parse(_python_regex(pcre))))
+	except (re.error, TypeError, ValueError, OverflowError, RecursionError):
+		return None
+
+
+def regex_pieces(src):
+	"""
+	The groups and the top-level pieces of a regex source. groups: (start, end, kind, number, name) in the
+	order they open, kind 'capture', 'other' (non-capturing) or 'look' (lookaround), number the capture
+	number or None. pieces: (start, end) of each piece at depth 0, with its quantifier.
+	"""
+	groups, stack, pieces = [], [], []
+	i, n, number = 0, len(src), 0
+
+	def piece(start, end):
+		j = end
+		while j < n and src[j] in '*+?{':
+			if src[j] == '{':
+				k = src.find('}', j)
+				if k < 0 or not re.fullmatch(r'\{\d*(?:,\d*)?\}', src[j:k + 1]):
+					break
+				j = k + 1
+			else:
+				j += 1
+		pieces.append((start, j))
+		return j
+
+	while i < n:
+		c = src[i]
+		if c == '\\':
+			end = min(i + 2, n)
+			i = end if stack else piece(i, end)
+			continue
+		if c == '[':
+			j = i + 1
+			if j < n and src[j] == '^':
+				j += 1
+			if j < n and src[j] == ']':
+				j += 1
+			while j < n and src[j] != ']':
+				j += 2 if src[j] == '\\' else 1
+			end = min(j + 1, n)
+			i = end if stack else piece(i, end)
+			continue
+		if c == '(':
+			if src.startswith('(?#', i):
+				j = src.find(')', i)
+				i = n if j < 0 else j + 1
+				continue
+			named = re.match(r"\(\?(?:P?<([A-Za-z_]\w*)>|'([A-Za-z_]\w*)')", src[i:])
+			flags = re.match(r'\(\?[a-zA-Z-]*\)', src[i:])
+			if named:
+				number += 1
+				kind, num, name = 'capture', number, named.group(1) or named.group(2)
+			elif src.startswith(('(?=', '(?!', '(?<=', '(?<!'), i):
+				kind, num, name = 'look', None, None
+			elif flags:
+				if not stack:
+					pieces.append((i, i + flags.end()))
+				i += flags.end()
+				continue
+			elif src.startswith('(?', i):
+				kind, num, name = 'other', None, None
+			else:
+				number += 1
+				kind, num, name = 'capture', number, None
+			stack.append(len(groups))
+			groups.append([i, None, kind, num, name])
+			i += 1
+			continue
+		if c == ')' and stack:
+			g = groups[stack.pop()]
+			g[1] = i + 1
+			i = piece(g[0], g[1]) if not stack else i + 1
+			continue
+		if stack:
+			i += 1
+		elif c == '|':
+			pieces.append((i, i + 1))
+			i += 1
+		else:
+			i = piece(i, i + 1)
+	return [tuple(g) for g in groups], pieces
+
+
+# Items of the text the xml-windows reader writes as fields, and the blocks of the event it reads them in.
+XML_ITEM_BLOCKS = {'data': ('EventData',), 'element': ('System', 'RenderingInfo'), 'attribute': ('System',)}
+# The names the System block of every Windows event uses (the event schema's System element: its child elements
+# and their attributes). The reader writes each as a field, so a copy that reads such a name as another kind of item
+# (Data Name='ProcessID', where Execution ProcessID='4' is in every event) would read the wrong item.
+XML_SYSTEM_NAMES = {
+	'element': frozenset(('Provider', 'EventID', 'Version', 'Level', 'Task', 'Opcode', 'Keywords', 'TimeCreated',
+		'EventRecordID', 'Correlation', 'Execution', 'Channel', 'Computer', 'Security')),
+	'attribute': frozenset(('Name', 'Guid', 'EventSourceName', 'Qualifiers', 'SystemTime', 'ActivityID', 'RelatedActivityID',
+		'ProcessID', 'ThreadID', 'ProcessorID', 'SessionID', 'KernelTime', 'UserTime', 'ProcessorTime', 'UserID')),
+}
+_ITEM_OPEN = (
+	('data', re.compile("<Data\\s+Name=(['\"])([A-Za-z_][\\w.\\-]*)\\1>\\Z")),
+	('element', re.compile('<([A-Za-z_][\\w.\\-]*)>\\Z')),
+	('attribute', re.compile("<([A-Za-z_][\\w.\\-]*)\\s+([A-Za-z_][\\w.\\-]*)=(['\"])\\Z")),
+)
+# Values the copy of a rule is checked on (see "Add-on rules that read the event's text").
+TEXT_RULE_PROBES = ('x', 'value', 'a b', '-', '0', '4', '0x3c8', '10.0.1.14', '::1', '127.0.0.1', '::ffff:10.1.2.3',
+	'host.example.local', 'AR-WIN-DC$', 'C:\\Windows\\System32\\svchost.exe', '"C:\\Program Files\\a b\\x.exe" --c',
+	'%%2080', 'a=b;c', '2023-10-13T00:35:42.412381800Z', '{54849625-5478-4994-A5BA-3E3B0328C30D}', 'x &amp; y', 'N/A',
+	'12a', 'a12')
+
+
+def _item_of(before, after):
+	"""(kind, field name, element) of the item the text before and after a value encloses (element: the
+	element an attribute belongs to, else None), None when it is not one item, and False when the text
+	cannot occur in XML (an attribute value not enclosed in a pair of the same quote, as from a class
+	like [}{'"] on both sides of a name)."""
+	m = _ITEM_UNPAIRED.match(before)
+	if m and (m.group(1) != m.group(3) or m.group(1) not in '\'"'):
+		return False
+	for kind, rx in _ITEM_OPEN:
+		m = rx.match(before)
+		if not m:
+			continue
+		if kind == 'data':
+			return (kind, m.group(2), None) if after == '</Data>' else None
+		if kind == 'element':
+			return (kind, m.group(1), None) if after == '</%s>' % m.group(1) else None
+		return (kind, m.group(2), m.group(1)) if after == m.group(3) else None
+	return None
+
+
+_ITEM_UNPAIRED = re.compile("<Data\\s*Name=(.)([A-Za-z_][\\w.\\-]*)(.)>\\Z")
+
+
+def probe_event_text(kind, name, value, block=None, element=None):
+	"""Synthetic event text for checking a copy: the item (none when value is None) among other items, as
+	_raw, or as the text of the block (System, EventData) a rule's SOURCE_KEY names."""
+	system = "<Provider Name='Probe-Provider'/><Level>0</Level><Channel>Security</Channel>"
+	data = "<Data Name='ProbeBefore'>before</Data>"
+	if value is not None:
+		if kind == 'data':
+			data += "<Data Name='%s'>%s</Data>" % (name, value)
+		elif kind == 'element':
+			system += '<%s>%s</%s>' % (name, value, name)
+		else:
+			system += "<%s %s='%s'/>" % (element or 'ProbeElement', name, value)
+	data += "<Data Name='ProbeAfter'>after</Data>"
+	if block == 'System':
+		return system
+	if block == 'EventData':
+		return data
+	return ("<Event xmlns='http://schemas.microsoft.com/win/2004/08/events/event'><System>%s</System>"
+		"<EventData>%s</EventData></Event>" % (system, data))
+
+
+def report_outputs(regex, fmt, text):
+	"""The fields a search-time REPORT transform writes for one text, as Python reads REGEX (already in
+	Python syntax): its named groups when FORMAT is empty, else FORMAT's name::$k and name::"$k" pairs. Outer
+	whitespace is dropped, as Splunk drops it from an extracted value. None when REGEX does not match."""
+	m = re.search(regex, text)
+	if m is None:
+		return None
+	if not fmt:
+		return dict((k, v.strip(TRIM_CHARS)) for k, v in m.groupdict().items() if v is not None)
+	out = {}
+	for name, _, k in re.findall(r'([^\s:"]+)::("?)\$(\d+)\2', fmt):
+		v = m.group(int(k)) if int(k) <= len(m.groups()) else None
+		if v is not None:
+			out[name] = v.strip(TRIM_CHARS)
+	return out
+
+
+def written_names(transform):
+	"""The field names a transform writes: FORMAT's literal names, else the named groups of REGEX."""
+	fmt = str(transform.get('FORMAT', '')).strip()
+	if fmt:
+		return sorted(set(n for n in re.findall(r'([^\s:"]+)::', fmt) if not n.startswith('$')))
+	return sorted(set(re.findall(r'\(\?P?<([A-Za-z_]\w*)>', str(transform.get('REGEX', '')))))
+
+
+TextRule = collections.namedtuple('TextRule', 'stanza cls name source_key regex format rule field kind')
+
+
+def _source_key(transform):
+	return str(transform.get('SOURCE_KEY', '_raw') or '_raw').strip()
+
+
+def text_rule_copies(props, transforms, rename, source=None, prefix='tenx_fm', seen=None):
+	"""
+	The field-reading copies of an add-on's rules that read the event's text (see "Add-on rules that read
+	the event's text"), for the xml-windows reader. A copy is not written for a name the System block of
+	every event holds as another kind of item (XML_SYSTEM_NAMES), since the field would then not be only
+	the item the rule reads. What is written depends on the add-on alone, so a template added later still
+	changes only the lookup file. seen: {field name: {item kind: most items of that name in one template}}
+	over the templates (XmlWindowsReader.items); a copy whose name the templates hold as another kind of
+	item, or more than once, is written and named in the report's warnings. Returns (copies, report): a list
+	of TextRule in the order they are written, and an OrderedDict naming each rule considered and what was
+	done with it.
+	"""
+	seen = seen or {}
+	stanzas = [rename] if rename in props else []
+	if source:
+		stanzas += [s for s in props if s.startswith('source::') and source_pattern_matches(s[len('source::'):], source)]
+	classes = []
+	for st in stanzas:
+		for key, value in props[st].items():
+			if key.startswith('REPORT-'):
+				classes.append((key[len('REPORT-'):], st, [x.strip() for x in value.split(',') if x.strip()]))
+	class_names = set(c for c, _, _ in classes)
+
+	# A block: a transform that reads _raw with REGEX <X(?:\s+[^>]+)?>(.*?)</X> and FORMAT Y::$1 writes the
+	# text of element X as field Y.
+	blocks = {}
+	for _, _, names in classes:
+		for tname in names:
+			t = transforms.get(tname, {})
+			fm = re.match(r'^([A-Za-z_]\w*)::\$1$', str(t.get('FORMAT', '')).strip())
+			rm = re.match(r'^(?:\(\?[a-z]+\))?<([A-Za-z_]\w*)\(\?:\\s\+\[\^>\]\+\)\?>\(\.\*\?\)<\\?/([A-Za-z_]\w*)>$',
+				str(t.get('REGEX', '')).strip())
+			if _source_key(t) == '_raw' and fm and rm and rm.group(1) == rm.group(2):
+				blocks[fm.group(1)] = rm.group(1)
+
+	report = collections.OrderedDict([('stanzas', stanzas), ('blocks', dict(blocks)), ('copied', []), ('not_copied', []),
+		('warnings', [])])
+	copies = []
+	for cls, st, names in sorted(classes, key=lambda c: c[0]):
+		for pos, tname in enumerate(names):
+			t = transforms.get(tname)
+			if t is None:
+				continue
+			sk = _source_key(t)
+			if sk != '_raw' and sk not in blocks:
+				continue
+			regex, fmt = str(t.get('REGEX', '')).strip(), str(t.get('FORMAT', '')).strip()
+			entry = collections.OrderedDict([('class', cls), ('stanza', st), ('transform', tname), ('source_key', sk),
+				('writes', written_names(t))])
+			reason, items, candidates = _copy_plan(regex, fmt, sk, blocks)
+			if reason:
+				report['not_copied'].append(dict(entry, why=reason))
+				continue
+			later = [n for n in names[pos + 1:] if n in transforms and set(written_names(transforms[n])) & set(entry['writes'])]
+			if later:
+				report['not_copied'].append(dict(entry, why='a later transform of its class (%s) writes the same field, '
+					'so a copy running after the class would come too late' % ', '.join(later)))
+				continue
+			copy_cls = '%s-%s' % (cls, prefix)
+			between = sorted(c for c in class_names if cls < c <= copy_cls)
+			if between:
+				report['not_copied'].append(dict(entry, why='the class %s of the add-on sorts between %s and the copy\'s '
+					'class' % (between[0], cls)))
+				continue
+			for item, copy_regex, copy_fmt, failed in candidates:
+				kind, field = item[0], item[1]
+				clash = sorted(k for k, names in XML_SYSTEM_NAMES.items() if k != kind and field in names)
+				if not failed and clash:
+					failed = 'every event\'s System block holds %s as an %s, so the field is not only the item the rule reads' % (
+						field, ' and '.join(clash))
+				if failed:
+					report['not_copied'].append(dict(entry, reads='%s %s' % (kind, field), why=failed))
+					continue
+				name = '%s%s%s' % (prefix, TEXT_RULE_INFIX, sanitize(tname))
+				if len(items) > 1:
+					name += '_' + sanitize(field)
+				copies.append(TextRule(st, copy_cls, name, field, copy_regex, copy_fmt, tname, field, kind))
+				other = dict((k, c) for k, c in seen.get(field, {}).items() if k != kind or c > 1)
+				if other:
+					report['warnings'].append('%s reads %s %s, which templates also hold as %s' % (name, kind, field,
+						', '.join('%s (up to %d in one template)' % kc for kc in sorted(other.items()))))
+				report['copied'].append(collections.OrderedDict([('class', cls), ('stanza', st), ('transform', tname),
+					('reads', '%s %s' % (kind, field)), ('copy', name), ('writes', entry['writes'])]))
+	return copies, report
+
+
+def _copy_plan(regex, fmt, sk, blocks):
+	"""(why one rule gets no copy, or None; the items it reads; per item (item, copy REGEX, copy FORMAT, why
+	that copy failed its check or None))."""
+	if sk == '_raw' and re.match(r'^([A-Za-z_]\w*)::\$1$', fmt) and fmt.split('::')[0] in blocks:
+		return 'writes the block %s; the map writes the fields inside it' % fmt.split('::')[0], (), ()
+	if not regex:
+		return 'no REGEX', (), ()
+	if re.search(r'\$\d+::', fmt) or (fmt and '::' not in fmt):
+		return 'takes field names from the text; the map writes those fields itself', (), ()
+	try:
+		py_rule = _python_regex(regex)
+		re.compile(py_rule)
+		groups, pieces = regex_pieces(regex)
+	except re.error as e:
+		return 'REGEX not read here: %s' % e, (), ()
+	if fmt:
+		wanted = set(int(k) for k in re.findall(r'::"?\$(\d+)', fmt))
+		outs = [g for g in groups if g[2] == 'capture' and g[3] in wanted]
+	else:
+		outs = [g for g in groups if g[2] == 'capture' and g[4]]
+	if not outs:
+		return 'writes no field', (), ()
+	if any(regex[a:b] == '|' for a, b in pieces):
+		return 'an alternation at the top of the pattern', (), ()
+	lo, hi = min(g[0] for g in outs), max(g[1] for g in outs)
+	around = [p for p in pieces if p[0] <= lo and hi <= p[1]]
+	if not around:
+		return 'the fields it writes are not one piece of the pattern', (), ()
+	k = pieces.index(around[0])
+	v0, v1 = around[0]
+	while k > 0 and regex.startswith(('(?=', '(?!'), pieces[k - 1][0]):
+		k -= 1
+		v0 = pieces[k][0]
+	fl = re.match(r'^\(\?[a-zA-Z]+\)', regex)
+	flags = fl.group(0) if fl else ''
+	before, value, after = regex[len(flags):v0], regex[v0:v1], regex[v1:]
+	if not _fixed_edge(before, last=True) or not _fixed_edge(after, last=False):
+		return 'the value is not enclosed by fixed text on both sides', (), ()
+	opens, closes = regex_language(flags + before), regex_language(flags + after)
+	if not opens or not closes:
+		return 'the text around the value is not a fixed item', (), ()
+	items = set()
+	for o in opens:
+		for c in closes:
+			item = _item_of(o, c)
+			if item is None:
+				return 'the text around the value is not one item (%r ... %r)' % (o[:70], c[:70]), (), ()
+			if item:
+				items.add(item)
+	if not items:
+		return 'the text around the value is not one item', (), ()
+	block = blocks.get(sk)
+	items = sorted(it for it in items if block is None or block in XML_ITEM_BLOCKS[it[0]])
+	if not items:
+		return 'reads an item of %s that the map does not write' % block, (), ()
+	shift = sum(1 for g in groups if g[2] == 'capture' and g[0] < v0)
+	copy_fmt = re.sub(r'\$(\d+)', lambda m: '$%d' % (int(m.group(1)) - shift), fmt) if fmt else ''
+	copy_regex = flags + '\\A' + value + '\\z'
+	py_copy = _python_regex(copy_regex).replace('\\z', '\\Z')
+	return None, items, [(item, copy_regex, copy_fmt, _check_copy(py_rule, fmt, py_copy, copy_fmt, item, block))
+		for item in items]
+
+
+def _fixed_edge(src, last):
+	"""Whether the piece of src next to the value (its last piece when last, else its first) is fixed text
+	that closes or opens an item: one character, ">", "<" or a quote, or a class of quotes, matched exactly
+	once. An optional or repeated piece there (\\D* before </Data>) could take characters of the value."""
+	_, pieces = regex_pieces(src)
+	if not pieces:
+		return False
+	a, b = pieces[-1] if last else pieces[0]
+	text = src[a:b]
+	if text in ('>', '\\>', '<', '\\<', "'", '"'):
+		return True
+	m = re.match(r'^\[([^\]]*)\]$', text)
+	return bool(m) and set(m.group(1).replace('\\', '')) <= set('\'"{}')
+
+
+def _check_copy(py_rule, fmt, py_copy, copy_fmt, item, block):
+	"""Why the copy of a rule does not give what the rule gives on synthetic events, or None."""
+	kind, field, element = item
+	if report_outputs(py_rule, fmt, probe_event_text(kind, field, None, block, element)):
+		return 'the rule gives a field on the text without the item'
+	for v in TEXT_RULE_PROBES:
+		if kind == 'attribute' and ("'" in v or '"' in v):
+			continue
+		want = report_outputs(py_rule, fmt, probe_event_text(kind, field, v, block, element)) or {}
+		got = report_outputs(py_copy, copy_fmt, v.strip(TRIM_CHARS)) or {}
+		if want != got:
+			return 'on the value %r the rule gives %r, a copy reading %s %r' % (v, want, field, got)
+	return None
+
+
+def text_rule_props(copies):
+	"""props.conf lines of the copies: stanza -> ['REPORT-<class> = <names>', ...], classes in order."""
+	out = collections.OrderedDict()
+	for c in copies:
+		classes = out.setdefault(c.stanza, collections.OrderedDict())
+		classes.setdefault(c.cls, []).append(c.name)
+	return collections.OrderedDict((st, ['REPORT-%s = %s' % (cls, ', '.join(names)) for cls, names in classes.items()])
+		for st, classes in out.items())
+
+
+def template_items(templates, reader):
+	"""{field name: {item kind: most items of that name in one template}} over the templates, for readers
+	that say which item a field comes from (XmlWindowsReader.items); {} for the others."""
+	seen = {}
+	if not hasattr(reader, 'items'):
+		return seen
+	for t in templates.values():
+		try:
+			text, _ = marked_text(t)
+		except ValueError:
+			continue
+		for (name, kind), count in reader.items(text).items():
+			kinds = seen.setdefault(name, {})
+			kinds[kind] = max(kinds.get(kind, 0), count)
+	return seen
+
+
+def addon_text_rules(addon_dir, target, templates):
+	"""(copies, report) for gen --addon: the copies of the add-on's rules that read the event's text (the
+	xml-windows reader), or, for another reader, the report of those rules with none copied."""
+	props, transforms = read_addon(addon_dir)
+	reader = READERS[target['reader']]()
+	copies, report = text_rule_copies(props, transforms, target['rename'], target.get('source'),
+		target['transform_prefix'], template_items(templates, reader))
+	if target['reader'] != XmlWindowsReader.name:
+		for c in report['copied']:
+			report['not_copied'].append(dict(c, why='the %s reader has no copies of rules that read the text'
+				% target['reader']))
+		copies, report['copied'] = [], []
+	report['addon'] = os.path.abspath(addon_dir)
+	report['source'] = target.get('source')
+	return copies, report
+
+
+def text_rule_transforms(copies):
+	"""transforms.conf text of the copies."""
+	parts = []
+	for c in copies:
+		parts.append('# Search-time: [%s] of the add-on reads the %s %s in the event\'s text; this reads the field.\n'
+			'[%s]\nSOURCE_KEY = %s\nREGEX = %s\n%s' % (c.rule, c.kind, c.field, c.name, c.source_key, c.regex,
+			('FORMAT = %s\n' % c.format) if c.format else ''))
+	return '\n'.join(parts)
+
+
+# ---------------------------------------------------------------------------------------------
 # Target description and the generated app
 
 def load_target(name_or_path, overrides):
@@ -1841,7 +2449,7 @@ def restore_stanza(name):
 	return RESTORE_TRANSFORM + sanitize(name)
 
 
-def props_text(target, field_map, settings, search_hash=True, sourcetype_field=SOURCETYPE_FIELD):
+def props_text(target, field_map, settings, search_hash=True, sourcetype_field=SOURCETYPE_FIELD, text_rules=()):
 	lines = [
 		'# %s. Index-time: the app\'s [%s] parsing plus one' % (target['description'], SOURCE_STANZA),
 		'# generated transform per template. Search-time: renamed to the add-on\'s sourcetype.',
@@ -1873,16 +2481,30 @@ def props_text(target, field_map, settings, search_hash=True, sourcetype_field=S
 			'[%s]' % target['rename'],
 			'REPORT-%s = %s' % (HASH_TRANSFORM, HASH_TRANSFORM)]
 	restored = restored_names(field_map)
+	in_rename = search_hash
 	if restored:
-		if not search_hash:
+		if not in_rename:
 			lines += ['', '[%s]' % target['rename']]
+			in_rename = True
 		lines += ['# Search-time: each name Splunk does not keep for an indexed field, given back from %s<name>.'
 			% field_map.reserved_prefix,
 			'REPORT-tenx_fm_restore = %s' % ', '.join(restore_stanza(n) for n in restored)]
+	by_stanza = text_rule_props(text_rules)
+	note = ('# Search-time: the add-on\'s rules that read the event\'s text, as copies that read the field the map\n'
+		'# indexes for that text, each in a class that sorts right after the rule\'s own class (see "Add-on rules\n'
+		'# that read the event\'s text" in tenx_field_map.py). On an uncompacted event the rule has already\n'
+		'# written the field when its copy runs, and the copy adds nothing.')
+	if target['rename'] in by_stanza:
+		if not in_rename:
+			lines += ['', '[%s]' % target['rename']]
+		lines += [note] + by_stanza.pop(target['rename'])
+		note = '# Search-time: as above, for the rules of this stanza of the add-on.'
+	for stanza, entries in by_stanza.items():
+		lines += ['', '[%s]' % stanza, note] + entries
 	return '\n'.join(lines) + '\n'
 
 
-def transforms_text(field_map, search_hash=True, target=None, sourcetype_field=SOURCETYPE_FIELD):
+def transforms_text(field_map, search_hash=True, target=None, sourcetype_field=SOURCETYPE_FIELD, text_rules=()):
 	if field_map.rules == RULES_LOOKUP:
 		stanzas = ['# The template rows, read by the rule below at index time (lookups/%s).\n[%s]\nfilename = %s\n'
 			'case_sensitive_match = true\n' % (lookup_file_name(target), lookup_stanza(target), lookup_file_name(target)),
@@ -1910,6 +2532,8 @@ def transforms_text(field_map, search_hash=True, target=None, sourcetype_field=S
 		text += ('\n# Search-time: %s, written at index time as %s%s.\n[%s]\nSOURCE_KEY = %s%s\nREGEX = %s\n'
 			'FORMAT = %s::$1\n' % (name, field_map.reserved_prefix, name, restore_stanza(name), field_map.reserved_prefix,
 				name, RESTORE_REGEX, name))
+	if text_rules:
+		text += '\n' + text_rule_transforms(text_rules)
 	return text
 
 
@@ -1928,7 +2552,7 @@ def app_conf_text(target):
 
 
 def write_app(out_dir, target, field_map, settings, search_hash=True, sourcetype_field=SOURCETYPE_FIELD,
-		lookup_bytes=None):
+		lookup_bytes=None, text_rules=()):
 	for sub in ('default', 'metadata'):
 		os.makedirs(os.path.join(out_dir, sub), exist_ok=True)
 
@@ -1940,8 +2564,10 @@ def write_app(out_dir, target, field_map, settings, search_hash=True, sourcetype
 		# First: the rule must never run without its file (a missing file drops compact events).
 		files[os.path.join('lookups', lookup_file_name(target))] = lookup_bytes
 	files.update([
-		(os.path.join('default', 'transforms.conf'), transforms_text(field_map, search_hash, target, sourcetype_field)),
-		(os.path.join('default', 'props.conf'), props_text(target, field_map, settings, search_hash, sourcetype_field)),
+		(os.path.join('default', 'transforms.conf'), transforms_text(field_map, search_hash, target, sourcetype_field,
+			text_rules)),
+		(os.path.join('default', 'props.conf'), props_text(target, field_map, settings, search_hash, sourcetype_field,
+			text_rules)),
 		(os.path.join('default', 'app.conf'), app_conf_text(target)),
 		(os.path.join('metadata', 'default.meta'), '[]\nexport = system\n'),
 	])
@@ -2348,6 +2974,36 @@ def cap_after_app(path, hashes):
 	return write_if_changed(path + CAP_PENDING_SUFFIX, cap_text(hashes, kept))
 
 
+class TlsVerifyError(Exception):
+	"""The certificate of a Splunk endpoint did not verify; str() is one line for the person running the tool."""
+
+	def __init__(self, url, detail):
+		Exception.__init__(self, 'the certificate of %s did not verify (%s); for an instance with Splunk\'s default '
+			'self-signed certificate, add --tls-verify off' % (url, detail))
+
+
+def _certificate_failure(e):
+	"""The verification message of an exception urlopen raised for a certificate that did not verify, or None."""
+	reason = getattr(e, 'reason', e)
+	if isinstance(reason, ssl.SSLCertVerificationError):
+		return getattr(reason, 'verify_message', None) or str(reason)
+	if isinstance(reason, ssl.SSLError) and 'CERTIFICATE_VERIFY_FAILED' in str(reason):
+		return 'CERTIFICATE_VERIFY_FAILED'
+	return None
+
+
+def urlopen_checked(req, context, timeout):
+	"""urllib.request.urlopen, with a certificate that does not verify raised as TlsVerifyError."""
+	try:
+		return urllib.request.urlopen(req, context=context, timeout=timeout)
+	except (urllib.error.URLError, ssl.SSLError) as e:
+		detail = _certificate_failure(e)
+		if detail is None:
+			raise
+		parts = urllib.parse.urlsplit(req.full_url)
+		raise TlsVerifyError('%s://%s' % (parts.scheme, parts.netloc), detail)
+
+
 class Splunkd(object):
 	"""The management port of the instance that parses the data (REST, JSON)."""
 
@@ -2377,7 +3033,7 @@ class Splunkd(object):
 		else:
 			data = urllib.parse.urlencode(params).encode('ascii')
 		req = urllib.request.Request(url, data=data, method=method, headers=self.headers)
-		with urllib.request.urlopen(req, context=self.ctx, timeout=120) as res:
+		with urlopen_checked(req, self.ctx, 120) as res:
 			body = res.read()
 		return json.loads(body) if body.strip() else {}
 
@@ -2391,7 +3047,7 @@ class Splunkd(object):
 		req = urllib.request.Request(node + '/services/collector/event', data=body, method='POST',
 			headers={'Authorization': 'Splunk %s' % self.hec_token})
 		try:
-			with urllib.request.urlopen(req, context=self.ctx, timeout=10) as res:
+			with urlopen_checked(req, self.ctx, 10) as res:
 				res.read()
 		except urllib.error.HTTPError as e:
 			if e.code == 503:
@@ -2413,13 +3069,13 @@ class Splunkd(object):
 				for l in lines).encode('utf-8')
 			req = urllib.request.Request(self.hec_url + '/services/collector/event', data=body, method='POST',
 				headers={'Authorization': 'Splunk %s' % self.hec_token})
-			with urllib.request.urlopen(req, context=self.ctx, timeout=120) as res:
+			with urlopen_checked(req, self.ctx, 120) as res:
 				res.read()
 			return [None]
 		q = urllib.parse.urlencode({'index': index, 'host': host, 'source': source, 'sourcetype': sourcetype})
 		req = urllib.request.Request(self.url + '/services/receivers/simple?' + q, data=('\n'.join(lines) + '\n').encode('utf-8'),
 			method='POST', headers=self.headers)
-		with urllib.request.urlopen(req, context=self.ctx, timeout=120) as res:
+		with urlopen_checked(req, self.ctx, 120) as res:
 			res.read()
 		return [None]
 
@@ -2651,6 +3307,14 @@ def activate(app_dir, cap_file, splunkd, app_name=None, probe_index=None, timeou
 				'' if not missing else '; not yet: %s' % ', '.join(repr(h) for h in missing[:5])))
 		if away:
 			out.write('activate: did not answer in at least one round, so left out of those rounds: %s\n' % ', '.join(sorted(away)))
+		if failed and not confirmed and all(failed[h] == [WHY_NO_ROW] for h in failed):
+			# Splunk 10.4.3: a lookup file moved away and back, so that it had again the modification time it had when
+			# Splunk last read it, was not reread in 75 s (probe no_row), and was read within 75 s once touched; a file
+			# put back with an older time than the one it replaced was read.
+			out.write('activate: every probe came back %s=%s, so the instance has not read the rows of %s. Splunk rereads a '
+				'lookup file when its modification time changes: a file put back with the time it had when Splunk last read '
+				'it (moved back, or copied with its time kept: cp -p, docker cp, rsync -a) stays unread until it is touched '
+				'on that instance\n' % (UNMAPPED_FIELD, WHY_NO_ROW, os.path.basename(table)))
 	now = (before & after) | confirmed
 	if now == after:
 		# Written anew rather than renamed: the pending file can be as old as the cap file it replaces (check
@@ -2749,7 +3413,7 @@ def _build(args):
 	overrides = {
 		'reader': args.reader, 'sourcetype': args.sourcetype, 'rename': args.rename,
 		'transform_prefix': args.transform_prefix, 'transforms_class': args.transforms_class,
-		'app_name': args.app_name,
+		'app_name': args.app_name, 'source': getattr(args, 'source', None),
 		'indexed_value_false': None if args.indexed_value_false is None
 			else [f for f in args.indexed_value_false.split(',') if f],
 	}
@@ -2789,6 +3453,8 @@ def build_parser():
 		p.add_argument('--reader', choices=sorted(READERS))
 		p.add_argument('--sourcetype', help='the compact sourcetype the generated props.conf defines')
 		p.add_argument('--rename', help='the original sourcetype, whose search-time rules should run')
+		p.add_argument('--source', help='the source the compact events carry (windows-security: XmlWinEventLog:Security); '
+			'with --addon, the add-on\'s source:: stanzas that match it are read as well')
 		p.add_argument('--transform-prefix')
 		p.add_argument('--transforms-class')
 		p.add_argument('--app-name')
@@ -2831,6 +3497,10 @@ def build_parser():
 		p.add_argument('--time-lookahead', type=int, help='MAX_TIMESTAMP_LOOKAHEAD for the rule, instead of the add-on\'s')
 		if mode == 'gen':
 			p.add_argument('--out', required=True, help='the app folder to write')
+			p.add_argument('--addon', help='the folder of the original sourcetype\'s add-on (its default/ and local/ '
+				'props.conf and transforms.conf are read): for each of its search-time rules that read the event\'s text, '
+				'which finds nothing on a compact event, write a copy that reads the field the map indexes for that '
+				'text (xml-windows reader; see "Add-on rules that read the event\'s text")')
 			p.add_argument('--report', help='report path (default: <out>_report.json)')
 			p.add_argument('--app-props', default=default_app_props(), help='the app props.conf holding [tenx_encoded]')
 			p.add_argument('--search-hash', choices=('on', 'off'), default='on',
@@ -2910,6 +3580,14 @@ def _splunkd(args):
 
 def main(argv=None):
 	args = build_parser().parse_args(argv)
+	try:
+		return _main(args)
+	except TlsVerifyError as e:
+		sys.stderr.write('%s: %s\n' % (args.mode, e))
+		return 1
+
+
+def _main(args):
 	if args.mode == 'activate':
 		return activate(args.app, args.cap_file, _splunkd(args), args.app_name, args.probe_index, args.timeout, args.poll,
 			check_timeout=args.check_timeout)
@@ -2941,6 +3619,16 @@ def main(argv=None):
 			sys.stderr.write('gen: the lookup file would be %d bytes, over --lookup-max-bytes %d; nothing written\n'
 				% (len(lookup_bytes), args.lookup_max_bytes))
 			return 2
+	text_rules, text_report = (), None
+	if args.addon:
+		try:
+			text_rules, text_report = addon_text_rules(args.addon, target, templates)
+		except (ValueError, OSError) as e:
+			sys.stderr.write('gen: --addon: %s\n' % e)
+			return 2
+	elif target['reader'] == XmlWindowsReader.name:
+		sys.stderr.write('gen: without --addon, the add-on\'s rules that read the event\'s text, not a field, give '
+			'nothing on mapped events; give --addon <the add-on\'s folder> to write copies that read the indexed fields\n')
 	cap = None
 	if args.cap_file:
 		hashes = cap_hashes(field_map, templates)
@@ -2949,7 +3637,8 @@ def main(argv=None):
 	if args.rules == RULES_LOOKUP and args.floor == 'on':
 		# First, so the definition and a file of its name exist before the rule that reads them.
 		sizes.update(write_floor_app(args.out, target))
-	sizes.update(write_app(args.out, target, field_map, settings, args.search_hash == 'on', sourcetype_field, lookup_bytes))
+	sizes.update(write_app(args.out, target, field_map, settings, args.search_hash == 'on', sourcetype_field, lookup_bytes,
+		text_rules))
 	if args.cap_file:
 		cap['pending_file_written'] = cap_after_app(args.cap_file, hashes)
 	report = field_map.report()
@@ -2964,12 +3653,18 @@ def main(argv=None):
 		report['lookup_csv_bytes'] = sum(len(','.join(r)) + 1 for r in rows)
 	report['target'] = target
 	report['sourcetype_field'] = sourcetype_field
+	if text_report is not None:
+		report['addon_rules_reading_text'] = text_report
 	report_path = args.report or args.out.rstrip(os.sep) + '_report.json'
 	with open(report_path, 'w', encoding='utf-8') as f:
 		json.dump(report, f, indent=1)
 	summary = collections.OrderedDict((k, report[k]) for k in ('templates', 'fields_per_template_min_max', 'skipped',
 		'literal_field_names', 'templates_without_transform', 'timestamp_written_as_epoch', 'timestamp_written_as_text',
 		'written_by_ingest_eval', 'reserved_field_names'))
+	if text_report is not None:
+		summary['addon_rules_reading_text'] = collections.OrderedDict([
+			('copied', ['%s (%s): %s' % (c['transform'], c['reads'], ', '.join(c['writes'])) for c in text_report['copied']]),
+			('not_copied', len(text_report['not_copied']))])
 	sys.stdout.write(json.dumps(summary, indent=1) + '\nreport: %s\n' % report_path)
 	if sourcetype_field:
 		sys.stdout.write('for tx: add %s::%s to the tenx-events macro, for example\n'
