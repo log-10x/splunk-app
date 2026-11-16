@@ -122,10 +122,21 @@ class TestNativeCompile:
 		result = make_compiler().compile('sourcetype=tenx_encoded status=500 payment')
 
 		assert result.strategy == AlertStrategy.NATIVE
-		# field conditions filter post-inflate: force generic key=value extraction on the decoded
-		# _raw, then filter with search-command semantics (works for string + numeric values).
-		assert '| extract kvdelim="=" pairdelim=" "' in result.compiled_search
+		# field conditions filter post-inflate, on the fields the event's own extraction gives the
+		# decoded _raw, with search-command semantics (works for string + numeric values).
+		assert '| fields - _kv | extract |' in result.compiled_search
+		assert 'kvdelim' not in result.compiled_search
 		assert '| search status=500' in result.compiled_search
+
+	def test_a_compiled_alert_replays_the_original_sourcetypes_fields(self):
+		# The macro is expanded when the alert runs, so an alert compiled before `tenxreplay`
+		# wrote it picks the replay up without being recompiled. It runs right after expansion;
+		# the generic key=value pass comes later, with replayed events hidden from it, and the
+		# field condition last, so status=500 can match a field that a calculated field or a
+		# lookup of the original sourcetype produces.
+		search = make_compiler().compile('sourcetype=tenx_encoded status=500 payment').compiled_search
+		assert search.index('`tenx-inflate`') < search.index('`tenx-replay`') \
+			< search.index('spath input=tenx_xml') < search.index('| search status=500')
 
 	def test_trailing_pipeline_is_preserved(self):
 		result = make_compiler().compile('sourcetype=tenx_encoded payment | stats count')
@@ -438,8 +449,9 @@ class TestNegationGuard:
 
 
 # ---------------------------------------------------------------------------
-# Field conditions compile to a working post-inflate
-# `| extract kvdelim=... | search field=value` filter (verified on live Splunk), but they
+# Field conditions compile to a post-inflate `| search field=value` filter on the fields the
+# event's own extraction gives the expanded text (compared with the generic `extract kvdelim=...`
+# pass it replaced on Splunk Enterprise 10.4.3: equal counts, no repeated values), but they
 # depend on the decoded events being logfmt-shaped, so they are stored NATIVE + needs_review
 # for a human to confirm against real data (not silently certified clean).
 # ---------------------------------------------------------------------------
@@ -452,7 +464,7 @@ class TestFieldConditions:
 		assert result.storable
 		assert result.needs_review
 		assert 'field condition' in result.reason
-		assert '| extract kvdelim="=" pairdelim=" "' in result.compiled_search
+		assert '| fields - _kv | extract |' in result.compiled_search
 		assert '| search level=error' in result.compiled_search
 
 	def test_numeric_field_value_compiles_native_and_is_flagged(self):

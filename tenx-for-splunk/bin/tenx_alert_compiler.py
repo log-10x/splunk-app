@@ -286,9 +286,10 @@ class TenxAlertCompiler:
 				reason="template lookup failed (transient); retry, and keep the existing alert")
 
 		# FAILURE (unparseable), PENDING or anything unexpected: do not persist a broken search.
+		# When splunkd itself refused to parse it, its own words are the reason.
 		return AlertCompileResult(
 			AlertStrategy.REJECTED, None, original, state,
-			reason="could not resolve search (state {})".format(
+			reason=getattr(result, 'parse_error', None) or "could not resolve search (state {})".format(
 				state.name if state is not None else "unknown"))
 
 	def _compile_native(self, original, result):
@@ -338,18 +339,17 @@ class TenxAlertCompiler:
 				"if a term appears as a variable value, not as template text. Confirm "
 				"that is the intent, or recompile once a matching template exists")
 
-		# Field conditions filter post-inflate via generic key=value extraction from the decoded
-		# event text (logfmt-style, space-separated). That works, but it depends on the decoded
-		# events actually carrying these as extractable fields: on a differently-shaped payload
-		# (JSON, key:value, quoted values with spaces) the field may not extract and the alert
-		# would silently never fire, or a bare key=value fragment elsewhere could over-match.
-		# Flag for a human to confirm against real data rather than certifying it clean.
+		# Field conditions filter post-inflate on the fields the decoded text gets from the event's
+		# own extraction (key=value pairs and JSON) and, for XML text, from spath. That works, but
+		# it depends on the decoded events actually carrying these as extractable fields: a field
+		# that only a field alias, calculated field or lookup of the original sourcetype gives is
+		# not there, and the alert would silently never fire. Flag for a human to confirm against
+		# real data rather than certifying it clean.
 		if result.field_terms:
 			review_reasons.append(
-				"filters on field condition(s) {} via key=value extraction from the decoded event "
-				"text; confirm those decode as fields (space-separated key=value). Other "
-				"payload shapes may not extract, and the alert would then not fire".format(
-					", ".join(result.field_terms)))
+				"filters on field condition(s) {} using the fields extracted from the decoded event "
+				"text (key=value pairs, JSON, XML paths); confirm the decoded events carry them, "
+				"or the alert will not fire".format(", ".join(result.field_terms)))
 
 		if review_reasons:
 			return AlertCompileResult(
@@ -379,5 +379,17 @@ class TenxAlertCompiler:
 						"for expansion (too ambiguous to resolve safely); review before scheduling "
 						"- it would otherwise alert on un-inflated compact events").format(
 							", ".join(referenced)))
+
+		# Names no sourcetype or source: an alert over an index holding compact events would read
+		# their compact text on every run. Flagged the same way when the probe finds any.
+		import tenx_search_builder
+		probe, message = tenx_search_builder.compact_probe(result, config)
+		manager = getattr(self.builder, 'search_manager', None)
+		if probe is not None and hasattr(manager, 'run_probe'):
+			rows = manager.run_probe(probe, '0', 'now')
+			if rows:
+				return AlertCompileResult(
+					AlertStrategy.PASSTHROUGH, original, original, result.state,
+					needs_review=True, reason=message(rows, refused=False))
 
 		return AlertCompileResult(AlertStrategy.PASSTHROUGH, original, original, result.state)

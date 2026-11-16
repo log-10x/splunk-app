@@ -28,12 +28,13 @@ from tenx_search_builder import (
 	conjoin,
 	is_wrapped,
 )
+from tenx_prefilter_parser import hash_term
 
 from support.local_search_manager import LocalSearchManager, CsvTemplateStore
 
 
-# Hashes shaped like the real ones: an interior space, a '*' after a usable prefix, a '*'
-# too early for a prefix, and plain. The words are the non-'$' tokens of each pattern.
+# Hashes shaped like the real ones: an interior space, a '*' after a longer run, a '*' after
+# one character, and plain. The words are the non-'$' tokens of each pattern.
 TEMPLATES = [
 	('KC 2c#eEev', 'cartstore called with $ for $'),
 	('0PIlry*uDJ', 'cart bootstrap $ items'),
@@ -82,9 +83,16 @@ def compile_search(search, **manager_kwargs):
 	return result, manager
 
 
+# What follows the prefilter: expand, replay the original sourcetype's fields, then the
+# rewrite's own extraction with replayed events hidden from it, and give them back.
+EXPAND_HEAD = '| eval tenx_compact_raw=_raw | `tenx-inflate` | eval tenx_hide_others=1 | `tenx-replay` | fields - tenx_hide_others | eval tenx_h_raw=if(isnotnull(tenx_rst) OR isnotnull(tenx_asis), _raw, null()), tenx_h_st=if(isnotnull(tenx_rst) OR isnotnull(tenx_asis), sourcetype, null()), tenx_h_src=if(isnotnull(tenx_rst) OR isnotnull(tenx_asis), source, null()), tenx_h_host=if(isnotnull(tenx_rst) OR isnotnull(tenx_asis), host, null()) | eval _raw=if(isnotnull(tenx_rst) OR isnotnull(tenx_asis), "", _raw), sourcetype=if(isnotnull(tenx_rst) OR isnotnull(tenx_asis), "tenx_replayed", sourcetype), source=if(isnotnull(tenx_rst) OR isnotnull(tenx_asis), "tenx_replayed", source), host=if(isnotnull(tenx_rst) OR isnotnull(tenx_asis), "tenx_replayed", host) | fields - _kv | extract | eval tenx_xml=if(match(_raw, "^\\s*<"), _raw, null()) | spath input=tenx_xml | fields - tenx_xml, tenx_hash, tenx_var_0, tenx_vars'
+RESTORE = ' | eval _raw=coalesce(tenx_h_raw, _raw), sourcetype=coalesce(tenx_h_st, sourcetype), source=coalesce(tenx_h_src, source), host=coalesce(tenx_h_host, host) | fields - tenx_h_raw, tenx_h_st, tenx_h_src, tenx_h_host, tenx_compact_raw, tenx_rst, tenx_asis'
+EXPAND = EXPAND_HEAD + RESTORE + ' '
+
+
 def prefilter(compiled):
 	"""The text between the modifiers and the inflate macro: the compact-event prefilter."""
-	head = compiled.split('| `tenx-inflate`')[0]
+	head = compiled.split('| eval tenx_compact_raw=_raw | `tenx-inflate`')[0]
 	return head.replace('| search sourcetype=tenx_encoded', '', 1).strip()
 
 
@@ -131,14 +139,27 @@ class TestHashPredicate:
 		# 305 of 2,991 real hashes contain a space; tenx_hash="KC 2c#eEev" found nothing.
 		assert hash_predicate('KC 2c#eEev') == '"~KC 2c#eEev"'
 
-	def test_star_hash_uses_prefix_before_star(self):
-		# tenx_hash="0PIlry*uDJ" gave 0 of 39 events; the phrase "~0PIlry" gave 39.
-		assert hash_predicate('0PIlry*uDJ') == '"~0PIlry"'
+	def test_star_hash_uses_a_term_of_the_hash(self):
+		# '*' is a wildcard even inside quotes, so a hash holding one is selected by one run of
+		# it between Splunk's major breakers, as TERM(): the term the tx prefilter uses.
+		assert hash_predicate('0PIlry*uDJ') == 'TERM(~0PIlry)'
+		assert hash_predicate('0PIlry*uDJ') == 'TERM(%s)' % hash_term('0PIlry*uDJ')
 
-	def test_star_too_early_falls_back_to_field_predicate(self):
-		# "~a" would be no filter at all ("~-" matched 12,648 of 20,000 events).
-		assert hash_predicate('a*bc') == 'tenx_hash="a*bc"'
-		assert hash_predicate('*abc') == 'tenx_hash="*abc"'
+	def test_star_hash_never_uses_the_field_predicate(self):
+		# tenx_hash="H*ly1wX1N{" found 0 of 1 event and tenx_hash="*FejY3hyM " 0 of 2 (Splunk
+		# 10.4.3, the search comparing sourcetype=); TERM(ly1wX1N) and TERM(FejY3hyM) found them.
+		assert hash_predicate('H*ly1wX1N{') == 'TERM(ly1wX1N)'
+		assert hash_predicate('*FejY3hyM ') == 'TERM(FejY3hyM)'
+		assert hash_predicate('a*bc') == 'TERM(~a)'
+		assert hash_predicate('*abc') == 'TERM(abc)'
+		for dml_hash in ('a*bc', '*abc', '-*', '*', '-*Hf8l*8.5}'):
+			assert 'tenx_hash=' not in hash_predicate(dml_hash)
+
+	def test_star_hash_skips_a_run_between_two_stars(self):
+		# TERM(Hf8l) found the 4 events of -*Hf8l*8.5} from the index alone and 0 of them with
+		# sourcetype=tenx_encoded in the same search.
+		assert hash_predicate('-*Hf8l*8.5}') == 'TERM(8.5)'
+		assert hash_predicate('-M;*DEsWy*;') == 'TERM(~-M)'
 
 	def test_quotes_and_backslashes_are_escaped(self):
 		assert hash_predicate('a"b\\c') == '"~a\\"b\\\\c"'
@@ -150,8 +171,8 @@ class TestHashPredicate:
 
 class TestHashClause:
 	def test_sorted_and_deduplicated(self):
-		# two hashes sharing a prefix before '*' collapse to one predicate
-		assert hash_clause(['zz*1', 'h_b', 'zz*2', 'h_a']) == '("~h_a" OR "~h_b" OR "~zz")'
+		# two hashes whose chosen term is the same collapse to one predicate
+		assert hash_clause(['zz*1', 'h_b', 'zz*2', 'h_a']) == '("~h_a" OR "~h_b" OR TERM(~zz))'
 
 	def test_same_set_same_text(self):
 		assert hash_clause(['h_b', 'h_a']) == hash_clause(['h_a', 'h_b'])
@@ -185,13 +206,13 @@ class TestCompiledPrefilter:
 
 		assert result.state == ResolvedState.SUCCESS
 		assert prefilter(result.resolved) == '("error" OR ("~h_err" OR "~h_err2"))'
-		assert result.resolved.endswith('| `tenx-inflate` | extract | spath | fields - tenx_hash, tenx_var_0, tenx_vars | search error')
+		assert result.resolved.endswith(EXPAND + '| search error')
 		assert manager.probes == ['"error"']
 
 	def test_space_and_star_hashes_are_selectable(self):
 		# live: `bootstrap` 6 of 8 (two hashes unreachable), `cartstore` 1,075 of 1,974
 		result, _ = compile_search('sourcetype=tenx_encoded bootstrap')
-		assert prefilter(result.resolved) == '("bootstrap" OR ("~0PIlry"))'
+		assert prefilter(result.resolved) == '("bootstrap" OR (TERM(~0PIlry)))'
 
 		result, _ = compile_search('sourcetype=tenx_encoded cartstore')
 		assert prefilter(result.resolved) == '("cartstore" OR ("~KC 2c#eEev" OR "~h_err2"))'
@@ -253,8 +274,26 @@ class TestCompiledPrefilter:
 		# matches any line with a comma; without this the sidebar shows a tenx_hash of
 		# '{"stream":"stdout"' on every expanded event. tenx_expand_refused stays.
 		result, _ = compile_search('sourcetype=tenx_encoded payment')
-		assert '| spath | fields - tenx_hash, tenx_var_0, tenx_vars |' in result.resolved
+		assert '| fields - tenx_xml, tenx_hash, tenx_var_0, tenx_vars |' in result.resolved
 		assert 'tenx_expand_refused' not in result.resolved
+
+	def test_key_value_fields_are_extracted_without_a_field_term(self):
+		# The rewrite ran extract with the _kv mark set, so a search without a field term got no
+		# key=value field from the expanded text (0 of 400 on Splunk Enterprise 10.4.3). It now
+		# drops the mark whatever the search holds, as tx does, and needs no second pass. With the
+		# field replay, the steps run after the replay macro, on the events it did not replay.
+		for search in ('sourcetype=tenx_encoded payment', 'sourcetype=tenx_encoded status=500'):
+			resolved = compile_search(search)[0].resolved
+			assert '| `tenx-inflate` |' in resolved and '| fields - _kv | extract |' in resolved, search
+			assert resolved.index('`tenx-inflate`') < resolved.index('| fields - _kv | extract |'), search
+			assert 'kvdelim' not in resolved, search
+
+	def test_spath_reads_only_xml_text(self):
+		# JSON gets its fields from extract; spath on it too gave every JSON field twice. XML text
+		# keeps spath's path fields (Event.System.EventID), which extract does not give.
+		resolved = compile_search('sourcetype=tenx_encoded payment')[0].resolved
+		assert '| eval tenx_xml=if(match(_raw, "^\\s*<"), _raw, null()) | spath input=tenx_xml |' in resolved
+		assert resolved.count('spath') == 1 and '| spath |' not in resolved
 
 	def test_original_terms_are_always_reapplied(self):
 		# the prefilter is a superset (the prefix branch over-selects), so even a single
@@ -267,7 +306,9 @@ class TestCompiledPrefilter:
 
 		assert prefilter(result.resolved) == ''
 		assert manager.probes == []
-		assert result.resolved.endswith('| extract kvdelim="=" pairdelim=" " | search status=500')
+		# The generic key=value pass runs while a replayed event is hidden from it (it would give
+		# each of the event's fields a second copy); the condition is applied once it is back.
+		assert result.resolved.endswith('tenx_var_0, tenx_vars' + RESTORE + ' | search status=500')
 		assert not result.no_prefilter   # no keywords at all is has_search_terms=False, not this
 
 	def test_downstream_pipeline_is_preserved(self):
@@ -354,7 +395,7 @@ class TestNegation:
 
 		assert result.state == ResolvedState.SUCCESS
 		assert prefilter(result.resolved) == ''
-		assert result.resolved.endswith('| `tenx-inflate` | extract | spath | fields - tenx_hash, tenx_var_0, tenx_vars | search NOT bootstrap')
+		assert result.resolved.endswith(EXPAND + '| search NOT bootstrap')
 		assert result.no_prefilter
 		assert result.has_search_terms
 		# the negated word is never sent to the dictionary
@@ -402,7 +443,9 @@ class TestSubTokenValues:
 
 		assert prefilter(result.resolved) == '("192") AND ("168") AND ("45") AND ("200")'
 		assert result.resolved.endswith('| search 192.168.45.200')
-		assert manager.probes == ['"192"', '"168"', '"45"', '"200"']
+		# Address parts are required without a dictionary lookup: digits only, never template
+		# text.
+		assert manager.probes == []
 
 	def test_hostname_mixes_required_and_template_pieces(self):
 		# live row 14: `ip-192-168-42-205.ec2.internal` returned 0 against 20,000. "ip",
@@ -411,8 +454,8 @@ class TestSubTokenValues:
 		result, _ = compile_search('sourcetype=tenx_encoded ip-192-168-42-205.ec2.internal')
 
 		assert prefilter(result.resolved) == (
-			'("ip" OR (tenx_hash="a*bc")) AND ("192") AND ("168") AND ("42") AND ("205") '
-			'AND ("ec2" OR (tenx_hash="a*bc")) AND ("internal" OR (tenx_hash="a*bc"))')
+			'("ip" OR (TERM(~a))) AND ("192") AND ("168") AND ("42") AND ("205") '
+			'AND ("ec2" OR (TERM(~a))) AND ("internal" OR (TERM(~a)))')
 		assert result.resolved.endswith('| search ip-192-168-42-205.ec2.internal')
 
 	def test_region(self):
@@ -420,14 +463,18 @@ class TestSubTokenValues:
 		result, _ = compile_search('sourcetype=tenx_encoded us-west-2')
 
 		assert prefilter(result.resolved) == (
-			'("us" OR (tenx_hash="a*bc")) AND ("west" OR (tenx_hash="a*bc")) AND ("2")')
+			'("us" OR (TERM(~a))) AND ("west" OR (TERM(~a))) AND ("2")')
 		assert result.resolved.endswith('| search us-west-2')
 
 	def test_repeated_piece_is_probed_once(self):
 		result, manager = compile_search('sourcetype=tenx_encoded 10.0.0.1')
 
 		assert prefilter(result.resolved) == '("10") AND ("0") AND ("1")'
-		assert manager.probes == ['"10"', '"0"', '"1"']
+		assert manager.probes == []   # an address: its parts need no lookup
+		result, manager = compile_search('sourcetype=tenx_encoded zq9.zq8.zq9')
+
+		assert prefilter(result.resolved) == '("zq9") AND ("zq8")'
+		assert manager.probes == ['"zq9"', '"zq8"']
 
 	def test_pieces_matching_many_templates_share_one_clause(self):
 		# a piece present in more templates than PER_PIECE_HASH_LIMIT does not repeat the

@@ -206,6 +206,14 @@ class LocalSearchManager(LocalSplParser):
 	def get_timestamp_formats(self, max_time_ms=2000, poll_interval_ms=50):
 		return None if self.timestamp_formats is None else list(self.timestamp_formats)
 
+	# What run_probe answers: the rows of the compact-events probe (tenx_search_builder.
+	# unnamed_compact_probe), none by default; probes records each probe search it was given.
+	probe_rows = ()
+
+	def run_probe(self, search, earliest='0', latest='now', max_time_ms=5000, poll_interval_ms=50):
+		self.probes = getattr(self, 'probes', []) + [search]
+		return None if self.probe_rows is None else list(self.probe_rows)
+
 	def run_dml_search(self, dml_search, max_time_ms=2000, poll_interval_ms=50):
 		if self.fail_dml:
 			return None, False

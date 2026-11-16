@@ -52,6 +52,13 @@ SEARCH_COPY_WRITTEN = "written"
 # The KV store's default limit on documents per batch_save call is 1,000.
 BATCH_SIZE = 500
 
+# One read of a collection returns no more than limits.conf [kvstore] max_rows_per_query rows (50,000)
+# and max_size_per_result_mb (50 MB) of them, whatever limit asks for (Splunk Enterprise 10.4.3: one
+# read of 18,809 template records returned 16,990). The pending records are read in pages sorted by key,
+# each starting after the rows already read, until a page brings no new record, so a page the size limit
+# cuts short is followed by the next one.
+PAGE_SIZE = 1000
+
 
 class TenxDmlInterface:
 	"""
@@ -92,8 +99,18 @@ class TenxDmlInterface:
 
 	def pending_records(self):
 		query = json.dumps({SEARCH_COPY: SEARCH_COPY_PENDING})
+		records, keys = [], set()
 
-		return self.server_connection.get(self.kv_intf.build_collection_url(), {'query': query})
+		while True:
+			page = self.server_connection.get(self.kv_intf.build_collection_url(),
+				{'query': query, 'sort': '_key', 'limit': PAGE_SIZE, 'skip': len(records)})
+			new = [r for r in (page or []) if r.get('_key') not in keys]
+
+			if not new:
+				return records
+
+			records.extend(new)
+			keys.update(r.get('_key') for r in new)
 
 	def write_pending(self):
 		"""

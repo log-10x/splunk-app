@@ -262,6 +262,17 @@
   <!-- Row 8: Template Pipeline Status -->
   <row>
     <panel>
+      <title>19. Original Sourcetypes Masked at Index Time</title>
+      <table>
+        <search>
+          <query>| rest splunk_server=local /servicesNS/nobody/tenx-for-splunk/configs/conf-tenx_replay count=0 | where isnotnull(masked_at_index_time) AND masked_at_index_time!="" | rename title AS original_sourcetype | eval note="compact events of this sourcetype hold these values as sent: Splunk does not mask them" | table original_sourcetype masked_at_index_time note</query>
+        </search>
+        <option name="count">20</option>
+      </table>
+    </panel>
+  </row>
+  <row>
+    <panel>
       <title>15. Raw DML Templates (Recent)</title>
       <table>
         <search>

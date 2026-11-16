@@ -37,15 +37,22 @@ Scheduled alerts run server-side, where the browser hook never fires. An alert c
 
 ## Receiver-side configuration
 
-Set three options in the Receiver's configuration for any deployment that feeds this app.
-From engine 1.1.88 they can also follow the app on the command line, which replaces the
-values the app's configuration sets:
+Start the Receiver with four arguments for any deployment that feeds this app.
+`receiverOptimize true` makes it send events compact. The other three are options of the
+Receiver's configuration; from engine 1.1.89 they can also follow the app on the command line,
+which replaces the values the app's configuration sets. With the published image, beside a Fluent
+Bit container:
 
 ```
-tenx run @apps/receiver varMaxRecurIndexes 0 timestampZone UTC timestampMaxPerObject 1
+docker run -d --name tenx-receiver --network container:<Fluent Bit container> log10x/edge-10x:1.1.180 \
+  @run/input/forwarder/fluentbit @apps/receiver receiverOptimize true varMaxRecurIndexes 0 \
+  timestampZone UTC timestampMaxPerObject 1
 ```
 
-They live in two files of the Receiver's config folder (`$TENX_CONFIG`, mounted at
+The first argument names the input module for the forwarder in use, here Fluent Bit; the
+[forwarder inputs](https://doc.log10x.com/run/input/forwarder/) page lists the others.
+
+The three options live in two files of the Receiver's config folder (`$TENX_CONFIG`, mounted at
 `/etc/tenx/config` in the container image):
 
 ```yaml
@@ -59,9 +66,8 @@ timestamp:
   zone: UTC
 ```
 
-Edit the values in place. Passing the same options on the command line, as
-`varMaxRecurIndexes 0`, stops the engine with `should be specified only once`, because
-these files already set them.
+With the shipped configuration, these arguments start the Receiver with these values.
+Setting them in these files instead works as well.
 
 ### Back-references
 
@@ -164,7 +170,7 @@ $SPLUNK_HOME/bin/splunk restart
 
 In a distributed deployment, install the app on the search heads and on the indexers or heavy
 forwarders that parse compact events. The compact sourcetype's parsing settings, `TRUNCATE` and
-the event time, apply on the instance that parses the data.
+the event time, apply on the instance that parses the data. [What to Install on Each Tier](tenx-for-splunk/README.md#what-to-install-on-each-tier) lists every tier.
 
 ### Step 2: Create the Index and HEC Tokens
 
@@ -188,11 +194,11 @@ Create an index named `tenx_dml` for templates, then two HTTP Event Collector to
 
 ### Step 3: Configure the Receiver and Forwarder
 
-Set `varMaxRecurIndexes: 0`, `timestampZone: UTC` and `maxPerObject: 1` in the Receiver's configuration (see [Receiver-side configuration](#receiver-side-configuration)), and point your forwarder at both tokens: templates to `tenx_dml`, and each compact event as the message with the record's metadata as indexed fields. The [setup guide](https://doc.log10x.com/apps/receiver/compact/splunk/) has the Fluent Bit and Fluentd configuration.
+Start the Receiver with `receiverOptimize true`, `varMaxRecurIndexes 0`, `timestampZone UTC` and `timestampMaxPerObject 1` (see [Receiver-side configuration](#receiver-side-configuration)), and point your forwarder at both tokens: templates to `tenx_dml`, and each compact event as the message with the record's metadata as indexed fields. The [setup guide](https://doc.log10x.com/apps/receiver/compact/splunk/) has the Fluent Bit and Fluentd configuration.
 
 ### Step 4: Point the Dashboards at Your Index
 
-Set the `tenx-events` macro to your compact index under **Settings > Advanced search > Search macros**, for example `index=my_compact_index sourcetype=tenx_encoded`.
+Set the `tenx-events` macro to your compact index under **Settings > Advanced search > Search macros**, for example `index=my_compact_index sourcetype::tenx_encoded`. Every `tx` search starts with this macro too, so it uses the indexed form `sourcetype::`.
 
 ### Step 5: Load Existing Templates
 
@@ -202,7 +208,7 @@ The **Consume KV** saved search stores new templates every five minutes. To load
 index=tenx_dml sourcetype=tenx_dml_raw_json earliest=-30d | sendalert tenx_dml_to_kv
 ```
 
-Widen `earliest` to reach older templates. Running it again is safe: templates already stored are kept, and their records are brought up to date when this version of the app derives them differently. The app's **Backfill KV** saved search holds the same search; its alert action fires only when the search runs on a schedule or with `sendalert`, not from the **Run** button.
+Widen `earliest` to reach older templates. Running it again is safe: templates already stored are kept, and their records are brought up to date when this version of the app derives them differently. The app's **Backfill KV** saved search holds the same search; its alert action fires only when the search runs on a schedule or with `sendalert`, not from the **Run** button. To load every template record ever indexed, use `earliest=0`.
 
 ### Step 6: Verify End-to-End
 
@@ -222,6 +228,10 @@ index=tenx_dml sourcetype=tenx_dml_raw_json | head 10
 ```spl
 index=your_logs_index `tx` | head 10
 ```
+
+## Security Sources
+
+The `txf` macro gives expanded events the fields, event types and tags of their original sourcetype, and the field map tool makes compact events readable by data models and detections. Setup: [Fields of the Original Sourcetype](tenx-for-splunk/README.md#fields-of-the-original-sourcetype-txf), [the Field Map](tenx-for-splunk/README.md#data-models-and-detections-the-field-map), [What to Install on Each Tier](tenx-for-splunk/README.md#what-to-install-on-each-tier).
 
 ## Analytics Dashboard
 
@@ -244,6 +254,9 @@ The Analytics dashboard finds compact events through the `tenx-events` macro.
 | **Search Hook** | `dashboard.js`, routing each classic dashboard panel's search to the Search Handler |
 | **Search Handler** | `/tenx-search` REST endpoint rewriting a search for compact events |
 | **tx Macro** | Written in front of a search to search compact events by what the lines say, from the search bar, Dashboard Studio, saved searches and alerts |
+| **txf Macro** | `tx` with the search-time fields of the original sourcetype; see [Fields of the Original Sourcetype](tenx-for-splunk/README.md#fields-of-the-original-sourcetype-txf) |
+| **tenxreplay Command** | Writes the replay macros `txf` runs, from the search head's props; run by the Rebuild Field Replay saved searches |
+| **Field Map Tool** | `bin/tenx_field_map.py`: generates the app that writes compact events' original fields at index time; see [the Field Map](tenx-for-splunk/README.md#data-models-and-detections-the-field-map) |
 | **tenxprefilter Command** | Run once per search by the `tx` macro; reads the search, looks up the templates that carry its words, and selects the compact events to expand |
 | **tx and tenxsearch Commands** | `\| tx <search>` and `\| tenxsearch searchstring="..."`: generating commands that write every event out through Python, kept so saved searches written with them keep working |
 | **tenxrecompile Command** | Recompiles every compiled alert so it picks up new templates |
@@ -254,6 +267,8 @@ The Analytics dashboard finds compact events through the `tenx-events` macro.
 | **Consume KV Search** | Scheduled search storing new templates in the KV Store |
 | **Backfill KV Search** | The same template load over 30 days, for templates indexed before the app was installed |
 | **Recompile Compiled Alerts Search** | Runs `tenxrecompile` every 15 minutes |
+| **Rebuild Field Replay Searches** | Run `tenxreplay` every hour, and every five minutes for sourcetypes not yet covered |
+| **Field Map Events Without Fields Search** | Not scheduled; where a field map is installed, counts compact events indexed without their fields by index, sourcetype and reason |
 | **Analytics Dashboard** | Compression and template metrics |
 | **Diagnostics Dashboard** | Troubleshooting and verification tools |
 

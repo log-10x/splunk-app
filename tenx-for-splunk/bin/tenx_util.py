@@ -91,6 +91,42 @@ SPLUNK_SOURCE_PREFIX = 'source::'
 # was read, False when it fell back to the built-in defaults because it could not be.
 CONFIG_LOADED = 'config_loaded'
 
+# Key on the config dict get_tenx_config returns: the field replay's coverage, read from
+# tenx_replay.conf (written by the tenxreplay command), as {original sourcetype: {'indexes':
+# <its list as written>}}. {} when the conf does not exist or lists no sourcetype: no compact
+# event carries tenx_sourcetype, and the search rewrite has no replay steps. None when it could
+# not be read: the rewrite then runs the tenx-replay macro. See
+# tenx_replay_builder.rewrite_replay().
+REPLAY_COVERAGE = 'tenx_replay'
+REPLAY_RESERVED = ('default', 'tenx:narrowing', 'tenx:retired')
+
+
+def get_replay_coverage(service):
+	"""The REPLAY_COVERAGE entry: see there."""
+	try:
+		conf = service.confs['tenx_replay']
+	except KeyError:
+		return {}
+	except Exception as e:
+		# Any failure other than "no such conf" (a 5xx, a timeout, a permission error) returns
+		# None, and the rewrite then runs the full `tenx-replay` macro, never the text without
+		# replay steps. Correct results first: if compact events carry tenx_sourcetype, only the
+		# full macro cannot drop their fields (the text without replay would lose every add-on
+		# field and so every event a field term on them selects). Cost second: where nothing
+		# carries the field, `tenx-replay` is the shipped definition (one hidden extract, a few
+		# hundred characters), whose results equal those of the text without replay, so the price
+		# of a failed read there is small; where something does, the price is the full macro's
+		# text, the most this search could pay.
+		logger.warning("Failed reading tenx_replay.conf - {}".format(e), exc_info=1)
+		return None
+	try:
+		return dict((stanza.name, {'indexes': str(stanza.content.get('indexes', '') or ''),
+								   'unit': str(stanza.content.get('unit', '') or '')})
+					for stanza in conf if stanza.name not in REPLAY_RESERVED)
+	except Exception as e:
+		logger.warning("Failed reading tenx_replay.conf - {}".format(e), exc_info=1)
+		return None
+
 
 def _unique(names):
 	"""The names in the order first seen, without repeats."""
@@ -155,6 +191,7 @@ def get_tenx_config(service=None, server_uri=None, token=None):
 		# configuration layer that defines it, and that is still one sourcetype.
 		result['tenx_sources'] = _unique(sources)
 		result['tenx_source_types'] = _unique(source_types)
+		result[REPLAY_COVERAGE] = get_replay_coverage(service)
 		result[CONFIG_LOADED] = True
 
 		return result

@@ -57,9 +57,27 @@ class TestDashboardsFindCompactEvents:
 		# A compact event is marked extracted (_kv) before expansion; without dropping the
 		# mark, extract does nothing and every field=value term on key=value text returns 0.
 		tx = conf('macros.conf').get('tx', 'definition')
-		assert '| `tenx-inflate` | fields - _kv | extract |' in tx
+		assert '| `tenx-inflate` | `tenx-mapped-hide` | fields - _kv | extract |' in tx
 		# spath on non-JSON text invents fields, and on JSON doubles what extract finds.
 		assert 'spath' not in tx
+
+	def test_txf_reruns_splunks_field_extraction_through_the_replay(self):
+		macros = conf('macros.conf')
+		for name in ('txf', 'txf(1)'):
+			txf = macros.get(name, 'definition')
+			assert '| `tenx-inflate` | fields - _kv | `tenx-mapped-hide` | `tenx-replay' in txf, name
+			assert 'spath' not in txf, name
+		# The shipped replay is exactly the extraction `tx` runs; tenxreplay writes the rest.
+		assert macros.get('tenx-replay', 'definition').count('| extract |') == 1
+		import tenx_replay_builder
+		assert ' | '.join(tenx_replay_builder.UNCHANGED) == macros.get('tenx-replay', 'definition')
+
+	def test_txf_keeps_the_compact_text_until_the_replay_has_read_it(self):
+		macros = conf('macros.conf')
+		for name in ('txf', 'txf(1)'):
+			txf = macros.get(name, 'definition')
+			assert txf.index('eval tenx_compact_raw=_raw') < txf.index('`tenx-inflate`') < txf.index('`tenx-replay')
+			assert 'fields - tenx_compact_raw' in txf
 
 	def test_the_prefilter_never_returns_a_bare_star(self):
 		# A bare * becomes the highlight keyword *** and lights every event in Splunk Web.
@@ -71,7 +89,8 @@ class TestDashboardsFindCompactEvents:
 		macros = conf('macros.conf')
 		assert macros.has_section('tx') and macros.has_section('tenx-templates')
 		meta = open(os.path.join(APP, 'metadata', 'default.meta'), encoding='utf-8').read()
-		for name in ('tx', 'tenx-events', 'tenx-templates', 'tenx-inflate'):
+		for name in ('tx', 'tenx-events', 'tenx-templates', 'tenx-inflate', 'tenx-replay', 'tenx-replay-tags', 'txf',
+					 'txf%281%29'):
 			assert re.search(r'\[macros/%s\]\naccess = [^\n]*\nexport = system' % re.escape(name), meta), name
 
 	def test_the_command_tx_calls_is_declared_and_kept_out_of_the_assistant(self):
@@ -84,7 +103,7 @@ class TestDashboardsFindCompactEvents:
 	def test_every_compact_panel_reads_the_macro(self):
 		for f in ('tenx_dashboard.xml', 'tenx_diagnostics.xml'):
 			compact = [q for q in queries(f) if 'inputlookup' not in q and 'index=_internal' not in q
-					   and 'sourcetype=tenx_dml' not in q]
+					   and 'sourcetype=tenx_dml' not in q and not q.lstrip().startswith('| rest ')]
 			assert compact, f
 			assert all('`tenx-events`' in q for q in compact), f
 
@@ -117,6 +136,27 @@ class TestSplunkbaseListingRules:
 
 	def test_package_id_matches_the_folder(self):
 		assert conf('app.conf').get('package', 'id') == os.path.basename(APP)
+
+	def test_the_manifest_names_the_app_and_the_three_workloads(self):
+		# slim partition (Splunk's packaging toolkit) reads targetWorkloads to give search heads, indexers and
+		# forwarders their own package; the indexer and forwarder packages keep the parsing settings only.
+		import json
+		m = json.load(open(os.path.join(APP, 'app.manifest'), encoding='utf-8'))
+		assert m['schemaVersion'] == '2.0.0'
+		assert m['info']['id']['name'] == os.path.basename(APP)
+		assert m['info']['id']['version'] == conf('app.conf').get('id', 'version')
+		assert m['targetWorkloads'] == ['_search_heads', '_indexers', '_forwarders']
+		assert '_distributed' in m['supportedDeployments'] and '_search_head_clustering' in m['supportedDeployments']
+
+	def test_scripts_find_their_libraries_next_to_themselves(self):
+		# An app pushed in an indexer cluster's bundle lives in etc/peer-apps, not etc/apps.
+		for name in sorted(os.listdir(os.path.join(APP, 'bin'))):
+			if not name.endswith('.py'):
+				continue
+			text = open(os.path.join(APP, 'bin', name), encoding='utf-8').read()
+			assert 'get_base_path' not in text, name
+			if 'apphome =' in text:
+				assert 'apphome = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))' in text, name
 
 
 class TestSideNavigationIsLegible:
@@ -189,3 +229,17 @@ class TestScheduledRecompile:
 		assert saved.get('Recompile Compiled Alerts', 'enableSched') == '1'
 		assert conf('commands.conf').get('tenxrecompile', 'filename') == 'tenxrecompile.py'
 		assert os.path.exists(os.path.join(APP, 'bin', 'tenxrecompile.py'))
+
+	def test_the_field_replay_is_rebuilt_on_a_schedule(self):
+		saved = conf('savedsearches.conf')
+		# by index time, over every event date: events dated a year ago or ahead are found when indexed
+		assert saved.get('Rebuild Field Replay', 'search').strip() == '| tenxreplay by_index_time=true'
+		assert saved.get('Rebuild Field Replay When New', 'search').strip() == '| tenxreplay only_new=true by_index_time=true'
+		assert saved.get('Rebuild Field Replay', 'enableSched') == '1'
+		assert conf('commands.conf').get('tenxreplay', 'filename') == 'tenxreplay.py'
+		assert os.path.exists(os.path.join(APP, 'bin', 'tenxreplay.py'))
+
+	def test_the_conf_the_replay_writes_is_declared(self):
+		spec = open(os.path.join(APP, 'README', 'tenx_replay.conf.spec')).read()
+		for key in ('computed_fields', 'aliased_fields'):
+			assert re.search(r'^' + key + r' = ', spec, re.M), key

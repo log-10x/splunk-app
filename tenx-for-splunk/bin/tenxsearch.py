@@ -58,7 +58,6 @@ import sys
 import json
 import logging
 
-from splunk.clilib.bundle_paths import get_base_path
 
 # ============================================================================
 # Application Setup
@@ -66,7 +65,8 @@ from splunk.clilib.bundle_paths import get_base_path
 
 # Application name - must match the app directory name
 APP_NAME = 'tenx-for-splunk'
-apphome = os.path.join(get_base_path(), APP_NAME)
+# The app's own folder, wherever Splunk keeps it (etc/apps, or etc/peer-apps on an indexer cluster peer).
+apphome = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.join(apphome, 'bin'))
 sys.path.append(os.path.join(apphome, 'lib'))
 
@@ -186,6 +186,9 @@ class TenxSearchCommandBase(GeneratingCommand):
 				if build_result.retryable:
 					self.write_error("10x: the template lookup did not complete, so this search was not run "
 						"(running it as typed would return the wrong events). Run it again.")
+				elif build_result.parse_error:
+					# splunkd refused the search itself: its own words
+					self.write_error(build_result.parse_error)
 				else:
 					self.write_error("10x: this search could not be parsed for compact data, so it was not run. "
 						"See tenx_search_command.log for the parse error.")
@@ -201,6 +204,24 @@ class TenxSearchCommandBase(GeneratingCommand):
 			# passthrough of the search as typed. On a search that names a compact sourcetype
 			# that is the silent wrong answer again, so it is refused the same way.
 			#
+			# A search that names no sourcetype or source runs as typed. Over an index that holds
+			# compact events that returns their compact text (zero events for most words) with no
+			# sign that anything is wrong, so look for them first, and refuse when there are some.
+			#
+			probe, message = tenx_search_builder.compact_probe(build_result, tenx_config)
+
+			if probe is not None:
+				rows = search_manager.run_probe(probe, job_details['request'].get('earliest_time', '0'),
+					job_details['request'].get('latest_time', 'now'))
+
+				if rows:
+					self.write_error(message(rows))
+					return
+
+				if rows is None:
+					self.write_warning("10x: whether this search reads compact events it would miss could not be "
+						"checked; it ran as typed.")
+
 			if not build_result.engaged:
 				compact_sources = tenx_alert_compiler._referenced_tenx_sources(searchstring, tenx_config)
 

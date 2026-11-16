@@ -10,16 +10,28 @@ from tenx_kv_intf import TenxKVInterface
 
 
 class FakeConnection:
-	def __init__(self, pending, copied=None, fail_search=False):
+	"""
+	The KV store's data endpoint as measured: a read returns the matching records sorted by sort, from
+	skip, at most limit of them, and never more than read_cap (the rows that fit in max_size_per_result_mb).
+	"""
+	def __init__(self, pending, copied=None, fail_search=False, read_cap=None):
 		self.pending = pending
 		self.copied = copied
 		self.fail_search = fail_search
+		self.read_cap = read_cap
 		self.searches = []
 		self.batches = []
+		self.reads = []
 
 	def get(self, url, params=None, output_mode="json"):
 		assert json.loads(params['query']) == {'search_copy': 'pending'}
-		return [dict(r) for r in self.pending]
+		self.reads.append(dict(params))
+		rows = [dict(r) for r in self.pending]
+		if params.get('sort') == '_key':
+			rows.sort(key=lambda r: r['_key'])
+		rows = rows[int(params.get('skip', 0)):]
+		limit = int(params.get('limit', 0)) or len(rows)
+		return rows[:min(limit, self.read_cap or len(rows))]
 
 	def post(self, url, data, params=None, output_mode="json", read_result=True):
 		if url.endswith('/search/jobs'):
@@ -82,3 +94,26 @@ def test_nothing_pending_runs_no_search():
 
 	assert writer(conn).write_pending() == 0
 	assert conn.searches == []
+
+
+def test_pending_records_past_what_one_read_returns_are_all_marked():
+	# one read gives at most 1,700 rows here, as 50 MB of records did on Splunk (16,990 of 18,809)
+	keys = ['k%05d' % i for i in range(4500)]
+	conn = FakeConnection([record(k) for k in reversed(keys)], read_cap=1700)
+
+	assert writer(conn).write_pending() == 4500
+	assert sorted(r['_key'] for b in conn.batches for r in b) == keys
+	assert len(conn.searches) == 1
+	# pages of at most 1,000, each starting where the rows read so far end, until one brings nothing new
+	assert [(r['skip'], r['limit']) for r in conn.reads] == [(k, 1000) for k in (0, 1000, 2000, 3000, 4000, 4500)]
+
+
+def test_a_store_that_ignores_skip_ends_the_read():
+	class IgnoresSkip(FakeConnection):
+		def get(self, url, params=None, output_mode="json"):
+			return FakeConnection.get(self, url, dict(params, skip=0), output_mode)
+
+	conn = IgnoresSkip([record('a'), record('b')])
+
+	assert writer(conn).write_pending() == 2
+	assert len(conn.reads) == 2

@@ -102,8 +102,11 @@ from enum import Enum, auto
 import urllib.error
 
 import tenx_util
+import tenx_prefilter_parser
 import tenx_spl_parser
 import tenx_search_manager
+import tenx_prefilter_parser
+import tenx_replay_builder
 
 
 class ResolvedState(Enum):
@@ -117,6 +120,20 @@ class ResolvedState(Enum):
 # breakers together, as single characters. '*' is a major breaker for the indexer but a live
 # wildcard in a search term, so it stays attached to its piece. The multi-character majors
 # ('--' and the %XX escapes) are covered by their single characters.
+# After expansion: drop the _kv mark so extract runs the event's own extraction (key=value and
+# JSON), and let spath read only text that starts with "<" (XML path fields). The same steps with
+# and without a field replay.
+XML_AND_KV_STEPS = (' | fields - _kv | extract | eval tenx_xml=if(match(_raw, "^\\s*<"), _raw, null())'
+					' | spath input=tenx_xml | fields - tenx_xml, tenx_hash, tenx_var_0, tenx_vars')
+# The events kept from those steps when the search replays: the replayed ones (tenx_rst), and the
+# ones that arrived whole and that Splunk read under the sourcetype whose rules they need, which
+# the replay leaves as read (tenx_replay_builder.AS_IS). Those steps on such an event added every
+# field an extraction with MV_ADD gives a second time.
+REPLAY_HELD = 'isnotnull(tenx_rst) OR isnotnull(%s)' % tenx_replay_builder.AS_IS
+
+# A search term written as TERM(<x>) or CASE(<x>).
+TERM_CALL = re.compile(r'^(TERM|CASE)\((.*)\)$', re.S)
+
 SEGMENT_BREAKERS = frozenset("[]<>(){}|!;,'\"\n\r\t &?+/:=@.-$#%\\_")
 
 # A piece that matches more templates than this does not get its own ("piece" OR <hashes>)
@@ -131,11 +148,6 @@ PER_PIECE_HASH_LIMIT = 500
 # to narrow, which is correct and wider.
 PROBE_BUDGET_MS = 30000
 PROBE_MAX_MS = 10000
-
-# A hash containing '*' cannot be matched as a whole phrase, because the '*' is a wildcard
-# even inside quotes. The text before the first '*' is matched instead, when it is long
-# enough to be a filter: "~-" matched 12,648 of 20,000 events and "~" matched 16,746.
-HASH_PREFIX_MIN = 2
 
 
 # Text a rendered timestamp can contain. A compact event stores its timestamp as epoch
@@ -403,22 +415,21 @@ def hash_predicate(dml_hash):
 	"""
 	The SPL that selects the compact events of one template.
 
-	Phrase "~<hash>" when the hash has no '*'; phrase "~<prefix>" for the text before the
-	first '*' when that prefix is at least HASH_PREFIX_MIN characters (a superset, since other
-	hashes may share the prefix); otherwise a field predicate, which Splunk answers by
-	extraction rather than from the lexicon and which is itself a wildcard match. All three
-	are supersets at worst, and the post-expansion search removes the excess. Measured
-	coverage on 2,991 templates: 20,000 of 20,000 events.
+	Phrase "~<hash>" when the hash has no '*'. A '*' is a wildcard in a search term even inside
+	quotes, so a hash holding one is selected by TERM(<term>) with the term the `tx` prefilter
+	uses for it, tenx_prefilter_parser.hash_term: a run of the hash between Splunk's major
+	breakers that the index holds for every event of the template and that Splunk also finds
+	when the search compares a field. Other templates' events can hold the same term, so this
+	is a superset at worst, and the post-expansion search removes the excess.
+
+	Before, such a hash was selected by the phrase of the text before its first '*', or by
+	tenx_hash="<hash>" when fewer than two characters preceded it. That field predicate found
+	none of the events of 6 of 74 such templates on 17,011 events (Splunk 10.4.3).
 	"""
 	if '*' not in dml_hash:
 		return quoted_term('~' + dml_hash)
 
-	prefix = dml_hash.split('*', 1)[0]
-
-	if len(prefix) >= HASH_PREFIX_MIN:
-		return quoted_term('~' + prefix)
-
-	return 'tenx_hash=' + quoted_term(dml_hash)
+	return 'TERM(' + tenx_prefilter_parser.hash_term(dml_hash) + ')'
 
 
 def hash_clause(hashes):
@@ -511,7 +522,17 @@ class BuildResult:
 	"""
 	def __init__(self, state, resolved, engaged=False, field_terms=None, retryable=False,
 				has_search_terms=False, no_dml_results=False, dml_truncated=False,
-				no_prefilter=False):
+				no_prefilter=False, indexes=None, names_source=True, sourcetypes=None, parse_error=None):
+		# parse_error: splunkd's own message when it refused to parse the search (a macro whose
+		# validation fails, an unknown command), for the caller to pass on.
+		self.parse_error = parse_error
+		# indexes: the index values the leading search names ([] for none, None when it cannot
+		# tell); names_source: whether it names a sourcetype or a source at all. Read by
+		# unnamed_compact_probe().
+		self.indexes = indexes
+		self.names_source = names_source
+		# sourcetypes: the sourcetype values the leading search names (None when it cannot tell)
+		self.sourcetypes = sourcetypes
 		self.state = state
 		self.resolved = resolved
 		self.engaged = engaged
@@ -721,12 +742,25 @@ class TenxSearchCommand(TenxSplCommand):
 		A piece that could be text printed from a timestamp is left unrestricted too: the
 		compact event holds the timestamp as epoch digits and the template holds only its
 		format, so the printed date and time are in neither, and are found after expansion.
+
+		The parts of an IPv4 address, and of a prefix of three parts and a wildcard (10.0.1.*),
+		are required in the raw without a dictionary lookup, as the `tx` prefilter does
+		(tenx_prefilter_parser.addresses_of, address_parts, prefix_parts): a part is digits only,
+		so never template text (FORMAT_SPEC S3.2), and a term of the compact event whether the
+		engine stored the address cut or whole (observed on Splunk Enterprise 10.4.3). A first
+		part of 1 is still looked up, since "-1" before a dot is template text.
 		"""
 		pieces = []
 		printed = set()
+		address_parts = set()
 
 		for word in tenx_util.strip_string(term_text).split():
 			printed |= timestamp_text_pieces(word, self._timestamp_text_patterns())
+
+			for address in tenx_prefilter_parser.addresses_of(word):
+				address_parts.update(tenx_prefilter_parser.address_parts(address))
+
+			address_parts.update(tenx_prefilter_parser.prefix_parts(word))
 
 			for piece in split_pieces(word):
 				if piece not in pieces:
@@ -742,6 +776,10 @@ class TenxSearchCommand(TenxSplCommand):
 		for piece in pieces:
 			if piece in printed:
 				self.timestamp_text = True
+				continue
+
+			if piece in address_parts:
+				conjuncts.append(quoted_term(piece))
 				continue
 
 			hashes, truncated = self._probe(piece)
@@ -790,7 +828,11 @@ class TenxSearchCommand(TenxSplCommand):
 		rule_type = node.rule_type
 
 		if rule_type == 'index_expression':
-			return self._term_prefilter(node.text)
+			# TERM(x) and CASE(x) match x as written (a whole indexed term, or with its case);
+			# the prefilter requires x's pieces, which every event matching either holds. The
+			# search after expansion applies TERM() or CASE() itself (original_search_terms).
+			call = TERM_CALL.match(node.text)
+			return self._term_prefilter(call.group(2) if call else node.text)
 
 		if rule_type in ('not_logical_expression', 'field_modifier', 'search_modifier'):
 			return None
@@ -1068,38 +1110,105 @@ class TenxSearchCommand(TenxSplCommand):
 
 		return result
 
-	def inflate_suffix(self):
+	def inflate_suffix(self, replay=tenx_replay_builder.FULL):
 		"""
-		Returns the suffix needed to chain into the 'tenx-inflate' macro, as well as chaining into SPL 'extract'
-		so we will restore the user defined extractions after we decode, and 'spath' so a decoded JSON
-		or XML line gets its structured fields back: 'extract' alone leaves them out, so a search for
-		kubernetes.container_name=accounting after expansion found 0 of 69. On a plain-text line 'spath'
-		extracts nothing and costs little.
+		Returns the suffix that expands the compact events and gives them the search-time fields
+		of their expanded text.
 
-		'extract' re-runs every search-time extraction of the compact sourcetype on the expanded line,
-		including the compact-format one, whose regex matches any line containing a comma. That put a
-		tenx_hash of '{"stream":"stdout"' and a tenx_vars of the rest of the line on every expanded
-		event, in the field sidebar. Those three are removed again; tenx_expand_refused, which the
-		macro keeps on purpose, is not.
+		Splunk marks a compact event as already extracted (_kv), and `extract` skips an event with
+		that mark. The suffix drops it first, as the `tx` macro does, so `extract` runs the event's
+		own extraction on the expanded text: key=value pairs and JSON. Then `spath` reads the
+		events whose expanded text starts with "<" (input=tenx_xml, set only for those), which
+		gives XML text its path fields (Event.System.EventID and the like).
+
+		Measured on Splunk Enterprise 10.4.3 against the earlier suffix (`extract` with the mark
+		still set, then `spath` on every event), every field of every event compared:
+		- 400 key=value lines: usr, status, act and the other pairs on 400 of 400 (before: 0, and
+		  only a search with a field term got them, from a generic `extract kvdelim="="` pass);
+		- 200 JSON lines and 21,455 multi-line JSON records: the same fields with the same values
+		  (`extract` gives them now; running `spath` on them as well gave every field twice);
+		- 120 XML lines and 662 Windows XML events: every path field identical; the key=value
+		  attributes of the XML text are added (xmlns, Name, SystemTime and the like), as `tx`
+		  gives them.
+		Plain text that is neither JSON nor XML got no field from `spath` before either.
+
+		`extract` also re-runs the compact-format extraction, whose regex matches any expanded
+		line with a comma, so tenx_hash, tenx_var_0 and tenx_vars are removed again;
+		tenx_expand_refused, which the inflate macro keeps on purpose, is not.
 
 		Different macro chosen if we're running in debug mode or not, either 'tenx-inflate' or 'tenx-inflate-debug'
+
+		The compact text is copied to tenx_compact_raw first, and the `tenx-replay` macro runs
+		right after the inflate macro. On a compact event whose sender recorded its original
+		sourcetype (the indexed field tenx_sourcetype) the macro clears what Splunk found on the
+		compact text, re-types the event and applies that sourcetype's search-time rules (see
+		tenx_replay_builder.py), and leaves tenx_rst set. Every step it runs is guarded, and
+		tenx_hide_others, set here and only here, hides the events it does not replay from its
+		one unguarded step, `extract`: those events reach the rewrite's own extract, spath and
+		key=value pass exactly as they do when nothing is replayed.
+
+		The steps after it (extract, spath and the key=value pass of field_extraction) must not
+		touch a replayed event: on Splunk Enterprise 10.4.3 the key=value pass gave every field of
+		a replayed event a second copy of its value, and spath added fields the original
+		sourcetype does not have.
+		So a replayed event is hidden from them (no text, and a sourcetype, source and host no
+		props stanza names) and given back by replay_restore().
+
+		`replay` is what runs in place of `tenx-replay` (see replay_steps()); None when nothing is
+		replayed, and then the suffix has no replay steps at all.
 		"""
-		return (" | " + tenx_util.splunk_inflate_macro(self.debug)
-				+ " | extract | spath | fields - tenx_hash, tenx_var_0, tenx_vars")
+		if replay is None:
+			# Nothing to replay: the suffix without any replay step.
+			return (" | " + tenx_util.splunk_inflate_macro(self.debug) + XML_AND_KV_STEPS)
+		held = REPLAY_HELD
+		return (" | eval tenx_compact_raw=_raw | " + tenx_util.splunk_inflate_macro(self.debug)
+				+ " | eval tenx_hide_others=1 | " + replay + " | fields - tenx_hide_others"
+				+ " | eval tenx_h_raw=if(%s, _raw, null()), tenx_h_st=if(%s, sourcetype, null()),"
+				  " tenx_h_src=if(%s, source, null()), tenx_h_host=if(%s, host, null())" % ((held,) * 4)
+				+ " | eval _raw=if(%s, \"\", _raw), sourcetype=if(%s, \"tenx_replayed\", sourcetype),"
+				  " source=if(%s, \"tenx_replayed\", source), host=if(%s, \"tenx_replayed\", host)" % ((held,) * 4)
+				+ XML_AND_KV_STEPS)
+
+	def replay_steps(self):
+		"""
+		The field replay this search runs right after expanding, or None for none (see
+		tenx_replay_builder.rewrite_replay): None when tenx_replay.conf says no compact event
+		carries tenx_sourcetype, or none in the indexes the search names; the units of the
+		sourcetypes recorded for those indexes; `tenx-replay` (every sourcetype) when the search
+		names no index, or when the coverage could not be read (the config has no 'tenx_replay'
+		entry, or it is None).
+		"""
+		covered = self.tenx_config.get(tenx_util.REPLAY_COVERAGE) if self.tenx_config else None
+		indexes = self.parsed_command.get_passing_specifiers('index_specifier')
+		return tenx_replay_builder.rewrite_replay(covered, indexes)
+
+	def replay_restore(self):
+		"""Gives a replayed event back its text, sourcetype, source and host (see inflate_suffix)."""
+		return (" | eval _raw=coalesce(tenx_h_raw, _raw), sourcetype=coalesce(tenx_h_st, sourcetype),"
+				" source=coalesce(tenx_h_src, source), host=coalesce(tenx_h_host, host)"
+				" | fields - tenx_h_raw, tenx_h_st, tenx_h_src, tenx_h_host, tenx_compact_raw, tenx_rst, "
+				+ tenx_replay_builder.AS_IS)
+
+	def field_extraction(self):
+		"""Nothing: the fields come from the event's own extraction in inflate_suffix (a generic
+		key=value pass here gave a key=value field a second copy of its value)."""
+		return ''
+
+	def field_filter(self):
+		"""The filter on the field conditions the user requested, after the replayed events are back."""
+		return ' | search ' + " ".join([item.text for item in self.user_field_terms])
 
 	def field_search(self):
 		"""
-		Returns the clause that filters on the field conditions the user requested.
-
-		The decoded events carry the user's original key=value pairs, but the encoded sourcetype's
-		own extraction is the compact comma form, which does not match the decoded text - so
-		`| extract` alone leaves those fields unextracted. We force generic key=value extraction on
-		the decoded _raw, then filter with search-command semantics (which is what the user wrote;
-		unlike `| where`, `| search field=value` reads a bare value as a literal, not a field
-		reference, so a string value like `level=error` matches instead of silently comparing two
-		fields). This handles string and numeric values, and IN(...) lists, uniformly.
+		Returns the clause that filters on the field conditions the user requested, with
+		search-command semantics (which is what the user wrote; unlike `| where`, `| search
+		field=value` reads a bare value as a literal, not a field reference, so a string value
+		like `level=error` matches instead of silently comparing two fields). The fields are the
+		ones inflate_suffix() extracted with the event's own rules. (The generic
+		`extract kvdelim="=" pairdelim=" "` pass this used to add would now give a key=value field a
+		second copy of its value: 33 of 77 events for status=500 on Splunk Enterprise 10.4.3.)
 		"""
-		return ' | extract kvdelim="=" pairdelim=" " | search ' + " ".join([item.text for item in self.user_field_terms])
+		return ' | search ' + " ".join([item.text for item in self.user_field_terms])
 
 	def original_search_terms(self):
 		"""
@@ -1149,10 +1258,22 @@ class TenxSearchCommand(TenxSplCommand):
 		# encoded data at this point (self.needs_tenx is True), so the data returned from Splunk will
 		# be encoded, and needs decoding.
 		#
-		result += self.inflate_suffix()
+		replay = self.replay_steps()
 
-		if len(self.user_field_terms) > 0:
-			result += self.field_search()
+		result += self.inflate_suffix(replay)
+
+		if replay is None:
+			# No compact event this search can read carries tenx_sourcetype: no replay steps.
+			if len(self.user_field_terms) > 0:
+				result += self.field_search()
+		else:
+			if len(self.user_field_terms) > 0:
+				result += self.field_extraction()
+
+			result += self.replay_restore()
+
+			if len(self.user_field_terms) > 0:
+				result += self.field_filter()
 
 		if self.needs_original_search_check:
 			result += self.original_search_terms()
@@ -1250,7 +1371,7 @@ class TenxSearchBuilder:
 			logger.error("Error parsing search - {} - {}.".format(search, e), exc_info=1)
 			return None
 
-		if 'commands' not in parsed_result:
+		if parsed_result is None or 'commands' not in parsed_result:
 			logger.warning("Missing commands when parsing search - {}.".format(search))
 			return None
 		
@@ -1286,7 +1407,8 @@ class TenxSearchBuilder:
 			# Logging already happens inside get_search_commands. An unparseable search is a
 			# permanent problem (not retryable).
 			#
-			return BuildResult(ResolvedState.FAILURE, base_search)
+			return BuildResult(ResolvedState.FAILURE, base_search,
+							   parse_error=getattr(self.search_manager, 'last_parse_error', None))
 
 		tenx_commands = []
 		leading_search = None
@@ -1315,6 +1437,13 @@ class TenxSearchBuilder:
 		no_dml_results = bool(leading_search is not None and leading_search.no_dml_results)
 		dml_truncated = bool(leading_search is not None and leading_search.dml_truncated)
 		no_prefilter = bool(has_search_terms and leading_search.resolved_done and leading_search.resolved_search is None)
+		indexes, names_source, sourcetypes = None, True, None
+		parsed = leading_search.parsed_command if leading_search is not None else None
+		if parsed is not None:
+			indexes = parsed.get_passing_specifiers('index_specifier')
+			names = [parsed.get_passing_specifiers(k) for k in ('sourcetype_specifier', 'source_specifier')]
+			names_source = any(n is None or len(n) > 0 for n in names)
+			sourcetypes = names[0]
 
 		return BuildResult(
 			spl_commands.resolved_state(),
@@ -1325,7 +1454,10 @@ class TenxSearchBuilder:
 			has_search_terms=has_search_terms,
 			no_dml_results=no_dml_results,
 			dml_truncated=dml_truncated,
-			no_prefilter=no_prefilter)
+			no_prefilter=no_prefilter,
+			indexes=indexes,
+			names_source=names_source,
+			sourcetypes=sourcetypes)
 
 	def resolve(self, base_search):
 		"""
@@ -1340,3 +1472,111 @@ class TenxSearchBuilder:
 		except Exception as e:
 			logger.warning("Error while resolving {} - {}.".format(base_search, e), exc_info=1)
 			return tenx_util.splunk_message_macro("Failed building tenx search")
+
+
+def _spl_value(value):
+	"""A specifier value as a search term: quoted unless it is a plain run of name characters or a '*' pattern."""
+	value = str(value)
+	if re.match(r'^[A-Za-z0-9_.:*\-]+$', value):
+		return value
+	return '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+
+def original_sourcetype_probe(build_result, tenx_config):
+	"""
+	The search that finds compact events whose ORIGINAL sourcetype a passthrough names, or None. A
+	compact event is indexed as the compact sourcetype and carries its original sourcetype in the
+	indexed field tenx_sourcetype, so `| tx index=x sourcetype=df:kv error` (not rewritten: df:kv is
+	not a compact sourcetype) matches none of them (Splunk Enterprise 10.4.3: 0 against 10,000 raw).
+	Field-mapped events (tenx_mapped) are left out: their sourcetype is renamed to the original.
+	A wildcard is probed too (sourcetype=df:*) unless it matches a compact sourcetype (tenx*, *).
+	"""
+	if build_result is None or build_result.engaged or not build_result.sourcetypes:
+		return None
+	import fnmatch
+	config = tenx_config or {}
+	compact = [t for t in (config.get('tenx_source_types') or []) if t]
+	selects_compact = lambda v: any(fnmatch.fnmatchcase(t.lower(), v.lower()) for t in compact)
+	named = sorted(set(v for v in build_result.sourcetypes if v and v.strip('*') and not selects_compact(v)))
+	if not compact or not named:
+		return None
+	if build_result.indexes is None:
+		where = 'index=* '
+	elif build_result.indexes:
+		where = '(%s) ' % ' OR '.join('index=%s' % _spl_value(i) for i in sorted(set(build_result.indexes)))
+	else:
+		where = ''
+	return ('| tstats count where %s(%s) NOT tenx_mapped=* (%s) by index, sourcetype, tenx_sourcetype' % (
+		where, ' OR '.join('sourcetype=%s' % _spl_value(t) for t in compact),
+		' OR '.join('tenx_sourcetype=%s' % _spl_value(t) for t in named)))
+
+
+def original_sourcetype_message(rows, refused=True):
+	"""
+	The message for a search whose original-sourcetype probe found compact events. Splunk keeps the first 256
+	characters of a search command's message, so the message says what to write first.
+	"""
+	named = sorted(set(r.get('tenx_sourcetype', '') for r in rows if r.get('tenx_sourcetype'))) or ['<sourcetype>']
+	compact = sorted(set(r.get('sourcetype', '') for r in rows if r.get('sourcetype')))
+	st = compact[0] if compact else 'tenx_encoded'
+	field = ' OR '.join('tenx_sourcetype=%s' % n for n in named)
+	return ("{}Write sourcetype={} {} instead. The compact events are indexed as {} and carry {} in "
+			"tenx_sourcetype, so as typed {} none of them.").format(
+				"10x: the search was not run. " if refused else "", st, field if len(named) == 1 else '(%s)' % field,
+				st, ' and '.join(named), "it would return" if refused else "it returns")
+
+
+def compact_probe(build_result, tenx_config):
+	"""(probe search, message function) for a passthrough that would miss compact events, or (None, None)."""
+	probe = unnamed_compact_probe(build_result, tenx_config)
+	if probe is not None:
+		return probe, unnamed_compact_message
+	probe = original_sourcetype_probe(build_result, tenx_config)
+	if probe is not None:
+		return probe, original_sourcetype_message
+	return None, None
+
+
+def unnamed_compact_probe(build_result, tenx_config):
+	"""
+	The search that finds compact events a passthrough would read as compact text, or None when
+	none is needed. The rewrite engages only for a search that names a compact sourcetype or source
+	(check_needs_tenx); one that names neither runs as typed, and over an index holding compact
+	events that is the wrong answer with no sign of it (Splunk Enterprise 10.4.3: `| tx
+	index=sr_compact error` 0 events, 102 with sourcetype=tenx_encoded added, equal to raw). So
+	when a search was not engaged and names no sourcetype or source, this tstats looks for events
+	of the registered compact sourcetypes and sources in the indexes it names (every index the
+	user searches by default when it names none, every index when that cannot be told).
+	"""
+	if build_result is None or build_result.engaged or build_result.names_source:
+		return None
+	config = tenx_config or {}
+	sourcetypes = [t for t in (config.get('tenx_source_types') or []) if t]
+	sources = [t for t in (config.get('tenx_sources') or []) if t]
+	if not sourcetypes and not sources:
+		return None
+	compact = ' OR '.join(['sourcetype=%s' % _spl_value(t) for t in sourcetypes] +
+						  ['source=%s' % _spl_value(t) for t in sources])
+	if build_result.indexes is None:
+		where = 'index=* '
+	elif build_result.indexes:
+		where = '(%s) ' % ' OR '.join('index=%s' % _spl_value(i) for i in sorted(set(build_result.indexes)))
+	else:
+		where = ''
+	return '| tstats count where %s(%s) by index, sourcetype, source' % (where, compact)
+
+
+def unnamed_compact_message(rows, refused=True):
+	"""
+	The message for a search whose probe found compact events (rows of index, sourcetype, source,
+	count): the refusal of the commands and the hook, or (refused=False) the review reason of a
+	compiled alert, which is stored. Splunk keeps the first 256 characters of a search command's
+	message, so the message says what to add first.
+	"""
+	sts = sorted(set(r.get('sourcetype', '') for r in rows if r.get('sourcetype')))
+	ixs = sorted(set(r.get('index', '') for r in rows if r.get('index')))
+	return ("{}Add the sourcetype to {}, for example sourcetype={}: it reads compact events (sourcetype {} in index {}) "
+			"and names no compact sourcetype or source, so it {} the wrong events.").format(
+				"10x: the search was not run. " if refused else "", "it" if refused else "the search",
+				sts[0] if sts else "tenx_encoded", ", ".join(sts) or "?", ", ".join(ixs) or "?",
+				"would return" if refused else "returns")

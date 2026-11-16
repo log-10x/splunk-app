@@ -2,6 +2,8 @@
 
 Search-time expansion of 10x compact log events, for Splunk Enterprise 9.4 through 10.6. The package passes AppInspect's Splunk Cloud checks. 10x replaces repetitive patterns with compact template hashes, cutting stored volume while maintaining full searchability.
 
+Compact events and their template records come from the Receiver, the Log10x engine running beside a log forwarder such as Fluent Bit or Fluentd; [deploying the Receiver](https://doc.log10x.com/apps/receiver/deploy/) is described in the Log10x documentation.
+
 ## Table of Contents
 
 - [Overview](#overview)
@@ -9,6 +11,9 @@ Search-time expansion of 10x compact log events, for Splunk Enterprise 9.4 throu
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Usage](#usage)
+- [Fields of the Original Sourcetype: txf](#fields-of-the-original-sourcetype-txf)
+- [Data Models and Detections: the Field Map](#data-models-and-detections-the-field-map)
+- [What to Install on Each Tier](#what-to-install-on-each-tier)
 - [Getting Started](#getting-started)
 - [Technical Reference](#technical-reference)
 - [Troubleshooting](#troubleshooting)
@@ -28,7 +33,7 @@ Search-time expansion of 10x compact log events, for Splunk Enterprise 9.4 throu
 
 The app provides the infrastructure to:
 
-1. **Receive** template definitions from the 10x pipeline
+1. **Receive** template definitions from the Receiver
 2. **Store** parsed template data in a KV store for efficient lookup
 3. **Inflate** compact events back to their original form at search time
 4. **Search** compact data by what the lines say: the `tx` macro in front of an ordinary search, and classic dashboards unchanged
@@ -42,12 +47,12 @@ The app provides the infrastructure to:
 
 **10x compact form:**
 ```
-~abc123def,1705315845123,john_doe,TX-789012
+~abc123def,1705314645123,john_doe,TX-789012
 ```
 
 **Template stored in KV store:**
 ```
-$(epoch) INFO [main] com.example.Service - Processing request for user $ with transaction id $
+$(yyyy-MM-dd'T'HH:mm:ss.SSS'Z') INFO [main] com.example.Service - Processing request for user $ with transaction id $
 ```
 
 At search time, the `tenx-inflate` macro reconstructs the original event by combining the template with the variable values.
@@ -60,7 +65,7 @@ At search time, the `tenx-inflate` macro reconstructs the original event by comb
 
 ```
                                     +------------------+
-                                    |   10x Pipeline   |
+                                    |   10x Receiver   |
                                     +--------+---------+
                                              |
                      +-----------------------+------------------------+
@@ -144,6 +149,7 @@ The `tenx_dml` collection stores parsed template data with fields:
 | `tenx-inflate-debug` | Same as above but keeps intermediate fields for debugging |
 | `tenx-message(1)` | Utility macro to display messages in search results |
 | `tx` | Written in front of a search: searches compact events by what the original lines say (see Usage) |
+| `txf`, `txf(<sourcetype>)` | `tx` with the search-time fields of the original sourcetype (see [Fields of the Original Sourcetype](#fields-of-the-original-sourcetype-txf)) |
 | `tenx-events` | Where the compact events are: the index and sourcetype `tx` and the dashboards read |
 | `tenx-templates` | Where the searchable copies of the templates are, for `tx` |
 
@@ -156,6 +162,17 @@ The `tenx_dml` collection stores parsed template data with fields:
 | `\| tx <search>`, `\| tenxsearch searchstring="..."` | Generating commands that run a rewritten search and write every event out through Python; kept so saved searches written with them keep working |
 | `appserver/static/dashboard.js` + `javascript/search/tenx_search_hook.js` | Loaded on every classic dashboard in an app that carries `dashboard.js`; routes panel searches through `/tenx-search` |
 | `/tenx-search` REST endpoint | Rewrites a search and returns an ordinary job id; what the dashboard hook calls |
+
+#### Saved Searches
+
+| Saved search | Schedule | What it does |
+|--------------|----------|--------------|
+| Consume KV | every 5 minutes | Stores the template records indexed in the last seven minutes in the KV store |
+| Backfill KV | not scheduled | The same load over 30 days, for templates indexed earlier |
+| Recompile Compiled Alerts | every 15 minutes | Runs `tenxrecompile` so compiled alerts pick up new templates |
+| Rebuild Field Replay | every hour | Runs `tenxreplay`, which writes the replay macros `txf` runs |
+| Rebuild Field Replay When New | every 5 minutes | Runs `tenxreplay` for original sourcetypes not yet covered |
+| Field Map Events Without Fields | not scheduled | Counts compact events indexed without their fields (`tenx_unmapped`) by index, sourcetype and reason, with index-time rule errors from `splunkd.log`; schedule it where a field map is installed |
 
 #### Python Scripts
 
@@ -177,6 +194,9 @@ The `tenx_dml` collection stores parsed template data with fields:
 | `tenx_consts.py` | Default configuration constants |
 | `tenx_kv_intf.py` | KV store interface (get/create entries) |
 | `tenx_dml_intf.py` | DML sourcetype interface (submit events) |
+| `tenxreplay.py` | The `tenxreplay` command, run by the Rebuild Field Replay saved searches: writes the replay macros `txf` runs |
+| `tenx_replay_builder.py` | Turns the props of the original sourcetypes into the replay macros |
+| `tenx_field_map.py` | The field map tool: `gen`, `verify`, `activate` and `check` (see [the Field Map](#data-models-and-detections-the-field-map)) |
 
 ---
 
@@ -190,9 +210,9 @@ The `tenx_dml` collection stores parsed template data with fields:
 
 ### Installation Steps
 
-1. **Copy the app to Splunk:**
+1. **Install the package file:**
    ```bash
-   cp -r tenx-for-splunk $SPLUNK_HOME/etc/apps/
+   $SPLUNK_HOME/bin/splunk install app tenx-for-splunk-<version>.tar.gz
    ```
 
 2. **Restart Splunk:**
@@ -207,7 +227,8 @@ The `tenx_dml` collection stores parsed template data with fields:
 4. **Create the template index:**
    - Create an index named `tenx_dml`. Templates arrive there as `tenx_dml_raw_json`, and their
      searchable copy is written there with `collect` (sourcetype `stash`, source `tenx_dml_pure`),
-     which is not licence-metered. Compact events (`tenx_encoded`) go to any index.
+     which is not licence-metered. The template records themselves are counted by Splunk's
+     license like any indexed event. Compact events (`tenx_encoded`) go to any index.
 
 5. **Point the dashboards at your compact index:** set the `tenx-events` macro, see
    [Pointing the Dashboards at Your Compact Events](#pointing-the-dashboards-at-your-compact-events).
@@ -219,25 +240,29 @@ The `tenx_dml` collection stores parsed template data with fields:
 
 ```
 tenx-for-splunk/
+├── app.manifest                 # Workloads, for slim partition
 ├── appserver/static/            # dashboard.js, the search hook, the Compile Alert script
-├── bin/                         # Python scripts, see Python Scripts above
+├── bin/                         # Python scripts, see Python Scripts above, the field map tool among them
 ├── default/
 │   ├── alert_actions.conf       # Alert action definition
 │   ├── app.conf                 # App metadata
 │   ├── collections.conf         # KV store schema
-│   ├── commands.conf            # The tenxprefilter, tx, tenxsearch and tenxrecompile commands
+│   ├── commands.conf            # The tenxprefilter, tx, tenxsearch, tenxrecompile and tenxreplay commands
 │   ├── macros.conf              # SPL macros, including tx
 │   ├── props.conf               # Sourcetype definitions
 │   ├── restmap.conf, web.conf   # The /tenx-search and /tenx-alert endpoints
-│   ├── savedsearches.conf       # Consume KV, Backfill KV, Recompile Compiled Alerts
+│   ├── savedsearches.conf       # Consume KV, Backfill KV, Recompile Compiled Alerts, Rebuild Field Replay,
+│   │                            # Rebuild Field Replay When New, Field Map Events Without Fields
+│   ├── searchbnf.conf, server.conf  # Command help; tenx_config and tenx_replay replicated in a search head cluster
 │   ├── tenx_config.conf         # App configuration
 │   ├── transforms.conf          # Field extractions and lookups
 │   └── data/ui/                 # Dashboards and navigation
 ├── lib/                         # splunklib and parsimonious, see THIRD_PARTY_NOTICES
 ├── metadata/
 │   └── default.meta             # Permissions
-├── README/
-│   └── tenx_config.conf.spec    # Configuration spec
+├── README/                      # alert_actions.conf.spec, savedsearches.conf.spec,
+│                                # tenx_config.conf.spec, tenx_replay.conf.spec
+├── static/                      # App icons
 ├── LICENSE
 └── THIRD_PARTY_NOTICES
 ```
@@ -281,12 +306,13 @@ Or modify `savedsearches.conf`:
 ```ini
 [Consume KV]
 cron_schedule = */5 * * * *
-dispatch.earliest_time = -7m
+search = index=tenx_dml sourcetype=tenx_dml_raw_json _index_earliest=-7m _index_latest=now
+dispatch.earliest_time = -24h
 dispatch.latest_time = now
 ```
 
-Keep the window wider than the interval, or a template that arrives between two runs is
-never stored.
+Keep the index-time window (`_index_earliest`) wider than the interval, or a template that
+arrives between two runs is never stored.
 
 ### Loading Templates Indexed Earlier
 
@@ -301,7 +327,8 @@ index=tenx_dml sourcetype=tenx_dml_raw_json earliest=-30d | sendalert tenx_dml_t
 Widen `earliest` to reach older templates. Running it again is safe: templates already
 stored are kept, and their records are brought up to date when this version of the app
 derives them differently. The **Backfill KV** saved search holds the same search; the **Run**
-button does not fire its alert action, so run the search above.
+button does not fire its alert action, so run the search above. To load every template
+record ever indexed, use `earliest=0`.
 
 ### Adding Custom Sourcetypes for Encoded Events
 
@@ -316,13 +343,16 @@ This applies the field extraction that parses compact events into `tenx_hash`, `
 
 ### Pointing the Dashboards at Your Compact Events
 
-The app's Analytics and Diagnostics dashboards read the `tenx-events` macro. Its default,
-`index=* sourcetype=tenx_encoded`, finds the app's sourcetype in every index you can search.
-Set it to your compact index, and add any custom sourcetype, under **Settings > Advanced
-search > Search macros**:
+The app's Analytics and Diagnostics dashboards read the `tenx-events` macro, and every `tx`
+and `txf` search starts with it, so it limits what they read as well. Its default,
+`index=* sourcetype::tenx_encoded`, finds the app's sourcetype in every index that can be
+searched. Set it to the compact index, and add any custom sourcetype, under **Settings >
+Advanced search > Search macros**. Write each sourcetype in the indexed form `sourcetype::`:
+beside the prefilter `tx` adds to this clause, Splunk dropped some events matched with
+`sourcetype=`. A field map's events are named with `tenx_compact_st::` (see the field map):
 
 ```spl
-index=my_compact_index (sourcetype=tenx_encoded OR sourcetype=my_custom_sourcetype)
+index=my_compact_index (sourcetype::tenx_encoded OR sourcetype::my_custom_sourcetype)
 ```
 
 Naming the index makes every panel faster.
@@ -346,10 +376,17 @@ index=myindex earliest=-4h `tx` "payment failed" NOT retry status=500 | stats co
 ```
 
 The words after `tx` are ordinary SPL, applied to the expanded lines. Phrases,
-`field=value`, `field IN (...)`, wildcards, `TERM()`, `CASE()`, `NOT`, `OR`, `AND` and
-parentheses behave as on the original data, with Splunk's precedence. The fields are the ones
-Splunk extracts from the original lines, key=value pairs and JSON alike. Searching an IP address, a hostname or an ID works the
-same way: the words go after `tx`, whether they are values or template text.
+`field=value`, `field IN (...)`, wildcards at the start or end of a word, `NOT`, `OR`, `AND`
+and parentheses behave as on the original data, with Splunk's precedence. A wildcard inside
+a word (`Se*Privilege`) is matched as Splunk matches it after a pipe, on the characters
+before its first `*`. Such a word can match more events than on the original lines, and
+under `NOT` fewer. Through `tx`, `TERM()` and `CASE()` are tested against the text of each
+expanded event, as in a search after a pipe. A `TERM()` whose match depends on how Splunk
+split the original event into terms at index time, such as `TERM(10.2.236.94)` inside
+`client_ip=10.2.236.94`, can match different events than on the original lines. The fields
+are the ones Splunk extracts from the original lines, key=value pairs and JSON alike.
+Searching an IP address, a hostname or an ID works the same way: the words go after `tx`,
+whether they are values or template text.
 
 **Classic dashboards.** `dashboard.js` loads on every classic dashboard in the app that
 carries it and routes the panel's search through the app's REST endpoint. Panels keep
@@ -362,16 +399,30 @@ their SPL. To cover another app's dashboards, copy the file into that app's
   event, so the search stops with a message saying so.
 - A comma outside quotes after `tx` is matched literally by Splunk, so the search stops with
   a message. Remove the comma, or put the text in quotes.
-- The index, sourcetype, host and the forwarder's indexed fields narrow what is read when
+- The index, the compact sourcetype, host and the forwarder's indexed fields narrow what is read when
   they come before `tx`. After it they filter the expanded events, which gives the same
   result more slowly.
+- The sourcetype before or after `tx` is the compact sourcetype (`sourcetype=tenx_encoded`); each
+  event's original sourcetype is in the field `tenx_sourcetype`. To search by the original
+  sourcetype, write `tenx_sourcetype=<sourcetype>` before `tx`, or `sourcetype=<sourcetype>` after
+  `txf`, which gives each event its original sourcetype. A search that names the original
+  sourcetype in place of the compact one stops with a message saying so.
 - `tx` inside another subsearch (`append`, `join`) or wrapped in another macro cannot read
   its own words. It then expands every compact event in range and applies the words after,
   with a warning: the same result, more slowly.
-- A compact event is the event the 10x engine formed. Lines without a timestamp of their
+- A compact event is the event the Receiver formed. Lines without a timestamp of their
   own, such as the lines of a stack trace, join the line before them, so a stack trace is
   one event, a count counts events, and words joined with AND can match on different lines
   of one event.
+
+When `tx` or `txf` stops a search, the search fails with a message. The search bar, dashboard panels
+and Jobs show it; a REST job holds it (on Splunk 10.4 and 10.6 the job also ends FAILED), and a
+oneshot job returns it. The REST export endpoint returns it with `output_mode=xml`; with `csv`, and
+on Splunk 10.4 and 10.6 with `json`, it returns HTTP 200 and an empty body, as Splunk does for any
+search that fails while running, so treat an empty export as a failure. A scheduled alert that stops
+does not fire, and its job holds the message. `txf(<sourcetype>)` for a sourcetype without a field
+replay is refused before the search runs, on every path. A saved search with such a macro cannot be
+saved, and one whose replay is removed later is skipped, with the message in the scheduler log.
 
 **How `tx` chooses the events to expand.** Its subsearch runs `tenxprefilter` once per
 search. The command reads the search's own text, takes the words after `tx`, finds which
@@ -385,7 +436,8 @@ the result, never narrower.
 **The `tx` and `tenxsearch` commands.** `| tx index=myindex sourcetype=tenx_encoded error`
 and `| tenxsearch searchstring="..."` run a rewritten search and write every event out
 through Python, which is several times slower than the macro. They are kept so saved
-searches written with them keep working.
+searches written with them keep working. The search they run must name the compact sourcetype,
+`sourcetype=tenx_encoded`. Without it the command stops and says so.
 
 **Search behavior.**
 
@@ -461,11 +513,406 @@ index=myindex sourcetype=tenx_encoded
 
 ---
 
+## Fields of the Original Sourcetype: `txf`
+
+`tx` gives an expanded event the fields Splunk extracts from its text. The `txf` macro also
+applies the search-time knowledge of the event's original sourcetype, as its add-on defines it:
+field extractions, aliases, calculated fields, lookups, event types and tags. It is written where
+`tx` goes:
+
+```spl
+index=wineventlog `txf` tag=authentication action=failure
+index=wineventlog `txf(XmlWinEventLog)` EventCode=4625 | stats count by user
+```
+
+`txf(<sourcetype>)` applies the rules of that one sourcetype and starts faster. `txf` applies the
+rules of every original sourcetype the app has recorded in the compact indexes.
+
+To set it up:
+
+1. Give every compact event the indexed field `tenx_sourcetype` with its original sourcetype: in
+   the HEC event's `fields`, for example `"fields": {"tenx_sourcetype": "XmlWinEventLog"}`, or with
+   `_meta = tenx_sourcetype::XmlWinEventLog` in the `inputs.conf` stanza that reads a compact file.
+   With Fluent Bit as in the setup guide, the events the Receiver sends back arrive on Fluent Bit's
+   `forward` input with `Tag_Prefix tenx.`; for each source, a `modify` filter adds the field and
+   the `splunk` output sends it as an indexed field:
+
+   ```
+   [FILTER]
+       Name    modify
+       Match   tenx.<tag of the source>
+       Add     tenx_sourcetype XmlWinEventLog
+
+   [OUTPUT]
+       Name              splunk
+       Match             tenx.<tag of the source>
+       Host              <HEC host>
+       Port              8088
+       Splunk_Token      ${HEC_TOKEN}
+       TLS               On
+       event_index       <compact index>
+       event_sourcetype  tenx_encoded
+       event_source      XmlWinEventLog:Security
+       event_key         $log
+       event_field       tenx_sourcetype $tenx_sourcetype
+   ```
+
+   The compact events must carry the source the add-on expects, as the raw events would: the
+   Windows add-on selects Security events by the source `XmlWinEventLog:Security` and sets its CIM
+   fields under that source, hence `event_source`. The AWS add-on sets its CloudTrail rules on the
+   sourcetype `aws:cloudtrail`, so CloudTrail events need no particular source.
+
+   Add `TLS.Verify Off` for an HTTP Event Collector with Splunk's default self-signed certificate.
+   Match each source's own tag, not `tenx.*`: the Receiver also sends its status record, tagged
+   `tenx.tenx-stdout`, which an output matching `tenx.*` indexes as a compact event at every start.
+
+   Windows Security events reach the Receiver as the rendered XML of each event, one event per
+   record: the form the Windows add-on's `XmlWinEventLog` sourcetype holds. For events in files,
+   Fluent Bit's `tail` input with a multiline parser that starts a record at `<Event` gives that
+   form, the parser in a parsers file named by `Parsers_File` in `[SERVICE]`:
+
+   ```
+   [MULTILINE_PARSER]
+       name          win_xml
+       type          regex
+       flush_timeout 2000
+       rule          "start_state"  "/^<Event/"       "cont"
+       rule          "cont"         "/^(?!<Event)/"   "cont"
+
+   [INPUT]
+       Name              tail
+       Path              <file of rendered Windows Security events>
+       Tag               src.win
+       Read_from_Head    true
+       Buffer_Chunk_Size 64k
+       Buffer_Max_Size   2M
+       multiline.parser  win_xml
+   ```
+2. Install the add-on of each original sourcetype on the search head, as for raw data.
+3. Run `| tenxreplay` once, or wait for the **Rebuild Field Replay When New** saved search, which
+   runs every five minutes. It writes the replay macros from the search head's own props for the
+   original sourcetypes found in the compact indexes. **Rebuild Field Replay** rewrites them every
+   hour. Its output lists, per original sourcetype, the indexed fields kept on replayed events
+   (`kept_indexed_fields`, the indexed fields its compact events carry), and may warn that some
+   fields set when compact events are read take their names from the data and are not cleared on
+   replayed events: names that a key=value or JSON extraction takes from the text cannot be listed
+   in advance.
+
+A compact event without `tenx_sourcetype` is expanded and extracted exactly as by `tx`.
+
+Checked with Splunk Add-on for Microsoft Windows 12.0.0, Splunk Add-on for AWS 8.3.1 and the Fortinet FortiGate Add-on for Splunk 1.6.10 against the same events indexed raw; the results are in the [listing's checks](https://github.com/log-10x/splunk-app/blob/main/splunkbase/LISTING.md#checks-run-on-this-package).
+
+With the Windows add-on's index-time XML profile (`XML_INDEXED_EXTRACTIONS_PIPELINE = typing`), raw
+events also carry fields Splunk indexes from the XML. `txf` gives the add-on's search-time fields,
+so three fields that depend on that indexing (`xmlns`, `vendor_privilege`, `privilege_id`) are not
+on expanded events.
+
+For FortiGate, the sender sets `tenx_sourcetype` to `fortigate_traffic`, `fortigate_utm`,
+`fortigate_event` or `fortigate_anomaly` by the line's `type=`.
+
+A compact event's `_time` is the first timestamp the Receiver found in the line. In a CloudTrail
+record that can be `userIdentity.sessionContext.attributes.creationDate`, which comes before
+`eventTime`. A CloudTrail field map built with `--time-props` (below) gives every compact
+CloudTrail event the raw event's `_time`.
+
+A FortiGate line has its date and time in two fields, `date=` and `time=`. The Receiver reads the
+time and supplies the date, so a compact FortiGate event's `_time` can fall on another day.
+
+## Data Models and Detections: the Field Map
+
+Needs the Receiver at release 1.1.180 or later.
+
+Data models, their accelerations, `tstats` and saved searches that do not use `tx` read the
+fields Splunk stored with an event. The field map writes a compact event's original fields while
+it is indexed, so these searches read them.
+`tenx_field_map.py`, in the app's `bin` folder, generates a Splunk app for one compact sourcetype.
+For each template it holds one row of a lookup file; one static index-time rule reads the row and
+writes the original event's fields as indexed fields, then renames the event to its original
+sourcetype. The add-on's search-time rules then run on the event as on the raw one, except rules
+that read the event's text instead of a field. For the Windows add-on, `--addon` in step 4 supplies
+those.
+
+A field map covers the templates stored when it is generated. The steps below are for Windows
+Security; CloudTrail follows them. Steps 1, 6 and 7 keep the Receiver from compacting the events of
+a template before its fields can be written; they were measured with the Windows map and the
+CloudTrail map, each through its own Receiver.
+
+A field map has its own Receiver and its own cap file. Send the mapped source, and only that
+source, through that Receiver: with the cap list on, an event of any template that is not listed
+arrives whole.
+
+Where things run: the tool runs with Python 3.9 or later on the Receiver's host, from a copy of
+the package unpacked there, because it writes the cap file the Receiver reads; the generated app
+folders are kept there too. From that host it needs the search head's management port (8089) and
+the HTTP Event Collector of every instance that parses the compact events. `tenx_dml`, the compact
+index and `tenx_probe` are created where events are indexed (on an indexer cluster, in the cluster
+bundle), and the HTTP Event Collector tokens on every instance that takes them. `--splunkd` names a
+search head that searches those indexes and is not a member of a search head cluster. Each Receiver
+has its own cap file and its own scheduled `check`.
+
+1. Before compact events are sent, set the Receiver to compact only the templates a cap file lists.
+   In its configuration folder (`$TENX_CONFIG`), set `fieldNames` to `[templateHash]` in
+   `pipelines/run/receive/compact/config.yaml` (`default: false` is the shipped value). Create the
+   cap file with its header row:
+
+   ```sh
+   mkdir -p /etc/tenx/win
+   printf 'pattern_hash,value\n' > /etc/tenx/win/compact-cap.csv
+   ```
+
+   The first row is a header; the Receiver matches the template hash against the first column,
+   whatever the header names it, and reads `true` or `false` from the second. Start the Receiver
+   with these arguments:
+
+   ```
+   @run/input/forwarder/fluentbit @apps/receiver varMaxRecurIndexes 0 timestampZone UTC timestampMaxPerObject 1 compactReceiverLookupFile /etc/tenx/win/compact-cap.csv
+   ```
+
+   Leave `receiverOptimize true` out of them: with it the Receiver compacts every template, listed or
+   not, so events would be compact before their fields can be written.
+
+   With the published image, the edit to the shipped `compact/config.yaml` is one: the two lines
+   `fieldNames:` and `- $=yield TenXEnv.get("symbolMessageField")` become `fieldNames: [templateHash]`.
+   Fluent Bit and the Receiver then run as two containers that share Fluent Bit's network:
+
+   ```sh
+   docker run -d --name tenx-fluentbit --network <network> --env-file <env file> \
+     -v <fluent-bit.conf>:/fluent-bit/etc/fluent-bit.conf:ro \
+     -v <parsers file>:/fluent-bit/etc/win-parsers.conf:ro -v <log folder>:/logs fluent/fluent-bit:5.1.5
+   docker run -d --name tenx-receiver --network container:tenx-fluentbit \
+     -v <edited compact config.yaml>:/etc/tenx/config/pipelines/run/receive/compact/config.yaml:ro \
+     -v <host folder of the cap file>:/etc/tenx/win log10x/edge-10x:1.1.180 \
+     @run/input/forwarder/fluentbit @apps/receiver varMaxRecurIndexes 0 timestampZone UTC \
+     timestampMaxPerObject 1 compactReceiverLookupFile /etc/tenx/win/compact-cap.csv
+   ```
+
+   `<network>` is a Docker network from which the HTTP Event Collector is reachable. The env file
+   sets each variable the configuration names, one `NAME=value` per line, such as
+   `HEC_TOKEN=<HEC token>` for `Splunk_Token ${HEC_TOKEN}`. The tool is then given the cap file's
+   path on the host, and the Receiver the path inside the container. The host folder need not be
+   `/etc/tenx` (creating a folder there needs root).
+
+   The Fluent Bit configuration of the mapped source holds:
+
+   - `Parsers_File /fluent-bit/etc/win-parsers.conf` in `[SERVICE]`, and in that file the `win_xml`
+     parser of [Fields of the Original Sourcetype](#fields-of-the-original-sourcetype-txf), step 1;
+   - the source's `tail` input with `multiline.parser win_xml`, as in that step;
+   - the hand-off to the Receiver and the input its events come back on:
+
+     ```
+     [OUTPUT]
+         Name        forward
+         Match       <tag of the source>
+         Host        127.0.0.1
+         Port        24224
+
+     [INPUT]
+         Name        forward
+         Listen      0.0.0.0
+         Port        24225
+         Tag_Prefix  tenx.
+     ```
+
+   - the template output of the [Splunk setup page](https://doc.log10x.com/apps/receiver/compact/splunk/),
+     step 3, with `Match tenx.tenx-template`, which sends the template records to `tenx_dml`;
+   - the `modify` filter and the `splunk` output of the source, as in that step 1, with
+     `event_sourcetype tenx_win` and `event_source XmlWinEventLog:Security` (step 5 below).
+
+   Every event arrives whole, with all its fields, until its template is listed. From the first
+   event on, send the mapped source with the map's compact sourcetype (`tenx_win` below), so whole
+   and compact events of that source share it.
+
+2. Let the **Consume KV** saved search store the template records (it runs every five minutes).
+
+3. Export the stored templates from the search head's KV store, 2,000 rows a page, until a page
+   holds no rows:
+
+   ```sh
+   curl -k -u admin "https://<search head>:8089/servicesNS/nobody/tenx-for-splunk/storage/collections/data/tenx_dml?output_mode=json&limit=2000&skip=0" > kv_0.json
+   curl -k -u admin "https://<search head>:8089/servicesNS/nobody/tenx-for-splunk/storage/collections/data/tenx_dml?output_mode=json&limit=2000&skip=2000" > kv_1.json
+   ```
+
+   One read without `limit` returns at most 50 MB of rows, which can be fewer than the collection holds.
+
+4. Generate the field map app and its floor app:
+
+   ```sh
+   python3 tenx-for-splunk/bin/tenx_field_map.py gen \
+     --records kv_0.json --records kv_1.json --target windows-security --rules lookup \
+     --addon Splunk_TA_windows --app-name fm_win --cap-file /etc/tenx/win/compact-cap.csv \
+     --out fm_win
+   ```
+
+   `--cap-file` takes the cap file's path on this host, not the path inside the Receiver's container.
+
+   `--addon` names a copy of the Windows add-on's folder on this host. The add-on downloads as a
+   `.spl` archive; `tar -xzf` on it gives that folder, `Splunk_TA_windows/`. `gen` adds a copy of
+   each of its rules that read the event's XML text (dest, src_ip, process_id and the 4688 process
+   fields among them), reading the indexed field instead. Without it, those fields and `src` are
+   missing on mapped events.
+
+   `--target windows-security` reads templates of the rendered XML events above; on other records
+   it writes an app with no rule and says so. This writes the apps `fm_win` and `fm_win_floor`
+   and the file `compact-cap.csv.pending`, and
+   prints the line step 5 adds to `tenx-events`. The compact sourcetype is `tenx_win`. The floor app
+   holds a one-row lookup that Splunk reads if the field map's own file is missing, so events are
+   kept and marked `tenx_unmapped` instead of dropped.
+
+5. Copy `fm_win` and `fm_win_floor` to every instance that parses the compact events, and `fm_win`
+   to the search head (see [What to Install on Each Tier](#what-to-install-on-each-tier)), add
+   `tenx_compact_st::tenx_win` to the `tenx-events` macro as `gen` printed, for example
+   `index=* (sourcetype::tenx_encoded OR tenx_compact_st::tenx_win)`, and send the compact Windows
+   events with sourcetype `tenx_win`: the Fluent Bit lines of
+   [Fields of the Original Sourcetype](#fields-of-the-original-sourcetype-txf), step 1, with
+   `event_sourcetype tenx_win` and `event_source XmlWinEventLog:Security`: the add-on's Security
+   rules apply only to events with that source. Restart a standalone instance or heavy forwarder
+   after the first install. On an indexer cluster, put both apps in `manager-apps` on the cluster
+   manager and push the bundle; a new field map app reaches the peers without a restart.
+
+6. Create the probe index where the compact events are parsed: on a standalone instance or heavy
+   forwarder `curl -k -u admin https://localhost:8089/services/data/indexes -d name=tenx_probe`, on
+   an indexer cluster a `[tenx_probe]` stanza with `repFactor = auto` in an `indexes.conf` of the
+   cluster bundle. The HTTP Event Collector token in `TENX_PROBE_HEC_TOKEN` must allow the probe
+   index; a token that writes only there:
+   `curl -k -u admin https://localhost:8089/servicesNS/nobody/splunk_httpinput/data/inputs/http -d name=tenx_probe -d token=<a new UUID> -d index=tenx_probe -d indexes=tenx_probe`. Then prove the field map and list its templates:
+
+   ```sh
+   TENX_SPLUNKD_TOKEN=<token> TENX_PROBE_HEC_TOKEN=<HEC token> python3 \
+     tenx-for-splunk/bin/tenx_field_map.py activate \
+     --app fm_win --cap-file /etc/tenx/win/compact-cap.csv \
+     --splunkd https://<search head>:8089 --probe-hec https://<parsing instance>:8088 \
+     --probe-index tenx_probe
+   ```
+
+   On an instance that still has Splunk's default self-signed certificate, the tool's certificate
+   check fails; add `--tls-verify off`. `<token>` is a Splunk authentication token of a user
+   whose role holds the capabilities `search`, `edit_tcp` and `list_all_objects` and may search
+   the probe index; `TENX_SPLUNKD_AUTH=<user>:<password>` works as well. `activate` sends one
+   small probe event per new template through the HTTP Event Collector into the probe index, an
+   index to keep out of data model and detection index lists. When Splunk writes a probe's
+   fields, that template moves from `compact-cap.csv.pending` into `compact-cap.csv`, and the
+   Receiver, which rereads the file, then compacts its events. Nothing is restarted.
+
+7. Schedule `check` with the arguments of `activate`, for example from cron:
+
+   ```sh
+   TENX_SPLUNKD_TOKEN=<token> TENX_PROBE_HEC_TOKEN=<HEC token> python3 \
+     tenx-for-splunk/bin/tenx_field_map.py check \
+     --app fm_win --cap-file /etc/tenx/win/compact-cap.csv \
+     --splunkd https://<search head>:8089 --probe-hec https://<parsing instance>:8088 \
+     --probe-index tenx_probe --timeout 20 --poll 5
+   ```
+
+   Add `--tls-verify off` as in step 6. `check` sends the probe of a listed template. When it comes
+   back without its fields, or is not indexed within `--timeout`, `check` empties `compact-cap.csv`,
+   and the Receiver sends every event whole until `activate` has proven the templates again. Events
+   indexed between the moment a listed template stops getting its fields and that `check` are kept,
+   marked `tenx_unmapped`, and lack their index-time fields. After `check` empties the list, events
+   the Receiver compacts before it rereads the file, within about 10 seconds, are kept and marked
+   `tenx_unmapped`; every later event of that source arrives whole. `check` probes the listed
+   templates only. The saved search **Field Map Events Without Fields** counts compact events
+   indexed without their fields (`tenx_unmapped`) by index, sourcetype and reason; schedule it where
+   a field map is installed.
+
+A template that appears later arrives whole until steps 3, 4 and 6 run again. `gen` then changes
+only the lookup file: copy `lookups/` of both apps over the installed ones (on a cluster, into
+`manager-apps` and push the bundle) and run `activate`. Copy the lookup files with `cp` (not
+`cp -p`), or touch them after copying. Splunk rereads a lookup file when its modification time
+changes; a file put back with the time it had when Splunk last read it stays unread. A standalone
+instance or heavy forwarder rereads the file within its `ingest_lookup_refresh_period_secs` (60
+seconds by default) with no reload or restart, and a change to the lookup file alone reloads cluster
+peers without a restart.
+
+Where several instances parse the compact events (indexer cluster peers, or several heavy
+forwarders), give `activate` and `check` each node's HTTP Event Collector,
+`--probe-hec https://<node>:8088` once per node. A template is then listed only when every node
+writes its fields, and `check` empties the list when any node does not.
+
+**AWS CloudTrail** has a second Receiver with its own cap file, `/etc/tenx/cloudtrail/compact-cap.csv`,
+set up as in step 1, with `compactReceiverLookupFile /etc/tenx/cloudtrail/compact-cap.csv` in its
+arguments. Steps 2, 3 and 5 are as for Windows Security, with the app `fm_cloudtrail`, the compact
+sourcetype `tenx_cloudtrail` (`event_sourcetype tenx_cloudtrail` and
+`Add tenx_sourcetype aws:cloudtrail` in the Fluent Bit lines) and
+`tenx_compact_st::tenx_cloudtrail` in `tenx-events`. Step 4
+generates the map with the AWS add-on's time settings, read from a copy of the add-on's
+`default/props.conf`, so every compact event takes the raw event's `_time`:
+
+```sh
+python3 tenx-for-splunk/bin/tenx_field_map.py gen \
+  --records kv_0.json --records kv_1.json --rules lookup --reader json \
+  --sourcetype tenx_cloudtrail --rename aws:cloudtrail --reserved-names restore --mixed-names \
+  --time-props Splunk_TA_aws/default/props.conf \
+  --time-format '%Y-%m-%dT%H:%M:%S.%6N%Z' \
+  --app-name fm_cloudtrail --cap-file /etc/tenx/cloudtrail/compact-cap.csv --out fm_cloudtrail
+```
+
+Steps 6 and 7 take that map's app and cap file, and `--tls-verify off` as in step 6:
+
+```sh
+TENX_SPLUNKD_TOKEN=<token> TENX_PROBE_HEC_TOKEN=<HEC token> python3 \
+  tenx-for-splunk/bin/tenx_field_map.py activate \
+  --app fm_cloudtrail --cap-file /etc/tenx/cloudtrail/compact-cap.csv \
+  --splunkd https://<search head>:8089 --probe-hec https://<parsing instance>:8088 \
+  --probe-index tenx_probe
+
+TENX_SPLUNKD_TOKEN=<token> TENX_PROBE_HEC_TOKEN=<HEC token> python3 \
+  tenx-for-splunk/bin/tenx_field_map.py check \
+  --app fm_cloudtrail --cap-file /etc/tenx/cloudtrail/compact-cap.csv \
+  --splunkd https://<search head>:8089 --probe-hec https://<parsing instance>:8088 \
+  --probe-index tenx_probe --timeout 20 --poll 5
+```
+
+`tstats` reads the indexed sourcetype, which stays `tenx_win`: `| tstats count where
+sourcetype=XmlWinEventLog` counts uncompacted events only. Use `where (sourcetype=XmlWinEventLog OR
+tenx_sourcetype=XmlWinEventLog)`, or a data model, which applies the rename.
+
+For all fields on a plain search of mapped CloudTrail events, set `indexed_kv_limit = 0` under
+`[kv]` in `limits.conf` on the indexers and heavy forwarders, in the cluster bundle on a cluster (a
+search head does not pass `limits.conf` to its peers). It takes a restart; on a cluster the bundle
+push restarts the peers one by one. Splunk's default, 200, caps the indexed fields a plain search
+shows on one event; 0 shows every field. Data model counts and detections through the map are the
+same at either value.
+
+Checked with the Windows add-on 12.0.0, the AWS add-on 8.3.1 and CIM 8.8.0 against the same events
+indexed raw; the results are in the
+[listing's checks](https://github.com/log-10x/splunk-app/blob/main/splunkbase/LISTING.md#checks-run-on-this-package).
+These limits remain. Event types that match words of the original text, such as `err0r` in the
+Windows add-on and `aws_cloudtrail_delete_events` in the AWS add-on, do not match mapped events. On
+Windows EventID 4798, 5156 and 5157, `dest` is the event's Computer and `src_ip` and `dest_ip` are
+not written. The add-on's XML block fields `EventData_Xml` and `System_Props_Xml` are not written.
+`vendor_privilege` and `privilege_id` carry `-` on events where the raw event has neither. A value
+that holds line breaks and tabs is written with spaces in their place. On CloudTrail,
+`responseElements.credentials.sessionToken` is not written.
+
+## What to Install on Each Tier
+
+In a distributed deployment, run `$SPLUNK_HOME/bin/slim partition tenx-for-splunk-<version>.tar.gz`
+once, on a clean copy of the package. Its `_indexers` package holds the parsing settings only and
+runs no search; it goes on the indexers and on heavy forwarders. The search heads take the
+`_search_heads` package or the whole app. The `_forwarders` package it also writes is not used: on
+a heavy forwarder it logs error lines at restart. `slim` prints "Undefined setting" warnings for
+settings it does not know, among them `python.required` and `INGEST_EVAL`, and each archive it
+writes holds a folder with the package archive inside.
+
+| Tier | What to install |
+|---|---|
+| Search heads (through the deployer for a search head cluster) | the `_search_heads` package or the whole app, the add-ons of the original sourcetypes, CIM, and the field map apps |
+| Indexers (through the cluster manager's bundle) | the `_indexers` package, the add-ons, the field map apps with their floor apps, and `indexed_kv_limit` where needed |
+| Heavy forwarders that parse the compact events | the `_indexers` package, the add-ons, and the field map apps with their floor apps |
+| Universal Forwarders | nothing of 10x |
+
+The whole app also works on indexers and heavy forwarders, and its scheduled searches then run
+there with nothing to do. Replacing the whole app with the `_indexers` package on the indexers, or
+the reverse, takes one rolling restart; updating the whole app in place takes none. The template
+collection reaches the indexers in the knowledge bundle, so `tx` and `txf` need nothing more on
+them.
+
 ## Getting Started
 
-### Step 1: Configure Your 10x Pipeline
+### Step 1: Configure the Receiver
 
-Configure your 10x pipeline to output:
+Set up the Receiver and its forwarder as the [Splunk setup page](https://doc.log10x.com/apps/receiver/compact/splunk/)
+of the Log10x documentation describes, so that they send:
 
 1. **Templates** to a Splunk HTTP Event Collector (HEC) or file input with:
    - Sourcetype: `tenx_dml_raw_json`
@@ -475,8 +922,8 @@ Configure your 10x pipeline to output:
    - Sourcetype: `tenx_encoded`
    - Format: `~<hash>,<var0>,<var1>,...`
 
-3. **Receiver settings** this app relies on: `varMaxRecurIndexes: 0`, `timestampZone: UTC`
-   and `maxPerObject: 1`. The [repository README](https://github.com/log-10x/splunk-app/blob/main/README.md#receiver-side-configuration)
+3. **Receiver settings** this app relies on: the arguments `receiverOptimize true`,
+   `varMaxRecurIndexes 0`, `timestampZone UTC` and `timestampMaxPerObject 1`. The [repository README](https://github.com/log-10x/splunk-app/blob/main/README.md#receiver-side-configuration)
    explains each one.
 
 ### Step 2: Verify Template Ingestion
@@ -500,7 +947,9 @@ Wait five minutes for the "Consume KV" saved search to run, or run the
 
 ### Step 4: Test Expansion
 
-Search for compact events and expand:
+Search for compact events and expand. An event `{"message":"10x engine connected to ..."}` is the
+Receiver's status record, indexed once per start when the forwarder's output matches `tenx.*`;
+match each source's own tag to keep it out:
 
 ```spl
 index=* sourcetype=tenx_encoded earliest=-15m
@@ -682,7 +1131,6 @@ Templates indexed before the app was installed are loaded only by the
    ```spl
    index=* sourcetype=tenx_dml_raw_json
    | head 5
-   | spath
    | table templateHash, template
    ```
 
