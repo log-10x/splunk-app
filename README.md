@@ -236,7 +236,7 @@ index=your_logs_index `tx` | head 10
 
 ## Security Sources
 
-The `txf` macro gives expanded events the fields, event types and tags of their original sourcetype, and the field map tool makes compact events readable by data models and detections. Setup: [Fields of the Original Sourcetype](tenx-for-splunk/README.md#fields-of-the-original-sourcetype-txf), [the Field Map](tenx-for-splunk/README.md#data-models-and-detections-the-field-map), [What to Install on Each Tier](tenx-for-splunk/README.md#what-to-install-on-each-tier).
+The `txf` macro gives expanded events the fields, event types and tags of their original sourcetype, and the field map tool makes compact events readable by data models and detections. Setup: [Fields of the Original Sourcetype](tenx-for-splunk/README.md#fields-of-the-original-sourcetype-txf), [the Field Map](tenx-for-splunk/README.md#data-models-and-detections-the-field-map), [What to Install on Each Tier](tenx-for-splunk/README.md#what-to-install-on-each-tier). Before a source moves, [the search report](tenx-for-splunk/README.md#which-searches-change-when-a-source-moves) lists which of a search head's saved searches, alerts and dashboard panels need an edit.
 
 ## Analytics Dashboard
 
@@ -262,6 +262,7 @@ The Analytics dashboard finds compact events through the `tenx-events` macro.
 | **txf Macro** | `tx` with the search-time fields of the original sourcetype; see [Fields of the Original Sourcetype](tenx-for-splunk/README.md#fields-of-the-original-sourcetype-txf) |
 | **tenxreplay Command** | Writes the replay macros `txf` runs, from the search head's props; run by the Rebuild Field Replay saved searches |
 | **Field Map Tool** | `bin/tenx_field_map.py`: generates the app that writes compact events' original fields at index time; see [the Field Map](tenx-for-splunk/README.md#data-models-and-detections-the-field-map) |
+| **Search Report** | `bin/tenx_search_report.py`: says which saved searches, alerts and dashboard panels run unchanged, need `tx` or `txf`, or need a field map when a source moves to compact events; see [Which Searches Change](tenx-for-splunk/README.md#which-searches-change-when-a-source-moves) |
 | **tenxprefilter Command** | Run once per search by the `tx` macro; reads the search, looks up the templates that carry its words, and selects the compact events to expand |
 | **tx and tenxsearch Commands** | `\| tx <search>` and `\| tenxsearch searchstring="..."`: generating commands that write every event out through Python, kept so saved searches written with them keep working |
 | **tenxrecompile Command** | Recompiles every compiled alert so it picks up new templates |
