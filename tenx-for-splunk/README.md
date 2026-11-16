@@ -57,6 +57,10 @@ $(yyyy-MM-dd'T'HH:mm:ss.SSS'Z') INFO [main] com.example.Service - Processing req
 
 At search time, the `tenx-inflate` macro reconstructs the original event by combining the template with the variable values.
 
+Each template is sent to Splunk once and counted like any other data. Where new templates keep
+arriving, as on a small or varied source, the template records can outweigh what compaction saves.
+On a steady source the count of templates levels off.
+
 ---
 
 ## Architecture

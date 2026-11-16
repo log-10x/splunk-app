@@ -164,10 +164,10 @@ Repository name: `log-10x/splunk-app`. Repository URL: https://github.com/log-10
 | Field | Value |
 |---|---|
 | Version | 1.2.2, read from the package |
-| Splunk platform compatibility | Splunk Enterprise 9.4.15, 10.0.12, 10.2.9, 10.4.3, 10.6.0.5 |
+| Splunk platform compatibility | Splunk Enterprise 9.4, 10.0, 10.2, 10.4, 10.6 |
 | CIM | None |
 
-Each line is tested: 9.4.15, 10.0.10, 10.2.7 and 10.4.3, each a fresh install of 1.1.2. 1.1.3
+Each line is tested: 9.4.15, 10.0.12, 10.2.9, 10.4.3 and 10.6.0.5 for 1.2.x, and 9.4.15, 10.0.10, 10.2.7 and 10.4.3, each a fresh install of 1.1.2. 1.1.3
 changed one `props.conf` key, checked on 10.4.3 and measured on 9.4. 1.1.4 changes how
 templates are stored; it is checked on 9.4.15, 10.4.3 and 10.6.0.5, on a fresh install and an
 upgrade over 1.1.3. 1.1.5 changes the compact sourcetype's event time and the expansion macro; it is
@@ -185,7 +185,7 @@ Paste the block for the version being uploaded. Splunkbase keeps notes per relea
 1.2.2:
 
 > - Alerts compiled in the Compile Alert view now fire when Splunk runs them. An alert compiled with an earlier version is rewritten by the app within 15 minutes of the upgrade, unless someone edited it since.
-> - The field map's `check` also counts the compact events of the map's sourcetype indexed without their fields since its previous run, and fails with the count and the reason; it empties the list when a row or the lookup file fails (`bad_row`, `no_table`), and leaves it for templates the list does not hold (`no_row`) and for values a row does not take (`no_match`).
+> - The field map's `check` also counts compact events indexed without their fields since its previous run, and fails with the count and the reason. It empties the list when a row or the lookup file fails (`bad_row`, `no_table`), and keeps it for templates the list does not hold (`no_row`) and values a row does not take (`no_match`).
 > - `activate` and `check` take `--tls-ca-file`, and refuse a lookup file that is not gzip or has no `hash` column. `gen` says when a KV store export holds no template records, such as an export that failed with "Unauthorized".
 > - Through `tx`, `txf`, `| tx`, `tenxsearch`, dashboards and compiled alerts, an event the sender passed whole without `tenx_sourcetype` keeps the fields Splunk read it with, each value once.
 > - The field replay behind `txf` keeps the indexed fields found on the most recent event of each index, host, source and sourcetype, besides those of the 1,000 most recent compact events and those fields.conf declares with `INDEXED = true`.
