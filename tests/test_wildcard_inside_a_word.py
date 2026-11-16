@@ -123,3 +123,24 @@ class TestWordsTogether:
 	def test_plain_words_already_match_as_terms_after_the_pipe(self):
 		plain = [(w, b, pipe) for w, b, pipe in MEASURED if '*' not in w and ' ' not in w and '=' not in w and '(' not in w]
 		assert len(plain) >= 11 and all(b == pipe for _, b, pipe in plain)
+
+
+class TestTheSearchRewrite:
+	"""`| tx`, `| tenxsearch`, the dashboard hook and compiled alerts re-apply the words after expanding
+	in the same kind of search after a pipe (Splunk Enterprise 10.4.3, Windows 662 sample:
+	`| tx index=x sourcetype=tenx_encoded Se*Privilege` 662 events against 3 raw): the same filter
+	runs before it."""
+
+	def resolved(self, search):
+		from test_tenx_search_builder import make_builder
+		return make_builder()[0].build(search).resolved
+
+	def test_a_wildcard_inside_a_word_is_filtered(self):
+		got = self.resolved('search index=x sourcetype=tenx_encoded error Se*Privilege')
+		assert ' | eval tenx_w0=if(match(_raw, "(?i)' in got
+		assert got.endswith('tenx_keep=if(tenx_w0=1, 1, null()) | search tenx_keep=1 | fields - tenx_keep, tenx_w* '
+							'| search error Se*Privilege')
+
+	def test_other_words_are_not(self):
+		got = self.resolved('search index=x sourcetype=tenx_encoded error Se*')
+		assert 'tenx_keep' not in got and got.endswith('| search error Se*')
