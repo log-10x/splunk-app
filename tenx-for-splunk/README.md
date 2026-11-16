@@ -417,7 +417,8 @@ their SPL. To cover another app's dashboards, copy the file into that app's
   sourcetype and its add-on's fields. `tenx_sourcetype=<sourcetype>` before `tx` selects the same
   events with only the fields Splunk extracts from the event's text, so a field an add-on defines
   matches nothing there. A search that names the original sourcetype in place of the compact one
-  stops with a message saying so.
+  stops with a message saying so. Splunk shows the first 256 characters of that message, which says
+  first what to write; it is whole when it names one sourcetype of up to 21 characters.
 - `tx` inside another subsearch (`append`, `join`) or wrapped in another macro cannot read
   its own words. It then expands every compact event in range and applies the words after,
   with a warning: the same result, more slowly.
@@ -580,7 +581,9 @@ To set it up:
    Windows Security events reach the Receiver as the rendered XML of each event, one event per
    record: the form the Windows add-on's `XmlWinEventLog` sourcetype holds. For events in files,
    Fluent Bit's `tail` input with a multiline parser that starts a record at `<Event` gives that
-   form, the parser in a parsers file named by `Parsers_File` in `[SERVICE]`:
+   form, the parser in a parsers file named by `Parsers_File` in `[SERVICE]`. Events read from the
+   Windows event log itself, by a Universal Forwarder's `WinEventLog` input or Fluent Bit's
+   `winevtlog` input, are outside these steps:
 
    ```
    [MULTILINE_PARSER]
@@ -625,6 +628,12 @@ so three fields that depend on that indexing (`xmlns`, `vendor_privilege`, `priv
 on expanded events. `linecount` and `punct` are computed by Splunk from the compact text it indexes,
 so on expanded events they differ from the raw event's.
 
+An index-time `SEDCMD` mask of the original sourcetype does not apply to compact events, so `txf`
+shows the value as the sender sent it; `tenxreplay` names such a rule in `masked_at_index_time`.
+Other index-time rules of the original sourcetype that read the text, such as a host taken from a
+syslog header (`TRANSFORMS = syslog-host`), do not run on compact events either, which keep the
+host the sender gave.
+
 For FortiGate, the sender sets `tenx_sourcetype` to `fortigate_traffic`, `fortigate_utm`,
 `fortigate_event` or `fortigate_anomaly` by the line's `type=`.
 
@@ -657,7 +666,9 @@ CloudTrail map, each through its own Receiver.
 
 A field map has its own Receiver and its own cap file. Send the mapped source, and only that
 source, through that Receiver: with the cap list on, an event of any template that is not listed
-arrives whole.
+arrives whole. A map lists the templates of the forwarder whose records it was generated from: the
+same Windows events sent through the OpenTelemetry Collector, Fluentd or Vector instead of Fluent
+Bit have other templates, and arrive whole until a map is generated from them.
 
 Where things run: the tool runs with Python 3.9 or later on the Receiver's host, from a copy of
 the package unpacked there, because it writes the cap file the Receiver reads; the generated app
@@ -816,7 +827,9 @@ has its own cap file and its own scheduled `check`.
    ```
 
    On an instance that still has Splunk's default self-signed certificate, the tool's certificate
-   check fails; add `--tls-verify off`. `<token>` is a Splunk authentication token of a user
+   check fails; add `--tls-verify off`. For a certificate signed by an authority this host does not
+   trust, add `--tls-ca-file <PEM file of that authority>`.
+   `<token>` is a Splunk authentication token of a user
    whose role holds the capabilities `search`, `edit_tcp` and `list_all_objects` and may search
    the probe index; `TENX_SPLUNKD_AUTH=<user>:<password>` works as well. `activate` sends one
    small probe event per new template through the HTTP Event Collector into the probe index, an
@@ -854,7 +867,8 @@ only the lookup file: copy `lookups/` of both apps over the installed ones (on a
 changes; a file put back with the time it had when Splunk last read it stays unread. A standalone
 instance or heavy forwarder rereads the file within its `ingest_lookup_refresh_period_secs` (60
 seconds by default) with no reload or restart, and a change to the lookup file alone reloads cluster
-peers without a restart.
+peers without a restart. After an upgrade of this app, `gen` can also write a new static rule;
+`activate` then refuses the map until both apps are installed again whole, as in step 5.
 
 Where several instances parse the compact events (indexer cluster peers, or several heavy
 forwarders), give `activate` and `check` each node's HTTP Event Collector,
@@ -878,6 +892,10 @@ python3 tenx-for-splunk/bin/tenx_field_map.py gen \
   --time-format '%Y-%m-%dT%H:%M:%S.%6N%Z' \
   --app-name fm_cloudtrail --cap-file /etc/tenx/cloudtrail/compact-cap.csv --out fm_cloudtrail
 ```
+
+`--time-props` reads `[default]` and the stanza of the renamed sourcetype only, and refuses a stanza
+that sets `TZ`, so it cannot follow an add-on that times events in a `source::` stanza, such as the
+Sysmon add-ons.
 
 Steps 6 and 7 take that map's app and cap file, and `--tls-verify off` as in step 6:
 
@@ -915,7 +933,12 @@ Windows EventID 4798, 5156 and 5157, `dest` is the event's Computer and `src_ip`
 not written. The add-on's XML block fields `EventData_Xml` and `System_Props_Xml` are not written.
 `vendor_privilege` and `privilege_id` carry `-` on events where the raw event has neither. A value
 that holds line breaks and tabs is written with spaces in their place. On CloudTrail,
-`responseElements.credentials.sessionToken` is not written.
+`responseElements.credentials.sessionToken` is not written. A template with more than 984 values
+gets no row, and its events arrive whole. An event whose compact value holds a line feed gets no
+fields and is marked `tenx_unmapped=no_match`. With `--reserved-names restore`, a mapped CloudTrail
+event carries `extracted_eventType` beside `eventType`. Mapped events carry no `date_*` fields
+(`date_hour`, `date_wday` and the others), which Splunk gives raw events it reads from a file, so a
+detection that reads them, such as a business-hours one, matches no mapped event.
 
 ## What to Install on Each Tier
 
