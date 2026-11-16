@@ -90,8 +90,21 @@ class TestDashboardsFindCompactEvents:
 		assert macros.has_section('tx') and macros.has_section('tenx-templates')
 		meta = open(os.path.join(APP, 'metadata', 'default.meta'), encoding='utf-8').read()
 		for name in ('tx', 'tenx-events', 'tenx-templates', 'tenx-inflate', 'tenx-replay', 'tenx-replay-tags', 'txf',
-					 'txf%281%29'):
+					 'txf%281%29', 'tenx-wild'):
 			assert re.search(r'\[macros/%s\]\naccess = [^\n]*\nexport = system' % re.escape(name), meta), name
+		# and every macro they call, however deep (a search in another app found no `tenx-wild` before it was shared)
+		seen, todo = set(), ['tx', 'txf', 'txf(1)']
+		while todo:
+			name = todo.pop()
+			if name in seen or not macros.has_section(name):
+				continue
+			seen.add(name)
+			for called in re.findall(r'`([A-Za-z0-9_-]+)(?:\(([^`]*)\))?`', macros.get(name, 'definition')):
+				todo.append(called[0] + ('(%d)' % len(called[1].split(',')) if called[1] else ''))
+		assert {'tx', 'txf', 'txf(1)', 'tenx-wild', 'tenx-events', 'tenx-inflate'} <= seen
+		for name in seen:
+			quoted = name.replace('(', '%28').replace(')', '%29')
+			assert re.search(r'\[macros/%s\]\naccess = [^\n]*\nexport = system' % re.escape(quoted), meta), name
 
 	def test_the_command_tx_calls_is_declared_and_kept_out_of_the_assistant(self):
 		commands = conf('commands.conf')
