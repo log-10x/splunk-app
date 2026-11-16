@@ -13,6 +13,7 @@ Compact events and their template records come from the Receiver, the Log10x eng
 - [Usage](#usage)
 - [Fields of the Original Sourcetype: txf](#fields-of-the-original-sourcetype-txf)
 - [Data Models and Detections: the Field Map](#data-models-and-detections-the-field-map)
+- [Which Searches Change When a Source Moves](#which-searches-change-when-a-source-moves)
 - [What to Install on Each Tier](#what-to-install-on-each-tier)
 - [Getting Started](#getting-started)
 - [Technical Reference](#technical-reference)
@@ -201,6 +202,7 @@ The `tenx_dml` collection stores parsed template data with fields:
 | `tenxreplay.py` | The `tenxreplay` command, run by the Rebuild Field Replay saved searches: writes the replay macros `txf` runs |
 | `tenx_replay_builder.py` | Turns the props of the original sourcetypes into the replay macros |
 | `tenx_field_map.py` | The field map tool: `gen`, `verify`, `activate` and `check` (see [the Field Map](#data-models-and-detections-the-field-map)) |
+| `tenx_search_report.py` | Says which saved searches, alerts and dashboard panels change when a source moves to compact events (see [Which Searches Change](#which-searches-change-when-a-source-moves)) |
 
 ---
 
@@ -967,6 +969,59 @@ fields and is marked `tenx_unmapped=no_match`. With `--reserved-names restore`, 
 event carries `extracted_eventType` beside `eventType`. Mapped events carry no `date_*` fields
 (`date_hour`, `date_wday` and the others), which Splunk gives raw events it reads from a file, so a
 detection that reads them, such as a business-hours one, matches no mapped event.
+
+## Which Searches Change When a Source Moves
+
+`tenx_search_report.py`, in the app's `bin` folder, reads the saved searches, alerts and dashboards
+of a search head and says, for each one, what moving the named sourcetypes or indexes to compact
+events asks of it. It reads them over the management port, or from a copy of the search head's
+`etc/apps` and `etc/users` folders. It changes nothing and starts no search: it reads saved searches
+and views, and expands each search's macros with Splunk's search parser. It runs with Python 3.9 or
+later, and reports the objects that the user it runs as can read.
+
+```sh
+TENX_SPLUNKD_TOKEN=<token> python3 tenx-for-splunk/bin/tenx_search_report.py \
+  --splunkd https://<search head>:8089 --sourcetype XmlWinEventLog --index wineventlog \
+  --field-map XmlWinEventLog --csv report.csv
+```
+
+`--sourcetype` and `--index` name what moves, each as often as needed. `--field-map` names a moved
+sourcetype that a field map covers; without it the report says what the move asks without a field
+map. Add `--tls-verify off` for a management port with Splunk's default self-signed certificate,
+and `--app <app>` to report one app. From files, `--dir` takes the place of `--splunkd`:
+
+```sh
+python3 tenx-for-splunk/bin/tenx_search_report.py --dir <copy of etc> \
+  --sourcetype XmlWinEventLog --index wineventlog --csv report.csv
+```
+
+It prints one line per saved search, alert, dashboard panel, base search and dashboard input, with
+its app, owner, kind, verdict and reason, then the number of each verdict. The CSV file adds each
+search and, where a macro is needed, the search with the macro in place: index, host, source and
+time terms before it, every other term after it.
+
+| Verdict | Meaning |
+|---|---|
+| unchanged | Runs as written and returns what it returns on the raw events |
+| needs tx | `tx` in front of its search terms; it reads only the events' text |
+| needs txf | `txf` in front of its search terms |
+| needs field map | Reads data models or `tstats`, which a field map serves as written |
+| limit | A shape this README lists as behaving differently on compact events; the reason quotes it |
+| not classified | A macro the tool cannot expand, `map`, `savedsearch`, a subsearch that writes search terms, a dashboard token without a default, or a shape not measured |
+| not affected | Reads none of the moved data |
+
+Without a field map, searches of the moved data need `tx` or `txf`, except searches that count by
+index, host and source; data models, and `tstats` on fields other than index, host and source, need a
+field map. With a field map, searches on fields run as written, also where a value is template text. Three kinds still need `txf`: a search
+on words of the text, a search whose later commands read `_raw` (`rex`, `regex`, `spath`, `search`
+on words), and a report that lists events. An alert that lists events fires as before, with the
+same number of events, and its results show the compact text.
+
+Checked on Splunk Enterprise 10.4.3 with the Windows add-on 12.0.0, the AWS add-on 8.3.1, the
+FortiGate add-on 1.6.10 and CIM 8.8.0, on 117 saved searches, 18 of them ESCU detections, and two
+dashboards over Windows Security, CloudTrail and FortiGate events, each run on the same events raw
+and compact, without and with a field map (FortiGate without); the results are in the
+[listing's checks](https://github.com/log-10x/splunk-app/blob/main/splunkbase/LISTING.md#checks-run-on-this-package).
 
 ## What to Install on Each Tier
 
