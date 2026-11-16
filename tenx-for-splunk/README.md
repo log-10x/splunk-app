@@ -1017,9 +1017,10 @@ on words of the text, a search whose later commands read `_raw` (`rex`, `regex`,
 on words), and a report that lists events. An alert that lists events fires as before, with the
 same number of events, and its results show the compact text.
 
-Checked on Splunk Enterprise 10.4.3 with the Windows add-on 12.0.0 and CIM 8.8.0, on 63 saved
-searches, 18 of them ESCU detections, and two dashboards, each run on the same events raw and
-compact, without and with a field map; the results are in the
+Checked on Splunk Enterprise 10.4.3 with the Windows add-on 12.0.0, the AWS add-on 8.3.1, the
+FortiGate add-on 1.6.10 and CIM 8.8.0, on 117 saved searches, 18 of them ESCU detections, and two
+dashboards over Windows Security, CloudTrail and FortiGate events, each run on the same events raw
+and compact, without and with a field map (FortiGate without); the results are in the
 [listing's checks](https://github.com/log-10x/splunk-app/blob/main/splunkbase/LISTING.md#checks-run-on-this-package).
 
 ## What to Install on Each Tier
