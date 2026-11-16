@@ -12,7 +12,7 @@ final search. searchmatch() is not used: it does not let `*` cross a minor break
 stand for nothing (SePrivilege) as the index does.
 
 The tables (wildcard_measured.py, wildcard_plan_measured.py) are 184 words, TERM() and CASE() among them, on 112
-more, measured on the index, after a pipe, and through the plan.
+events, measured on the index, after a pipe, and through the plan.
 """
 import hashlib
 import os
