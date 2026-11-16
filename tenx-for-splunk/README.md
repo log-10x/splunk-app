@@ -391,14 +391,14 @@ index=myindex earliest=-4h `tx` "payment failed" NOT retry status=500 | stats co
 
 The words after `tx` are ordinary SPL, applied to the expanded lines. Phrases,
 `field=value`, `field IN (...)`, wildcards at the start or end of a word, `NOT`, `OR`, `AND`
-and parentheses behave as on the original data, with Splunk's precedence. A wildcard inside
-a word (`Se*Privilege`) is matched as Splunk matches it after a pipe, on the characters
-before its first `*`. Such a word can match more events than on the original lines, and
-under `NOT` fewer. Through `tx`, `TERM()` and `CASE()` are tested against the text of each
-expanded event, as in a search after a pipe. A `TERM()` whose match depends on how Splunk
-split the original event into terms at index time, such as `TERM(10.2.236.94)` inside
-`client_ip=10.2.236.94`, can match different events than on the original lines. The fields
+and parentheses behave as on the original data, with Splunk's precedence. The fields
 are the ones Splunk extracts from the original lines, key=value pairs and JSON alike.
+
+Under `NOT` through the `tx` and `txf` macros, two kinds of word can return fewer events than on
+the original lines: a wildcard inside a word (`Se*Privilege`), and `TERM()` of part of a longer
+term (`TERM(10.2.236.94)` inside `client_ip=10.2.236.94`). Outside `NOT`, both match as on the
+original lines. Under `NOT` in `| tx`, the same words give the exact opposite of the word, which
+can be more events than Splunk's own `NOT` returns on the original lines.
 Searching an IP address, a hostname or an ID works the same way: the words go after `tx`,
 whether they are values or template text.
 
