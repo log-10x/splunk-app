@@ -68,6 +68,17 @@ import tenx_util
 from enum import Enum, auto
 
 
+
+def splunkd_message(error):
+	"""The text of the messages in splunkd's error reply `error` (an HTTPError), or None."""
+	import json
+	try:
+		body = json.loads(error.read().decode('utf-8', 'replace'))
+	except Exception:
+		return None
+	texts = [m.get('text') for m in (body.get('messages') or []) if isinstance(m, dict) and m.get('text')]
+	return ' '.join(texts) or None
+
 class JobState(Enum):
 	SUCCESS = auto()
 	FAILURE = auto()
@@ -106,11 +117,19 @@ class TenxSearchManager:
 	def create_search_job(self, search_data):
 		"""
 		Creates a new search job with the provided search_data.
-		Returns the new job SID, or None in case of errors.
+		Returns the new job SID, or None in case of errors. When splunkd refuses the job (HTTP 400: a
+		macro whose validation fails, an unknown command), its message is kept in last_job_error.
 		"""
+		self.last_job_error = None
 		try:
 			url = self.create_search_job_url()
-			create_res = self.server_connection.post(url, search_data)
+			try:
+				create_res = self.server_connection.post(url, search_data)
+			except urllib.error.HTTPError as e:
+				self.last_job_error = splunkd_message(e)
+				logger.warning("splunkd refused the search job for search - {} - {} ({}).".format(
+					search_data['search'], e, self.last_job_error))
+				return None
 
 			if 'sid' not in create_res:
 				logger.warning("Missing sid in job creation result for search - {}.".format(search_data['search']))
@@ -431,6 +450,12 @@ class TenxSearchManager:
 		return '/servicesNS/' + self.server_connection.user + '/' + self.app + '/search/parser'
 
 	def parse_search_string(self, search, parse_only=False):
+		"""
+		splunkd's parse of `search`, or None when it fails. When splunkd refuses the search (HTTP
+		400: an unknown command, a macro whose validation fails), its message is kept in
+		last_parse_error, so the caller can pass Splunk's own words on instead of a generic one.
+		"""
+		self.last_parse_error = None
 		try:
 			data = {'q': search}
 
@@ -439,6 +464,10 @@ class TenxSearchManager:
 
 			# Note: The search parser endpoint requires POST method
 			return self.server_connection.post(self.parse_search_string_url(), data)
+		except urllib.error.HTTPError as e:
+			self.last_parse_error = splunkd_message(e)
+			logger.error("Failed parsing search {} - {} ({}).".format(search, e, self.last_parse_error), exc_info=1)
+			return None
 		except Exception as e:
 			logger.error("Failed parsing search {} - {}.".format(search, e), exc_info=1)
 			return None

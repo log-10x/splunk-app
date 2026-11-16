@@ -286,9 +286,10 @@ class TenxAlertCompiler:
 				reason="template lookup failed (transient); retry, and keep the existing alert")
 
 		# FAILURE (unparseable), PENDING or anything unexpected: do not persist a broken search.
+		# When splunkd itself refused to parse it, its own words are the reason.
 		return AlertCompileResult(
 			AlertStrategy.REJECTED, None, original, state,
-			reason="could not resolve search (state {})".format(
+			reason=getattr(result, 'parse_error', None) or "could not resolve search (state {})".format(
 				state.name if state is not None else "unknown"))
 
 	def _compile_native(self, original, result):
