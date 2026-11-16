@@ -989,7 +989,7 @@ as `WinEventLog`, as the add-on stores the raw event. Step 4:
 ```sh
 python3 tenx-for-splunk/bin/tenx_field_map.py gen \
   --records kv_0.json --records kv_1.json --target windows-security-classic --rules lookup \
-  --addon Splunk_TA_windows --mixed-names --app-name fm_wincl \
+  --addon Splunk_TA_windows --mixed-names --leave-out Message --app-name fm_wincl \
   --cap-file /etc/tenx/wincl/compact-cap.csv --out fm_wincl
 ```
 
@@ -998,13 +998,29 @@ python3 tenx-for-splunk/bin/tenx_field_map.py gen \
 rules that read a section of the text (`Subject_Account_Name`, `Target_Account_Name`,
 `process_id` and others) for every template where their result does not depend on a value.
 `--mixed-names` writes the field names the Receiver split into text and a value
-(`Token_Elevation_Type`). Steps 6 and 7 take `--app fm_wincl --cap-file
+(`Token_Elevation_Type`). `--leave-out Message` keeps the index near the raw index's size (see
+Index size below). Steps 6 and 7 take `--app fm_wincl --cap-file
 /etc/tenx/wincl/compact-cap.csv`.
 
-Indexed fields take index space. `Message`, the whole text of each event's message, takes most of it:
-on 100,000 events the mapped index took 174 MB against 18 MB for the same events indexed raw, and
-19 MB with `--leave-out Message`, which the data model and `tstats` results did not change.
-`Message` and `body` are then not on mapped events.
+**Index size.** Indexed fields take index space beside the event's text, most of all a field whose
+value differs on nearly every event. `--leave-out a,b` leaves out the fields named. `--fields cim`,
+with `--addon` and `--cim <folder of Splunk_SA_CIM>`, writes only the fields that the CIM data models
+and the add-on's event types read, directly or through the add-on's own search-time rules. Measured on
+the same events indexed raw and mapped, each index merged to one index file:
+
+| Events | Raw | Every field | Heavy field left out | `--fields cim` |
+|---|---|---|---|---|
+| FortiGate traffic, 100,000 | 13.6 MB | 22.6 MB | 20.0 MB (`time`) | 19.9 MB |
+| Windows Security XML, 8,311 | 1.5 MB | 3.4 MB | 2.5 MB (`SystemTime`, `EventRecordID`) | 3.4 MB |
+| Windows Security classic, 100,000 | 16.4 MB | 176 MB | 17.9 MB (`Message`) | 17.3 MB |
+
+Data model, `tstats` and detection results were the same in every column. A plain search shows only
+the written fields on a mapped event; `--fields cim` leaves out more of them (FortiGate's `vd`,
+`appid` and `osname` among others) than one heavy field does. Without `Message`, classic Windows
+events carry neither `Message` nor `body`. On Windows XML,
+`SystemTime` is the heavy field and `--fields cim` writes it, because the add-on's `event_time` comes
+from it and the Endpoint data model reads that on event 5154 (none among these events); without
+`SystemTime`, mapped events carry no `event_time`.
 
 `tstats` reads the indexed sourcetype, which stays the compact one with or without a field map, so
 `tstats` by or on the original sourcetype counts no compact event; `tenx_sourcetype` holds the
@@ -1029,8 +1045,9 @@ Windows EventID 4798, 5156 and 5157, `dest` is the event's Computer and `src_ip`
 not written. The add-on's XML block fields `EventData_Xml` and `System_Props_Xml` are not written.
 `vendor_privilege` and `privilege_id` carry `-` on events where the raw event has neither. A value
 that holds line breaks and tabs is written with spaces in their place. A JSON string whose escape
-the Receiver split before a value is written for `\/` (a CloudTrail `sessionToken`), and for `\n`,
-`\t` and `\r` with a space; with any other escape there, that field is not written. A plain search
+the Receiver split from the value after it, such as a CloudTrail `sessionToken`, is written for `\/`
+and for `\u003c`, `\u003e`, `\u0026`, `\u003d` and `\u0027` as the character each stands for, and for
+`\n`, `\t` and `\r` with a space; with any other escape there, that field is not written. A plain search
 shows a mapped field longer than 1,000 characters, such as a PowerShell `ScriptBlockText`, cut to its first 1,000;
 `tstats` on the field reads it whole. A template with more than 984 values
 gets no row, and its events arrive whole. An event whose compact value holds a line feed or another
@@ -1040,9 +1057,9 @@ event carries `extracted_eventType` beside `eventType`, and a mapped FortiGate U
 `extracted_eventtype` beside `eventtype`. Mapped events carry no `date_*` fields
 (`date_hour`, `date_wday` and the others), which Splunk gives raw events it reads from a file, so a
 detection that reads them, such as a business-hours one, matches no mapped event. On classic
-Windows events, `Message` and `body` have spaces in place of line breaks and tabs (as do values
-such as `Access_Reasons`), so the add-on's fields read from lines of the message (`privilege_id`,
-`vendor_privilege`, `privilege`) and `event_time` are not written, and `src_nt_domain` takes every
+Windows events, values such as `Access_Reasons` have spaces in place of line breaks and tabs, as do
+`Message` and `body` when the map writes them, and the add-on's fields read from lines of the message
+(`privilege_id`, `vendor_privilege`, `privilege`) and `event_time` are not written, and `src_nt_domain` takes every
 value of `Security_ID` where the raw event takes the subject's.
 
 ## Which Searches Change When a Source Moves
