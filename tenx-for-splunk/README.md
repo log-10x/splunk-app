@@ -668,9 +668,8 @@ has its own cap file and its own scheduled `check`.
    @run/input/forwarder/fluentbit @apps/receiver varMaxRecurIndexes 0 timestampZone UTC timestampMaxPerObject 1 compactReceiverLookupFile /etc/tenx/win/compact-cap.csv
    ```
 
-   Leave `receiverOptimize true` out of them: with it the Receiver compacts every template the cap
-   file does not list (the shipped `compact/config.yaml` says the cap file is then the list of
-   templates kept whole), so events would be compact before their fields can be written.
+   Leave `receiverOptimize true` out of them: with it the Receiver compacts every template, listed or
+   not, so events would be compact before their fields can be written.
 
    With the published image, the edit to the shipped `compact/config.yaml` is one: the two lines
    `fieldNames:` and `- $=yield TenXEnv.get("symbolMessageField")` become `fieldNames: [templateHash]`.
@@ -744,6 +743,8 @@ has its own cap file and its own scheduled `check`.
      --out fm_win
    ```
 
+   `--cap-file` takes the cap file's path on this host, not the path inside the Receiver's container.
+
    `--addon` names a copy of the Windows add-on's folder on this host. The add-on downloads as a
    `.spl` archive; `tar -xzf` on it gives that folder, `Splunk_TA_windows/`. `gen` adds a copy of
    each of its rules that read the event's XML text (dest, src_ip, process_id and the 4688 process
@@ -808,7 +809,10 @@ has its own cap file and its own scheduled `check`.
    indexed between the moment a listed template stops getting its fields and that `check` are kept,
    marked `tenx_unmapped`, and lack their index-time fields. After `check` empties the list, events
    the Receiver compacts before it rereads the file, within about 10 seconds, are kept and marked
-   `tenx_unmapped`; every later event of that source arrives whole.
+   `tenx_unmapped`; every later event of that source arrives whole. `check` probes the listed
+   templates only. The saved search **Field Map Events Without Fields** counts compact events
+   indexed without their fields (`tenx_unmapped`) by index, sourcetype and reason; schedule it where
+   a field map is installed.
 
 A template that appears later arrives whole until steps 3, 4 and 6 run again. `gen` then changes
 only the lookup file: copy `lookups/` of both apps over the installed ones (on a cluster, into
@@ -877,7 +881,7 @@ Windows add-on and `aws_cloudtrail_delete_events` in the AWS add-on, do not matc
 Windows EventID 4798, 5156 and 5157, `dest` is the event's Computer and `src_ip` and `dest_ip` are
 not written. The add-on's XML block fields `EventData_Xml` and `System_Props_Xml` are not written.
 `vendor_privilege` and `privilege_id` carry `-` on events where the raw event has neither. A value
-that holds line breaks is written with spaces in their place. On CloudTrail,
+that holds line breaks and tabs is written with spaces in their place. On CloudTrail,
 `responseElements.credentials.sessionToken` is not written.
 
 ## What to Install on Each Tier
