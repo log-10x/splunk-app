@@ -1485,8 +1485,8 @@ def lookup_eval_text(lookup_def, time_rule=None, trim=False):
 		# A JSON escape the Receiver split at its backslash (see SPLIT_ESCAPE): decoded with the value's first character,
 		# and a field that holds any other escape is left out.
 		'%s=if(isnull(%s) OR %s==%s, %s, replace(replace(replace(%s, "%s([%s])", "\\1"), "%s[%s]", " "), '
-		'"[^ ]+::" . %s . "([^" . %s . urldecode("%%5C") . "]|" . urldecode("%%5C") . ".)*%s([^" . %s . urldecode("%%5C") . '
-		'"]|" . urldecode("%%5C") . ".)*" . %s . " ?", ""))' % (m, m, m, x, m, m, SPLIT_ESCAPE, SPLIT_ESCAPE_KEEP, SPLIT_ESCAPE,
+		'"[^ ]+::" . %s . "([^" . %s . urldecode("%%5C%%5C") . "]|" . urldecode("%%5C%%5C") . ".)*%s([^" . %s . '
+		'urldecode("%%5C%%5C") . "]|" . urldecode("%%5C%%5C") . ".)*" . %s . " ?", ""))' % (m, m, m, x, m, m, SPLIT_ESCAPE, SPLIT_ESCAPE_KEEP, SPLIT_ESCAPE,
 			SPLIT_ESCAPE_SPACE, quote, quote, SPLIT_ESCAPE, quote, quote),
 	] + ([
 		'%s=if(isnull(%s) OR %s==%s, %s, replace(replace(%s, "::" . %s . "[[:cntrl:]]+", "::" . %s), '

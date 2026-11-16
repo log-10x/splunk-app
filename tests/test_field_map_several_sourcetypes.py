@@ -222,3 +222,9 @@ class TestLeaveOut:
 			'windows-security-classic', '--leave-out', 'Message,Logon_ID', '--out', str(tmp_path / 'fm_w')]) == 0
 		row = fm.read_lookup_file(str(tmp_path / 'fm_w' / 'lookups' / 'tenx_wincl_fields.csv.gz'))['w1']['f']
 		assert 'Message::' not in row and 'Logon_ID::' not in row and 'Account_Name::"' in row
+
+	def test_the_rule_matches_a_backslash_with_two(self):
+		# Splunk Enterprise 10.4.3 refused the rule ("Regular expression error") with one backslash inside the class.
+		rule = fm.lookup_eval_text('t', None, False)
+		piece = [x for x in rule.split(', $pd') if fm.SPLIT_ESCAPE in x][0]
+		assert 'urldecode("%5C%5C") . "]|" . urldecode("%5C%5C") . ".)*' in piece and 'urldecode("%5C") .' not in piece
