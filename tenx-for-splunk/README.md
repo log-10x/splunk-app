@@ -398,7 +398,9 @@ Under `NOT` through the `tx` and `txf` macros, two kinds of word can return fewe
 the original lines: a wildcard inside a word (`Se*Privilege`), and `TERM()` of part of a longer
 term (`TERM(10.2.236.94)` inside `client_ip=10.2.236.94`). Outside `NOT`, both match as on the
 original lines. Under `NOT` in `| tx`, the same words give the exact opposite of the word, which
-can be more events than Splunk's own `NOT` returns on the original lines.
+can be more events than Splunk's own `NOT` returns on the original lines. `TERM()` of text that
+holds a major breaker, outside `NOT`, and `NOT CASE()` can return more events than on the original
+lines, never fewer. Under `NOT` through the macros, such a `TERM()` can return fewer.
 Searching an IP address, a hostname or an ID works the same way: the words go after `tx`,
 whether they are values or template text.
 
