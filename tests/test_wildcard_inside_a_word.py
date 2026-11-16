@@ -5,7 +5,10 @@ is the word, case-insensitively, `*` standing for any characters. `tx` applies i
 search after a pipe Splunk cannot fold, and there a word with a `*` after its first character is
 matched as its prefix alone (Windows 662 sample, `Se*Privilege`: 3 on the index, 662 through `tx`;
 `le*FO` 0 and 662). The `tx` and `txf` macros now filter on term_regex() for such words before their
-final search (wildcard_filter(), `eval [| tenxprefilter after=t] | search tenx_keep=1`).
+final search (wildcard_filter(), `eval [| tenxprefilter after=t] | search tenx_keep=1`). searchmatch()
+is not used: it does not let `*` cross a minor breaker (Se:Privilege) or stand for nothing
+(SePrivilege) as the index does, and for phrases and field comparisons it gave fewer events than the
+final search.
 
 The table (wildcard_measured.py) is 96 words on 40 events, measured on the index and after a pipe.
 """
@@ -74,11 +77,21 @@ class TestTheFilter:
 		got = p.wildcard_filter('error Se*Privilege status=500 NOT foo "Sub*Sid"')
 		assert got.count('match(_raw') == 2 and got.endswith('tenx_keep=if(tenx_w0=1 AND tenx_w1=1, 1, null())')
 
-	def test_or_is_evaluated_with_searchmatch(self):
-		got = p.wildcard_filter('zzz OR (Se*Privilege AND x=1) NOT S*P*e')
-		assert got.endswith('tenx_keep=if(searchmatch("zzz OR (tenx_w0=1 AND x=1) NOT S*P*e"), 1, null())')
-		got = p.wildcard_filter('a OR "Se*Privilege" OR NOT NOT b*c')
-		assert got.endswith('tenx_keep=if(searchmatch("a OR tenx_w0=1 OR NOT NOT tenx_w1=1"), 1, null())')
+	def test_an_and_term_of_plain_words_is_evaluated_whole(self):
+		got = p.wildcard_filter('trace AND (currency OR 19*bc)')
+		assert got.endswith('tenx_keep=if((tenx_w0=1 OR tenx_w1=1), 1, null())') and got.count('match(_raw') == 2
+		# under NOT, a word with a wildcard inside it is its prefix, as the index tests it
+		got = p.wildcard_filter('a OR (b*c AND NOT d*e)')
+		assert got.endswith('tenx_keep=if((tenx_w0=1 OR (tenx_w1=1 AND NOT (tenx_w2=1))), 1, null())')
+
+	def test_anything_else_in_that_term_leaves_it_to_the_final_search(self):
+		# measured on the key=value set (differential): searchmatch() of the whole term, phrases and
+		# field comparisons included, gave fewer events than the final search for 4 of them
+		for text in ('("level=INFO msg=\\"rate" OR 20*01)', '((20*2Z OR 12.50) AND ("v1" OR NOT "089Z"))',
+					 'INFO AND (ra*00 OR service= search.api)', '(tm*mp OR "ua=x")', '(*44 OR se*pi)'):
+			assert p.wildcard_filter(text) is None, text
+		got = p.wildcard_filter('(tm*mp OR "ua=x") Se*Privilege')
+		assert got.endswith('tenx_keep=if(tenx_w0=1, 1, null())') and got.count('match(_raw') == 1
 
 	def test_none_needed(self):
 		for text in ('error', 'Se*', '*Privilege', '10.0*14', 'x=Se*Privilege', '"alpha Se*Privilege"', 'Se* | stats count',
