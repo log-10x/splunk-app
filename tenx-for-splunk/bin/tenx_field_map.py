@@ -3831,8 +3831,8 @@ def _main(args):
 			'    index=* (sourcetype::tenx_encoded OR %s::%s)\n' % (sourcetype_field, target['sourcetype'], sourcetype_field,
 			target['sourcetype']))
 	if args.rules == RULES_LOOKUP and args.floor == 'on':
-		sys.stdout.write('floor app: %s; install it wherever %s is installed\n' % (floor_dir(args.out),
-			os.path.basename(os.path.abspath(args.out))))
+		sys.stdout.write('floor app: %s; install it on every instance that parses the compact events\n'
+			% floor_dir(args.out))
 	if cap is not None:
 		sys.stdout.write('compact cap: %s\n' % json.dumps(cap))
 		if args.splunkd:

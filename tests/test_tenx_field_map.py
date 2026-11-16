@@ -425,6 +425,14 @@ class TestApp:
 			('TRANSFORMS-tenx_time', 'tenx-event-time')]
 		assert sorted(not_copied) == ['REPORT-tenx', 'category', 'disabled', 'pulldown_type']
 
+	def test_gen_says_where_the_floor_app_goes(self, tmp_path, capsys):
+		records = tmp_path / 'templates.json'
+		records.write_text(json.dumps({'templateHash': 'k1', 'template': 'time=$(HH:mm:ss) user=$ src=$'}) + '\n')
+		assert fm.main(['gen', '--rules', 'lookup', '--records', str(records), '--reader', 'kv', '--sourcetype', 'tenx_fw',
+			'--rename', 'fw:traffic', '--out', str(tmp_path / 'app')]) == 0
+		out = capsys.readouterr().out
+		assert 'floor app: %s; install it on every instance that parses the compact events\n' % (tmp_path / 'app_floor') in out
+
 	def test_gen_writes_the_app_folder(self, tmp_path):
 		records = tmp_path / 'templates.json'
 		records.write_text(json.dumps({'templateHash': 'k1 ', 'template': 'time=$(HH:mm:ss) user=$ src=$'}) + '\n')
