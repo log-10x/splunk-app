@@ -201,6 +201,8 @@ class TestSplitEscape:
 		assert dict(fm.apply_lookup_row(t, '~h,1,/def=')) == {'a': '1', 'b': 'x/def='}
 		# a line break or tab escape reads as a space, as in any indexed value
 		assert dict(fm.apply_lookup_row(t, '~h,1,ndef')) == {'a': '1', 'b': 'x def'}
+		# the HTML-safe \u escapes read as their characters (AWS CloudTrail: a sessionToken ending in \u003d)
+		assert dict(fm.apply_lookup_row(t, '~h,1,u003d')) == {'a': '1', 'b': 'x='}
 		# any other escape leaves the field out, not the event's other fields
 		assert dict(fm.apply_lookup_row(t, '~h,1,u00e9')) == {'a': '1'}
 

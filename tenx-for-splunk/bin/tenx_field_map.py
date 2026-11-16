@@ -241,6 +241,9 @@ UNDECODABLE = "\x01"
 SPLIT_ESCAPE = "\ue000"
 SPLIT_ESCAPE_KEEP = "/"
 SPLIT_ESCAPE_SPACE = "ntr"
+# The \u escapes JSON encoders write to keep text HTML-safe (Gson, used for AWS CloudTrail, writes "=" as \u003d at the
+# end of a sessionToken), decoded by the rule; any other \u escape leaves the field out.
+SPLIT_ESCAPE_UNICODE = (('003c', '<'), ('003e', '>'), ('0026', '&'), ('003d', '='), ('0027', "'"))
 
 REFUSED_UNSAFE = "the app does not expand this template (expand_unsafe: %s)"
 REFUSED_CONFLICT = "two different templates under one hash"
@@ -1431,6 +1434,16 @@ def lookup_ts_supported(fmt):
 	return True
 
 
+def split_escape_eval(m):
+	"""The SPL that decodes SPLIT_ESCAPE in the field text m: "/" as itself, a line break or tab escape as a space, the
+	\\u escapes of SPLIT_ESCAPE_UNICODE as their characters."""
+	text = 'replace(replace(%s, "%s([%s])", "\\1"), "%s[%s]", " ")' % (m, SPLIT_ESCAPE, SPLIT_ESCAPE_KEEP, SPLIT_ESCAPE,
+		SPLIT_ESCAPE_SPACE)
+	for code, char in SPLIT_ESCAPE_UNICODE:
+		text = 'replace(%s, "(?i)%su%s", "%s")' % (text, SPLIT_ESCAPE, code, char)
+	return text
+
+
 def lookup_eval_text(lookup_def, time_rule=None, trim=False):
 	"""The static INGEST_EVAL of --rules lookup (see "Lookup rules"). Every intermediate value sits in a
 	pd: key, which is not indexed. A compact event the rule writes no fields for gets UNMAPPED_FIELD with
@@ -1485,10 +1498,10 @@ def lookup_eval_text(lookup_def, time_rule=None, trim=False):
 		'%s=if(isnull(%s), null(), replace(%s, %s, %s))' % (m, x, x, regex, f),
 		# A JSON escape the Receiver split at its backslash (see SPLIT_ESCAPE): decoded with the value's first character,
 		# and a field that holds any other escape is left out.
-		'%s=if(isnull(%s) OR %s==%s, %s, replace(replace(replace(%s, "%s([%s])", "\\1"), "%s[%s]", " "), '
-		'"[^ ]+::" . %s . "([^" . %s . urldecode("%%5C%%5C") . "]|" . urldecode("%%5C%%5C") . ".)*%s([^" . %s . '
-		'urldecode("%%5C%%5C") . "]|" . urldecode("%%5C%%5C") . ".)*" . %s . " ?", ""))' % (m, m, m, x, m, m, SPLIT_ESCAPE, SPLIT_ESCAPE_KEEP, SPLIT_ESCAPE,
-			SPLIT_ESCAPE_SPACE, quote, quote, SPLIT_ESCAPE, quote, quote),
+		'%s=if(isnull(%s) OR %s==%s, %s, replace(%s, %s, ""))' % (m, m, m, x, m, split_escape_eval(m),
+			'"[^ ]+::" . %s . "([^" . %s . urldecode("%%5C%%5C") . "]|" . urldecode("%%5C%%5C") . ".)*%s([^" . %s . '
+			'urldecode("%%5C%%5C") . "]|" . urldecode("%%5C%%5C") . ".)*" . %s . " ?"' % (quote, quote, SPLIT_ESCAPE, quote,
+				quote)),
 	] + ([
 		'%s=if(isnull(%s) OR %s==%s, %s, replace(replace(%s, "::" . %s . "[[:cntrl:]]+", "::" . %s), '
 		'"[[:cntrl:]]+" . %s, %s))' % (mt, m, m, x, m, m, quote, quote, quote, quote),
@@ -1615,7 +1628,10 @@ _SPLIT_LEFT = re.compile(r'[^ ]+::"([^"\\]|\\.)*' + SPLIT_ESCAPE + r'([^"\\]|\\.
 
 def split_escape_decode(text):
 	"""The lookup rule's decoding of SPLIT_ESCAPE in index-time field text, as Python reads it."""
-	return _SPLIT_LEFT.sub('', _SPLIT_SPACE.sub(' ', _SPLIT_KEEP.sub(r'\1', text)))
+	text = _SPLIT_SPACE.sub(' ', _SPLIT_KEEP.sub(r'\1', text))
+	for code, char in SPLIT_ESCAPE_UNICODE:
+		text = re.sub('(?i)' + SPLIT_ESCAPE + 'u' + code, lambda _m, c=char: c, text)
+	return _SPLIT_LEFT.sub('', text)
 
 
 def apply_lookup_time(transform, compact_line, rule):
