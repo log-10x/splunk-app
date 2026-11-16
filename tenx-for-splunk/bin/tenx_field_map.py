@@ -392,6 +392,30 @@ TARGETS = {
 		'time_format': ['%Y-%m-%d time=%H:%M:%S'],
 		'description': 'Compact FortiGate events',
 	},
+	# Palo Alto Networks PAN-OS syslog (the Splunk Add-on for Palo Alto Networks): one map for the log types the
+	# add-on stores by the line's fourth value ([pan:log] TRANSFORMS-sourcetype). The csv reader takes each
+	# sourcetype's FIELDS from the add-on (--addon), and the compact events' source names their sourcetype (see
+	# "Rules that read a compact event's text").
+	'palo-alto': {
+		'reader': 'csv',
+		'sourcetype': 'tenx_pan',
+		# pan:log last: a line none of the add-on's rules routes stays under the sourcetype it came in with.
+		'rename': ['pan:traffic', 'pan:threat', 'pan:system', 'pan:config', 'pan:hipmatch', 'pan:correlation',
+			'pan:userid', 'pan:globalprotect', 'pan:decryption', 'pan:log'],
+		'transform_prefix': 'tenx_pan',
+		'transforms_class': 'tenx_pan',
+		'reserved_names': 'restore',
+		'compact_source': True,
+		# Splunk fixes _time before the add-on's rule renames the event, with the settings of the sourcetype it
+		# came in with: [pan:log] TIME_PREFIX = ^(?:[^,]*,){5}, [pan:firewall] ^(?:[^,]*,){6}, neither with a
+		# TIME_FORMAT, so Splunk recognises the value after the sixth comma (generated_time) itself, and reads the
+		# digits that open the next value as its fraction: 21:46:38,10.0.2.107 gave 21:46:38.10 (97,736 of 97,736
+		# BOTS v2 traffic lines, Splunk Enterprise 10.4.3). strptime() with %N reads the same digits (10.0.2.107
+		# .10, 192.168 .192, 7.1 .7) and gives null when none follow; the plain format then reads the time.
+		'time_prefix': r'^(?:[^,]*,){6}',
+		'time_format': ['%Y/%m/%d %H:%M:%S,%N', '%Y/%m/%d %H:%M:%S'],
+		'description': 'Compact Palo Alto Networks events',
+	},
 }
 
 
@@ -863,6 +887,125 @@ class DelimsReader(object):
 		return out
 
 
+class CsvReader(object):
+	r"""
+	A transforms.conf DELIMS extraction with one set of delimiters and a FIELDS list: positional values, the
+	n-th value under the n-th name (Palo Alto Networks PAN-OS syslog: DELIMS = ",", FIELDS = "future_use1",
+	"receive_time", ...). Read from what Splunk Enterprise 10.4.3 extracted with the Splunk Add-on for Palo Alto
+	Networks 4.0.0 ([extract_traffic]) on probe lines, each a BOTS v2 traffic line with one value changed:
+	* a value runs to the next delimiter; values past the last name are dropped, and names past the last value
+	  get nothing;
+	* spaces at both ends of a value go ("  dns  " gave dns), and a value that is empty then gives no field
+	  (",," and "\"\"" alike);
+	* a value that opens with a double quote runs to the next double quote followed by a delimiter or the end of
+	  the text and loses those two quotes: "Client,Server" gave Client,Server and "a""b,c" gave a""b,c; inside
+	  it a backslash before a double quote or a backslash goes ("a\"b,c" gave a"b,c);
+	* a double quote with no such closing quote, opening a value ("abc,...) or inside one (a"b,...), takes the
+	  rest of the text as that value, quotes kept, and no later value is read;
+	* a tab inside a value stays.
+	Not checked: a backslash before another character inside quotes (kept here), spaces between a closing
+	quote and the delimiter (allowed here), a quote inside an unquoted value that a later quote closes (the
+	value then runs to that quote here), tabs at the ends of a value (kept here), a name listed twice in FIELDS
+	(the first value kept here) and an empty name (no field here).
+
+	Which names a text takes (layouts): each layout is (route, names, delimiters). With several, the first
+	whose route (a regex) finds the text: the add-on's own index-time rule that sets the event's sourcetype
+	(Palo Alto: [pan_traffic] REGEX = ^[^,]+,[^,]+,[^,]+,TRAFFIC,), applied to the template's text, so a
+	template gets the names of the sourcetype its events are stored under. A template that no route finds gets
+	no field. A compact value holds no delimiter and no double quote.
+	"""
+	name = 'csv'
+	raw_split = r'\n'
+	trims_values = True
+	keeps_empty = False
+	field_name = re.compile(r'[A-Za-z_][A-Za-z0-9_.:\-]*\Z')
+
+	def __init__(self, layouts=()):
+		self.layouts = [(re.compile(_python_regex(r)) if r else None, list(names), delims) for r, names, delims in layouts]
+
+	def layout(self, text):
+		for route, names, delims in self.layouts:
+			if route is None or route.search(text):
+				return names, delims
+		return None, None
+
+	@staticmethod
+	def split(text, delims=','):
+		out, pos, n = [], 0, len(text)
+		while True:
+			start = j = pos
+			while j < n and text[j] == ' ':
+				j += 1
+			if j < n and text[j] == '"':
+				k, buf, closed = j + 1, [], None
+				while k < n:
+					c = text[k]
+					if c == '\\' and k + 1 < n and text[k + 1] in '"\\':
+						buf.append(text[k + 1])
+						k += 2
+						continue
+					if c == '"':
+						m = k + 1
+						while m < n and text[m] == ' ':
+							m += 1
+						if m == n or text[m] in delims:
+							closed = m
+							break
+					buf.append(c)
+					k += 1
+				if closed is None:
+					out.append(text[start:].strip(' '))
+					return out
+				out.append(''.join(buf).strip(' '))
+				if closed == n:
+					return out
+				pos = closed + 1
+				continue
+			k = j
+			while k < n and text[k] not in delims and text[k] != '"':
+				k += 1
+			if k < n and text[k] == '"':
+				m = k + 1
+				while m < n:
+					if text[m] == '"':
+						e = m + 1
+						while e < n and text[e] == ' ':
+							e += 1
+						if e == n or text[e] in delims:
+							break
+					m += 1
+				if m >= n:
+					out.append(text[start:].strip(' '))
+					return out
+				out.append(text[start:m + 1].strip(' '))
+				e = m + 1
+				while e < n and text[e] == ' ':
+					e += 1
+				if e == n:
+					return out
+				pos = e + 1
+				continue
+			out.append(text[start:k].strip(' '))
+			if k == n:
+				return out
+			pos = k + 1
+
+	def pairs(self, text):
+		names, delims = self.layout(text)
+		if names is None:
+			return []
+		out, seen = [], set()
+		for name, value in zip(names, self.split(text, delims)):
+			if not name or value == '' or name in seen:
+				continue
+			seen.add(name)
+			out.append((name, value))
+		return out
+
+	def items(self, text):
+		return collections.Counter((name, 'column') for name, _ in self.pairs(text))
+
+
 class WindowsClassicReader(object):
 	r"""
 	Classic Windows event log text (sourcetype WinEventLog), as Splunk's own search-time rules for sources
@@ -924,7 +1067,7 @@ class WindowsClassicReader(object):
 		return out
 
 
-READERS = {r.name: r for r in (XmlWindowsReader, JsonReader, KeyValueReader, DelimsReader, WindowsClassicReader)}
+READERS = {r.name: r for r in (XmlWindowsReader, JsonReader, KeyValueReader, DelimsReader, WindowsClassicReader, CsvReader)}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1189,6 +1332,27 @@ Transform = collections.namedtuple('Transform',
 # Not reproduced: the timestamp processor's own recognition when a sourcetype has no TIME_FORMAT
 # (datetime.xml), its use of the previous event's time outside the day window (MAX_DAYS_AGO), and TZ
 # (gen refuses a stanza that sets it). A text that no format reads leaves _time as it was.
+
+# Values a TIME_PREFIX match may span: a compact value holds no comma and no control character (see "Lookup
+# rules"), so these stand for any of them.
+TIME_PREFIX_PROBES = ('', 'x', '0', ' ', 'a b', 'Z9-x', ':', '=')
+
+
+def prefix_match_is_stable(prefix_re, text, end):
+	"""
+	Whether the first TIME_PREFIX match on a template's marked text ends at the same template text for whatever
+	values it spans: with each probe in place of every value (TIME_PREFIX_PROBES), the match must end where the
+	template text that follows the match on the marked text begins (Palo Alto's ^(?:[^,]*,){6} spans the syslog
+	header's values and still ends after the sixth comma, which is template text).
+	"""
+	head, rest = text[:end], text[end:]
+	for probe in TIME_PREFIX_PROBES:
+		h, r = MARK_RE.sub(lambda _: probe, head), MARK_RE.sub(lambda _: probe, rest)
+		m = prefix_re.search(h + r)
+		if m is None or m.end() != len(h):
+			return False
+	return True
+
 
 TimeRule = collections.namedtuple('TimeRule', 'prefix formats lookahead max_days_ago max_days_hence')
 
@@ -1922,7 +2086,7 @@ class FieldMap(object):
 		m = self._time_re.search(text)
 		if m is None:
 			return None, WHY_TIME_NO_PREFIX
-		if '\x00' in m.group(0):
+		if '\x00' in m.group(0) and not prefix_match_is_stable(self._time_re, text, m.end()):
 			return None, WHY_TIME_PREFIX_VALUE
 		as_text = bool(fmt) and fmt != tenx_dml_builder.EPOCH_PASSTHROUGH
 		limit = self.time_rule.lookahead
@@ -2116,6 +2280,77 @@ def read_addon(addon_dir):
 	if not merged[0]:
 		raise AddonError('no props.conf under %s (default/ or local/)' % addon_dir)
 	return merged[0], merged[1]
+
+
+def quoted_list(value):
+	"""A transforms.conf <quoted string list> ("a","b" or ",", "="): the strings, with the escapes tab, line feed,
+	carriage return, backslash and double quote read."""
+	out = []
+	for m in re.finditer(r'"((?:[^"\\]|\\.)*)"', value or ''):
+		out.append(re.sub(r'\\(.)', lambda e: {'t': '\t', 'n': '\n', 'r': '\r'}.get(e.group(1), e.group(1)), m.group(1)))
+	return out
+
+
+def csv_layouts(addon_dir, sourcetypes):
+	"""
+	(layouts, report) for the csv reader from an add-on: for each sourcetype, the names (FIELDS) and delimiters
+	(DELIMS, one set) of the first REPORT- transform of its stanza that reads the event's text that way, and,
+	with several sourcetypes, the REGEX of the add-on's index-time transform that stores an event under it
+	(DEST_KEY = MetaData:Sourcetype, FORMAT = sourcetype::<it>), which picks a template's layout.
+	"""
+	props, transforms = read_addon(addon_dir)
+	routes = collections.OrderedDict()
+	for settings in props.values():
+		for key, value in settings.items():
+			if not key.startswith('TRANSFORMS-'):
+				continue
+			for name in [x.strip() for x in value.split(',') if x.strip()]:
+				t = transforms.get(name, {})
+				m = re.match(r'\s*sourcetype::(\S+)\s*$', str(t.get('FORMAT', '')))
+				if str(t.get('DEST_KEY', '')).strip() == 'MetaData:Sourcetype' and m and t.get('REGEX'):
+					routes.setdefault(m.group(1), str(t['REGEX']).strip())
+	layouts, report = [], collections.OrderedDict()
+	for st in sourcetypes:
+		found = None
+		for key, value in props.get(st, {}).items():
+			if not key.startswith('REPORT-'):
+				continue
+			for name in [x.strip() for x in value.split(',') if x.strip()]:
+				t = transforms.get(name, {})
+				delims = quoted_list(t.get('DELIMS'))
+				if _source_key(t) == '_raw' and len(delims) == 1 and t.get('FIELDS'):
+					found = (name, quoted_list(t['FIELDS']), delims[0])
+					break
+			if found:
+				break
+		if found is None:
+			report[st] = 'no REPORT- transform of [%s] reads the text with one DELIMS set and FIELDS' % st
+			continue
+		route = routes.get(st) if len(sourcetypes) > 1 else None
+		if len(sourcetypes) > 1 and route is None:
+			report[st] = 'no index-time rule of the add-on stores an event under %s, so no template is read as one' % st
+			continue
+		layouts.append((route, found[1], found[2]))
+		report[st] = '%s: %d names, delimiters %r%s' % (found[0], len(found[1]), found[2],
+			', templates whose text %s finds' % route if route else '')
+	return layouts, report
+
+
+def text_reading_classes(props, transforms, stanza):
+	"""
+	[(class, transforms that do not read the event's text)] for the REPORT- and EXTRACT- classes of an add-on
+	stanza that read it (REPORT- with SOURCE_KEY _raw, EXTRACT- without "in <field>").
+	"""
+	out = []
+	for key, value in props.get(stanza, {}).items():
+		if key.startswith('REPORT-'):
+			names = [x.strip() for x in value.split(',') if x.strip()]
+			keep = [n for n in names if n in transforms and _source_key(transforms[n]) != '_raw']
+			if len(keep) != len(names):
+				out.append((key, keep))
+		elif key.startswith('EXTRACT-') and not re.search(r'\s+in\s+[A-Za-z_][A-Za-z0-9_]*\s*$', value):
+			out.append((key, None))
+	return out
 
 
 def source_pattern_matches(pattern, source):
@@ -3120,6 +3355,8 @@ def props_text(target, field_map, settings, search_hash=True, sourcetype_field=S
 		names.append(eval_stanza(target))
 	if several(target):
 		names.append(rename_stanza(target))
+	if target.get('compact_overrides'):
+		names.append(source_stanza(target))
 	if first:
 		lines.append('# %s first, then the fields and the event time from the template\'s row.' % ', '.join(first))
 	if several(target):
@@ -3160,6 +3397,7 @@ def props_text(target, field_map, settings, search_hash=True, sourcetype_field=S
 			note = '# Search-time: as above, for the rules of this stanza of the add-on.'
 	for stanza, entries in by_stanza.items():
 		lines += ['', '[%s]' % stanza, note] + entries
+	lines += compact_source_props(target)
 	return '\n'.join(lines) + '\n'
 
 
@@ -3183,6 +3421,8 @@ def transforms_text(field_map, search_hash=True, target=None, sourcetype_field=S
 				' but the sourcetype rule' if several(target) else '', eval_stanza(target), ingest_eval_text(field_map)))
 	if target and several(target):
 		stanzas.append(rename_transform_text(target))
+	if target and target.get('compact_overrides'):
+		stanzas.append(source_transform_text(target))
 	header = ('# Generated by tenx_field_map.py from the app\'s template records: one index-time transform per '
 		'template.\n\n') if field_map.rules != RULES_LOOKUP else (
 		'# Generated by tenx_field_map.py: one index-time rule for every template of the sourcetype.\n\n')
@@ -3206,6 +3446,35 @@ def rename_transform_text(target):
 		'[%s]\nSOURCE_KEY = field:%s\nREGEX = ^(%s)$\nDEST_KEY = MetaData:Sourcetype\nFORMAT = sourcetype::$1\n' % (
 			target['sourcetype'], target['rename_field'], target['sourcetype'], rename_stanza(target),
 			target['rename_field'], '|'.join(regex_escape(n) for n in renames(target))))
+
+
+COMPACT_SOURCE_PREFIX = 'tenx:'
+
+
+def source_stanza(target):
+	return '%s_source' % target['transform_prefix']
+
+
+def source_transform_text(target):
+	"""The index-time rule of a target with compact_source (see "Rules that read a compact event's text")."""
+	return ('# A compact event stored under one of the add-on\'s sourcetypes gets the source %s<sourcetype>:<source>, so\n'
+		'# the [source::] stanzas of props.conf can leave out, for it alone, the add-on\'s rules that read the text.\n'
+		'# After the sourcetype rule.\n'
+		'[%s]\nINGEST_EVAL = source:=if(substr(_raw,1,1)=="~" AND sourcetype!="%s", "%s" . sourcetype . ":" . source, source)\n'
+		% (COMPACT_SOURCE_PREFIX, source_stanza(target), target['sourcetype'], COMPACT_SOURCE_PREFIX))
+
+
+def compact_source_props(target):
+	"""The [source::] stanzas of a target with compact_source: each class of the add-on that reads the text, without it."""
+	lines = []
+	for stanza, classes in target.get('compact_overrides') or ():
+		lines += ['', '# Search-time, compact %s events only (source %s%s:...): the add-on\'s rules that read the event\'s'
+			% (stanza, COMPACT_SOURCE_PREFIX, stanza),
+			'# text are left out; a compact event\'s text is the Receiver\'s line, and the map has indexed those fields.',
+			'[source::%s%s:...]' % (COMPACT_SOURCE_PREFIX, stanza)]
+		for key, keep in classes:
+			lines.append('%s = %s' % (key, ', '.join(keep)) if keep is not None else '%s = (?!)' % key)
+	return lines
 
 
 def fields_text(target):
@@ -4262,6 +4531,29 @@ def _build(args):
 			settings = each[0]
 		time_rule = make_time_rule(settings, time_prefix, time_formats, args.time_lookahead)
 	reader, text_rules = READERS[target['reader']](), None
+	if target['reader'] == CsvReader.name:
+		columns = getattr(args, 'columns', None) or target.get('columns')
+		if columns:
+			names = [c.strip() for c in (columns.split(',') if isinstance(columns, str) else columns)]
+			layouts, layout_report = [(None, names, getattr(args, 'delimiter', None) or target.get('delimiter') or ',')], {}
+		elif getattr(args, 'addon', None):
+			try:
+				layouts, layout_report = csv_layouts(args.addon, renames(target))
+			except OSError as e:
+				raise AddonError(str(e))
+		else:
+			raise ValueError('the csv reader needs the column names: --columns a,b,c, or --addon with the add-on whose '
+				'REPORT- transforms list them (DELIMS and FIELDS)')
+		if not layouts:
+			raise ValueError('the csv reader found no column names: %s' % '; '.join('%s: %s' % kv for kv in layout_report.items()))
+		reader = CsvReader(layouts)
+		target['layouts'] = layout_report
+	if target.get('compact_source'):
+		if not getattr(args, 'addon', None):
+			raise ValueError('compact_source needs --addon: the [source::] stanzas copy the add-on\'s classes that read the text')
+		props, transforms = read_addon(args.addon)
+		target['compact_overrides'] = [(st, text_reading_classes(props, transforms, st)) for st in renames(target)
+			if text_reading_classes(props, transforms, st)]
 	leave_out = target.get('leave_out') or []
 	if leave_out:
 		reader = LeaveOutReader(reader, leave_out)
@@ -4320,6 +4612,9 @@ def build_parser():
 		p.add_argument('--app-name')
 		p.add_argument('--indexed-value-false', help='comma-separated field names for fields.conf')
 		p.add_argument('--leave-out', help='comma-separated field names the map does not write')
+		p.add_argument('--columns', help='csv reader: the column names, in order, separated by commas (a header list); '
+			'without it the names come from the add-on (--addon)')
+		p.add_argument('--delimiter', help='csv reader with --columns: the delimiter (default a comma)')
 		p.add_argument('--fields', choices=('all', 'cim'), default='all',
 			help='all: every field the reader finds (default); cim: only the fields the CIM data models and the add-on\'s '
 				'event types read, through the add-on\'s rules (needs --addon and --cim; see "The fields the data models '
