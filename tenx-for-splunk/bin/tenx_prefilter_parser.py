@@ -1049,17 +1049,29 @@ def _eval_string(text):
 	return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
+def _plain_term(word):
+	"""A word the filter can match as a term itself: no breaker but `*`, not starting with `*`."""
+	return bool(word) and word[0] != "*" and not any(
+		c in MAJOR_CHARS.replace("*", "") or c in MINOR_CHARS or c.isspace() for c in word)
+
+
 def wildcard_filter(text):
 	"""
 	The eval expression the `tx` macro runs before its final search (`eval [| tenxprefilter after=t]`,
-	then `search tenx_keep=1`): tenx_keep set on the events the words after `tx` match as a base search
-	on the index would match them, for each word mid_wildcard() names; None when there is none (or the
-	words are not read with certainty), and every event is kept. Only the words that select (not
-	under NOT) are matched with term_regex(): under NOT, Splunk's base search tests the word's prefix
-	too on the data measured (Windows 662 sample: NOT Se*Privilege 0 events on the index, as after
-	the pipe), so the search after the pipe already gives what the index gives. Where every such word
-	is one of the search's top-level AND terms, tenx_keep is their regex matches; otherwise the words
-	are evaluated with searchmatch(), each such word replaced by its regex match.
+	then `search tenx_keep=1`): tenx_keep set on the events whose words with a wildcard inside them
+	(mid_wildcard()) match as a base search on the index would match them; None when there is none
+	(or the words are not read with certainty), and every event is kept. The final search still
+	applies every word, so the filter only has to be right where the final search is too broad:
+	- a word with a wildcard inside it that is one of the search's top-level AND terms, alone or
+	  quoted, is its term_regex() match;
+	- a top-level AND term made only of such words and plain words (no breaker, no leading `*`,
+	  under AND, OR and NOT) is evaluated whole, each word by term_regex(); a plain word or a word
+	  with a trailing `*` matches after the pipe as on the index, and term_regex() gives the same;
+	- any other place (next to a phrase, a field comparison, a word with a breaker or a leading
+	  `*`) is left to the final search, as before.
+	A word with a wildcard inside it under NOT is left alone: on the Windows 662 sample the base
+	search on the index tests its prefix too (NOT Se*Privilege: 0 events on the index, as after the
+	pipe), so its NOT is the prefix one (term_regex of the prefix and `*`).
 	"""
 	tokens = tokenize(text)
 	if any(kind == "subsearch" for kind, _ in tokens):
@@ -1069,36 +1081,55 @@ def wildcard_filter(text):
 		tree = reader.parse()
 	except Unparsed:
 		return None
-	found = []  # (token index, top-level AND term)
+	marks, steps = {}, []
 
-	def walk(node, positive, top):
+	def mark(word):
+		if word not in marks:
+			marks[word] = "tenx_w%d" % len(marks)
+			steps.append("%s=if(match(_raw, %s), 1, 0)" % (marks[word], _eval_string(term_regex(word))))
+		return marks[word] + "=1"
+
+	def selects(node, positive=True):
+		"""Whether `node` holds a word with a wildcard inside it where it selects events."""
+		if node[0] == "text":
+			return positive and id(node) in reader.text_at and mid_wildcard(node[1])
+		if node[0] == "not":
+			return selects(node[1], not positive)
+		if node[0] in ("and", "or"):
+			return any(selects(c, positive) for c in node[1])
+		return False
+
+	def whole(node, positive=True, build=True):
+		"""`node` as an eval condition from term_regex() alone, or None when it holds anything else."""
 		kind = node[0]
-		if kind == "text" and positive and id(node) in reader.text_at and mid_wildcard(node[1]):
-			found.append((reader.text_at[id(node)], top))
-		elif kind == "not":
-			walk(node[1], not positive, False)
-		elif kind == "and":
-			for child in node[1]:
-				walk(child, positive, top)
-		elif kind == "or":
-			for child in node[1]:
-				walk(child, positive, False)
-	walk(tree, True, True)
-	if not found:
+		if kind == "text":
+			index = reader.text_at.get(id(node))
+			if index is None or tokens[index][0] != "word" or not _plain_term(node[1]):
+				return None
+			word = node[1]
+			if mid_wildcard(word) and not positive:
+				word = word[:word.index("*") + 1]
+			return mark(word) if build else word
+		if kind == "not":
+			inner = whole(node[1], not positive, build)
+			return None if inner is None else "NOT (%s)" % inner
+		if kind in ("and", "or"):
+			parts = [whole(c, positive, build) for c in node[1]]
+			if any(p is None for p in parts):
+				return None
+			return "(%s)" % (" %s " % kind.upper()).join(parts)
 		return None
-	steps, marks = [], {}
-	for n, (index, _) in enumerate(found):
-		marks[index] = "tenx_w%d" % n
-		steps.append("tenx_w%d=if(match(_raw, %s), 1, 0)" % (n, _eval_string(term_regex(tokens[index][1]))))
-	if all(top for _, top in found):
-		keep = " AND ".join("tenx_w%d=1" % n for n in range(len(found)))
-	else:
-		out, last = [], 0
-		for index in sorted(marks):
-			start, end = tokens.spans[index]
-			out.append(text[last:start] + marks[index] + "=1")
-			last = end
-		out.append(text[last:])
-		keep = "searchmatch(%s)" % _eval_string("".join(out))
-	steps.append("%s=if(%s, 1, null())" % (WILD_STEP_FIELD, keep))
+
+	conditions = []
+	for term in (tree[1] if tree[0] == "and" else [tree]):
+		if not selects(term):
+			continue
+		if term[0] == "text":
+			conditions.append(mark(term[1]))
+			continue
+		if whole(term, build=False) is not None:
+			conditions.append(whole(term))
+	if not conditions:
+		return None
+	steps.append("%s=if(%s, 1, null())" % (WILD_STEP_FIELD, " AND ".join(conditions)))
 	return ", ".join(steps)
