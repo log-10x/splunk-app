@@ -366,11 +366,31 @@ def load_templates(path):
 		text = f.read()
 
 	if text.lstrip().startswith('['):
-		return [_from_kv_row(r) for r in json.loads(text)]
+		rows = json.loads(text)
+		for i, r in enumerate(rows):
+			if not isinstance(r, dict) or '_key' not in r:
+				raise ValueError('%s: row %d is not a template record of the KV store (no _key)' % (path, i + 1))
+		return [_from_kv_row(r) for r in rows]
 
 	builder = tenx_dml_builder.TenxDMLBuilder(timestamp_placeholder=TIMESTAMP_PLACEHOLDER,
 		variable_separator=VARIABLE_SEPARATOR)
-	return [_from_template_line(json.loads(line), builder) for line in text.splitlines() if line.strip()]
+	records = []
+	for n, line in enumerate(text.splitlines(), 1):
+		if not line.strip():
+			continue
+		try:
+			obj = json.loads(line)
+		except ValueError:
+			raise ValueError('%s: line %d is not JSON' % (path, n))
+		if isinstance(obj, dict) and 'templateHash' not in obj and isinstance(obj.get('messages'), list):
+			# A KV store export that failed: Splunk's REST answer, such as {"messages":[{"type":"ERROR","text":"Unauthorized"}]}.
+			said = '; '.join(str(m.get('text', '')) for m in obj['messages'] if isinstance(m, dict)) or 'no text'
+			raise ValueError('%s holds no template records: Splunk answered "%s". Export the KV store again with a '
+				'user and password or token that can read it' % (path, said))
+		if not isinstance(obj, dict) or 'templateHash' not in obj or 'template' not in obj:
+			raise ValueError('%s: line %d is not a template record (no templateHash and template)' % (path, n))
+		records.append(_from_template_line(obj, builder))
+	return records
 
 
 def _same_template(a, b):
@@ -3011,6 +3031,9 @@ def verify(templates, field_map, encoded_path, raw_path, raw_split=None, out=sys
 
 CAP_HEADER = 'pattern_hash,value\n'
 CAP_PENDING_SUFFIX = '.pending'
+# check writes the index time up to which it has counted the map's compact events indexed without their
+# fields to <cap file>.checked; the next check counts from there (from the cap file's own time the first time).
+CAP_CHECKED_SUFFIX = '.checked'
 # Per-template transforms (--rules transforms) are not activated: on Splunk Enterprise 10.4.3 a
 # transform stanza added to the app takes effect after POST conf-transforms/_reload and
 # conf-props/_reload only for an input stream (host, source and sourcetype) that starts afterwards; a
@@ -3473,8 +3496,9 @@ def activate(app_dir, cap_file, splunkd, app_name=None, probe_index=None, timeou
 def check(app_dir, cap_file, splunkd, app_name=None, probe_index=None, sample=1, timeout=60, poll=10, out=sys.stdout,
 		clock=time.time, sleep=time.sleep, rng=None):
 	"""
-	Probes `sample` listed templates, chosen at random. When every probe is indexed with its fields, returns 0 and
-	changes nothing. When one is indexed without them or is not indexed within `timeout` seconds, the cap
+	Probes `sample` listed templates, chosen at random. When every probe is indexed with its fields, counts the
+	compact events of the map's sourcetype indexed without their fields since the previous check and returns 0
+	when there are none, else 1 (check_unmapped says when the list is emptied). When one is indexed without them or is not indexed within `timeout` seconds, the cap
 	file keeps only its rows that do not start with true, every listed template is left pending
 	(<cap file>.pending, merged with a pending list already there), and returns 1: the Receiver sends
 	those templates whole until activate proves them again.
@@ -3526,13 +3550,60 @@ def check(app_dir, cap_file, splunkd, app_name=None, probe_index=None, sample=1,
 			if all(got):
 				out.write('check: %d of %d listed templates probed%s, all indexed with their fields (%.0f s)%s\n' % (
 					len(probed), len(listed), '' if up == [None] else ' on %d nodes' % len(up), clock() - start, away))
-				return 0
+				return check_unmapped(cap_file, splunkd, sourcetype, clock, out)
 			if clock() - start > timeout:
 				late = [n for (h, n), g in zip(pairs, got) if g is None]
 				why = '%d of %d probes not indexed within %.0f s%s' % (len(late), len(pairs), timeout,
 					'' if up == [None] else ' (%s)' % ', '.join(sorted(set(late))))
 				break
 	withdraw(cap_file, why, out)
+	return 1
+
+
+def unmapped_since(splunkd, sourcetype, since, until):
+	"""
+	{reason: count} of the compact events of `sourcetype` indexed without their fields (tenx_unmapped) from
+	`since` to `until` (epoch seconds, index time), probe events left out: the search of the saved search
+	Field Map Events Without Fields, held to one compact sourcetype.
+	"""
+	rows = splunkd.search('| tstats count where index=* sourcetype="%s" %s=* NOT host="%s" _index_earliest=%d '
+		'_index_latest=%d by %s' % (sourcetype, UNMAPPED_FIELD, PROBE_HOST, int(since), int(until), UNMAPPED_FIELD))
+	got = {}
+	for r in rows:
+		n = int(float(r.get('count') or 0))
+		if n:
+			got[r.get(UNMAPPED_FIELD) or '?'] = n
+	return got
+
+
+def check_unmapped(cap_file, splunkd, sourcetype, clock, out):
+	"""
+	Counts the compact events of `sourcetype` indexed without their fields since the previous check (from the cap
+	file's own time the first time) and returns 0 when there are none, else 1:
+	* reason no_row only: templates the lookup has no row for arrived compact, so the Receiver compacts templates
+	  the cap file does not list (receiverOptimize true in its arguments, or another map's cap file). Taking the
+	  listed templates off the list would not stop that, so the list is left as it is.
+	* any other reason (no_match, bad_row, no_table): events of listed templates lose their fields, so the list is
+	  emptied, as when a probe comes back without its fields.
+	"""
+	state = cap_file + CAP_CHECKED_SUFFIX
+	try:
+		with open(state, encoding='utf-8') as f:
+			since = float(f.read().strip())
+	except (IOError, OSError, ValueError):
+		since = os.path.getmtime(cap_file) if os.path.exists(cap_file) else 0
+	until = clock()
+	got = unmapped_since(splunkd, sourcetype, since, until)
+	write_if_changed(state, '%d\n' % int(until))
+	if not got:
+		return 0
+	what = '%d compact events of %s were indexed without their fields since %s (%s)' % (sum(got.values()), sourcetype,
+		time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(since)), ', '.join('%s %d' % kv for kv in sorted(got.items())))
+	if set(got) == {WHY_NO_ROW}:
+		out.write('check: %s: templates the cap file does not list arrive compact, so the Receiver compacts them '
+			'(receiverOptimize true in its arguments, or another map\'s cap file); the cap file is left as it was\n' % what)
+	else:
+		withdraw(cap_file, what, out)
 	return 1
 
 
@@ -3633,7 +3704,7 @@ def build_parser():
 			help='indexed field every FORMAT writes as <mark>::"1" (default %s; none: no mark). `tx` keeps the '
 				'indexed fields of an event that has it from being extracted a second time' % MARK_FIELD)
 		p.add_argument('--mixed-names', action='store_true',
-			help='write names that join text and values (checked on Splunk 10.4.3 with the CloudTrail map; off by default)')
+			help='write names that join text and values (checked on Splunk 9.4.15, 10.4.3 and 10.6.0.5 with the CloudTrail map; off by default)')
 		p.add_argument('--rules', choices=(RULES_TRANSFORMS, RULES_LOOKUP), default=RULES_TRANSFORMS,
 			help='transforms: one index-time transform per template (default); lookup: one static rule per sourcetype '
 				'and one row per template in lookups/<prefix>_fields.csv.gz, so adding a template changes only that '

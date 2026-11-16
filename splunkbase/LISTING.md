@@ -163,8 +163,8 @@ Repository name: `log-10x/splunk-app`. Repository URL: https://github.com/log-10
 
 | Field | Value |
 |---|---|
-| Version | 1.2.1, read from the package |
-| Splunk platform compatibility | Splunk Enterprise 9.4, 10.0, 10.2, 10.4, 10.6 |
+| Version | 1.2.2, read from the package |
+| Splunk platform compatibility | Splunk Enterprise 9.4, 10.4, 10.6 |
 | CIM | None |
 
 Each line is tested: 9.4.15, 10.0.10, 10.2.7 and 10.4.3, each a fresh install of 1.1.2. 1.1.3
@@ -300,7 +300,7 @@ From the repository root:
 rm -rf /tmp/sbpkg && mkdir -p /tmp/sbpkg
 rsync -a --exclude 'local/' --exclude '__pycache__/' --exclude '*.pyc' --exclude '*.pyo' --exclude '.*' \
   tenx-for-splunk/ /tmp/sbpkg/tenx-for-splunk/
-cd /tmp/sbpkg && COPYFILE_DISABLE=1 tar --format ustar -czf tenx-for-splunk-1.2.1.tar.gz tenx-for-splunk
+cd /tmp/sbpkg && COPYFILE_DISABLE=1 tar --format ustar -czf tenx-for-splunk-1.2.2.tar.gz tenx-for-splunk
 ```
 
 ## Submitting

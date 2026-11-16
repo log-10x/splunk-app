@@ -215,6 +215,8 @@ The `tenx_dml` collection stores parsed template data with fields:
    $SPLUNK_HOME/bin/splunk install app tenx-for-splunk-<version>.tar.gz
    ```
 
+   In a shell without a Splunk login, add `-auth <user>:<password>`.
+
 2. **Restart Splunk:**
    ```bash
    $SPLUNK_HOME/bin/splunk restart
@@ -353,6 +355,12 @@ beside the prefilter `tx` adds to this clause, Splunk dropped some events matche
 
 ```spl
 index=my_compact_index (sourcetype::tenx_encoded OR sourcetype::my_custom_sourcetype)
+```
+
+Several compact indexes, one of them with a field map:
+
+```spl
+(index=app_compact OR index=win_compact) (sourcetype::tenx_encoded OR tenx_compact_st::tenx_win)
 ```
 
 Naming the index makes every panel faster.
@@ -704,6 +712,10 @@ has its own cap file and its own scheduled `check`.
    path on the host, and the Receiver the path inside the container. The host folder need not be
    `/etc/tenx` (creating a folder there needs root).
 
+   The Receiver runs in Fluent Bit's network, so restart the Receiver after each restart of Fluent
+   Bit. With `Retry_Limit False`, Fluent Bit keeps the records it reads in the meantime and sends them
+   when the Receiver is back.
+
    The Fluent Bit configuration of the mapped source holds:
 
    - `Parsers_File /fluent-bit/etc/win-parsers.conf` in `[SERVICE]`, and in that file the `win_xml`
@@ -717,6 +729,7 @@ has its own cap file and its own scheduled `check`.
          Match       <tag of the source>
          Host        127.0.0.1
          Port        24224
+         Retry_Limit False
 
      [INPUT]
          Name        forward
@@ -821,10 +834,12 @@ has its own cap file and its own scheduled `check`.
    indexed between the moment a listed template stops getting its fields and that `check` are kept,
    marked `tenx_unmapped`, and lack their index-time fields. After `check` empties the list, events
    the Receiver compacts before it rereads the file, within about 10 seconds, are kept and marked
-   `tenx_unmapped`; every later event of that source arrives whole. `check` probes the listed
-   templates only. The saved search **Field Map Events Without Fields** counts compact events
-   indexed without their fields (`tenx_unmapped`) by index, sourcetype and reason; schedule it where
-   a field map is installed.
+   `tenx_unmapped`; every later event of that source arrives whole. `check` also counts the compact
+   events of the map's sourcetype indexed without their fields since its previous run, and when
+   there are any it fails and names the count and the reason. For `no_row`, a template the cap file
+   does not list arrived compact, and the list is left as it is; for any other reason the list is
+   emptied as above. The saved search **Field Map Events Without Fields** counts such events for
+   every map by index, sourcetype and reason; schedule it where a field map is installed.
 
 A template that appears later arrives whole until steps 3, 4 and 6 run again. `gen` then changes
 only the lookup file: copy `lookups/` of both apps over the installed ones (on a cluster, into

@@ -52,6 +52,10 @@ docker run -d --name tenx-receiver --network container:<Fluent Bit container> lo
 The first argument names the input module for the forwarder in use, here Fluent Bit; the
 [forwarder inputs](https://doc.log10x.com/run/input/forwarder/) page lists the others.
 
+The Receiver runs in Fluent Bit's network, so restart the Receiver after each restart of Fluent Bit.
+With `Retry_Limit False`, Fluent Bit keeps the records it reads in the meantime and sends them when the
+Receiver is back.
+
 The three options live in two files of the Receiver's config folder (`$TENX_CONFIG`, mounted at
 `/etc/tenx/config` in the container image):
 
@@ -160,13 +164,14 @@ Asia/Kolkata, Etc/GMT-4): every line is the UTC text. A zone in the timestamp fo
 
 ### Step 1: Install Splunk App
 
-Install from Splunkbase, or clone the repository into your Splunk apps directory:
+Download the package from Splunkbase, install it with Splunk's app install, and restart:
 
 ```bash
-git clone https://github.com/log-10x/splunk-app.git
-cp -r splunk-app/tenx-for-splunk $SPLUNK_HOME/etc/apps/
+$SPLUNK_HOME/bin/splunk install app tenx-for-splunk-<version>.tar.gz
 $SPLUNK_HOME/bin/splunk restart
 ```
+
+In a shell without a Splunk login, add `-auth <user>:<password>` to the install.
 
 In a distributed deployment, install the app on the search heads and on the indexers or heavy
 forwarders that parse compact events. The compact sourcetype's parsing settings, `TRUNCATE` and

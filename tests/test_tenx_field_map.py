@@ -453,6 +453,23 @@ class TestApp:
 		report = json.loads((tmp_path / 'app_report.json').read_text())
 		assert report['hashes_with_outer_spaces'] == 1 and report['templates'] == 1
 
+	def test_gen_says_a_kv_export_that_failed_holds_no_templates(self, tmp_path, capsys):
+		# curl -u admin in a script: no password, and Splunk's answer is written as the export.
+		records = tmp_path / 'kv_0.json'
+		records.write_text('{"messages":[{"type":"ERROR","text":"Unauthorized"}]}')
+		assert fm.main(['gen', '--rules', 'lookup', '--records', str(records), '--target', 'windows-security',
+			'--out', str(tmp_path / 'app')]) == 2
+		err = capsys.readouterr().err
+		assert 'holds no template records: Splunk answered "Unauthorized"' in err and 'KeyError' not in err
+		assert not os.path.exists(str(tmp_path / 'app'))
+
+	def test_gen_names_a_line_that_is_not_a_template_record(self, tmp_path, capsys):
+		records = tmp_path / 'templates.json'
+		records.write_text(json.dumps({'templateHash': 'k1', 'template': 'a=$'}) + '\n' + json.dumps({'x': 1}) + '\n')
+		assert fm.main(['gen', '--rules', 'lookup', '--records', str(records), '--reader', 'kv', '--sourcetype', 'tenx_fw',
+			'--rename', 'fw:traffic', '--out', str(tmp_path / 'app')]) == 2
+		assert 'line 2 is not a template record' in capsys.readouterr().err
+
 	def test_gen_says_so_when_no_template_gets_a_rule(self, tmp_path, capsys):
 		# Records the Windows reader finds no field in: gen still writes the app and exits 0, and says so.
 		records = tmp_path / 'templates.json'
@@ -1120,6 +1137,17 @@ class FakeSplunkd(object):
 						h = line[1:].split(',', 1)[0].strip()
 						outer.events.append(dict(q, raw=line, hash=h, mapped=h in outer.rows, t=outer.now()))
 					self._send({})
+				elif path == '/services/search/jobs' and dict(up.parse_qsl(data))['search'].startswith('| tstats'):
+					# check's count of the map's compact events indexed without their fields (not probes)
+					m = dict(up.parse_qsl(data))
+					st = re.search(r'sourcetype="([^"]*)"', m['search']).group(1)
+					lo = int(re.search(r'_index_earliest=(-?\d+)', m['search']).group(1))
+					hi = int(re.search(r'_index_latest=(-?\d+)', m['search']).group(1))
+					counts = {}
+					for e in outer.events:
+						if e.get('host') != fm.PROBE_HOST and e.get('sourcetype') == st and not e['mapped'] and lo <= e['t'] < hi:
+							counts[e.get('why', fm.WHY_NO_ROW)] = counts.get(e.get('why', fm.WHY_NO_ROW), 0) + 1
+					self._send({'results': [{fm.UNMAPPED_FIELD: k, 'count': str(v)} for k, v in sorted(counts.items())]})
 				elif path == '/services/search/jobs':
 					m = dict(up.parse_qsl(data))
 					assert m['exec_mode'] == 'oneshot' and 'host="%s"' % fm.PROBE_HOST in m['search']
@@ -1410,6 +1438,61 @@ class TestCapFile:
 		assert rc == 0 and read(str(cap)) == before and not os.path.exists(str(cap) + '.pending')
 		assert sorted(e['hash'] for e in fake.events) == ['k1', 'k2'] and 'all indexed with their fields' in out
 		assert set(c[1] for c in fake.posts()) == {'/services/receivers/simple', '/services/search/jobs'}
+
+	def counted_from_zero(self, cap):
+		# The first check counts from the cap file's own time; these tests run check on a clock that starts at 0.
+		(cap.parent / (cap.name + fm.CAP_CHECKED_SUFFIX)).write_text('0\n', encoding='utf-8')
+
+	def compact(self, fake, h, t, why=None, sourcetype='tenx_fw'):
+		e = dict(index='main', host='app1', source='a.log', sourcetype=sourcetype, raw='~%s,x' % h, hash=h, mapped=False, t=t)
+		if why:
+			e['why'] = why
+		fake.events.append(e)
+
+	def test_check_fails_when_unlisted_templates_arrive_compact(self, tmp_path):
+		# receiverOptimize true kept in the Receiver's arguments: templates the cap file does not list arrive compact,
+		# with no row in the lookup. The probes of the listed ones pass; check counts those events and fails, and
+		# leaves the list, since taking listed templates off it would not stop them.
+		cap = self.listed(tmp_path, ['k1', 'k2'])
+		before = read(str(cap))
+		self.counted_from_zero(cap)
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		for i in range(3):
+			self.compact(fake, 'unlisted%d' % i, 1)
+		self.compact(fake, 'other', 1, sourcetype='tenx_other')
+		try:
+			rc, out = self.check(tmp_path, cap, fake, sample=2)
+		finally:
+			fake.close()
+		assert rc == 1 and read(str(cap)) == before and not os.path.exists(str(cap) + '.pending')
+		assert 'check: 3 compact events of tenx_fw were indexed without their fields since 1970-01-01T00:00:00Z (no_row 3)' in out
+		assert 'receiverOptimize true' in out and 'the cap file is left as it was' in out
+
+	def test_check_empties_the_list_when_listed_templates_arrive_without_fields(self, tmp_path):
+		cap = self.listed(tmp_path, ['k1', 'k2'])
+		self.counted_from_zero(cap)
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		self.compact(fake, 'k1', 1, why='no_match')
+		self.compact(fake, 'x', 1)
+		try:
+			rc, out = self.check(tmp_path, cap, fake, sample=2)
+		finally:
+			fake.close()
+		assert rc == 1 and fm.read_cap(str(cap))[0] == set() and fm.read_cap(str(cap) + '.pending')[0] == {'k1', 'k2'}
+		assert '2 compact events of tenx_fw were indexed without their fields since' in out and '(no_match 1, no_row 1)' in out
+
+	def test_the_next_check_counts_only_what_was_indexed_since(self, tmp_path):
+		cap = self.listed(tmp_path, ['k1'])
+		self.counted_from_zero(cap)
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		self.compact(fake, 'u1', 1)
+		try:
+			first, _ = self.check(tmp_path, cap, fake)
+			assert read(str(cap) + fm.CAP_CHECKED_SUFFIX).strip().isdigit()
+			second, out = self.check(tmp_path, cap, fake)
+		finally:
+			fake.close()
+		assert first == 1 and second == 0 and 'all indexed with their fields' in out
 
 	def test_check_empties_the_list_when_a_probe_comes_back_without_fields(self, tmp_path):
 		cap = self.listed(tmp_path, ['k1', 'k2'], '"keep",false\n')
