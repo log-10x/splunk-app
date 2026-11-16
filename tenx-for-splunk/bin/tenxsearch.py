@@ -186,6 +186,9 @@ class TenxSearchCommandBase(GeneratingCommand):
 				if build_result.retryable:
 					self.write_error("10x: the template lookup did not complete, so this search was not run "
 						"(running it as typed would return the wrong events). Run it again.")
+				elif build_result.parse_error:
+					# splunkd refused the search itself: its own words
+					self.write_error(build_result.parse_error)
 				else:
 					self.write_error("10x: this search could not be parsed for compact data, so it was not run. "
 						"See tenx_search_command.log for the parse error.")

@@ -81,6 +81,7 @@ import tenx_util
 import tenx_search_manager
 import tenx_search_builder
 import tenx_alert_compiler
+import tenx_prefilter_parser
 
 tenx_util.setup_logger('tenx_search_handler', logging.INFO)
 logger = logging.getLogger(__name__)
@@ -175,7 +176,14 @@ class TenxSearchHandler(PersistentServerConnectionApplication):
 
 			original_search = search_data.get('search')
 
-			if original_search:
+			# A search that calls `tx` or `txf` already reads compact events: it runs as typed, as
+			# from the search bar. Rewritten, the macro's prefilter could not find its own words in
+			# the job's text, so it expanded every compact event and its stops (a time modifier or a
+			# comma after `tx`, an original sourcetype named) never ran: through this endpoint a
+			# search naming the original sourcetype before `tx` returned 0 events with no message
+			# (Splunk Enterprise 10.4.3), where the search bar stops with one.
+			#
+			if original_search and tenx_prefilter_parser.macro_call(original_search) is None:
 				search_builder = tenx_search_builder.TenxSearchBuilder(
 					server_connection=server_connection,
 					tenx_config=tenx_config,
@@ -199,6 +207,11 @@ class TenxSearchHandler(PersistentServerConnectionApplication):
 					if build_result.retryable:
 						return refusal("10x: the template lookup did not complete, so this search was not run "
 							"(run as typed it would return the wrong events). Run it again.")
+
+					if build_result.parse_error:
+						# splunkd refused the search itself (a macro whose validation fails, an
+						# unknown command): its own words, as it would show them.
+						return refusal(build_result.parse_error)
 
 					return refusal("10x: this search could not be parsed for compact data, so it was not "
 						"run. See tenx_search_handler.log for the parse error.")
@@ -235,6 +248,11 @@ class TenxSearchHandler(PersistentServerConnectionApplication):
 			search_job_sid = search_manager.create_search_job(search_data)
 
 			if not search_job_sid:
+				if getattr(search_manager, 'last_job_error', None):
+					# splunkd refused the job (txf(<sourcetype>) without a field replay unit fails its
+					# validation, for one): its own words, as it would show them.
+					return refusal(search_manager.last_job_error)
+
 				return {'payload': "Missing sid in job creation result", 'status': 500}
 
 			# Return SID

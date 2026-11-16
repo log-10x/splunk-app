@@ -522,7 +522,10 @@ class BuildResult:
 	"""
 	def __init__(self, state, resolved, engaged=False, field_terms=None, retryable=False,
 				has_search_terms=False, no_dml_results=False, dml_truncated=False,
-				no_prefilter=False, indexes=None, names_source=True, sourcetypes=None):
+				no_prefilter=False, indexes=None, names_source=True, sourcetypes=None, parse_error=None):
+		# parse_error: splunkd's own message when it refused to parse the search (a macro whose
+		# validation fails, an unknown command), for the caller to pass on.
+		self.parse_error = parse_error
 		# indexes: the index values the leading search names ([] for none, None when it cannot
 		# tell); names_source: whether it names a sourcetype or a source at all. Read by
 		# unnamed_compact_probe().
@@ -1368,7 +1371,7 @@ class TenxSearchBuilder:
 			logger.error("Error parsing search - {} - {}.".format(search, e), exc_info=1)
 			return None
 
-		if 'commands' not in parsed_result:
+		if parsed_result is None or 'commands' not in parsed_result:
 			logger.warning("Missing commands when parsing search - {}.".format(search))
 			return None
 		
@@ -1404,7 +1407,8 @@ class TenxSearchBuilder:
 			# Logging already happens inside get_search_commands. An unparseable search is a
 			# permanent problem (not retryable).
 			#
-			return BuildResult(ResolvedState.FAILURE, base_search)
+			return BuildResult(ResolvedState.FAILURE, base_search,
+							   parse_error=getattr(self.search_manager, 'last_parse_error', None))
 
 		tenx_commands = []
 		leading_search = None

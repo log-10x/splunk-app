@@ -32,8 +32,8 @@ date carries it any longer: one tstats over all time for those sourcetypes alone
 
 It writes the macro; one unit per original sourcetype (tenx-replay-u<hash>: that sourcetype's
 rules alone, limited to the source:: and host:: stanzas matching what was recorded for it), with
-the alias tenx-replay-st-<sourcetype>; the definition of txf(1), which reaches the unit of a
-sourcetype that has one and stops with a message for one that has none; one tenx_replay.conf stanza
+the alias tenx-replay-st-<sourcetype>; the validation of txf(1), which lets txf(<sourcetype>) through
+for a sourcetype that has a unit and stops it with a message for one that has none; one tenx_replay.conf stanza
 per original sourcetype listing the fields a calculated field or a lookup produces and the
 sources, hosts and indexes recorded (the search rewrite reads `indexes` to pick the units a search
 needs); and the stanza [tenx:narrowing]: every field whose value some props stanza takes from
@@ -369,16 +369,20 @@ class TenxReplayCommand(GeneratingCommand):
 
 	def _write_txf_one(self, unit_names=None):
 		"""
-		Writes [txf(1)] so that `txf(<sourcetype>)` reaches the unit of a sourcetype that has one and
-		stops with a message for one that has none (builder.txf_one_definition), instead of failing
-		with Splunk's "macro cannot be found". Written only when it changes.
+		Writes the validation of [txf(1)] with the units written, so that `txf(<sourcetype>)` for a
+		sourcetype without one stops while Splunk parses the search, with builder.TXF_ONE_ERROR,
+		instead of failing with Splunk's "macro cannot be found" (builder.txf_one_validation).
+		Written only when it changes; a definition other than the unit's (one an earlier build wrote)
+		is set back to it.
 		"""
-		want = builder.txf_one_definition(self._unit_names() if unit_names is None else unit_names)
+		want = {'validation': builder.txf_one_validation(self._unit_names() if unit_names is None else unit_names),
+				'definition': builder.TXF_ONE_UNIT}
 		path = self._macro_path(builder.TXF_ONE)
-		have = self._rest(path).get('entry', [{}])[0].get('content', {}).get('definition')
-		if have == want:
+		have = self._rest(path).get('entry', [{}])[0].get('content', {})
+		write = dict((k, v) for k, v in want.items() if have.get(k) != v)
+		if not write:
 			return []
-		self._rest(path, {'definition': want})
+		self._rest(path, write)
 		return [builder.TXF_ONE]
 
 	def _write_nocarrier(self, have, want):
@@ -566,7 +570,7 @@ class TenxReplayCommand(GeneratingCommand):
 				new = builder.uncovered(seen, covered) + builder.uncovered_values(rows, covered)
 				if self.apply:
 					self._check_indexes(rows)
-					# After an upgrade, before any rebuild writes it: txf(<sourcetype>) finds the units.
+					# After an upgrade, before any rebuild writes it: txf(<sourcetype>) passes for the units written.
 					self._write_txf_one()
 					self._recompile_alerts()
 			except Exception as e:
