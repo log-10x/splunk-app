@@ -223,7 +223,7 @@ TIME_DEFAULT_DAYS_HENCE = 2
 # Settings of the app's [tenx_encoded] stanza that are copied, in this order, then every key
 # with one of the prefixes in the stanza's own order. Every other key of the stanza is listed
 # in the report as not copied, so a parsing setting added to the app later is seen, not lost.
-COPIED_KEYS = ('DATETIME_CONFIG', 'LINE_BREAKER', 'SHOULD_LINEMERGE', 'NO_BINARY_CHECK', 'TRUNCATE')
+COPIED_KEYS = ('DATETIME_CONFIG', 'LINE_BREAKER', 'SHOULD_LINEMERGE', 'NO_BINARY_CHECK', 'TRUNCATE', 'ADD_EXTRA_TIME_FIELDS')
 COPIED_PREFIXES = ('TRANSFORMS-', 'SEDCMD-')
 SOURCE_STANZA = 'tenx_encoded'
 # The indexed field every FORMAT writes, unless --mark none.
@@ -3496,9 +3496,10 @@ def activate(app_dir, cap_file, splunkd, app_name=None, probe_index=None, timeou
 def check(app_dir, cap_file, splunkd, app_name=None, probe_index=None, sample=1, timeout=60, poll=10, out=sys.stdout,
 		clock=time.time, sleep=time.sleep, rng=None):
 	"""
-	Probes `sample` listed templates, chosen at random. When every probe is indexed with its fields, counts the
-	compact events of the map's sourcetype indexed without their fields since the previous check and returns 0
-	when there are none, else 1 (check_unmapped says when the list is emptied). When one is indexed without them or is not indexed within `timeout` seconds, the cap
+	Probes `sample` listed templates, chosen at random. When every probe is indexed with its fields, or nothing
+	is listed, counts the compact events of the map's sourcetype indexed without their fields since the previous
+	check and returns 0 when there are none, else 1 (check_unmapped says when the list is emptied). When one is
+	indexed without them or is not indexed within `timeout` seconds, the cap
 	file keeps only its rows that do not start with true, every listed template is left pending
 	(<cap file>.pending, merged with a pending list already there), and returns 1: the Receiver sends
 	those templates whole until activate proves them again.
@@ -3509,11 +3510,13 @@ def check(app_dir, cap_file, splunkd, app_name=None, probe_index=None, sample=1,
 	"""
 	import random
 	listed, kept = read_cap(cap_file)
-	if not listed:
-		out.write('check: nothing listed (%s)\n' % cap_file)
-		return 0
-	app_name = app_name or os.path.basename(os.path.abspath(app_dir))
 	layout = lookup_app(app_dir)
+	if not listed:
+		# Nothing to probe; a Receiver that compacts every template (receiverOptimize true) still sends
+		# compact events that have no row, so those are counted.
+		out.write('check: nothing listed (%s)\n' % cap_file)
+		return check_unmapped(cap_file, splunkd, layout[0], clock, out) if layout else 0
+	app_name = app_name or os.path.basename(os.path.abspath(app_dir))
 	if layout is None or not probe_index:
 		out.write('check: needs an app generated with --rules lookup and --probe-index; cap file left as it was\n')
 		return 2
@@ -3602,6 +3605,8 @@ def check_unmapped(cap_file, splunkd, sourcetype, clock, out):
 	if set(got) == {WHY_NO_ROW}:
 		out.write('check: %s: templates the cap file does not list arrive compact, so the Receiver compacts them '
 			'(receiverOptimize true in its arguments, or another map\'s cap file); the cap file is left as it was\n' % what)
+	elif not read_cap(cap_file)[0]:
+		out.write('check: %s; the cap file lists no template\n' % what)
 	else:
 		withdraw(cap_file, what, out)
 	return 1

@@ -422,7 +422,7 @@ class TestApp:
 		copied, not_copied = fm.parsing_settings(fm.default_app_props())
 		assert copied == [('DATETIME_CONFIG', 'CURRENT'), ('LINE_BREAKER', '([\\r\\n]+)'),
 			('SHOULD_LINEMERGE', 'false'), ('NO_BINARY_CHECK', 'true'), ('TRUNCATE', '262144'),
-			('TRANSFORMS-tenx_time', 'tenx-event-time')]
+			('ADD_EXTRA_TIME_FIELDS', 'subseconds'), ('TRANSFORMS-tenx_time', 'tenx-event-time')]
 		assert sorted(not_copied) == ['REPORT-tenx', 'category', 'disabled', 'pulldown_type']
 
 	def test_gen_says_where_the_floor_app_goes(self, tmp_path, capsys):
@@ -1575,15 +1575,35 @@ class TestCapFile:
 		assert fake.events and all(e.get('via') == 'hec' for e in fake.events)
 		assert '/services/receivers/simple' not in set(c[1] for c in fake.posts())
 
-	def test_check_with_nothing_listed_sends_nothing(self, tmp_path):
+	def test_check_with_nothing_listed_sends_no_probe(self, tmp_path):
 		cap = tmp_path / 'compact-cap.csv'
 		assert self.gen(tmp_path, ['k1'], cap) == 0
+		self.counted_from_zero(cap)
 		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
 		try:
 			rc, out = self.check(tmp_path, cap, fake)
 		finally:
 			fake.close()
-		assert rc == 0 and fake.posts() == [] and 'nothing listed' in out
+		assert rc == 0 and fake.events == [] and 'nothing listed' in out
+		assert set(c[1] for c in fake.posts()) == {'/services/search/jobs'}
+
+	def test_check_with_nothing_listed_fails_when_templates_arrive_compact(self, tmp_path):
+		# The Receiver keeps receiverOptimize true: with nothing listed it still compacts every template, and the
+		# ones the lookup has no row for arrive without their fields.
+		cap = tmp_path / 'compact-cap.csv'
+		assert self.gen(tmp_path, ['k1'], cap) == 0
+		# no probe moves the clock, so the previous check is put before the events
+		(tmp_path / ('compact-cap.csv' + fm.CAP_CHECKED_SUFFIX)).write_text('-10\n', encoding='utf-8')
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		self.compact(fake, 'u1', -5)
+		self.compact(fake, 'u2', -5)
+		try:
+			rc, out = self.check(tmp_path, cap, fake)
+		finally:
+			fake.close()
+		assert rc == 1 and fake.events[2:] == [] and read(str(cap)) == 'pattern_hash,value\n'
+		assert 'check: nothing listed' in out and '2 compact events of tenx_fw were indexed without their fields' in out
+		assert '(no_row 2)' in out and 'receiverOptimize true' in out
 
 	class Clock(object):
 		"""Time that moves only when activate or check sleeps."""

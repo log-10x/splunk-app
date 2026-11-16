@@ -595,19 +595,25 @@ To set it up:
        Path              <file of rendered Windows Security events>
        Tag               src.win
        Read_from_Head    true
+       DB                <file where Fluent Bit records how far it has read>
        Buffer_Chunk_Size 64k
        Buffer_Max_Size   2M
        multiline.parser  win_xml
    ```
+
+   The `DB` file keeps Fluent Bit's place in each file it reads, so after a restart it reads on
+   from there instead of from the start of the file.
 2. Install the add-on of each original sourcetype on the search head, as for raw data.
 3. Run `| tenxreplay` once, or wait for the **Rebuild Field Replay When New** saved search, which
    runs every five minutes. It writes the replay macros from the search head's own props for the
    original sourcetypes found in the compact indexes. **Rebuild Field Replay** rewrites them every
    hour. Its output lists, per original sourcetype, the indexed fields kept on replayed events
-   (`kept_indexed_fields`, the indexed fields its compact events carry), and may warn that some
-   fields set when compact events are read take their names from the data and are not cleared on
-   replayed events: names that a key=value or JSON extraction takes from the text cannot be listed
-   in advance.
+   (`kept_indexed_fields`): those fields.conf declares with `INDEXED = true`, and those found on
+   the 1,000 most recent compact events or on the most recent event of each index, host, source
+   and sourcetype. An indexed field that only older events of a sender carry is kept once
+   fields.conf declares it. The output may also warn that some fields set when compact events are
+   read take their names from the data and are not cleared on replayed events: names that a
+   key=value or JSON extraction takes from the text cannot be listed in advance.
 
 A compact event without `tenx_sourcetype` is expanded and extracted exactly as by `tx`.
 
