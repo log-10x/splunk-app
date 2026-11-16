@@ -658,7 +658,8 @@ record that can be `userIdentity.sessionContext.attributes.creationDate`, which 
 CloudTrail event the raw event's `_time`.
 
 A FortiGate line has its date and time in two fields, `date=` and `time=`. The Receiver reads the
-time and supplies the date, so a compact FortiGate event's `_time` can fall on another day.
+time and supplies the date, so a compact FortiGate event's `_time` can fall on another day. A
+FortiGate field map (below) gives every compact FortiGate event the raw event's `_time`.
 
 A timestamp without a year takes its year from the time the event is processed, so a replayed or
 backfilled file from an earlier year gets the wrong year. Splunk guesses the year for such lines
@@ -679,9 +680,9 @@ that read the event's text instead of a field. For the Windows add-on, `--addon`
 those.
 
 A field map covers the templates stored when it is generated. The steps below are for Windows
-Security; CloudTrail follows them. Steps 1, 6 and 7 keep the Receiver from compacting the events of
-a template before its fields can be written; they were measured with the Windows map and the
-CloudTrail map, each through its own Receiver.
+Security; CloudTrail and FortiGate follow them. Steps 1, 6 and 7 keep the Receiver from compacting
+the events of a template before its fields can be written; they were measured with the Windows,
+CloudTrail and FortiGate maps, each through its own Receiver.
 
 A field map has its own Receiver and its own cap file. Send the mapped source, and only that
 source, through that Receiver: with the cap list on, an event of any template that is not listed
@@ -945,10 +946,63 @@ TENX_SPLUNKD_TOKEN=<token> TENX_PROBE_HEC_TOKEN=<HEC token> python3 \
   --probe-index tenx_probe --timeout 20 --poll 5
 ```
 
+**Fortinet FortiGate** has one map for all its log types, with its own Receiver and cap file,
+`/etc/tenx/fgt/compact-cap.csv`, set up as in step 1. The add-on keeps the rules of each log type
+under its own sourcetype (`fortigate_traffic`, `fortigate_utm`, `fortigate_event`,
+`fortigate_anomaly`), so the sender sets `tenx_sourcetype` by the line's `type=`, with the Fluent Bit
+lines of [Fields of the Original Sourcetype](#fields-of-the-original-sourcetype-txf) for FortiGate,
+and sends the compact events with `event_sourcetype tenx_fgt`. The map stores each event under the
+sourcetype its `tenx_sourcetype` names, while it is indexed, so `tstats ... by sourcetype` and the
+add-on's event types see it as a raw event of that type. Steps 2, 3 and 5 are as for Windows
+Security, with the app `fm_fgt` and `tenx_compact_st::tenx_fgt` in `tenx-events`. Step 4:
+
+```sh
+python3 tenx-for-splunk/bin/tenx_field_map.py gen \
+  --records kv_0.json --records kv_1.json --target fortigate --rules lookup \
+  --app-name fm_fgt --cap-file /etc/tenx/fgt/compact-cap.csv --out fm_fgt
+```
+
+`--target fortigate` reads the add-on's key=value extraction and sets `_time` from the line's
+`date=` and `time=`, as Splunk reads them on the raw event. Steps 6 and 7 take `--app fm_fgt
+--cap-file /etc/tenx/fgt/compact-cap.csv`.
+
+**Windows Security as classic text** (sourcetype `WinEventLog:Security`: a date line, then
+`name=value` lines and the `Message=` block, not rendered XML) has its own map, Receiver and cap file,
+`/etc/tenx/wincl/compact-cap.csv`. Fluent Bit starts a record at the event's date line:
+
+```
+[MULTILINE_PARSER]
+    name          win_classic
+    type          regex
+    flush_timeout 2000
+    rule          "start_state"  "/^\d{2}\/\d{2}\/\d{4} \d{2}:\d{2}:\d{2} [AP]M$/"       "cont"
+    rule          "cont"         "/^(?!\d{2}\/\d{2}\/\d{4} \d{2}:\d{2}:\d{2} [AP]M$)/"  "cont"
+```
+
+and the `splunk` output sends the compact events with `event_sourcetype tenx_wincl`,
+`event_source WinEventLog:Security` and `Add tenx_sourcetype WinEventLog`; the map stores each event
+as `WinEventLog`, as the add-on stores the raw event. Step 4:
+
+```sh
+python3 tenx-for-splunk/bin/tenx_field_map.py gen \
+  --records kv_0.json --records kv_1.json --target windows-security-classic --rules lookup \
+  --addon Splunk_TA_windows --mixed-names --app-name fm_wincl \
+  --cap-file /etc/tenx/wincl/compact-cap.csv --out fm_wincl
+```
+
+`--target windows-security-classic` reads the header's `name=value` lines and the message's
+`name:` lines as Splunk's own rules for `WinEventLog` sources do, and `--addon` adds the add-on's
+rules that read a section of the text (`Subject_Account_Name`, `Target_Account_Name`,
+`process_id` and others) for every template where their result does not depend on a value.
+`--mixed-names` writes the field names the Receiver split into text and a value
+(`Token_Elevation_Type`). Steps 6 and 7 take `--app fm_wincl --cap-file
+/etc/tenx/wincl/compact-cap.csv`.
+
 `tstats` reads the indexed sourcetype, which stays the compact one with or without a field map, so
 `tstats` by or on the original sourcetype counts no compact event; `tenx_sourcetype` holds the
 original. Use `where (sourcetype=XmlWinEventLog OR tenx_sourcetype=XmlWinEventLog)`, or a data
-model, which applies the rename.
+model, which applies the rename. A FortiGate or classic Windows map stores each event under its original
+sourcetype while it is indexed, so there `tstats` by sourcetype counts it as a raw event.
 
 For all fields on a plain search of mapped CloudTrail events, set `indexed_kv_limit = 0` under
 `[kv]` in `limits.conf` on the indexers and heavy forwarders, in the cluster bundle on a cluster (a
@@ -957,8 +1011,8 @@ push restarts the peers one by one. Splunk's default, 200, caps the indexed fiel
 shows on one event; 0 shows every field. Data model counts and detections through the map are the
 same at either value.
 
-Checked with the Windows add-on 12.0.0, the AWS add-on 8.3.1 and CIM 8.8.0 against the same events
-indexed raw; the results are in the
+Checked with the Windows add-on 12.0.0, the AWS add-on 8.3.1, the Fortinet FortiGate Add-on 1.6.10
+and CIM 8.8.0 against the same events indexed raw; the results are in the
 [listing's checks](https://github.com/log-10x/splunk-app/blob/main/splunkbase/LISTING.md#checks-run-on-this-package).
 These limits remain. Event types that match words of the original text, such as `err0r` in the
 Windows add-on and `aws_cloudtrail_delete_events` in the AWS add-on, match a mapped event only where
@@ -970,11 +1024,17 @@ that holds line breaks and tabs is written with spaces in their place. On CloudT
 `responseElements.credentials.sessionToken` is not written. A plain search shows a mapped field
 longer than 1,000 characters, such as a PowerShell `ScriptBlockText`, cut to its first 1,000;
 `tstats` on the field reads it whole. A template with more than 984 values
-gets no row, and its events arrive whole. An event whose compact value holds a line feed gets no
-fields and is marked `tenx_unmapped=no_match`. With `--reserved-names restore`, a mapped CloudTrail
-event carries `extracted_eventType` beside `eventType`. Mapped events carry no `date_*` fields
+gets no row, and its events arrive whole. An event whose compact value holds a line feed or another
+control character, such as a NUL byte in a FortiGate line, gets no fields and is marked
+`tenx_unmapped=no_match`. With `--reserved-names restore`, a mapped CloudTrail
+event carries `extracted_eventType` beside `eventType`, and a mapped FortiGate UTM event
+`extracted_eventtype` beside `eventtype`. Mapped events carry no `date_*` fields
 (`date_hour`, `date_wday` and the others), which Splunk gives raw events it reads from a file, so a
-detection that reads them, such as a business-hours one, matches no mapped event.
+detection that reads them, such as a business-hours one, matches no mapped event. On classic
+Windows events, `Message` and `body` have spaces in place of line breaks and tabs (as do values
+such as `Access_Reasons`), so the add-on's fields read from lines of the message (`privilege_id`,
+`vendor_privilege`, `privilege`) and `event_time` are not written, and `src_nt_domain` takes every
+value of `Security_ID` where the raw event takes the subject's.
 
 ## Which Searches Change When a Source Moves
 
