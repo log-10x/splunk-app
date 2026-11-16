@@ -2732,21 +2732,80 @@ def search_fields(search):
 
 
 _SEARCH_TAG = re.compile(r'(?<![A-Za-z0-9_])tag\s*=\s*"?([A-Za-z0-9_:-]+)"?')
+_SEARCH_TOKEN = re.compile(r'\(|\)|"(?:[^"\\]|\\.)*"|`[^`]*`|[^\s()]+')
+
+
+def tags_can_match(search, tags):
+	"""Whether an event carrying every tag in tags can match the search part of a dataset's constraint: tag=x is
+	true when x is among tags, index=_x (one of Splunk's own indexes) is false, any other term is true, NOT is true,
+	terms side by side (or AND) must all be true and OR needs one side. Endpoint.Processes (tag=process tag=report) can match the Windows add-on's tags;
+	Application_State's (tag=listening tag=port) OR (tag=process tag=report) can match tags holding either pair."""
+	tokens = _SEARCH_TOKEN.findall(search or '')
+	pos = [0]
+
+	def peek():
+		return tokens[pos[0]] if pos[0] < len(tokens) else None
+
+	def take():
+		pos[0] += 1
+		return tokens[pos[0] - 1]
+
+	def unary():
+		t = take()
+		if t.upper() == 'NOT':
+			if peek() is not None:
+				unary()
+			return True
+		if t == '(':
+			v = disjunction()
+			if peek() == ')':
+				take()
+			return v
+		m = _SEARCH_TAG.fullmatch(t)
+		if m:
+			return m.group(1) in tags
+		# Splunk's own indexes (Splunk_Audit's index=_internal) hold no event of an add-on.
+		return re.fullmatch(r'index\s*=\s*"?_\S*', t) is None
+
+	def conjunction():
+		v = True
+		while peek() is not None and peek() != ')' and peek().upper() != 'OR':
+			if peek().upper() == 'AND':
+				take()
+				continue
+			v = unary() and v
+		return v
+
+	def disjunction():
+		v = conjunction()
+		while peek() is not None and peek().upper() == 'OR':
+			take()
+			v = conjunction() or v
+		return v
+
+	return disjunction()
+
+
+def _dataset_search(obj):
+	"""A dataset's search: its constraints, and for a BaseSearch dataset (Endpoint's) its base search up to the first pipe."""
+	parts = ['(%s)' % c['search'] for c in obj.get('constraints', []) if c.get('search')]
+	if obj.get('baseSearch'):
+		parts.append('(%s)' % obj['baseSearch'].split('|')[0])
+	return ' '.join(parts)
 
 
 def cim_fields(cim_dir, tags=None):
 	"""Every field name the CIM data models of cim_dir use: dataset fields, calculation outputs and inputs, and the
-	fields their constraints search. With tags, only the models whose root dataset's constraint asks for tags that are
-	all among them (Network_Traffic's tag=network tag=communicate), so a model the add-on's events never reach adds
-	no name."""
+	fields their constraints and base searches read. With tags, only the models with a root dataset an event carrying
+	those tags can match (tags_can_match), so a model the add-on's events never reach adds no name."""
 	names = set()
 	for path in sorted(glob.glob(os.path.join(cim_dir, 'default', 'data', 'models', '*.json'))):
 		with open(path, encoding='utf-8') as f:
 			model = json.load(f)
 		roots = [o for o in model.get('objects', []) if o.get('parentName') in ('BaseEvent', 'BaseSearch')]
 		if tags is not None:
-			wanted = [set(_SEARCH_TAG.findall(' '.join(c.get('search') or '' for c in o.get('constraints', [])))) for o in roots]
-			if not any(w and w <= tags for w in wanted):
+			searches = [_dataset_search(o) for o in roots]
+			if not any(_SEARCH_TAG.search(q) and tags_can_match(q, tags) for q in searches):
 				continue
 		for obj in model.get('objects', []):
 			for fld in obj.get('fields', []):
@@ -2758,6 +2817,12 @@ def cim_fields(cim_dir, tags=None):
 				names |= set(calc.get('inputField') and [calc['inputField']] or [])
 			for c in obj.get('constraints', []):
 				names |= search_fields(c.get('search'))
+			if obj.get('baseSearch'):
+				parts = obj['baseSearch'].split('|')
+				names |= search_fields(parts[0])
+				for part in parts[1:]:
+					if re.match(r'\s*eval\s', part):
+						names |= expr_fields(re.sub(r'^\s*eval\s', '', part))
 	names.discard(None)
 	return names
 
@@ -2797,8 +2862,10 @@ def addon_rules(props, transforms, stanzas):
 	return rules
 
 
-def needed_fields(addon_dir, cim_dir, stanzas):
-	"""The fields the CIM models and the add-on's event types read, closed over the add-on's rules (see above)."""
+def needed_fields(addon_dir, cim_dir, stanzas, copies=()):
+	"""The fields the CIM models and the add-on's event types read, closed over the add-on's rules (see above).
+	copies: the TextRule copies gen writes of the add-on's rules that read the event's text; such a copy reads an
+	indexed field (Data CommandLine for Process_Command_Line), which is then needed when the rule's field is."""
 	props, transforms = read_addon(addon_dir)
 	eventtypes = collections.OrderedDict()
 	for sub in ('default', 'local'):
@@ -2811,6 +2878,7 @@ def needed_fields(addon_dir, cim_dir, stanzas):
 	for settings in eventtypes.values():
 		needed |= search_fields(settings.get('search'))
 	rules = addon_rules(props, transforms, stanzas)
+	rules += [(set(written_names(transforms.get(c.rule, {}))), {c.field}) for c in copies]
 	while True:
 		before = len(needed)
 		for outs, ins in rules:
@@ -4197,20 +4265,20 @@ def _build(args):
 	leave_out = target.get('leave_out') or []
 	if leave_out:
 		reader = LeaveOutReader(reader, leave_out)
-	if getattr(args, 'fields', 'all') == 'cim':
-		if not (getattr(args, 'addon', None) and getattr(args, 'cim', None)):
-			raise ValueError('--fields cim needs --addon and --cim (the folders of the add-on and of Splunk_SA_CIM)')
-		stanzas = renames(target)
-		if target.get('source'):
-			props, _ = read_addon(args.addon)
-			stanzas = stanzas + [st for st in props if st.startswith('source::') and source_pattern_matches(
-				st[len('source::'):], target['source'])]
-		reader = NeededFieldsReader(reader, needed_fields(args.addon, args.cim, stanzas))
+	if getattr(args, 'fields', 'all') == 'cim' and not (getattr(args, 'addon', None) and getattr(args, 'cim', None)):
+		raise ValueError('--fields cim needs --addon and --cim (the folders of the add-on and of Splunk_SA_CIM)')
 	if getattr(args, 'addon', None):
 		try:
 			copies, report, derived = addon_text_rules(args.addon, target, templates)
 		except OSError as e:
 			raise AddonError(str(e))
+		if getattr(args, 'fields', 'all') == 'cim':
+			stanzas = renames(target)
+			if target.get('source'):
+				props, _ = read_addon(args.addon)
+				stanzas = stanzas + [st for st in props if st.startswith('source::') and source_pattern_matches(
+					st[len('source::'):], target['source'])]
+			reader = NeededFieldsReader(reader, needed_fields(args.addon, args.cim, stanzas, copies))
 		if derived:
 			reader = TextRuleReader(reader, derived, DERIVE_PROBES_NO_LINE_FEED if target['reader'] == WindowsClassicReader.name
 				else DERIVE_PROBES)

@@ -272,3 +272,33 @@ class TestCimFields:
 		assert fm.main(['gen', '--rules', 'lookup', '--records', records(tmp_path, [('k', 'a=$')]), '--reader', 'delims',
 			'--sourcetype', 'tenx_fw', '--rename', 'fw:traffic', '--fields', 'cim', '--out', str(tmp_path / 'fm')]) == 2
 		assert '--fields cim needs --addon and --cim' in capsys.readouterr().err
+
+	def test_a_base_search_dataset_counts(self, tmp_path):
+		# CIM 8.8.0's Endpoint datasets are BaseSearch objects with a baseSearch and no constraints.
+		addon, cim = self.addon(tmp_path)
+		(tmp_path / 'cim' / 'default' / 'data' / 'models' / 'Endpoint.json').write_text(json.dumps({'objects': [
+			{'objectName': 'Ports', 'parentName': 'BaseSearch', 'baseSearch': '(`cim_Endpoint_indexes`) tag=network '
+				'tag=communicate | eval transport=lower(transport_raw)', 'fields': [{'fieldName': 'dest_port'}]}]}),
+			encoding='utf-8')
+		needed = fm.needed_fields(addon, cim, ['fw:traffic'])
+		assert {'dest_port', 'transport', 'transport_raw'} <= needed
+
+	def test_a_constraint_with_or(self):
+		tags = {'process', 'report', 'network'}
+		assert fm.tags_can_match('(`m`) (tag=listening tag=port) OR (tag=process tag=report)', tags)
+		assert not fm.tags_can_match('(`m`) tag=inventory (tag=cpu OR tag=network)', tags)
+		assert fm.tags_can_match('tag=network NOT tag=email', tags)
+		assert not fm.tags_can_match('index=_internal sourcetype=splunk_web_service tag=network', tags)
+
+	def test_the_field_a_copy_reads_is_needed(self, tmp_path):
+		# A copy of an add-on rule that reads the event's text reads an indexed field (Data CommandLine for
+		# Process_Command_Line): needed when the rule's field is.
+		addon, cim = self.addon(tmp_path)
+		with open(os.path.join(addon, 'default', 'props.conf'), 'a', encoding='utf-8') as f:
+			f.write('EVAL-action = coalesce(cmd_line, act)\n')
+		with open(os.path.join(addon, 'default', 'transforms.conf'), 'a', encoding='utf-8') as f:
+			f.write("[cmd_from_xml]\nREGEX = <Data Name='CommandLine'>(?<cmd_line>[^<]+)<\\/Data>\n")
+		copy = fm.TextRule('fw:traffic', 'x-tenx_fm', 'tenx_fm_cmd', 'CommandLine', '(.*)', 'cmd_line::$1',
+			'cmd_from_xml', 'CommandLine', 'data')
+		assert 'CommandLine' not in fm.needed_fields(addon, cim, ['fw:traffic'])
+		assert 'CommandLine' in fm.needed_fields(addon, cim, ['fw:traffic'], [copy])
