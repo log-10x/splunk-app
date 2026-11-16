@@ -93,6 +93,7 @@ Not covered (reported as warnings): index-time fields of the original sourcetype
 (INDEXED_EXTRACTIONS, TRANSFORMS that write fields), KV_MODE multi, a sourcetype rewrite that reads
 a field other than _raw, lookups whose definition this app cannot see.
 """
+import math
 import re
 
 CARRIER_FIELD = 'tenx_sourcetype'
@@ -1426,6 +1427,27 @@ ALIAS_NAME = re.compile(r'^[A-Za-z0-9_-]+$')
 MAX_LISTED = MAX_LISTED_SOURCES
 
 
+# `txf(<sourcetype>)` (macros.conf [txf(1)], an eval definition): the unit of that sourcetype when
+# one is written, else a search that stops with a message saying none is, instead of Splunk's
+# "macro cannot be found". tenxreplay rewrites the definition with the units it has written
+# (txf_one_definition()); the shipped one names none.
+TXF_ONE_UNIT = ('"`tenx-events` [| tenxprefilter] | eval tenx_compact_raw=_raw | `tenx-inflate` | fields - _kv | '
+				'`tenx-mapped-hide` | `tenx-replay-u" . substr(md5("$st$"), 1, 12) . "` | `tenx-replay-tags` | '
+				'`tenx-mapped-restore` | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars | '
+				'eval tenx_expand_refused=if(len(tenx_expand_refused)>0, tenx_expand_refused, null()) | search *"')
+TXF_ONE_MISSING = '"`tenx-events` [| tenxprefilter missing_unit=\\"$st$\\"] | search *"'
+TXF_ONE = 'txf(1)'
+
+
+def txf_one_definition(unit_names):
+	"""The [txf(1)] definition for the units `unit_names` (tenx-replay-u<12 hex digits> names)."""
+	hashes = sorted(n[len(UNIT_PREFIX):] for n in unit_names if n.startswith(UNIT_PREFIX))
+	if not hashes:
+		return TXF_ONE_MISSING
+	return 'if(like("|%s|", "%%|" . substr(md5("$st$"), 1, 12) . "|%%"), %s, %s)' % (
+		"|".join(hashes), TXF_ONE_UNIT, TXF_ONE_MISSING)
+
+
 def unit_macro(sourcetype):
 	"""The name of a sourcetype's unit: letters, digits and dashes whatever the sourcetype is called."""
 	import hashlib
@@ -1704,6 +1726,44 @@ def replay_settings(content):
 def day_of(epoch):
 	"""The start of the UTC day holding `epoch`: last_seen is kept per day so the stanza changes at most daily."""
 	return int(epoch) // DAY * DAY
+
+
+def keep_present(recorded, covered, expired, counts, now):
+	"""
+	(covered, expired) after the check that the expired sourcetypes have no compact event left:
+	`counts` {sourcetype: compact events of any date}. One that still has some is covered again,
+	its last_seen today, so its replay and its unit stay while its events do; the rest expire.
+	"""
+	covered, gone = dict(covered), []
+	for st in expired:
+		if int(counts.get(st, 0) or 0) > 0:
+			value = dict(recorded.get(st) or {})
+			value['last_seen'] = str(day_of(now))
+			covered[st] = value
+		else:
+			gone.append(st)
+	return covered, gone
+
+
+def index_time_terms(earliest, latest):
+	"""
+	The search terms for an index-time range: _index_earliest (and _index_latest unless the range
+	has no end). An epoch (as the search's time range gives it) is written as whole seconds,
+	widened to hold the whole range; a relative time (-7d, -10m@m) as it is.
+	"""
+	def value(v, widen):
+		v = str(v).strip()
+		try:
+			f = float(v)
+		except ValueError:
+			if not re.match(r'^[-+@A-Za-z0-9]+$', v):
+				raise ValueError('not a time: %r' % v)
+			return v
+		return str(int(math.ceil(f) if widen else math.floor(f)))
+	terms = '_index_earliest=%s' % value(earliest, False)
+	if latest not in (None, '', 'now'):
+		terms += ' _index_latest=%s' % value(latest, True)
+	return terms
 
 
 def expire_covered(covered, now, days):

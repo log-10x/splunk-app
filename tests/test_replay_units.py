@@ -146,8 +146,10 @@ class TestTxIsTheShippedMacro:
 		# Splunk Enterprise 10.4.3 refuses a colon in a macro name, so txf(1) computes the unit's
 		# name with md5() in eval; on 10.4.3, md5 in eval equals hashlib's for the five names tried
 		assert conf.get('txf(1)', 'iseval') == '1'
-		assert conf.get('txf(1)', 'definition') == ('"' + head + '`tenx-replay-u" . substr(md5("$st$"), 1, 12) . '
-													 '"` | `tenx-replay-tags`' + tail + '"')
+		# what tenxreplay writes for a sourcetype with a unit; shipped, txf(1) names none
+		assert b.TXF_ONE_UNIT == ('"' + head + '`tenx-replay-u" . substr(md5("$st$"), 1, 12) . '
+								  '"` | `tenx-replay-tags`' + tail + '"')
+		assert conf.get('txf(1)', 'definition') == b.TXF_ONE_MISSING
 		assert without_guard(conf.get('txf', 'definition')) == (
 			'`tenx-events` [| tenxprefilter] | eval tenx_compact_raw=_raw | `tenx-inflate` | fields - _kv | '
 			'`tenx-replay` | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars' + REFUSED_STEP + ' | search *')
@@ -790,6 +792,7 @@ out['acl'] = sorted((k, v['sharing']) for k, v in fake.acl.items())
 out['conf'] = fake.conf
 out['kv_unit'] = fake.macros[tenxreplay.builder.unit_macro('app:kv')]
 out['alias'] = fake.macros.get('tenx-replay-st-app:kv')
+out['txf_one'] = fake.macros.get('txf(1)')
 run(fake)
 out['writes_second'] = fake.writes
 # app:json stops: its stanza expires
@@ -816,7 +819,10 @@ def test_the_command_writes_units_aliases_and_what_they_cover():
 	assert len(out['all_time']) == 1 and 'tenx_sourcetype="app:json" OR tenx_sourcetype="app:kv"' in out['all_time'][0]
 	# units before their aliases, every new macro shared with every app
 	writes = [w for w in out['writes_first'] if w[0].startswith('macro')]
-	assert writes == [['macro-', 'tenx-replay-st-app:kv']] + [['macro+', n] for n in sorted([js, kv])] + [['macro~', 'tenx-replay']]
+	assert writes == ([['macro-', 'tenx-replay-st-app:kv']] + [['macro+', n] for n in sorted([js, kv])]
+					  + [['macro~', 'txf(1)'], ['macro~', 'tenx-replay']])
+	# txf(<sourcetype>) reaches the two units it wrote
+	assert out['txf_one'] == b.txf_one_definition([js, kv])
 	assert out['acl'] == [[n, 'global'] for n in sorted([js, kv])]
 	assert out['alias'] is None
 	assert out['conf']['app:kv']['hosts'] == 'web-0,web-1' and out['conf']['app:kv']['indexes'] == 'app,app_old'

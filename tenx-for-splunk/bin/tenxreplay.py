@@ -4,6 +4,8 @@ Tenx Replay Command
 
     | tenxreplay              rebuild the field replay macros and the replay field lists
     | tenxreplay apply=false  report what it would write, and write nothing
+    | tenxreplay by_index_time=true  the time range is when the compact events were indexed,
+                                     whatever their event dates (the saved searches)
 
 `txf` expands a compact event and then runs the `tenx-replay` macro, which applies the search-time
 rules of the event's original sourcetype: the indexed field tenx_sourcetype, set by the sender.
@@ -13,7 +15,9 @@ configuration (see tenx_replay_builder.py for the rules and their order):
 
 1. the original sourcetypes, sources, hosts and indexes present in the compact events, over the
    search's time range (`| tstats ... where `tenx-events` by tenx_sourcetype, source, host,
-   index`), and over all time for a sourcetype the replay does not cover yet;
+   index`), and over all time for a sourcetype the replay does not cover yet. With
+   by_index_time the range selects the events indexed in it, over every event date (all time,
+   no end), so events dated a year ago or ahead of now are found when they are indexed;
 2. the props stanzas this app can see, as merged by Splunk, and the [default] stanza;
 3. the lookup definitions this app can see, with their fields;
 4. the indexed fields of the compact events, which the replay keeps when it clears the fields
@@ -23,10 +27,13 @@ configuration (see tenx_replay_builder.py for the rules and their order):
 What the written replay already covers stays covered (see tenx_replay_builder.keep_covered and
 coverage), so a sourcetype that stopped sending keeps its replay for searches over its older
 events, and the sources, hosts and indexes recorded for a sourcetype accumulate until it expires.
+It expires (replay_expire_days after a rebuild last saw it) only when no compact event of any
+date carries it any longer: one tstats over all time for those sourcetypes alone.
 
 It writes the macro; one unit per original sourcetype (tenx-replay-u<hash>: that sourcetype's
 rules alone, limited to the source:: and host:: stanzas matching what was recorded for it), with
-the alias tenx-replay-st-<sourcetype> that `txf(<sourcetype>)` calls; one tenx_replay.conf stanza
+the alias tenx-replay-st-<sourcetype>; the definition of txf(1), which reaches the unit of a
+sourcetype that has one and stops with a message for one that has none; one tenx_replay.conf stanza
 per original sourcetype listing the fields a calculated field or a lookup produces and the
 sources, hosts and indexes recorded (the search rewrite reads `indexes` to pick the units a search
 needs); and the stanza [tenx:narrowing]: every field whose value some props stanza takes from
@@ -81,6 +88,8 @@ CONF = 'tenx_replay'
 # default/savedsearches.conf: rewrites every managed compiled alert whose compiled text changed.
 RECOMPILE_SEARCH = 'Recompile Compiled Alerts'
 SAMPLE_EVENTS = 1000
+# Every event date: from the epoch, with no end (an end of 'now' leaves out events dated ahead).
+ALL_TIME = ('0', None)
 
 
 def shared_with_everyone(acl):
@@ -101,6 +110,12 @@ class TenxReplayCommand(GeneratingCommand):
 	only_new = Option(require=False, validate=validators.Boolean(), default=False)
 	# Time range of the rebuild (present sourcetypes) when only_new finds something new.
 	lookback = Option(require=False, default='-7d')
+	# Read the search's time range (and lookback) as the time the compact events were indexed,
+	# over every event date: a sourcetype whose events are dated a year ago, or in the future, is
+	# found when they are indexed. The saved searches set it.
+	by_index_time = Option(require=False, validate=validators.Boolean(), default=False)
+	# (earliest, latest) of the index-time range while by_index_time is set (see generate).
+	index_range = None
 
 	def _rest(self, path, data=None, method=None):
 		info = self._metadata.searchinfo
@@ -121,17 +136,29 @@ class TenxReplayCommand(GeneratingCommand):
 		return '/servicesNS/nobody/%s/%s' % (APP_NAME, path)
 
 	def _oneshot(self, search, earliest, latest):
+		# latest None: no end, so events dated in the future are read too ('now' leaves them out).
+		data = {'search': search, 'exec_mode': 'oneshot', 'count': '0', 'earliest_time': earliest}
+		if latest is not None:
+			data['latest_time'] = latest
 		result = self._rest('/servicesNS/%s/%s/search/jobs' % (
-			urllib.parse.quote(self._metadata.searchinfo.username), APP_NAME),
-			{'search': search, 'exec_mode': 'oneshot', 'count': '0',
-			 'earliest_time': earliest, 'latest_time': latest})
+			urllib.parse.quote(self._metadata.searchinfo.username), APP_NAME), data)
 		return result.get('results', [])
 
 	def _time_range(self):
+		"""The search's time range; All time has no end, so it holds events dated in the future."""
 		info = self._metadata.searchinfo
 		earliest = info.earliest_time if info.earliest_time not in (None, '', 0, '0') else '0'
-		latest = info.latest_time if info.latest_time not in (None, '', 0, '0') else 'now'
-		return str(earliest), str(latest)
+		latest = info.latest_time if info.latest_time not in (None, '', 0, '0') else None
+		return str(earliest), (None if latest is None else str(latest))
+
+	def _events(self, all_time=False):
+		"""
+		`tenx-events`, held to the index-time range when by_index_time is set (the event-time range
+		is then all time, see generate). all_time: every compact event of the index-time range too.
+		"""
+		if self.index_range is None or all_time:
+			return '`tenx-events`'
+		return '`tenx-events` ' + builder.index_time_terms(*self.index_range)
 
 	def _stanzas(self):
 		default = dict((e['name'], e['content']) for e in
@@ -180,16 +207,16 @@ class TenxReplayCommand(GeneratingCommand):
 				declared.add(entry['name'])
 		names = set(declared)
 		by_sourcetype = {}
-		rows = self._oneshot('search `tenx-events` | head %d | fieldsummary | fields field' % SAMPLE_EVENTS, earliest, latest)
+		rows = self._oneshot('search %s | head %d | fieldsummary | fields field' % (self._events(), SAMPLE_EVENTS), earliest, latest)
 		candidates = sorted(set(r.get('field') for r in rows if r.get('field')) - set(builder.DEFAULT_KEEP))
 		candidates = [c for c in candidates if not c.startswith(('_', 'tenx_', 'date_')) and '"' not in c]
 		if candidates:
 			funcs = ', '.join('dc("%s") as f%d' % (c, n) for n, c in enumerate(candidates))
-			counts = self._oneshot('| tstats %s where `tenx-events`' % funcs, earliest, latest)
+			counts = self._oneshot('| tstats %s where %s' % (funcs, self._events()), earliest, latest)
 			row = counts[0] if counts else {}
 			names.update(c for n, c in enumerate(candidates) if str(row.get('f%d' % n, '0')) not in ('0', ''))
-			for row in self._oneshot('| tstats %s where `tenx-events` NOT %s=* by %s' % (
-					funcs, builder.MAPPED_FIELD, builder.CARRIER_FIELD), earliest, latest):
+			for row in self._oneshot('| tstats %s where %s NOT %s=* by %s' % (
+					funcs, self._events(), builder.MAPPED_FIELD, builder.CARRIER_FIELD), earliest, latest):
 				st = row.get(builder.CARRIER_FIELD)
 				if st:
 					by_sourcetype.setdefault(st, set()).update(
@@ -234,7 +261,7 @@ class TenxReplayCommand(GeneratingCommand):
 		collections = self._rest('/servicesNS/nobody/-/storage/collections/config?count=0').get('entry', [])
 		return builder.lookup_problems(definitions, files, collections)
 
-	def _present(self, earliest, latest, sourcetypes=None):
+	def _present(self, earliest, latest, sourcetypes=None, all_time=False):
 		"""
 		(original sourcetype, source, host, count, index) of the compact events in the time range,
 		of every original sourcetype or only of `sourcetypes`.
@@ -242,8 +269,8 @@ class TenxReplayCommand(GeneratingCommand):
 		where = ''
 		if sourcetypes:
 			where = ' (%s)' % ' OR '.join('%s=%s' % (builder.CARRIER_FIELD, builder.spl_string(st)) for st in sorted(sourcetypes))
-		rows = self._oneshot('| tstats count where `tenx-events`%s by %s, source, host, index' % (where, builder.CARRIER_FIELD),
-			earliest, latest)
+		rows = self._oneshot('| tstats count where %s%s by %s, source, host, index' % (
+			self._events(all_time), where, builder.CARRIER_FIELD), earliest, latest)
 		return [(r[builder.CARRIER_FIELD], r.get('source', ''), r.get('host', ''), int(r.get('count', 0) or 0),
 				 r.get('index', '')) for r in rows if r.get(builder.CARRIER_FIELD)]
 
@@ -332,7 +359,27 @@ class TenxReplayCommand(GeneratingCommand):
 			if not shared.get(name):
 				self._share(name)
 				changed.append('acl:' + name)
-		return changed
+		units_now = set(n for n in existing if n.startswith(builder.UNIT_PREFIX)) | set(
+			n for n in want if n.startswith(builder.UNIT_PREFIX))
+		return changed + self._write_txf_one(units_now)
+
+	def _unit_names(self):
+		return set(e['name'] for e in self._rest(self._ns('configs/conf-macros?count=0&search=%s' % urllib.parse.quote(
+			builder.UNIT_PREFIX))).get('entry', []) if e['name'].startswith(builder.UNIT_PREFIX))
+
+	def _write_txf_one(self, unit_names=None):
+		"""
+		Writes [txf(1)] so that `txf(<sourcetype>)` reaches the unit of a sourcetype that has one and
+		stops with a message for one that has none (builder.txf_one_definition), instead of failing
+		with Splunk's "macro cannot be found". Written only when it changes.
+		"""
+		want = builder.txf_one_definition(self._unit_names() if unit_names is None else unit_names)
+		path = self._macro_path(builder.TXF_ONE)
+		have = self._rest(path).get('entry', [{}])[0].get('content', {}).get('definition')
+		if have == want:
+			return []
+		self._rest(path, {'definition': want})
+		return [builder.TXF_ONE]
 
 	def _write_nocarrier(self, have, want):
 		"""Writes the negative record [tenx:nocarrier] indexes = `want` (deleted when empty)."""
@@ -351,7 +398,7 @@ class TenxReplayCommand(GeneratingCommand):
 
 	def _compact_indexes(self, earliest, latest):
 		"""{index: count} of every compact event in the time range, carrier or not."""
-		rows = self._oneshot('| tstats count where `tenx-events` by index', earliest, latest)
+		rows = self._oneshot('| tstats count where %s by index' % self._events(), earliest, latest)
 		return dict((r.get('index', ''), int(r.get('count', 0) or 0)) for r in rows if r.get('index'))
 
 	def _check_indexes(self, rows):
@@ -507,6 +554,10 @@ class TenxReplayCommand(GeneratingCommand):
 	def generate(self):
 		self.rewrite_changed, self.dispatched = [], []
 		earliest, latest = self._time_range()
+		self.index_range = None
+		if self.by_index_time:
+			# The time range selects by index time; every event date is read.
+			self.index_range, (earliest, latest) = (earliest, latest), ALL_TIME
 		if self.only_new:
 			try:
 				rows = self._present(earliest, latest)
@@ -515,6 +566,8 @@ class TenxReplayCommand(GeneratingCommand):
 				new = builder.uncovered(seen, covered) + builder.uncovered_values(rows, covered)
 				if self.apply:
 					self._check_indexes(rows)
+					# After an upgrade, before any rebuild writes it: txf(<sourcetype>) finds the units.
+					self._write_txf_one()
 					self._recompile_alerts()
 			except Exception as e:
 				self.logger.exception("tenxreplay: the coverage check failed")
@@ -526,12 +579,20 @@ class TenxReplayCommand(GeneratingCommand):
 					   'warnings': ['every original sourcetype and source in this time range is covered']}
 				return
 			self.logger.info("tenxreplay: not covered %s; rebuilding over %s", new[:20], self.lookback)
-			earliest, latest = self.lookback, 'now'
+			if self.index_range is not None:
+				self.index_range = (self.lookback, None)
+			else:
+				earliest, latest = self.lookback, None
 		try:
 			config = self._config()
 			settings = builder.replay_settings(config)
 			now = time.time()
-			covered, expired = builder.expire_covered(self._covered(), now, settings['replay_expire_days'])
+			recorded = self._covered()
+			covered, expired = builder.expire_covered(recorded, now, settings['replay_expire_days'])
+			if expired:
+				# A sourcetype that still has compact events, of any date, keeps its replay and unit.
+				counts = dict((r[0], r[3]) for r in self._present(*ALL_TIME, sourcetypes=expired, all_time=True))
+				covered, expired = builder.keep_present(recorded, covered, expired, counts, now)
 			if expired:
 				self.logger.warning("tenxreplay: no compact event carried %s for more than replay_expire_days = %d days; "
 									"their replay is removed", builder._listed(expired), settings['replay_expire_days'])
@@ -540,8 +601,8 @@ class TenxReplayCommand(GeneratingCommand):
 			# all time, so its unit (txf(<sourcetype>), the search rewrite) has the source:: and
 			# host:: rules of its older events too; afterwards each rebuild adds what it sees.
 			first = sorted(set(r[0] for r in rows if builder.usable_sourcetype(r[0])) - set(covered))
-			if first and str(earliest) not in ('0', ''):
-				rows += [r[:3] + (0,) + r[4:] for r in self._present('0', 'now', first)]
+			if first and (self.index_range is not None or (earliest, latest) != ALL_TIME):
+				rows += [r[:3] + (0,) + r[4:] for r in self._present(*ALL_TIME, sourcetypes=first, all_time=True)]
 			present = [tuple(p) + (0,) * (4 - len(p)) for p in
 					   builder.keep_covered([r[:4] for r in rows], covered)]
 			cov = builder.coverage(rows, covered)
