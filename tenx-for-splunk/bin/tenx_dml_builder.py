@@ -63,7 +63,8 @@ logger = logging.getLogger(__name__)
 
 # Timestamp formats whose value is the source text itself (format spec S4.4), and the
 # timestamp_format the KV record carries for them. The inflate macro checks for it.
-EPOCH_FORMATS = frozenset(('epoch', 'epochNano', '+%s', '+%s.%N'))
+# +%s.%f (engine 1.1.181): seconds since the epoch, a dot and 1 to 9 fraction digits, the value the text as read.
+EPOCH_FORMATS = frozenset(('epoch', 'epochNano', '+%s', '+%s.%N', '+%s.%f'))
 EPOCH_PASSTHROUGH = '__TENX_EPOCH__'
 
 
@@ -319,7 +320,7 @@ class TenxDMLBuilder:
 		"""
 		normalized = self._collapse_dollar_zero_escape(pattern)
 
-		return normalized.replace(self.variable_separator, "").replace("\r\n", " ").replace("\n", " ")
+		return normalized.replace(self.variable_separator, "").replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
 
 	def _collapse_dollar_zero_escape(self, pattern):
 		"""
