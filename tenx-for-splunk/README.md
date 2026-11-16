@@ -227,10 +227,12 @@ The `tenx_dml` collection stores parsed template data with fields:
    - Confirm "Log10x App" appears in the app list
 
 4. **Create the template index:**
-   - Create an index named `tenx_dml`. Templates arrive there as `tenx_dml_raw_json`, and their
-     searchable copy is written there with `collect` (sourcetype `stash`, source `tenx_dml_pure`),
-     which is not licence-metered. The template records themselves are counted by Splunk's
-     license like any indexed event. Compact events (`tenx_encoded`) go to any index.
+   - Create an index named `tenx_dml` where events are stored: on a standalone instance
+     `curl -k -u admin https://localhost:8089/services/data/indexes -d name=tenx_dml`, on an indexer
+     cluster a `[tenx_dml]` stanza with `repFactor = auto` in an `indexes.conf` of the cluster
+     bundle. Templates arrive there as `tenx_dml_raw_json` and count against the Splunk licence
+     like any indexed event; their searchable copy, written there with `collect` (sourcetype
+     `stash`, source `tenx_dml_pure`), does not. Compact events (`tenx_encoded`) go to any index.
 
 5. **Point the dashboards at your compact index:** set the `tenx-events` macro, see
    [Pointing the Dashboards at Your Compact Events](#pointing-the-dashboards-at-your-compact-events).
@@ -432,7 +434,9 @@ and Jobs show it; a REST job holds it (on Splunk 10.4 and 10.6 the job also ends
 oneshot job returns it. The REST export endpoint returns it with `output_mode=xml`; with `csv`, and
 on Splunk 10.4 and 10.6 with `json`, it returns HTTP 200 and an empty body, as Splunk does for any
 search that fails while running, so treat an empty export as a failure. A scheduled alert that stops
-does not fire, and its job holds the message. `txf(<sourcetype>)` for a sourcetype without a field
+does not fire, and its job holds the message: on Splunk 9.4 the job ends DONE and the scheduler log
+records the run as a success with no results; on 10.4 and 10.6 the job ends FAILED and `splunkd.log`
+holds the message. `txf(<sourcetype>)` for a sourcetype without a field
 replay is refused before the search runs, on every path. A saved search with such a macro cannot be
 saved, and one whose replay is removed later is skipped, with the message in the scheduler log.
 
@@ -634,6 +638,9 @@ Other index-time rules of the original sourcetype that read the text, such as a 
 syslog header (`TRANSFORMS = syslog-host`), do not run on compact events either, which keep the
 host the sender gave.
 
+Through `txf`, a field whose name holds `*`, such as the JSON key `"a*"`, has each value twice on an
+event the sender passed whole; on a compact event it is as on the raw event.
+
 For FortiGate, the sender sets `tenx_sourcetype` to `fortigate_traffic`, `fortigate_utm`,
 `fortigate_event` or `fortigate_anomaly` by the line's `type=`.
 
@@ -775,6 +782,7 @@ has its own cap file and its own scheduled `check`.
    ```
 
    One read without `limit` returns at most 50 MB of rows, which can be fewer than the collection holds.
+   `-u admin` asks for the password; in a script, pass `-H "Authorization: Bearer <token>"` instead.
 
 4. Generate the field map app and its floor app:
 
@@ -830,8 +838,9 @@ has its own cap file and its own scheduled `check`.
    check fails; add `--tls-verify off`. For a certificate signed by an authority this host does not
    trust, add `--tls-ca-file <PEM file of that authority>`.
    `<token>` is a Splunk authentication token of a user
-   whose role holds the capabilities `search`, `edit_tcp` and `list_all_objects` and may search
-   the probe index; `TENX_SPLUNKD_AUTH=<user>:<password>` works as well. `activate` sends one
+   whose role holds the capabilities `search` and `list_all_objects` and may search the probe
+   index and the indexes that hold the map's compact events; with `--probe-hec`, `edit_tcp` is not
+   needed. `TENX_SPLUNKD_AUTH=<user>:<password>` works as well. `activate` sends one
    small probe event per new template through the HTTP Event Collector into the probe index, an
    index to keep out of data model and detection index lists. Probe events count against the
    Splunk licence like any indexed event: one compact line each, 194 to 787 bytes for the Windows
@@ -949,8 +958,8 @@ detection that reads them, such as a business-hours one, matches no mapped event
 ## What to Install on Each Tier
 
 In a distributed deployment, run `$SPLUNK_HOME/bin/slim partition tenx-for-splunk-<version>.tar.gz`
-once, on a clean copy of the package. Its `_indexers` package holds the parsing settings only and
-runs no search; it goes on the indexers and on heavy forwarders. The search heads take the
+once, on a clean copy of the package. Its `_indexers` package holds the parsing settings and
+schedules no search; it goes on the indexers and on heavy forwarders. The search heads take the
 `_search_heads` package or the whole app. The `_forwarders` package it also writes is not used: on
 a heavy forwarder it logs error lines at restart. `slim` prints "Undefined setting" warnings for
 settings it does not know, among them `python.required` and `INGEST_EVAL`, and each archive it
@@ -1087,12 +1096,12 @@ The `tenx-inflate` macro performs these operations:
 The `tenx-hash-vars-extraction` transform:
 
 ```regex
-^~?(?<tenx_hash>[^,]+),(?<tenx_var_0>[^,]+)(?:,(?<tenx_vars>.*))?
+^~?(?<tenx_hash>[^,]+)(?:,(?<tenx_var_0>[^,]+)(?:,(?<tenx_vars>.*))?)?
 ```
 
 - `~?`: Optional tilde prefix
 - `(?<tenx_hash>[^,]+)`: Capture hash (everything up to first comma)
-- `(?<tenx_var_0>[^,]+)`: Capture first variable (timestamp)
+- `(?:,(?<tenx_var_0>[^,]+)...)?`: Optionally capture the first variable (timestamp), so `~<hash>` alone also matches
 - `(?:,(?<tenx_vars>.*))?`: Optionally capture remaining variables
 
 ### Timestamp Format Conversion
@@ -1200,11 +1209,12 @@ Templates indexed before the app was installed are loaded only by the
 
 - **The time range comes after `tx`.** Move `earliest=` and `latest=` before it; in the
   search bar the job stops with a message that says so.
-- **The search goes through the REST export endpoint.** `/services/search/jobs/export`
-  drops the message of a command that fails inside a subsearch and returns no rows. Run the
-  search through `/services/search/jobs` to read the message.
+- **The search goes through the REST export endpoint.** With `output_mode=csv`, and on Splunk
+  10.4 and 10.6 with `json`, `/services/search/jobs/export` returns an empty body when the search
+  stops; read the message with `output_mode=xml` or through `/services/search/jobs`.
 - **The words belong to a template stored in the last few minutes.** Wait for the next
-  Consume KV run, or run it by hand (Settings > Searches, reports, and alerts).
+  Consume KV run, or store it at once with the search under
+  [Loading Templates Indexed Earlier](#loading-templates-indexed-earlier).
 
 ### Expansion Returns Empty or Wrong Results
 

@@ -274,8 +274,9 @@ LOOKUP_TAIL = '0123456789\\\t\n\r'
 LOOKUP_COLUMNS = ('hash', 'n', 'e', 't', 'f')
 # With an event time rule (see "Event time"), one more column: the recipe of the text after TIME_PREFIX.
 LOOKUP_TIME_COLUMN = 'w'
-# The file must stay under limits.conf [lookup] ingest_max_memtable_bytes (default 10485760): above it
-# lookup() fails at index time and Splunk drops the event (see "Lookup rules").
+# Kept under limits.conf [lookup] ingest_max_memtable_bytes (default 10485760). A missing file makes lookup()
+# fail at index time and Splunk drop the event (see "Lookup rules"); gzip files of 12.8 MB and 25.6 MB, over
+# that setting, still mapped 2 of 2 events each on Splunk 10.4.3, so the bound is kept as a margin only.
 LOOKUP_DEFAULT_MAX_BYTES = 10000000
 REFUSED_TOO_MANY = "more values than the lookup rule takes (%d)"
 # The indexed field a compact event gets when the lookup rule writes none of its fields, and its values:
@@ -3774,9 +3775,8 @@ def build_parser():
 				help='indexed field every event of the compact sourcetype gets as <field>::"<sourcetype>", which '
 					'tenx-events names so that `tx` finds these events (default %s; none: not written)' % SOURCETYPE_FIELD)
 			p.add_argument('--lookup-max-bytes', type=int, default=LOOKUP_DEFAULT_MAX_BYTES,
-				help='with --rules lookup, refuse to write a lookup file larger than this (default %d; Splunk drops '
-					'compact events when the file passes limits.conf ingest_max_memtable_bytes, default 10485760)'
-					% LOOKUP_DEFAULT_MAX_BYTES)
+				help='with --rules lookup, refuse to write a lookup file larger than this (default %d, below '
+					'limits.conf ingest_max_memtable_bytes, 10485760)' % LOOKUP_DEFAULT_MAX_BYTES)
 			p.add_argument('--floor', choices=('on', 'off'), default='on',
 				help='with --rules lookup, also write the floor app <out>_floor (default on): the lookup definition and a '
 					'file of the same name holding one row, which Splunk reads when the app\'s own file is missing, so the rule '

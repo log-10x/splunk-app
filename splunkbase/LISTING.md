@@ -173,7 +173,7 @@ templates are stored; it is checked on 9.4.15, 10.4.3 and 10.6.0.5, on a fresh i
 upgrade over 1.1.3. 1.1.5 changes the compact sourcetype's event time and the expansion macro; it is
 checked on 9.4.15, 10.4.3 and 10.6.0.5, each a fresh install. 1.1.6 adds the `tx` macro and
 its command and replicates the template collection; it is checked on 10.4.3 as an upgrade over
-1.1.5, and on 9.4.15 and 10.6.0.5 as a fresh install. 1.1.7 changes how fields and dates come out of an expanded event; it is checked on 10.4.3 as an upgrade over 1.1.6, and on 9.4.15 and 10.6.0.5 as a fresh install. 1.2.1 adds the `txf` macro and the field map tool, and changes when template records are stored and how a template whose hash contains `*` is selected; it is checked on 10.4.3 as an upgrade over 1.1.7, and on 9.4.15, 10.4.3 and 10.6.0.5 as a fresh install. Splunk
+1.1.5, and on 9.4.15 and 10.6.0.5 as a fresh install. 1.1.7 changes how fields and dates come out of an expanded event; it is checked on 10.4.3 as an upgrade over 1.1.6, and on 9.4.15 and 10.6.0.5 as a fresh install. 1.2.1 adds the `txf` macro and the field map tool, and changes when template records are stored and how a template whose hash contains `*` is selected. Splunk
 ships on-premises releases every other minor, so 10.1 and 10.3 exist only on Splunk Cloud
 Platform, where compatibility is set by cloud vetting after upload rather than selected here.
 Splunkbase requires a release to run on every version it names.
@@ -181,6 +181,16 @@ Splunkbase requires a release to run on every version it names.
 **Release notes**
 
 Paste the block for the version being uploaded. Splunkbase keeps notes per release.
+
+1.2.2:
+
+> - An alert compiled to native SPL finds its events when it runs. Compile again, from the Compile Alert view, each alert compiled to native SPL before this version.
+> - The field map's `check` also counts the compact events of the map's sourcetype indexed without their fields since its previous run, and fails with the count and the reason; it empties the list when a row or the lookup file fails (`bad_row`, `no_table`), and leaves it for templates the list does not hold (`no_row`) and for values a row does not take (`no_match`).
+> - `activate` and `check` take `--tls-ca-file`, and refuse a lookup file that is not gzip or has no `hash` column. `gen` says when a KV store export holds no template records, such as an export that failed with "Unauthorized".
+> - The field replay behind `txf` keeps the indexed fields found on the most recent event of each index, host, source and sourcetype, besides those of the 1,000 most recent compact events and those fields.conf declares with `INDEXED = true`.
+> - Compact events read from a file by a forwarder carry no indexed `timestamp=none`, on the compact sourcetype and on a field map's.
+> - Splunk reads each entry of the app's own logs as one event, and the app reads its settings without broken-pipe warnings in `splunkd.log`.
+> - The README's Fluent Bit settings keep records across a restart: `Retry_Limit False` on the `forward` output, a `DB` file on the `tail` input, and the Receiver restarted after Fluent Bit.
 
 1.2.1:
 

@@ -100,7 +100,7 @@ Pinning the Receiver to UTC makes that choice fixed and knowable, and this app's
 inflate macro renders in UTC to match. Without it, expansion returns a time
 shifted by the difference between the Receiver's host clock and UTC.
 
-Timestamps that carry their own zone, anything ending in `Z` or an offset, are unaffected.
+A timestamp written in UTC, ending in `Z`, `+0000` or `+00:00`, is unaffected.
 
 ### One timestamp per event
 
