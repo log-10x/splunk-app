@@ -128,23 +128,30 @@ class AlertCompileResult:
 
 def _normalize_native(resolved_search):
 	"""
-	Normalizes a natively-compiled search into an idiomatic saved-search value.
+	Normalizes a natively-compiled search into a saved-search value.
 
-	The builder joins commands with a leading ' | ', so its output begins with
-	'| search ...'. A leading pipe is valid but non-idiomatic in savedsearches.conf, where
-	the first command is conventionally the bare 'search ...'. Strip exactly the leading
-	pipe when the first command is the `search` command - matched as a whole token (followed
-	by whitespace, '(' or end), so a leading-pipe generating command whose name merely starts
-	with "search" (e.g. `searchtxn`) is never corrupted. Inner '| search' re-narrow clauses
-	are left untouched.
+	The builder joins commands with a leading ' | ', so its output begins with '| search ...'.
+	Splunk puts `search ` in front of a saved search's text when it dispatches it (the scheduler,
+	and the saved search's dispatch endpoint), unless the text begins with a pipe. So the first
+	`search` command is written as its bare terms: kept as 'search ...', the job ran
+	'search search ...', the word "search" became a term every event had to hold, and the alert
+	found nothing (Splunk 9.4.15, 10.4.3 and 10.6.0.5: 0 events where `tx` found 50). Strip the
+	leading pipe and the command only when the first command is the `search` command, matched as a
+	whole token (followed by whitespace, '(' or end), so a leading-pipe generating command whose
+	name merely starts with "search" (e.g. `searchtxn`) is never corrupted; a `search` with no
+	terms keeps its pipe. Inner '| search' re-narrow clauses are left untouched.
 	"""
 	stripped = resolved_search.strip()
 
 	if stripped.startswith('|'):
 		remainder = stripped[1:].lstrip()
+		match = re.match(r'search(?=\s|\(|$)\s*', remainder, re.IGNORECASE)
 
-		if re.match(r'search(\s|\(|$)', remainder, re.IGNORECASE):
-			return remainder
+		if match:
+			terms = remainder[match.end():]
+
+			if terms and not terms.startswith('|'):
+				return terms
 
 	return stripped
 
