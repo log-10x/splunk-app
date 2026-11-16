@@ -15,6 +15,7 @@ The tables (wildcard_measured.py) are 96 words on 40 events and 78 TERM() and CA
 more, measured on the index, after a pipe, and through the plan.
 """
 import hashlib
+import os
 import re
 
 import pytest
@@ -23,6 +24,7 @@ import tenx_prefilter_parser as p
 from wildcard_measured import EVENTS, MEASURED
 from wildcard_plan_measured import TC_EVENTS, TERM_CASE, WORDS as PLAN_WORDS
 
+APP = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'tenx-for-splunk')
 # NOT CASE() on the index (see TestOnTheIndex)
 NOT_CASE = {'NOT CASE(root)', 'NOT CASE(Root)', 'NOT CASE(Se*Privilege)', 'NOT CASE(se*privilege)', 'NOT (CASE(root) OR TERM(0000))'}
 
@@ -213,3 +215,35 @@ class TestOnTheIndex:
 					continue
 				rx = re.compile(p.term_regex(x, major_only=any(c in p.MINOR_CHARS for c in x)))
 				assert [n for n, e in enumerate(EVENTS + TC_EVENTS) if rx.search(e)] == base, word
+
+
+class TestTheMacroStep:
+	"""macros.conf [tenx-wild] reads back what the prefilter stores on the job: the same two custom fields, the same
+	rule from a subsearch's name to the job's, and a default that marks nothing and keeps every event."""
+
+	def definition(self):
+		import configparser
+		conf = configparser.RawConfigParser(strict=False)
+		conf.read(os.path.join(APP, 'default', 'macros.conf'))
+		return conf.get('tenx-wild', 'definition')
+
+	def test_the_fields_and_the_job(self):
+		step = self.definition()
+		prefilter = open(os.path.join(APP, 'bin', 'tenx_prefilter.py')).read()
+		for field in ('custom.tenx_wild_eval', 'custom.tenx_wild_search'):
+			assert field in step and '"%s"' % field in prefilter
+		assert step.count('replace(info_sid, "^subsearch_(.+)_\\d+\\.\\d+$", "\\1")') == 2
+		assert 'SUBSEARCH_SID = re.compile(r"^subsearch_(.+)_\\d+\\.\\d+$")' in prefilter
+		assert step.startswith('eval [') and '| search [' in step and step.endswith('| fields - tenx_w*')
+
+	def test_nothing_stored_marks_nothing(self):
+		step = self.definition()
+		assert "coalesce('custom.tenx_wild_eval', \"tenx_w=0\")" in step and "coalesce('custom.tenx_wild_search', \"*\")" in step
+		assert step.count('appendpipe [stats count | where count=0]') == 2
+
+	def test_every_tx_macro_runs_it_before_the_final_search(self):
+		import configparser
+		conf = configparser.RawConfigParser(strict=False)
+		conf.read(os.path.join(APP, 'default', 'macros.conf'))
+		for name in ('tx', 'txf', 'txf(1)'):
+			assert conf.get(name, 'definition').rstrip('"').endswith(' | `tenx-wild` | search *'), name
