@@ -108,11 +108,13 @@ README = {
 	'data_models': 'Data models, their accelerations, `tstats` and saved searches that do not use `tx` read the '
 		'fields Splunk stored with an event. The field map writes a compact event\'s original fields while it is '
 		'indexed, so these searches read them.',
-	'tstats_sourcetype': '`tstats` reads the indexed sourcetype, which stays `tenx_win`: `| tstats count where '
-		'sourcetype=XmlWinEventLog` counts uncompacted events only. Use `where (sourcetype=XmlWinEventLog OR '
-		'tenx_sourcetype=XmlWinEventLog)`, or a data model, which applies the rename.',
+	'tstats_sourcetype': '`tstats` reads the indexed sourcetype, which stays the compact one with or without a field '
+		'map, so `tstats` by or on the original sourcetype counts no compact event; `tenx_sourcetype` holds the '
+		'original. Use `where (sourcetype=XmlWinEventLog OR tenx_sourcetype=XmlWinEventLog)`, or a data model, which '
+		'applies the rename.',
 	'eventtype_words': 'Event types that match words of the original text, such as `err0r` in the Windows add-on '
-		'and `aws_cloudtrail_delete_events` in the AWS add-on, do not match mapped events.',
+		'and `aws_cloudtrail_delete_events` in the AWS add-on, match a mapped event only where its compact text holds '
+		'the word.',
 	'dest_4798': 'On Windows EventID 4798, 5156 and 5157, `dest` is the event\'s Computer and `src_ip` and '
 		'`dest_ip` are not written.',
 	'xml_blocks': 'The add-on\'s XML block fields `EventData_Xml` and `System_Props_Xml` are not written.',
@@ -679,10 +681,7 @@ def _tstats(args, move):
 	if any(n[0] in ('text', 'unknown') for _, n in leaves):
 		return Result(NOT_CLASSIFIED, ['Its `where` clause holds words: not measured.'])
 	if 'sourcetype' in fields:
-		if move.is_mapped(sts):
-			return Result(LIMIT, [readme('tstats_sourcetype')])
-		return Result(LIMIT, [readme('sourcetype'), 'Write where (sourcetype=<original> OR tenx_sourcetype=<original>) '
-			'(measured equal to raw).'])
+		return Result(LIMIT, [readme('tstats_sourcetype')])
 	if fields & {'punct', 'linecount'}:
 		return Result(LIMIT, [readme('punct')])
 	if fields <= SAME_ON_COMPACT:

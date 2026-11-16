@@ -191,7 +191,9 @@ class TestWithoutFieldMap:
 
 	def test_tstats_on_sourcetype_is_a_limit_with_the_fix(self):
 		res = verdict('| tstats count where index=wineventlog sourcetype=XmlWinEventLog')
-		assert res.verdict == r.LIMIT and 'tenx_sourcetype=<original>' in res.reason
+		# the same README sentence with and without a map: tstats reads the indexed, compact sourcetype
+		assert res.verdict == r.LIMIT and r.README['tstats_sourcetype'] in res.reason
+		assert 'tenx_sourcetype=XmlWinEventLog' in res.reason
 		assert verdict('| tstats count where index=wineventlog by sourcetype').verdict == r.LIMIT
 
 	def test_tstats_on_other_fields_not_classified(self):
@@ -252,7 +254,7 @@ class TestWithFieldMap:
 
 	def test_tstats_on_sourcetype_quotes_the_map_sentence(self):
 		res = verdict('| tstats count where sourcetype=XmlWinEventLog by host', MAP)
-		assert res.verdict == r.LIMIT and 'stays `tenx_win`' in res.reason
+		assert res.verdict == r.LIMIT and 'stays the compact one with or without a field map' in res.reason
 
 	@pytest.mark.parametrize('search,quote', [
 		('index=wineventlog EventCode=1 | stats count by date_wday', 'date_fields'),

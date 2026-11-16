@@ -660,6 +660,10 @@ CloudTrail event the raw event's `_time`.
 A FortiGate line has its date and time in two fields, `date=` and `time=`. The Receiver reads the
 time and supplies the date, so a compact FortiGate event's `_time` can fall on another day.
 
+A timestamp without a year takes its year from the time the event is processed, so a replayed or
+backfilled file from an earlier year gets the wrong year. Splunk guesses the year for such lines
+too, and the two guesses can differ.
+
 ## Data Models and Detections: the Field Map
 
 Needs the Receiver at release 1.1.180 or later.
@@ -941,9 +945,10 @@ TENX_SPLUNKD_TOKEN=<token> TENX_PROBE_HEC_TOKEN=<HEC token> python3 \
   --probe-index tenx_probe --timeout 20 --poll 5
 ```
 
-`tstats` reads the indexed sourcetype, which stays `tenx_win`: `| tstats count where
-sourcetype=XmlWinEventLog` counts uncompacted events only. Use `where (sourcetype=XmlWinEventLog OR
-tenx_sourcetype=XmlWinEventLog)`, or a data model, which applies the rename.
+`tstats` reads the indexed sourcetype, which stays the compact one with or without a field map, so
+`tstats` by or on the original sourcetype counts no compact event; `tenx_sourcetype` holds the
+original. Use `where (sourcetype=XmlWinEventLog OR tenx_sourcetype=XmlWinEventLog)`, or a data
+model, which applies the rename.
 
 For all fields on a plain search of mapped CloudTrail events, set `indexed_kv_limit = 0` under
 `[kv]` in `limits.conf` on the indexers and heavy forwarders, in the cluster bundle on a cluster (a
@@ -956,7 +961,8 @@ Checked with the Windows add-on 12.0.0, the AWS add-on 8.3.1 and CIM 8.8.0 again
 indexed raw; the results are in the
 [listing's checks](https://github.com/log-10x/splunk-app/blob/main/splunkbase/LISTING.md#checks-run-on-this-package).
 These limits remain. Event types that match words of the original text, such as `err0r` in the
-Windows add-on and `aws_cloudtrail_delete_events` in the AWS add-on, do not match mapped events. On
+Windows add-on and `aws_cloudtrail_delete_events` in the AWS add-on, match a mapped event only where
+its compact text holds the word. On
 Windows EventID 4798, 5156 and 5157, `dest` is the event's Computer and `src_ip` and `dest_ip` are
 not written. The add-on's XML block fields `EventData_Xml` and `System_Props_Xml` are not written.
 `vendor_privilege` and `privilege_id` carry `-` on events where the raw event has neither. A value
@@ -1005,7 +1011,7 @@ time terms before it, every other term after it.
 | unchanged | Runs as written and returns what it returns on the raw events |
 | needs tx | `tx` in front of its search terms; it reads only the events' text |
 | needs txf | `txf` in front of its search terms |
-| needs field map | Reads data models or `tstats`, which a field map serves as written |
+| needs field map | Reads data models, which a field map serves as written |
 | limit | A shape this README lists as behaving differently on compact events; the reason quotes it |
 | not classified | A macro the tool cannot expand, `map`, `savedsearch`, a subsearch that writes search terms, a dashboard token without a default, or a shape not measured |
 | not affected | Reads none of the moved data |
