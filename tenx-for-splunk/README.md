@@ -1001,6 +1001,11 @@ rules that read a section of the text (`Subject_Account_Name`, `Target_Account_N
 (`Token_Elevation_Type`). Steps 6 and 7 take `--app fm_wincl --cap-file
 /etc/tenx/wincl/compact-cap.csv`.
 
+Indexed fields take index space. `Message`, the whole text of each event's message, takes most of it:
+on 100,000 events the mapped index took 174 MB against 18 MB for the same events indexed raw, and
+19 MB with `--leave-out Message`, which the data model and `tstats` results did not change.
+`Message` and `body` are then not on mapped events.
+
 `tstats` reads the indexed sourcetype, which stays the compact one with or without a field map, so
 `tstats` by or on the original sourcetype counts no compact event; `tenx_sourcetype` holds the
 original. Use `where (sourcetype=XmlWinEventLog OR tenx_sourcetype=XmlWinEventLog)`, or a data
