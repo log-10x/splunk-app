@@ -10,12 +10,23 @@ own search text, and this module
    original sourcetype's fields replayed, are read the same way);
 2. parses it as Splunk search terms: quoted phrases (with backslash escapes), parentheses,
    NOT, OR and AND with Splunk's precedence (NOT, then OR, then the implied AND), field
-   comparisons, field IN (...), TERM() and CASE(), subsearches;
+   comparisons (a quoted or unquoted name, spaces or none around the operator), field IN (...),
+   indexed field terms (host::x), TERM() and CASE(), subsearches. A word or phrase is a required
+   search term only when the parser recognises it as one: a plain word (no operator, quote,
+   bracket, backslash or backtick in it) or a phrase. Every other token sequence places no
+   restriction, and where the shape of the whole search is in doubt (a macro, AND, OR or IN where
+   a term should be, IN without its parentheses) the search is not narrowed at all (Unparsed).
+   TERM() and CASE() place no restriction: `tx` applies the user's words after a pipe, where
+   Splunk tests them against the event's text, and for some arguments that differs from the same
+   search on an index;
 3. builds the prefilter. A word or phrase is cut into pieces at the characters Splunk breaks
    indexed text at (SEGMENT_BREAKERS, the same set the search rewrite uses) and at white space;
    each piece must appear in the compact event as a value (TERM(piece)) or be carried by the
    event's template (TERM(<token of the template's hash>)). A piece is not used when a rendered
-   timestamp could print it, when it holds a character outside a-z and 0-9, or when more than
+   timestamp could print text it matches (any run of digits, month and day names, 14t10, and any
+   wildcard that can match such text: 2026*, nov*, *t10; see timestamp_could_print()), when it
+   holds a character outside a-z and 0-9, when a wildcard sits between two of its characters
+   (Splunk matches that across a minor breaker the compact text does not keep), or when more than
    MAX_TEMPLATES templates carry it. A character that is neither a letter, a digit nor a breaker
    stays in its piece, so the piece is not used: Splunk indexes PROGRA~1 (a short name in a
    Windows path) as one term, and TERM(progra) would miss it. Inside a phrase a backslash
@@ -103,6 +114,10 @@ TIME_FORMS = (
 )
 FIELD_NAME = re.compile(r"^[A-Za-z0-9_.:@{}\-]+$")
 OPERATOR = re.compile(r"^(?:!=|<=|>=|=|<|>)")
+# A word that is a search term and nothing else: no comparison operator, quote, bracket, backslash
+# or backtick in it (each of those is syntax, or an escape Splunk resolves before it matches).
+PLAIN_WORD = re.compile(r'^[^=<>"\[\]\\`]+$')
+INDEXED_TERM = re.compile(r"^([A-Za-z0-9_.@{}\-]+)::(.*)$", re.S)
 # An IPv4 address in a search word, cut the way the engine's ipv4SingleToken option cuts it: four
 # parts of 1 to 3 digits joined by single dots, the first not right after a letter or digit or
 # after a digit and a dot, the last not followed by a letter or digit or by a dot and a digit.
@@ -160,13 +175,27 @@ def text_after_macro(search):
 	return search[start:]
 
 
+class Tokens(list):
+	"""The tokens of tokenize(); `glued` holds the positions of the tokens written right after the one
+	before them, with no white space between (`"abc"def` is a phrase and a glued word)."""
+
+	def __init__(self):
+		list.__init__(self)
+		self.glued = set()
+
+
 def tokenize(text):
-	tokens, i, n = [], 0, len(text)
+	tokens, i, n = Tokens(), 0, len(text)
+	space = True
 	while i < n:
 		c = text[i]
 		if c.isspace():
 			i += 1
+			space = True
 			continue
+		if not space and tokens:
+			tokens.glued.add(len(tokens))
+		space = False
 		if c == '"':
 			j, buf = i + 1, []
 			while j < n:
@@ -248,6 +277,9 @@ class Parser(object):
 	def parse(self):
 		if not self.tokens:
 			return ("true",)
+		if any(kind == "word" and "`" in value for kind, value in self.tokens):
+			# A macro after tx expands to search text this module never sees, operators included.
+			raise Unparsed("a macro after tx")
 		node = self._and()
 		if self.i < len(self.tokens):
 			raise Unparsed("unbalanced parentheses")
@@ -273,6 +305,26 @@ class Parser(object):
 			self._take()
 			return ("not", self._not())
 		return self._primary()
+
+	def _glued(self):
+		"""Whether the next token is written right after the one just taken, with no space."""
+		return self.i in getattr(self.tokens, "glued", ())
+
+	def _in_values(self, field):
+		"""After `<field> IN`: the values up to the closing parenthesis, as ("in", field, values)."""
+		self._take()
+		values = []
+		while self._peek()[0] not in (")", None):
+			kind_, item = self._take()
+			if kind_ == "phrase":
+				values.append(item)
+			elif kind_ == "word":
+				values.extend(unquote(v) for v in item.split(",") if v)
+			else:
+				values.append(None)
+		if self._take()[0] != ")":
+			raise Unparsed("IN without its closing parenthesis")
+		return ("in", field, values)
 
 	def _primary(self):
 		kind, value = self._take()
@@ -305,31 +357,44 @@ class Parser(object):
 					else:
 						raise Unparsed("a comparison whose value is not a word or a phrase: " + value)
 				return ("field", value, op.group(0), unquote(rest))
+			if following == ("word", "IN"):
+				# A quoted field name before IN: `"user" IN (alice, bob)`. Read as text, the name, the
+				# keyword and each value were required words.
+				self._take()
+				if self._peek()[0] != "(":
+					raise Unparsed("IN without a parenthesis after it")
+				return self._in_values(value)
+			if following[0] in ("word", "phrase") and self._glued():
+				# A phrase with a word written right after it (`"abc"def`): not a form this module reads
+				# with certainty, so it places no restriction.
+				self._take()
+				return ("unknown", value)
 			return ("text", value)
 		if kind != "word":
 			raise Unparsed("unexpected %s" % kind)
+		if value in ("AND", "OR", "IN"):
+			raise Unparsed("%s where a search term should be" % value)
 		following = self._peek()
 		if value in ("TERM", "CASE") and following[0] == "(":
 			self._take()
 			inner = []
 			while self._peek()[0] not in (")", None):
-				inner.append(self._take()[1])
-			self._take()
-			return ("text", " ".join(inner))
-		if following == ("word", "IN") and self._peek(1)[0] == "(":
-			self._take()
-			self._take()
-			values = []
-			while self._peek()[0] not in (")", None):
 				kind_, item = self._take()
-				if kind_ == "phrase":
-					values.append(item)
-				elif kind_ == "word":
-					values.extend(unquote(v) for v in item.split(",") if v)
-				else:
-					values.append(None)
+				if kind_ not in ("word", "phrase"):
+					raise Unparsed("%s() holding %s" % (value, kind_))
+				inner.append(item)
+			if self._take()[0] != ")":
+				raise Unparsed("%s( without its closing parenthesis" % value)
+			# `tx` applies the user's words after a pipe, where Splunk tests TERM() and CASE() against
+			# the event's text, which for some arguments differs from the same search on an index
+			# (TERM(pattern=*.log): 0 events on the index, 1,025 after a pipe, Splunk Enterprise 10.4.3).
+			# Which words every such event holds is not certain, so they place no restriction.
+			return ("unknown", "%s(%s)" % (value, " ".join(inner)))
+		if following == ("word", "IN"):
 			self._take()
-			return ("in", value, values)
+			if self._peek()[0] != "(":
+				raise Unparsed("IN without a parenthesis after it")
+			return self._in_values(value)
 		if FIELD_NAME.match(value) and following[0] == "word" and value not in ("AND", "OR", "NOT"):
 			# A comparison written with spaces: `eventName = DeleteTrail`, `userAgent !=console.amazonaws.com`,
 			# `src_ip != "x"`. Splunk reads these as field comparisons; read as words, the field name would be
@@ -364,6 +429,16 @@ class Parser(object):
 			if match.group(1).lower() in TIME_FIELDS:
 				self.time_modifier = True
 			return ("field", match.group(1), match.group(2), unquote(match.group(3)))
+		indexed = INDEXED_TERM.match(value)
+		if indexed:
+			# An indexed field term, `host::web-01`, `sourcetype::tenx_encoded`: matched against the
+			# event's indexed fields, never its text.
+			return ("field", indexed.group(1), "::", indexed.group(2))
+		if not PLAIN_WORD.match(value) or value in ("TERM", "CASE"):
+			# Not a search word this module recognises (an operator outside a comparison it reads, a
+			# quote or a bracket inside a word, a backslash, whose escape Splunk applies before it
+			# matches): it places no restriction.
+			return ("unknown", value)
 		if "," in value:
 			self.unquoted_comma = True
 		return ("text", value)
@@ -566,8 +641,70 @@ def pieces_outside_times(text):
 	return pieces
 
 
+# What a rendered timestamp prints, as runs between Splunk's breakers. The engine stores a
+# timestamp as an epoch and tenx-inflate prints it at search time with the template's format, so
+# none of this text is in the compact event. The formats are the engine's timestamp patterns
+# (pipelines/run/transform/timestamp config.yaml): digits; month and day names (MMM, EEE; Splunk's
+# strftime prints them in English); AM and PM; the zone as UTC or GMT; and the literal letters T,
+# Z, I, W, E, F and the literal '*' those patterns write. Where no breaker separates them they print
+# as one run: 2026-11-14T10 gives the run 14t10, 15.162Z gives 162z, 14Nov2026 would give 14nov2026.
+TIMESTAMP_NAMES = ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "sept", "oct", "nov", "dec",
+				   "january", "february", "march", "april", "june", "july", "august", "september", "october",
+				   "november", "december", "mon", "tue", "wed", "thu", "fri", "sat", "sun", "monday", "tuesday",
+				   "wednesday", "thursday", "friday", "saturday", "sunday", "am", "pm", "utc", "gmt",
+				   "t", "z", "i", "w", "e", "f", "*")
+
+
+def timestamp_could_print(piece):
+	"""
+	Whether some run a rendered timestamp prints could be matched by `piece`, a run of the search
+	with '*' as a wildcard: runs of digits and TIMESTAMP_NAMES joined in any order. Decided with a
+	small automaton over those runs; the wildcard stands for any text.
+	"""
+	start, done, digits = ("start",), ("done",), ("digits",)
+
+	def step(states, ch):
+		out = set()
+		for state in states:
+			if state == digits:
+				if ch.isdigit():
+					out.add(digits)
+				state = done
+			if state in (start, done):
+				if ch.isdigit():
+					out.add(digits)
+				for name in TIMESTAMP_NAMES:
+					if name[0] == ch:
+						out.add(done if len(name) == 1 else ("name", name, 1))
+			elif state[0] == "name":
+				name, k = state[1], state[2]
+				if name[k] == ch:
+					out.add(done if k + 1 == len(name) else ("name", name, k + 1))
+		return out
+
+	states = {start}
+	for ch in piece:
+		if ch == "*":
+			# any text: every state reachable from a live one
+			states = states | {done, digits} | set(("name", n, k) for n in TIMESTAMP_NAMES for k in range(1, len(n)))
+		else:
+			states = step(states, ch)
+		if not states:
+			return False
+	return bool(states & {done, digits})
+
+
 def usable(piece):
-	return bool(re.fullmatch(r"[a-z0-9*]+", piece)) and piece.strip("*") != "" and not TIMESTAMP_PIECE.match(piece)
+	"""
+	Whether a piece of the search may narrow: a run of letters and digits (with '*' at its start or
+	end only) that every matching event's compact text holds. Not when a rendered timestamp could
+	print text it matches (TIMESTAMP_PIECE, timestamp_could_print(): `2026*`, `nov*`, `*t10`, any run
+	of digits), and not with a '*' between two characters: Splunk's wildcard there also matches a run
+	that holds a minor breaker (fo*ar matches fo-x-ar), which the compact event, cut at those breakers,
+	does not hold as one term.
+	"""
+	return (bool(re.fullmatch(r"[a-z0-9*]+", piece)) and piece.strip("*") != "" and "*" not in piece.strip("*")
+			and not TIMESTAMP_PIECE.match(piece) and not timestamp_could_print(piece))
 
 
 def addresses_of(text):

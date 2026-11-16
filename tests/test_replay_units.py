@@ -919,7 +919,7 @@ class TestNarrowingOffMakesNoRestCall:
 	def test_shipped_default_is_off(self):
 		assert not pp.narrowing_on_disk(os.path.join(ROOT, 'tenx-for-splunk'))
 
-	def test_off_equals_the_baseline_on_the_opt_in_searches(self):
+	def test_off_selects_at_least_the_baseline_on_the_opt_in_searches(self):
 		from support import tenx_prefilter_parser_baseline as baseline
 		from test_prefilter_narrowing_opt_in import SEARCHES as OPT_IN_SEARCHES, dictionary
 		compared = 0
@@ -930,9 +930,11 @@ class TestNarrowingOffMakesNoRestCall:
 				tree, mtree = pp.Parser(pp.tokenize(text)).parse(), baseline.Parser(baseline.tokenize(text)).parse()
 			except (pp.Unparsed, baseline.Unparsed):
 				continue
+			from support.prefilter_compare import selects_at_least
 			text_field = None   # what _text_field() returns with narrowing off: see the command test
-			d = dictionary(baseline.lookup_pieces(mtree))
-			assert pp.lookup_pieces(tree, text_field=text_field) == baseline.lookup_pieces(mtree), text
-			assert pp.prefilter(tree, d, text_field) == baseline.prefilter(mtree, d), text
+			d = dictionary(baseline.lookup_pieces(mtree) | pp.lookup_pieces(tree, text_field=text_field))
+			assert pp.lookup_pieces(tree, text_field=text_field) <= baseline.lookup_pieces(mtree), text
+			# the same or less restrictive: the parser leaves unnarrowed what it does not recognise
+			assert selects_at_least(baseline.prefilter(mtree, d), pp.prefilter(tree, d, text_field)), text
 			compared += 1
 		assert compared >= 40

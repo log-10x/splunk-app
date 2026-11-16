@@ -1,8 +1,10 @@
 """
 Field narrowing is opt-in (tenx_config.conf [config] field_narrowing, default false). Off, the
-prefilter must be exactly the one of the parser without field narrowing: compared here against a
-copy of that parser (tests/support/tenx_prefilter_parser_baseline.py) on a set of searches. On,
-pieces the compact event stores in another written form (FORMAT_SPEC.md S2.2, S4.4) are not used.
+prefilter must select at least every compact event that the parser without field narrowing selects
+(tests/support/tenx_prefilter_parser_baseline.py, compared by what each prefilter selects,
+tests/support/prefilter_compare.py) on a set of searches: the parser now leaves unnarrowed what it
+does not recognise, and pieces a rendered timestamp could print, so it may select more, never fewer.
+On, pieces the compact event stores in another written form (FORMAT_SPEC.md S2.2, S4.4) are not used.
 """
 import json
 import os
@@ -14,6 +16,7 @@ import tenx_prefilter_parser as new
 import tenx_replay_builder as b
 from support import tenx_prefilter_parser_address_rule as address_rule
 from support import tenx_prefilter_parser_baseline as baseline
+from support.prefilter_compare import selects_at_least
 
 ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 
@@ -53,41 +56,36 @@ def has_address(text):
 
 class TestOffMatchesTheBaseline:
 	"""
-	Off, the prefilter is the baseline parser's, except that an IPv4 address requires its parts:
-	equal to the baseline on every search without an address, and equal to the parser with the
-	address rule and no opt-in setting (tests/support/tenx_prefilter_parser_address_rule.py, no
-	narrowing list) on every search.
+	Off, the prefilter selects at least what the baseline parser's selects, and what the parser with
+	the address rule and no opt-in setting (tests/support/tenx_prefilter_parser_address_rule.py)
+	selects, on every search: the same or fewer required terms, never a new one.
 	"""
 
-	def test_the_prefilter_is_the_baselines_on_every_search_without_an_address(self):
-		checked = 0
-		for text in SEARCHES:
-			if has_address(text):
-				continue
-			checked += 1
-			(old_tree, old_tm, old_comma, old_err), (new_tree, new_tm, new_comma, new_err) = parse_both(text)
-			assert (old_tm, old_comma, old_err) == (new_tm, new_comma, new_err), text
-			if old_tree is None:
-				continue
-			old_pieces, new_pieces = baseline.lookup_pieces(old_tree), new.lookup_pieces(new_tree, text_field=None)
-			assert old_pieces == new_pieces, text
-			d = dictionary(old_pieces)
-			assert baseline.prefilter(old_tree, d) == new.prefilter(new_tree, d, None), text
-			if old_pieces:
-				assert baseline.dictionary_search(old_pieces) == new.dictionary_search(new_pieces), text
-		assert checked == len(SEARCHES) - 4
+	def compare(self, ref_mod, text):
+		try:
+			ref_reader = ref_mod.Parser(ref_mod.tokenize(text))
+			ref = ref_reader.parse()
+		except ref_mod.Unparsed:
+			return 'ref unparsed'
+		try:
+			reader = new.Parser(new.tokenize(text))
+			tree = reader.parse()
+		except new.Unparsed:
+			return 'unparsed'   # every compact event in range is expanded: selects at least as much
+		assert reader.time_modifier == ref_reader.time_modifier, text
+		pieces = ref_mod.lookup_pieces(ref) | new.lookup_pieces(tree, text_field=None)
+		d = dictionary(pieces)
+		assert new.lookup_pieces(tree, text_field=None) <= ref_mod.lookup_pieces(ref), text
+		assert selects_at_least(ref_mod.prefilter(ref, d), new.prefilter(tree, d, None)), text
+		return 'compared'
 
-	def test_the_prefilter_is_the_address_rules_on_every_search(self):
+	def test_the_prefilter_selects_at_least_the_baselines(self):
+		outcomes = [self.compare(baseline, text) for text in SEARCHES if not has_address(text)]
+		assert outcomes.count('compared') >= 35
+
+	def test_the_prefilter_selects_at_least_the_address_rules(self):
 		for text in SEARCHES + ['10.0.1.14:8443', 'kafka 10.0.1.14', '1.2.3.4', '10.0.1.14 OR 0.0.0.0']:
-			try:
-				ref = address_rule.Parser(address_rule.tokenize(text)).parse()
-			except address_rule.Unparsed:
-				continue
-			tree = new.Parser(new.tokenize(text)).parse()
-			pieces = address_rule.lookup_pieces(ref)
-			assert pieces == new.lookup_pieces(tree, text_field=None), text
-			d = dictionary(pieces)
-			assert address_rule.prefilter(ref, d) == new.prefilter(tree, d, None), text
+			self.compare(address_rule, text)
 
 	def test_text_after_the_macro_is_the_baselines(self):
 		for text in SEARCHES:
@@ -132,9 +130,12 @@ class TestOnSkipsOtherWrittenForms:
 		assert 'TERM(c129)' in got and 'TERM(4320)' not in got
 
 	def test_ordinary_words_and_values_still_narrow(self):
-		assert 'TERM(error)' in narrowed('error') and 'TERM(4663)' in narrowed('EventCode=4663')
-		assert 'TERM(reed)' in narrowed('user=REED_LARSEN') and 'TERM(0x80)' in narrowed('AccessMask=0x80')
-		assert 'TERM(192)' in narrowed('src=192.168.100.200')
+		assert 'TERM(error)' in narrowed('error') and 'TERM(reed)' in narrowed('user=REED_LARSEN')
+		assert 'TERM(0x80)' in narrowed('AccessMask=0x80') and 'TERM(192)' in narrowed('src=192.168.100.200')
+
+	def test_a_value_of_digits_alone_does_not_narrow(self):
+		# a rendered timestamp prints runs of digits of every length (a fraction, a year, an offset)
+		assert 'TERM(4663)' not in narrowed('EventCode=4663')
 
 
 CHILD = r'''
