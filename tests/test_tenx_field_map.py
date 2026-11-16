@@ -897,9 +897,20 @@ class TestLookupRules:
 		conf = fm.read_conf(os.path.join(os.path.dirname(fm.default_app_props()), 'savedsearches.conf'))
 		ss = conf['Field Map Events Without Fields']
 		assert ss['enableSched'] == '0' and ss['counttype'] == 'number of events' and ss['relation'] == 'greater than'
-		assert ss['search'].startswith('| tstats count where index=* %s=* NOT host=%s by index sourcetype %s' % (
-			fm.UNMAPPED_FIELD, fm.PROBE_HOST, fm.UNMAPPED_FIELD))
+		assert ss['search'].startswith('| tstats count where index=* %s=* NOT host=%s _index_earliest=-15m _index_latest=now '
+			'by index sourcetype %s' % (fm.UNMAPPED_FIELD, fm.PROBE_HOST, fm.UNMAPPED_FIELD))
 		assert '"processor=regexreplacement" "Runtime exception"' in ss['search'] and ss['search'].endswith('| where count > 0')
+
+	def test_the_search_for_events_without_fields_selects_by_index_time(self):
+		# A compact event keeps its original date: an event dated a day ago and indexed now must count, so the
+		# 15 minutes are index time and the dispatch range is every event date.
+		conf = fm.read_conf(os.path.join(os.path.dirname(fm.default_app_props()), 'savedsearches.conf'))
+		ss = conf['Field Map Events Without Fields']
+		assert ss['dispatch.earliest_time'] == '0' and ss['dispatch.latest_time'] == '+10y'
+		tstats, internal = ss['search'].split('| append [', 1)
+		assert '_index_earliest=-15m _index_latest=now' in tstats
+		# splunkd.log lines are dated when they are written, so that part keeps its own 15 minutes of event time.
+		assert internal.startswith('search index=_internal earliest=-15m latest=now ')
 
 	def test_no_floor_app_with_floor_off_or_per_template_transforms(self, tmp_path):
 		self.gen(tmp_path, [('k1', 'user=$')], 'fm_fw', '--floor', 'off')
