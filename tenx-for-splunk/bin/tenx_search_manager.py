@@ -354,6 +354,27 @@ class TenxSearchManager:
 
 		return [row.get('timestamp_format') for row in results['results'] if row.get('timestamp_format')]
 
+	def run_probe(self, search, earliest='0', latest='now', max_time_ms=5000, poll_interval_ms=50):
+		"""
+		Runs a short search (a tstats probe) over the given time range and returns its result rows,
+		or None when it could not be run or did not finish in time.
+		"""
+		sid = self.create_search_job({'earliest_time': earliest or '0', 'latest_time': latest or 'now', 'search': search})
+
+		if sid is None:
+			return None
+
+		if self.poll_for_job_end(sid, max_time_ms, poll_interval_ms) != JobState.SUCCESS:
+			logger.warning("Probe not finished in {}ms ({}): {}".format(max_time_ms, sid, search))
+			return None
+
+		results = self.get_search_results(sid, {'count': 0}, transformed=True)
+
+		if results is None or 'results' not in results:
+			return None
+
+		return [row for row in results['results'] if str(row.get('count', '0')) not in ('0', '')]
+
 	def run_dml_search(self, dml_search, max_time_ms=2000, poll_interval_ms=50):
 		"""
 		Runs a search on the 10x DML, waits for the search job to finish, and returns the results.

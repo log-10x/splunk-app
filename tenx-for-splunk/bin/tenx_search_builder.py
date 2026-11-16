@@ -522,7 +522,14 @@ class BuildResult:
 	"""
 	def __init__(self, state, resolved, engaged=False, field_terms=None, retryable=False,
 				has_search_terms=False, no_dml_results=False, dml_truncated=False,
-				no_prefilter=False):
+				no_prefilter=False, indexes=None, names_source=True, sourcetypes=None):
+		# indexes: the index values the leading search names ([] for none, None when it cannot
+		# tell); names_source: whether it names a sourcetype or a source at all. Read by
+		# unnamed_compact_probe().
+		self.indexes = indexes
+		self.names_source = names_source
+		# sourcetypes: the sourcetype values the leading search names (None when it cannot tell)
+		self.sourcetypes = sourcetypes
 		self.state = state
 		self.resolved = resolved
 		self.engaged = engaged
@@ -1426,6 +1433,13 @@ class TenxSearchBuilder:
 		no_dml_results = bool(leading_search is not None and leading_search.no_dml_results)
 		dml_truncated = bool(leading_search is not None and leading_search.dml_truncated)
 		no_prefilter = bool(has_search_terms and leading_search.resolved_done and leading_search.resolved_search is None)
+		indexes, names_source, sourcetypes = None, True, None
+		parsed = leading_search.parsed_command if leading_search is not None else None
+		if parsed is not None:
+			indexes = parsed.get_passing_specifiers('index_specifier')
+			names = [parsed.get_passing_specifiers(k) for k in ('sourcetype_specifier', 'source_specifier')]
+			names_source = any(n is None or len(n) > 0 for n in names)
+			sourcetypes = names[0]
 
 		return BuildResult(
 			spl_commands.resolved_state(),
@@ -1436,7 +1450,10 @@ class TenxSearchBuilder:
 			has_search_terms=has_search_terms,
 			no_dml_results=no_dml_results,
 			dml_truncated=dml_truncated,
-			no_prefilter=no_prefilter)
+			no_prefilter=no_prefilter,
+			indexes=indexes,
+			names_source=names_source,
+			sourcetypes=sourcetypes)
 
 	def resolve(self, base_search):
 		"""
@@ -1451,3 +1468,111 @@ class TenxSearchBuilder:
 		except Exception as e:
 			logger.warning("Error while resolving {} - {}.".format(base_search, e), exc_info=1)
 			return tenx_util.splunk_message_macro("Failed building tenx search")
+
+
+def _spl_value(value):
+	"""A specifier value as a search term: quoted unless it is a plain run of name characters or a '*' pattern."""
+	value = str(value)
+	if re.match(r'^[A-Za-z0-9_.:*\-]+$', value):
+		return value
+	return '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+
+def original_sourcetype_probe(build_result, tenx_config):
+	"""
+	The search that finds compact events whose ORIGINAL sourcetype a passthrough names, or None. A
+	compact event is indexed as the compact sourcetype and carries its original sourcetype in the
+	indexed field tenx_sourcetype, so `| tx index=x sourcetype=df:kv error` (not rewritten: df:kv is
+	not a compact sourcetype) matches none of them (Splunk Enterprise 10.4.3: 0 against 10,000 raw).
+	Field-mapped events (tenx_mapped) are left out: their sourcetype is renamed to the original.
+	A wildcard is probed too (sourcetype=df:*) unless it matches a compact sourcetype (tenx*, *).
+	"""
+	if build_result is None or build_result.engaged or not build_result.sourcetypes:
+		return None
+	import fnmatch
+	config = tenx_config or {}
+	compact = [t for t in (config.get('tenx_source_types') or []) if t]
+	selects_compact = lambda v: any(fnmatch.fnmatchcase(t.lower(), v.lower()) for t in compact)
+	named = sorted(set(v for v in build_result.sourcetypes if v and v.strip('*') and not selects_compact(v)))
+	if not compact or not named:
+		return None
+	if build_result.indexes is None:
+		where = 'index=* '
+	elif build_result.indexes:
+		where = '(%s) ' % ' OR '.join('index=%s' % _spl_value(i) for i in sorted(set(build_result.indexes)))
+	else:
+		where = ''
+	return ('| tstats count where %s(%s) NOT tenx_mapped=* (%s) by index, sourcetype, tenx_sourcetype' % (
+		where, ' OR '.join('sourcetype=%s' % _spl_value(t) for t in compact),
+		' OR '.join('tenx_sourcetype=%s' % _spl_value(t) for t in named)))
+
+
+def original_sourcetype_message(rows, refused=True):
+	"""The message for a search whose original-sourcetype probe found compact events."""
+	named = sorted(set(r.get('tenx_sourcetype', '') for r in rows if r.get('tenx_sourcetype'))) or ['<sourcetype>']
+	compact = sorted(set(r.get('sourcetype', '') for r in rows if r.get('sourcetype')))
+	st = compact[0] if compact else 'tenx_encoded'
+	field = ' OR '.join('tenx_sourcetype=%s' % n for n in named)
+	return ("{}this search names {} {}, which its compact events carry in the field tenx_sourcetype "
+			"(they are indexed as {}){}: as typed it {} none of them. Write sourcetype={} {} "
+			"instead.").format("10x: " if refused else "", 'sourcetype' if len(named) == 1 else 'sourcetypes',
+							   ' and '.join(named), st, ", so it was not run" if refused else "",
+							   "would return" if refused else "returns", st,
+							   field if len(named) == 1 else '(%s)' % field)
+
+
+def compact_probe(build_result, tenx_config):
+	"""(probe search, message function) for a passthrough that would miss compact events, or (None, None)."""
+	probe = unnamed_compact_probe(build_result, tenx_config)
+	if probe is not None:
+		return probe, unnamed_compact_message
+	probe = original_sourcetype_probe(build_result, tenx_config)
+	if probe is not None:
+		return probe, original_sourcetype_message
+	return None, None
+
+
+def unnamed_compact_probe(build_result, tenx_config):
+	"""
+	The search that finds compact events a passthrough would read as compact text, or None when
+	none is needed. The rewrite engages only for a search that names a compact sourcetype or source
+	(check_needs_tenx); one that names neither runs as typed, and over an index holding compact
+	events that is the wrong answer with no sign of it (Splunk Enterprise 10.4.3: `| tx
+	index=sr_compact error` 0 events, 102 with sourcetype=tenx_encoded added, equal to raw). So
+	when a search was not engaged and names no sourcetype or source, this tstats looks for events
+	of the registered compact sourcetypes and sources in the indexes it names (every index the
+	user searches by default when it names none, every index when that cannot be told).
+	"""
+	if build_result is None or build_result.engaged or build_result.names_source:
+		return None
+	config = tenx_config or {}
+	sourcetypes = [t for t in (config.get('tenx_source_types') or []) if t]
+	sources = [t for t in (config.get('tenx_sources') or []) if t]
+	if not sourcetypes and not sources:
+		return None
+	compact = ' OR '.join(['sourcetype=%s' % _spl_value(t) for t in sourcetypes] +
+						  ['source=%s' % _spl_value(t) for t in sources])
+	if build_result.indexes is None:
+		where = 'index=* '
+	elif build_result.indexes:
+		where = '(%s) ' % ' OR '.join('index=%s' % _spl_value(i) for i in sorted(set(build_result.indexes)))
+	else:
+		where = ''
+	return '| tstats count where %s(%s) by index, sourcetype, source' % (where, compact)
+
+
+def unnamed_compact_message(rows, refused=True):
+	"""
+	The message for a search whose probe found compact events (rows of index, sourcetype, source,
+	count): the refusal of the commands and the hook, or (refused=False) the review reason of a
+	compiled alert, which is stored.
+	"""
+	sts = sorted(set(r.get('sourcetype', '') for r in rows if r.get('sourcetype')))
+	ixs = sorted(set(r.get('index', '') for r in rows if r.get('index')))
+	return ("{}this search reads compact events (sourcetype {} in index {}) but names no compact sourcetype "
+			"or source{}: as typed it {} their compact text and {} the wrong events. "
+			"Add the sourcetype to the search, for example sourcetype={}.").format(
+				"10x: " if refused else "", ", ".join(sts) or "?", ", ".join(ixs) or "?",
+				", so it was not run" if refused else "", "would read" if refused else "reads",
+				"return" if refused else "returns",
+				sts[0] if sts else "tenx_encoded")

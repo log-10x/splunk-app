@@ -93,9 +93,14 @@ class TestPrefilter:
 	def test_field_in_beside_a_word_keeps_the_word(self):
 		assert plan('ValkeyCartStore kubernetes.container_name IN ("cart", "frontend")')[0] == "(((TERM(valkeycartstore) OR TERM(~v1))))"
 
-	def test_term_and_case_are_read_as_their_word(self):
-		assert plan("TERM(ValkeyCartStore)")[0] == "((TERM(valkeycartstore) OR TERM(~v1)))"
-		assert plan("CASE(ValkeyCartStore)")[0] == "((TERM(valkeycartstore) OR TERM(~v1)))"
+	def test_term_and_case_place_no_restriction(self):
+		# `tx` applies them after a pipe, where Splunk tests them against the event's text, and for
+		# some arguments that differs from the same search on an index; which words every such
+		# event holds is not certain.
+		for text in ("TERM(ValkeyCartStore)", "CASE(ValkeyCartStore)", "TERM(pattern=*.log)", "TERM(91%)",
+					 "NOT CASE(ERROR)", "TERM(10.0.1.14)", "CASE(error) OR x"):
+			assert plan(text)[0] is None, text
+		assert plan("error TERM(x)")[0] == "(((TERM(error) OR TERM(~e1))))"
 
 	def test_an_escaped_quote_inside_a_phrase(self):
 		pf = plan('"\\"stream\\": \\"stdout\\""')[0]
@@ -252,10 +257,14 @@ class TestDigitsOfAWrittenDateOrTime:
 					 '1763020800.123', '1763020800123456', '"-04:00"'):
 			assert plan(text)[0] is None, text
 
-	def test_a_number_outside_a_date_or_time_still_narrows(self):
-		assert plan("error 936")[0] == "(((TERM(error) OR TERM(~e1))) AND (TERM(936)))"
-		assert plan('"took 1234 ms"')[0] == "(TERM(took) AND TERM(1234) AND TERM(ms))"
-		assert plan("error-404")[0] == "((TERM(error) OR TERM(~e1)) AND TERM(404))"
+	def test_a_number_alone_does_not_narrow(self):
+		# A rendered timestamp prints runs of digits of every length: a fraction (936), a year, a
+		# zone offset (0000 of +0000), none of which the compact event holds (it stores an epoch).
+		assert plan("error 936")[0] == "(((TERM(error) OR TERM(~e1))))"
+		assert plan('"took 1234 ms"')[0] == "(TERM(took) AND TERM(ms))"
+		assert plan("error-404")[0] == "((TERM(error) OR TERM(~e1)))"
+		for text in ("0000", "*44", "*36*", "936", "20*26"):
+			assert plan(text)[0] is None, text
 
 	def test_the_prefilter_only_ever_widens(self):
 		# The pieces used are a subset of the pieces the earlier rule used, in the same order: a
@@ -270,11 +279,11 @@ class TestDigitsOfAWrittenDateOrTime:
 
 	def test_numbers_beside_a_colon_or_dots_that_are_no_date_or_time_still_narrow(self):
 		# a port after an address, and the parts of an address, are not a time or a date
-		assert "TERM(8443)" in plan("10.0.1.14:8443")[0]
+		assert "TERM(8443)" not in plan("10.0.1.14:8443")[0] and "TERM(10.0.1.14)" in plan("10.0.1.14:8443")[0]
 		assert plan("192.168.33.161")[0] == (
 			"((TERM(192) OR TERM(192.168.33.161)) AND (TERM(168) OR TERM(192.168.33.161))"
 			" AND (TERM(33) OR TERM(192.168.33.161)) AND (TERM(161) OR TERM(192.168.33.161)))")
-		assert "TERM(1234)" in plan("job:1234")[0]
+		assert plan("job:1234")[0] == "(TERM(job))"
 
 
 class TestFieldNarrowing:
@@ -354,7 +363,7 @@ class TestWholeAddress:
 
 	def test_term_quotes_and_a_text_field_read_as_the_address(self):
 		want = plan("10.0.1.14")[0]
-		assert plan("TERM(10.0.1.14)")[0] == want and plan('"10.0.1.14"')[0] == want
+		assert plan('"10.0.1.14"')[0] == want and plan("TERM(10.0.1.14)")[0] is None
 		reader = p.Parser(p.tokenize("IpAddress=10.0.1.14"))
 		assert p.prefilter(reader.parse(), D, p.text_field_predicate([])) == want
 		reader = p.Parser(p.tokenize("IpAddress=10.0.1.14"))
@@ -366,10 +375,11 @@ class TestWholeAddress:
 			" AND (TERM(33) OR TERM(192.168.33.161)) AND (TERM(161) OR TERM(192.168.33.161)))")
 
 	def test_a_port_is_a_piece_of_its_own(self):
+		# the port is digits alone, which a rendered timestamp could print: it does not narrow
 		pf = plan("10.0.1.14:8443")[0]
-		assert pf.startswith("(TERM(8443) AND (TERM(10) OR TERM(10.0.1.14))")
+		assert pf.startswith("((TERM(10) OR TERM(10.0.1.14))") and "8443" not in pf
 		reader = p.Parser(p.tokenize("10.0.1.14:8443"))
-		assert p.lookup_pieces(reader.parse()) == {"8443"}
+		assert p.lookup_pieces(reader.parse()) == set()
 
 	def test_repeated_parts_once(self):
 		assert plan("0.0.0.0")[0] == "((TERM(0) OR TERM(0.0.0.0)))"
@@ -396,12 +406,12 @@ class TestWholeAddress:
 		# 10.0.2.1* matches 10.0.2.14 and *10.0.1.14 matches 110.0.1.14: requiring the part 1, or
 		# the part 10, would miss them.
 		assert p.addresses_of("10.0.2.1*") == [] and p.addresses_of("*10.0.1.14") == []
-		assert plan("10.0.2.1*")[0] == "(TERM(1*) AND TERM(10) AND TERM(0) AND TERM(2))"
-		assert "TERM(10)" not in plan("*10.0.1.14")[0]
+		assert plan("10.0.2.1*")[0] == "(TERM(10) AND TERM(0) AND TERM(2))"
+		assert "TERM(10)" not in (plan("*10.0.1.14")[0] or "")
 
 	def test_a_prefix_of_three_parts_requires_them(self):
 		assert plan("10.0.1.*")[0] == "(TERM(10) AND TERM(0) AND TERM(1))"
-		assert plan("10.0.1.14*")[0] == "(TERM(14*) AND TERM(10) AND TERM(0) AND TERM(1))"
+		assert plan("10.0.1.14*")[0] == "(TERM(10) AND TERM(0) AND TERM(1))"
 		assert p.prefix_parts("1.2.3.*") == ["2", "3"]
 		reader = p.Parser(p.tokenize("10.0.1.*"))
 		assert p.lookup_pieces(reader.parse()) == set()
@@ -410,7 +420,7 @@ class TestWholeAddress:
 		# Two dotted numbers are as likely a date or a time a timestamp slot prints.
 		assert p.prefix_parts("10.0.*") == [] and p.prefix_parts("192.168.*") == []
 		assert plan("10.0.*")[0] is None
-		assert plan("192.168.*")[0] == "(TERM(192) AND TERM(168))"
+		assert plan("192.168.*")[0] is None
 		assert p.prefix_parts("256.0.1.*") == [] and p.prefix_parts("x10.0.1.*") == []
 
 	def test_negated_or_ored_with_nothing(self):
@@ -438,7 +448,7 @@ class TestWindowsPaths:
 		# ~ is no breaker: PROGRA~1 is one index term, and TERM(progra) would select nothing
 		assert p.pieces_of("PROGRA~1") == ["progra~1"]
 		assert plan("PROGRA~1")[0] is None
-		assert plan("C:\\PROGRA~1\\WINDOW~1\\wordpad.exe")[0] == "(TERM(c) AND TERM(wordpad) AND TERM(exe))"
+		assert plan('"C:\\\\PROGRA~1\\\\WINDOW~1\\\\wordpad.exe"')[0] == "(TERM(c) AND TERM(wordpad) AND TERM(exe))"
 
 	def test_a_path_in_a_phrase_is_cut_at_its_backslashes(self):
 		assert plan('"C:\\Program Files\\Google\\Chrome"')[0] == (
@@ -449,9 +459,13 @@ class TestWindowsPaths:
 		assert p.tokenize('"say \\"hi\\" a\\\\b"') == [("phrase", 'say "hi" a\\b')]
 		assert p.tokenize('"C:\\Windows"') == [("phrase", "C:\\Windows")]
 
-	def test_an_unquoted_path_and_term_read_the_same(self):
-		assert plan("C:\\Windows\\explorer.exe")[0] == "(TERM(c) AND TERM(windows) AND TERM(explorer) AND TERM(exe))"
-		assert plan("TERM(C:\\Windows\\explorer.exe)")[0] == plan("C:\\Windows\\explorer.exe")[0]
+	def test_an_unquoted_path_places_no_restriction(self):
+		# Splunk resolves a backslash in an unquoted word before it matches (Splunk Enterprise 10.4.3:
+		# C:\Windows\explorer.exe unquoted found 0 of 62 events that hold the path, quoted with doubled
+		# backslashes 62), so the words it compares are not the ones written: no restriction.
+		assert plan("C:\\Windows\\explorer.exe")[0] is None
+		assert plan("TERM(C:\\Windows\\explorer.exe)")[0] is None
+		assert plan('"C:\\\\Windows\\\\explorer.exe"')[0] == "(TERM(c) AND TERM(windows) AND TERM(explorer) AND TERM(exe))"
 
 	def test_a_field_comparison_places_no_restriction(self):
 		assert plan('ObjectName="*Chrome*"')[0] is None

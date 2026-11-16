@@ -13,9 +13,11 @@ event, and the field is not on it. Off (the default), no field comparison restri
 
 When it cannot read the search (tx inside another subsearch, or wrapped in another macro) or
 cannot parse the words, it returns `(*)`, so every compact event in range is expanded and the
-words are applied to the expanded text: slower, never fewer results. Two things it stops with
-an error instead, because the search after `tx` would silently match nothing: a time modifier
-after `tx`, and an unquoted comma after `tx`.
+words are applied to the expanded text: slower, never fewer results. It stops with an error
+instead where the search would silently miss events: a time modifier after `tx`, an unquoted
+comma after `tx`, and a sourcetype= term naming an original sourcetype, which the compact events
+carry in tenx_sourcetype (they are indexed as the compact sourcetype). Called by
+`txf(<sourcetype>)` for a sourcetype with no replay unit (missing_unit), it stops saying so.
 """
 import json
 import os
@@ -32,7 +34,7 @@ apphome = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.join(apphome, 'bin'))
 sys.path.append(os.path.join(apphome, 'lib'))
 
-from splunklib.searchcommands import dispatch, Configuration, GeneratingCommand
+from splunklib.searchcommands import dispatch, Configuration, GeneratingCommand, Option
 
 import tenx_prefilter_parser as parser
 
@@ -48,6 +50,10 @@ SUBSEARCH_SID = re.compile(r"^subsearch_(.+)_\d+\.\d+$")
 
 @Configuration()
 class TenxPrefilterCommand(GeneratingCommand):
+
+	# txf(<sourcetype>) on a sourcetype with no replay unit (tenx_replay_builder.TXF_ONE_MISSING):
+	# stop with a message saying so, instead of Splunk's "macro cannot be found".
+	missing_unit = Option(require=False, default=None)
 
 	def _rest(self, path, data=None):
 		info = self._metadata.searchinfo
@@ -67,7 +73,31 @@ class TenxPrefilterCommand(GeneratingCommand):
 		if not match:
 			return None
 		job = self._rest("/services/search/jobs/%s?output_mode=json" % urllib.parse.quote(match.group(1), safe=""))
-		return parser.text_after_macro(job["entry"][0]["content"].get("search", ""))
+		search = job["entry"][0]["content"].get("search", "")
+		self.before = parser.macro_call(search)
+		return parser.text_after_macro(search)
+
+	def _original_sourcetype_rows(self, tree):
+		"""
+		Compact events (not field-mapped) whose original sourcetype the search names where it can
+		match none of them: before `tx` or `txf`, or after `tx`. None when it names none, or when the
+		check could not run.
+		"""
+		before, macro = self.before if getattr(self, "before", None) else ("", "`tx`")
+		sourcetypes = parser.named_sourcetypes(before, tree, after_counts=(macro == "`tx`"))
+		probe = parser.original_sourcetype_probe(sourcetypes, parser.named_indexes(before))
+		if probe is None:
+			return None, macro
+		info = self._metadata.searchinfo
+		try:
+			result = self._rest(
+				"/servicesNS/%s/%s/search/jobs" % (urllib.parse.quote(info.username), APP_NAME),
+				{"search": probe, "exec_mode": "oneshot", "output_mode": "json", "count": "0",
+				 "earliest_time": str(info.earliest_time or "0"), "latest_time": str(info.latest_time or "now")})
+		except Exception as e:
+			self.logger.warning("tx: the original sourcetype check failed: %s", e)
+			return None, macro
+		return [r for r in result.get("results", []) if str(r.get("count", "0")) not in ("0", "")], macro
 
 	def _text_field(self):
 		"""
@@ -90,6 +120,9 @@ class TenxPrefilterCommand(GeneratingCommand):
 		return parser.text_field_predicate(names)
 
 	def generate(self):
+		if self.missing_unit:
+			self.error_exit(RuntimeError("no replay unit"), parser.missing_unit_message(self.missing_unit))
+			return
 		try:
 			text = self._search_text()
 		except Exception as e:
@@ -112,6 +145,9 @@ class TenxPrefilterCommand(GeneratingCommand):
 		if reader.unquoted_comma:
 			self.error_exit(RuntimeError("comma after tx"),
 				"tx: a comma after `tx` is matched literally, so this search would miss events. Remove it, or put the text in quotes.")
+		rows, macro = self._original_sourcetype_rows(tree)
+		if rows:
+			self.error_exit(RuntimeError("original sourcetype"), parser.original_sourcetype_message(rows, macro))
 		# The setting is read only when it can change the prefilter (see narrowing_matters).
 		text_field = self._text_field() if parser.narrowing_matters(tree) else None
 		dictionary = {}

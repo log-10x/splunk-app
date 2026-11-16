@@ -201,6 +201,24 @@ class TenxSearchCommandBase(GeneratingCommand):
 			# passthrough of the search as typed. On a search that names a compact sourcetype
 			# that is the silent wrong answer again, so it is refused the same way.
 			#
+			# A search that names no sourcetype or source runs as typed. Over an index that holds
+			# compact events that returns their compact text (zero events for most words) with no
+			# sign that anything is wrong, so look for them first, and refuse when there are some.
+			#
+			probe, message = tenx_search_builder.compact_probe(build_result, tenx_config)
+
+			if probe is not None:
+				rows = search_manager.run_probe(probe, job_details['request'].get('earliest_time', '0'),
+					job_details['request'].get('latest_time', 'now'))
+
+				if rows:
+					self.write_error(message(rows))
+					return
+
+				if rows is None:
+					self.write_warning("10x: whether this search reads compact events it would miss could not be "
+						"checked; it ran as typed.")
+
 			if not build_result.engaged:
 				compact_sources = tenx_alert_compiler._referenced_tenx_sources(searchstring, tenx_config)
 

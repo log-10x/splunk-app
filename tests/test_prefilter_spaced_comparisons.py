@@ -49,8 +49,9 @@ class TestSpacedComparisons:
 	def test_words_and_unspaced_comparisons_are_unchanged(self):
 		assert tree('error') == ('text', 'error')
 		assert tree('eventName=X user') == ('and', [('field', 'eventName', '=', 'X'), ('text', 'user')])
-		assert tree('a OR = b') == ('and', [('or', [('text', 'a'), ('text', '=')]), ('text', 'b')])
-		assert tree('NOT = x') == ('and', [('not', ('text', '=')), ('text', 'x')])
+		# an operator word on its own is not a search word: it places no restriction
+		assert tree('a OR = b') == ('and', [('or', [('text', 'a'), ('unknown', '=')]), ('text', 'b')])
+		assert tree('NOT = x') == ('and', [('not', ('unknown', '=')), ('text', 'x')])
 
 
 class TestAnOperatorAtTheEndOfTheFieldWord:
@@ -139,6 +140,39 @@ class TestAQuotedFieldName:
 
 	def test_what_cannot_be_read_with_certainty_is_not_narrowed(self):
 		for text in ('"usr"!= (a OR b)', '"usr" != OR x', '"usr"= NOT x'):
+			try:
+				tree(text)
+			except p.Unparsed:
+				continue
+			raise AssertionError('read with certainty: %s' % text)
+
+
+class TestAQuotedFieldNameBeforeIn:
+	"""`"user" IN (alice)`: read as text, the name, the keyword IN and each value were required words
+	(Splunk Enterprise 10.4.3, the released package: `"user" IN (alice)` 43 events through tx against
+	256 raw, `"host" IN (df-app01)` 0 against 10,000). Each form is one IN comparison, which places no
+	restriction, as the unquoted name does."""
+
+	def test_each_form(self):
+		cases = {
+			'"user" IN (alice)': ['alice'], '"level" IN (ERROR)': ['ERROR'], '"host" IN (df-app01)': ['df-app01'],
+			'"user" IN ("alice" "bob")': ['alice', 'bob'], '"user" IN (alice, bob)': ['alice', 'bob'],
+			'"user" IN (alice,bob)': ['alice', 'bob'], '"user" IN ("a b", c)': ['a b', 'c'], '"user" IN(alice)': ['alice'],
+			'user IN (alice)': ['alice'], 'user IN (alice, "b c")': ['alice', 'b c']}
+		for text, values in cases.items():
+			field = text.split(' ')[0].strip('"')
+			field = field.split('IN')[0].strip('"') if 'IN(' in field else field
+			reader = p.Parser(p.tokenize(text))
+			assert reader.parse() == ('in', field.strip('"'), values), text
+			assert not reader.unquoted_comma, text
+			assert p.prefilter(tree(text), {"alice": (1, ["TERM(~a1)"]), "user": (1, ["TERM(~u1)"])}) is None, text
+
+	def test_not_before_it(self):
+		assert tree('NOT "user" IN (alice)') == ('not', ('in', 'user', ['alice']))
+		assert p.prefilter(tree('error NOT "user" IN (alice)'), {}) == "((TERM(error)))"
+
+	def test_in_without_its_parentheses_is_not_read(self):
+		for text in ('"user" IN alice', 'user IN alice', '"user" IN (alice', 'user IN (alice'):
 			try:
 				tree(text)
 			except p.Unparsed:

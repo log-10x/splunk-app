@@ -914,9 +914,20 @@ class TestLookupRules:
 		conf = fm.read_conf(os.path.join(os.path.dirname(fm.default_app_props()), 'savedsearches.conf'))
 		ss = conf['Field Map Events Without Fields']
 		assert ss['enableSched'] == '0' and ss['counttype'] == 'number of events' and ss['relation'] == 'greater than'
-		assert ss['search'].startswith('| tstats count where index=* %s=* NOT host=%s by index sourcetype %s' % (
-			fm.UNMAPPED_FIELD, fm.PROBE_HOST, fm.UNMAPPED_FIELD))
+		assert ss['search'].startswith('| tstats count where index=* %s=* NOT host=%s _index_earliest=-15m _index_latest=now '
+			'by index sourcetype %s' % (fm.UNMAPPED_FIELD, fm.PROBE_HOST, fm.UNMAPPED_FIELD))
 		assert '"processor=regexreplacement" "Runtime exception"' in ss['search'] and ss['search'].endswith('| where count > 0')
+
+	def test_the_search_for_events_without_fields_selects_by_index_time(self):
+		# A compact event keeps its original date: an event dated a day ago and indexed now must count, so the
+		# 15 minutes are index time and the dispatch range is every event date.
+		conf = fm.read_conf(os.path.join(os.path.dirname(fm.default_app_props()), 'savedsearches.conf'))
+		ss = conf['Field Map Events Without Fields']
+		assert ss['dispatch.earliest_time'] == '0' and ss['dispatch.latest_time'] == '+10y'
+		tstats, internal = ss['search'].split('| append [', 1)
+		assert '_index_earliest=-15m _index_latest=now' in tstats
+		# splunkd.log lines are dated when they are written, so that part keeps its own 15 minutes of event time.
+		assert internal.startswith('search index=_internal earliest=-15m latest=now ')
 
 	def test_no_floor_app_with_floor_off_or_per_template_transforms(self, tmp_path):
 		self.gen(tmp_path, [('k1', 'user=$')], 'fm_fw', '--floor', 'off')
@@ -1567,6 +1578,28 @@ class TestCapFile:
 		# rounds at 0, 10, ... 70 s: the probe indexed at 70 s (refresh 60 + poll 10) is the one that counts
 		assert rc == 1 and len(listed) == len(new) == 8 and '8 checks' in out
 		assert max(b - a for a, b in zip(listed, listed[1:])) == 10
+
+	def test_activate_says_when_the_instance_has_not_read_the_rows(self, tmp_path):
+		# Splunk 10.4.3 did not reread a lookup file that came back with the time it had when it was last read:
+		# every probe is then indexed without fields (no_row), and activate says why that can be
+		cap, fake, clock = self.waiting(tmp_path, [], ['k1', 'k2'])
+		fake.rows = set()
+		try:
+			rc, out = self.activate(tmp_path, cap, fake, timeout=200, poll=10, clock=clock, sleep=clock.sleep)
+		finally:
+			fake.close()
+		assert rc == 1 and read(str(cap)) == fm.cap_text(set())
+		assert 'every probe came back tenx_unmapped=no_row, so the instance has not read the rows of tenx_fw_fields.csv.gz' in out
+		assert 'stays unread until it is touched on that instance' in out
+
+	def test_no_word_on_rows_when_some_template_has_its_fields(self, tmp_path):
+		cap, fake, clock = self.waiting(tmp_path, [], ['k1', 'k2'])
+		fake.rows = {'k2'}
+		try:
+			rc, out = self.activate(tmp_path, cap, fake, timeout=200, poll=10, clock=clock, sleep=clock.sleep)
+		finally:
+			fake.close()
+		assert "'k1' (tenx_unmapped=no_row)" in out and 'has not read the rows' not in out
 
 	def test_without_rows_activate_sends_one_probe_a_round_and_lists_templates_once_rows_return(self, tmp_path):
 		added = ['k1', 'k2', 'k3', 'k4', 'k5', 'k6']
