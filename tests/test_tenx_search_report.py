@@ -264,7 +264,6 @@ class TestWithFieldMap:
 		('index=wineventlog EventCode=4798 | stats count by dest', 'dest_4798'),
 		('index=wineventlog EventCode=1 | table EventData_Xml', 'xml_blocks'),
 		('index=wineventlog EventCode=1 | stats count by punct', 'punct'),
-		('index=wineventlog EventCode=1 | stats count by responseElements.credentials.sessionToken', 'session_token'),
 		('index=wineventlog EventCode=4104 | stats count by ScriptBlockText', 'long_value'),
 	])
 	def test_limits_of_the_map(self, search, quote):
@@ -305,6 +304,11 @@ class TestEventTime:
 	def test_fortigate_time_is_a_limit(self, search):
 		res = verdict(search, FGT)
 		assert res.verdict == r.LIMIT and 'can fall on another day' in res.reason
+
+	def test_a_fortigate_map_gives_the_raw_time(self):
+		# A map built with --target fortigate sets _time from date= and time= (the README's FortiGate field map).
+		mapped = r.Move(['fortigate_*', 'fgt_*'], ['fw'], ['fortigate_traffic'])
+		assert 'fall on another day' not in verdict('index=fw sourcetype=fortigate_traffic | timechart count', mapped).reason
 
 	def test_fortigate_counts_over_all_time_are_not(self):
 		assert verdict('index=fw sourcetype=fortigate_traffic | stats count by action', FGT).verdict == r.NEEDS_TXF

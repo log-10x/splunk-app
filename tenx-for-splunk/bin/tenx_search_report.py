@@ -119,7 +119,6 @@ README = {
 		'`dest_ip` are not written.',
 	'xml_blocks': 'The add-on\'s XML block fields `EventData_Xml` and `System_Props_Xml` are not written.',
 	'privilege_dash': '`vendor_privilege` and `privilege_id` carry `-` on events where the raw event has neither.',
-	'session_token': 'On CloudTrail, `responseElements.credentials.sessionToken` is not written.',
 	'long_value': 'A plain search shows a mapped field longer than 1,000 characters, such as a PowerShell '
 		'`ScriptBlockText`, cut to its first 1,000',
 	'ct_time': 'A compact event\'s `_time` is the first timestamp the Receiver found in the line. In a CloudTrail record '
@@ -176,12 +175,11 @@ LIMIT_FIELDS = (
 	(re.compile(r'^(?:EventData_Xml|System_Props_Xml)$'), 'xml_blocks'),
 	(re.compile(r'^(?:vendor_privilege|privilege_id)$'), 'privilege'),
 	(re.compile(r'^xmlns$'), 'xmlns'),
-	(re.compile(r'^responseElements\.credentials\.sessionToken$'), 'session_token'),
 	(re.compile(r'^ScriptBlockText$'), 'long_value'),
 )
 # Sources whose compact events can carry another `_time` than their raw events (README): patterns of the original
 # sourcetype, the README sentence, and whether a field map (built with --time-props, as the README says) removes it.
-TIME_SOURCES = ((('fortigate_*', 'fgt_*'), 'fgt_date', False), (('aws:cloudtrail',), 'ct_time', True))
+TIME_SOURCES = ((('fortigate_*', 'fgt_*'), 'fgt_date', True), (('aws:cloudtrail',), 'ct_time', True))
 # Commands and functions whose results depend on the events' times or their order.
 TIME_COMMANDS = frozenset(('timechart', 'bin', 'bucket', 'transaction', 'streamstats', 'head', 'tail', 'dedup', 'reverse',
 	'delta', 'autoregress', 'trendline', 'predict', 'timewrap', 'concurrency', 'localize', 'sitimechart', 'accum'))
@@ -755,7 +753,7 @@ def _map_limits(text, leaves):
 	names = set(identifiers(text)) | set(n[1] for _, n in leaves if n[0] in ('field', 'in'))
 	keys, results = _limit_keys(names), []
 	for key, quote in (('date', 'date_fields'), ('punct', 'punct'), ('xml_blocks', 'xml_blocks'),
-			('privilege', 'privilege_dash'), ('session_token', 'session_token'), ('long_value', 'long_value')):
+			('privilege', 'privilege_dash'), ('long_value', 'long_value')):
 		if key in keys:
 			results.append(Result(LIMIT, [readme(quote)]))
 	if set(named(leaves, 'eventtype')) & EVENTTYPE_WORDS:
