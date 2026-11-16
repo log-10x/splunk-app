@@ -64,8 +64,8 @@ class TestTimestampText:
 
 class TestAWildcardInsideAWord:
 	"""Splunk matches a wildcard between two characters across a minor breaker (`le*FO` matches
-	`level=INFO`), which the compact event, cut at those breakers, does not hold as one term (DF:
-	`le*FO` raw 2,278, tx 0; `am*50` 197, 0)."""
+	`level=INFO`), which the compact event, cut at those breakers, does not hold as one term (an
+	OpenTelemetry demo set, raw against tx: `le*FO` 2,278 and 0; `am*50` 197 and 0)."""
 
 	@pytest.mark.parametrize("text", ["le*FO", "am*50", "to*en", "ER*OR", "ro*t", "a*ce", "us*ot", "Se*Privilege"])
 	def test_places_no_restriction(self, text):
@@ -116,7 +116,9 @@ class TestEveryConstruct:
 	def test_words_not_recognised(self):
 		for text in ("a/b=c", "=x", "<5", 'a"b"c', "a]b", "x\\y", "C:\\Windows\\explorer.exe", "TERM", "CASE", '"abc"def'):
 			assert pf(text) is None, text
-		assert tree("error a/b=c") == ("and", [("text", "error"), ("unknown", "a/b=c")])
+		assert tree("error a!b=c") == ("and", [("text", "error"), ("unknown", "a!b=c")])
+		# a slash is a character of a field name (Kubernetes label keys)
+		assert tree("error a/b=c") == ("and", [("text", "error"), ("field", "a/b", "=", "c")])
 
 	def test_subsearches_macros_and_misplaced_operators(self):
 		assert pf("[| makeresults | eval search=\"root\" | fields search]") is None
@@ -144,3 +146,31 @@ class TestEveryConstruct:
 		# with certainty, so it places no restriction
 		assert pf('"user"root') is None
 		assert pf('"user" root') == "(((TERM(user) OR TERM(~u1))) AND ((TERM(root) OR TERM(~r1))))"
+
+
+class TestFieldNamesSplunkExtracts:
+	"""A field name as its source writes it: a Kubernetes label key from JSON holds dots and a slash
+	(an OpenTelemetry demo set, raw against the parser before: `...app.kubernetes.io/name!= prometheus`
+	4,639/23, `NOT ...eks.amazonaws.com/component ="coredns"` 4,892/3, `...helm.sh/chart != "grafana-10.0.0"`
+	287/36, `.../component!=frontend` 1,712/124). Each spelling is a comparison, which places no
+	restriction."""
+
+	@pytest.mark.parametrize("text, name, op, value", [
+		('kubernetes.labels.app.kubernetes.io/name!= prometheus', 'kubernetes.labels.app.kubernetes.io/name', '!=', 'prometheus'),
+		('kubernetes.labels.helm.sh/chart != "grafana-10.0.0"', 'kubernetes.labels.helm.sh/chart', '!=', 'grafana-10.0.0'),
+		('kubernetes.labels.app.kubernetes.io/component!=frontend', 'kubernetes.labels.app.kubernetes.io/component', '!=', 'frontend'),
+		('kubernetes.labels.app.kubernetes.io/component = frontend', 'kubernetes.labels.app.kubernetes.io/component', '=', 'frontend'),
+		('a#b=c', 'a#b', '=', 'c'), ('x+y=1', 'x+y', '=', '1'), ('k%v>=3', 'k%v', '>=', '3'), ('p?q<2', 'p?q', '<', '2'),
+		('é=1', 'é', '=', '1')])
+	def test_read_as_a_comparison(self, text, name, op, value):
+		assert tree(text) == ('field', name, op, value)
+		assert pf(text) is None
+
+	def test_with_not(self):
+		text = 'NOT kubernetes.labels.eks.amazonaws.com/component ="coredns"'
+		assert tree(text) == ('not', ('field', 'kubernetes.labels.eks.amazonaws.com/component', '=', 'coredns'))
+		assert pf(text) is None
+
+	def test_a_name_it_cannot_read_takes_its_operator_and_value_along(self):
+		assert tree('a\\b = c root') == ('and', [('unknown', 'a\\b'), ('text', 'root')])
+		assert pf('a\\b != c') is None and pf('a!b=c') is None

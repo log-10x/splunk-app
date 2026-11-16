@@ -93,7 +93,13 @@ TIMESTAMP_PIECE = re.compile(
 # Splunk's default segment breakers, major and minor, as single characters; '*' is left out, as a
 # wildcard of the search it stays in its piece. The same set as tenx_search_builder.SEGMENT_BREAKERS.
 SEGMENT_BREAKERS = frozenset("[]<>(){}|!;,'\"\n\r\t &?+/:=@.-$#%\\_")
-FIELD_TERM = re.compile(r"^([A-Za-z0-9_.:@{}\-]+)(!=|<=|>=|=|<|>)(.*)$", re.S)
+# A field name as a search writes it unquoted: Splunk takes the text before the operator, and an
+# extracted field's name can hold almost anything its source wrote (a Kubernetes label key from
+# JSON, kubernetes.labels.app.kubernetes.io/name, holds dots and a slash). Everything but white
+# space, quotes, brackets, parentheses, a pipe, a backtick, a backslash, a comma and the operator
+# characters.
+NAME_CHARS = r"[^\s\"'()\[\]|`\\,=<>!]"
+FIELD_TERM = re.compile(r"^(" + NAME_CHARS + r"+)(!=|<=|>=|=|<|>)(.*)$", re.S)
 # Written forms of a date or a time in searched text (see the module docstring). A piece that
 # overlaps one is not used. Matching more than a timestamp prints only leaves a piece unused,
 # which expands more compact events and never drops one the search after `tx` would keep.
@@ -112,7 +118,7 @@ TIME_FORMS = (
 	# zone offsets: +0000, -04:00
 	re.compile(r"[-+](?:[01]\d|2[0-3]):?[0-5]\d(?![0-9])"),
 )
-FIELD_NAME = re.compile(r"^[A-Za-z0-9_.:@{}\-]+$")
+FIELD_NAME = re.compile(r"^" + NAME_CHARS + r"+$")
 OPERATOR = re.compile(r"^(?:!=|<=|>=|=|<|>)")
 # A word that is a search term and nothing else: no comparison operator, quote, bracket, backslash
 # or backtick in it (each of those is syntax, or an escape Splunk resolves before it matches).
@@ -434,6 +440,15 @@ class Parser(object):
 			# An indexed field term, `host::web-01`, `sourcetype::tenx_encoded`: matched against the
 			# event's indexed fields, never its text.
 			return ("field", indexed.group(1), "::", indexed.group(2))
+		if self._peek()[0] == "word" and OPERATOR.match(self._peek()[1]):
+			# A word, then an operator word: a comparison whose name this module does not read (the
+			# name rule above took every name it can). The name, the operator and the value place no
+			# restriction.
+			self._take()
+			if OPERATOR.fullmatch(self._peek(-1)[1]) and self._peek()[0] in ("word", "phrase") \
+					and self._peek() not in (("word", "AND"), ("word", "OR"), ("word", "NOT")):
+				self._take()
+			return ("unknown", value)
 		if not PLAIN_WORD.match(value) or value in ("TERM", "CASE"):
 			# Not a search word this module recognises (an operator outside a comparison it reads, a
 			# quote or a bracket inside a word, a backslash, whose escape Splunk applies before it
