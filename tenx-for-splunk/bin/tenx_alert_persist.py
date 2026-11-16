@@ -214,6 +214,42 @@ def is_drifted(saved_search):
 	return bool(fingerprint) and (saved_search.get('search') or '') != fingerprint
 
 
+# The first `search` command as versions before 1.2.2 stored it, followed by the search's terms.
+_LEADING_SEARCH_RE = re.compile(r'search(?=\s|\(|$)\s*', re.IGNORECASE)
+
+
+def repaired_search(saved_search):
+	"""
+	The stored search of an alert this app compiled before 1.2.2, in the form that runs, or None.
+
+	Those versions stored a native compile as 'search <terms> | ...'. Splunk puts `search ` in
+	front of a saved search's text when it runs it (the scheduler and the saved search's dispatch
+	endpoint), so the job ran 'search search <terms> ...', the word "search" became a term every
+	event had to hold, and the alert found nothing (Splunk 9.4.15, 10.4.3 and 10.6.0.5). The form
+	that runs is the same text without that first `search`, which is what the compiler now writes.
+	Only an alert the compiler wrote and nobody edited since (its search equals the stored
+	fingerprint) is repaired; an alert whose first command is not `search`, or a `search` with no
+	terms, is left as it is.
+	"""
+	fingerprint = (saved_search.get(COMPILED_SEARCH_KEY) or '').strip()
+	live = (saved_search.get('search') or '').strip()
+
+	if not fingerprint or live != fingerprint:
+		return None
+
+	match = _LEADING_SEARCH_RE.match(live)
+
+	if not match:
+		return None
+
+	terms = live[match.end():]
+
+	if not terms or terms.startswith('|'):
+		return None
+
+	return terms
+
+
 def recompile_source(saved_search):
 	"""
 	Given a saved-search stanza (a dict with at least 'search', and optionally the stored
