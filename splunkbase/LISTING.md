@@ -250,7 +250,7 @@ Paste the block for the version being uploaded. Splunkbase keeps notes per relea
 
 | Check | Result |
 |---|---|
-| 1.2.0 unit tests | 1014 passed, among them the field replay behind `txf`, the field map and its fail-safe, field comparisons written with spaces, the index time of template records, the Consume KV window, and the term that selects a template whose hash contains `*` |
+| 1.2.0 unit tests | 1016 passed, among them the field replay behind `txf`, the field map and its fail-safe, field comparisons written with spaces, the index time of template records, the Consume KV window, and the term that selects a template whose hash contains `*` |
 | 1.2.0 AppInspect 4.4.0: default, cloud, future, private_victoria, private_classic | 0 errors, 0 failures, 0 future failures; warnings 6, 5, 0, 6, 6 in that order |
 | 1.2.0 as packaged on Splunk 10.4.3, upgraded in place over 1.1.7 with Splunk's app install; Windows Security, OpenTelemetry demo and synthetic key=value events with their templates | every stored template kept; 64 of 75 searches unchanged; 10 now equal raw; one, a wildcard inside a word (`Se*Privilege`), follows the limit stated in the README: 3 events on raw, 662 through `tx`; after the upgrade step, records sent with 2022 event times are stored and their events expand (200 of 200) |
 | 1.2.0 as packaged, fresh install on Splunk 9.4.15, 10.4.3 and 10.6.0.5; the same events | no error from the app in `splunkd.log` outside Splunk's restarts; the 75 `tx` searches return the same events on all three versions; 16 field comparisons with and without spaces equal the same 5,500 events indexed raw; `txf` on 662 Windows Security events gives the raw counts of tags, event types, `EventCode` and `action` |
