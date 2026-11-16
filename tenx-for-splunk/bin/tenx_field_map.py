@@ -159,6 +159,7 @@ import argparse
 import base64
 import collections
 import configparser
+import glob
 import csv
 import datetime
 import hashlib
@@ -2680,6 +2681,142 @@ def derive_pairs(rule, text, probes=DERIVE_PROBES):
 	return got, False
 
 
+# ---------------------------------------------------------------------------------------------
+# The fields the data models need (--fields cim)
+#
+# Every indexed field takes index space (the classic Windows Message field made a mapped index 10 times its raw
+# index). With --fields cim the map writes only the fields that the CIM data models, and the add-on's event types,
+# read on the event, directly or through the add-on's own search-time rules: starting from every field name the CIM
+# models use (their fields, calculations and constraints) and every field the add-on's event types search, the
+# inputs of each rule that writes a needed field are needed too (FIELDALIAS, EVAL, LOOKUP, a REPORT or EXTRACT that
+# reads a field), until nothing is added. A field whose name the map takes from a value is kept. Every other field is
+# left out: a search that reads it directly finds it through txf, not on the indexed event.
+
+_SEARCH_FIELD = re.compile(r'(?<![A-Za-z0-9_.:{}])([A-Za-z_][A-Za-z0-9_.:{}-]*)\s*(?:!=|<=|>=|=|<|>|\s+IN\s*\()', re.I)
+_EXPR_WORD = re.compile(r'[A-Za-z_][A-Za-z0-9_.:{}]*')
+_EXPR_KEYWORDS = frozenset(('AND', 'OR', 'NOT', 'IN', 'LIKE', 'TRUE', 'FALSE', 'NULL', 'AS', 'BY', 'XOR'))
+
+
+def expr_fields(expr):
+	"""Field names an eval expression reads: words outside string literals that are not functions or keywords, and
+	names in single quotes."""
+	text = re.sub(r'"(?:[^"\\]|\\.)*"', ' ', expr)
+	names = set(re.findall(r"'([^']+)'", text))
+	text = re.sub(r"'[^']*'", ' ', text)
+	for m in _EXPR_WORD.finditer(text):
+		if text[m.end():].lstrip().startswith('(') or m.group(0).upper() in _EXPR_KEYWORDS:
+			continue
+		names.add(m.group(0))
+	return names
+
+
+def search_fields(search):
+	"""Field names a search string compares (name=value, name!=value, name IN (...))."""
+	return set(m.group(1) for m in _SEARCH_FIELD.finditer(search or ''))
+
+
+_SEARCH_TAG = re.compile(r'(?<![A-Za-z0-9_])tag\s*=\s*"?([A-Za-z0-9_:-]+)"?')
+
+
+def cim_fields(cim_dir, tags=None):
+	"""Every field name the CIM data models of cim_dir use: dataset fields, calculation outputs and inputs, and the
+	fields their constraints search. With tags, only the models whose root dataset's constraint asks for tags that are
+	all among them (Network_Traffic's tag=network tag=communicate), so a model the add-on's events never reach adds
+	no name."""
+	names = set()
+	for path in sorted(glob.glob(os.path.join(cim_dir, 'default', 'data', 'models', '*.json'))):
+		with open(path, encoding='utf-8') as f:
+			model = json.load(f)
+		roots = [o for o in model.get('objects', []) if o.get('parentName') in ('BaseEvent', 'BaseSearch')]
+		if tags is not None:
+			wanted = [set(_SEARCH_TAG.findall(' '.join(c.get('search') or '' for c in o.get('constraints', [])))) for o in roots]
+			if not any(w and w <= tags for w in wanted):
+				continue
+		for obj in model.get('objects', []):
+			for fld in obj.get('fields', []):
+				names.add(fld.get('fieldName'))
+			for calc in obj.get('calculations', []):
+				for fld in calc.get('outputFields', []):
+					names.add(fld.get('fieldName'))
+				names |= expr_fields(calc.get('expression') or '')
+				names |= set(calc.get('inputField') and [calc['inputField']] or [])
+			for c in obj.get('constraints', []):
+				names |= search_fields(c.get('search'))
+	names.discard(None)
+	return names
+
+
+def addon_rules(props, transforms, stanzas):
+	"""[(written names, read names)] of the add-on's search-time rules in the given props stanzas."""
+	rules = []
+	for st in stanzas:
+		for key, value in props.get(st, {}).items():
+			kind = key.split('-', 1)[0].upper()
+			if kind == 'FIELDALIAS':
+				for a, b in re.findall(r'("[^"]+"|\S+)\s+AS(?:NEW)?\s+("[^"]+"|\S+)', value, re.I):
+					rules.append(({b.strip('"')}, {a.strip('"')}))
+			elif kind == 'EVAL':
+				rules.append(({key.split('-', 1)[1]}, expr_fields(value)))
+			elif kind == 'LOOKUP':
+				m = re.match(r'\s*\S+\s+(.*?)(?:\s+OUTPUT(?:NEW)?\s+(.*))?$', value, re.I | re.S)
+				if not m:
+					continue
+				ins = set(x.strip().split()[-1].strip('"') for x in m.group(1).split(',') if x.strip())
+				outs = set(x.strip().split()[-1].strip('"') for x in (m.group(2) or '').split(',') if x.strip())
+				rules.append((outs or {'*'}, ins))
+			elif kind in ('REPORT', 'EXTRACT'):
+				names = [x.strip() for x in value.split(',')] if kind == 'REPORT' else []
+				for t in names:
+					tr = transforms.get(t, {})
+					sk = str(tr.get('SOURCE_KEY', '_raw')).strip()
+					if sk == '_raw':
+						continue
+					fmt, regex = str(tr.get('FORMAT', '')), str(tr.get('REGEX', ''))
+					outs = set(re.findall(r'([A-Za-z_][A-Za-z0-9_]*)::', fmt)) | set(re.findall(r'\(\?P?<([A-Za-z_]\w*)>', regex))
+					rules.append((outs or {'*'}, {sk}))
+				if kind == 'EXTRACT':
+					m = re.search(r'\s+in\s+([A-Za-z_][A-Za-z0-9_]*)\s*$', value)
+					if m:
+						rules.append((set(re.findall(r'\(\?P?<([A-Za-z_]\w*)>', value)), {m.group(1)}))
+	return rules
+
+
+def needed_fields(addon_dir, cim_dir, stanzas):
+	"""The fields the CIM models and the add-on's event types read, closed over the add-on's rules (see above)."""
+	props, transforms = read_addon(addon_dir)
+	eventtypes = collections.OrderedDict()
+	for sub in ('default', 'local'):
+		eventtypes.update(read_splunk_conf(os.path.join(addon_dir, sub, 'eventtypes.conf')))
+	tags = set()
+	for sub in ('default', 'local'):
+		for settings in read_splunk_conf(os.path.join(addon_dir, sub, 'tags.conf')).values():
+			tags |= set(k for k, v in settings.items() if str(v).strip().lower() == 'enabled')
+	needed = cim_fields(cim_dir, tags)
+	for settings in eventtypes.values():
+		needed |= search_fields(settings.get('search'))
+	rules = addon_rules(props, transforms, stanzas)
+	while True:
+		before = len(needed)
+		for outs, ins in rules:
+			if '*' in outs or outs & needed:
+				needed |= ins
+		if len(needed) == before:
+			return needed
+
+
+class NeededFieldsReader(object):
+	"""A reader that keeps only the fields of needed_fields; a name that holds a compact value is kept."""
+
+	def __init__(self, reader, needed):
+		self.reader, self.needed = reader, frozenset(needed)
+
+	def __getattr__(self, name):
+		return getattr(self.reader, name)
+
+	def pairs(self, text):
+		return [(n, v) for n, v in self.reader.pairs(text) if n in self.needed or MARK_RE.search(n)]
+
+
 class LeaveOutReader(object):
 	"""A reader without the fields --leave-out names: the map does not write them (each indexed field costs index space,
 	and a field such as classic Windows Message, which an indexed field cannot hold with its line breaks, may not be
@@ -4044,6 +4181,15 @@ def _build(args):
 	leave_out = target.get('leave_out') or []
 	if leave_out:
 		reader = LeaveOutReader(reader, leave_out)
+	if getattr(args, 'fields', 'all') == 'cim':
+		if not (getattr(args, 'addon', None) and getattr(args, 'cim', None)):
+			raise ValueError('--fields cim needs --addon and --cim (the folders of the add-on and of Splunk_SA_CIM)')
+		stanzas = renames(target)
+		if target.get('source'):
+			props, _ = read_addon(args.addon)
+			stanzas = stanzas + [st for st in props if st.startswith('source::') and source_pattern_matches(
+				st[len('source::'):], target['source'])]
+		reader = NeededFieldsReader(reader, needed_fields(args.addon, args.cim, stanzas))
 	if getattr(args, 'addon', None):
 		try:
 			copies, report, derived = addon_text_rules(args.addon, target, templates)
@@ -4090,6 +4236,11 @@ def build_parser():
 		p.add_argument('--app-name')
 		p.add_argument('--indexed-value-false', help='comma-separated field names for fields.conf')
 		p.add_argument('--leave-out', help='comma-separated field names the map does not write')
+		p.add_argument('--fields', choices=('all', 'cim'), default='all',
+			help='all: every field the reader finds (default); cim: only the fields the CIM data models and the add-on\'s '
+				'event types read, through the add-on\'s rules (needs --addon and --cim; see "The fields the data models '
+				'need")')
+		p.add_argument('--cim', help='with --fields cim, the folder of Splunk_SA_CIM (its default/data/models/*.json)')
 		p.add_argument('--stanza-names', choices=('indexed', 'hash', 'stable'), default='indexed',
 			help='indexed: <prefix>_<position>_<hash> (default); hash: <prefix>_<hash>, refused on a clash; '
 				'stable: <prefix>_<hash>_<sha1 prefix>, unchanged when templates are added')

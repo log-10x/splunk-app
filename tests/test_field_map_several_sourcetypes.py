@@ -228,3 +228,45 @@ class TestLeaveOut:
 		rule = fm.lookup_eval_text('t', None, False)
 		piece = [x for x in rule.split(', $pd') if fm.SPLIT_ESCAPE in x][0]
 		assert 'urldecode("%5C%5C") . "]|" . urldecode("%5C%5C") . ".)*' in piece and 'urldecode("%5C") .' not in piece
+
+
+class TestCimFields:
+	def addon(self, tmp_path):
+		a = tmp_path / 'addon' / 'default'
+		os.makedirs(str(a))
+		(a / 'props.conf').write_text('[fw:traffic]\nREPORT-kv = kv\nFIELDALIAS-src = srcip AS src\n'
+			'EVAL-bytes = coalesce(rcvd + sent, 0)\nLOOKUP-act = act_lookup vendor_action OUTPUT action\n'
+			'FIELDALIAS-va = act AS vendor_action\n', encoding='utf-8')
+		(a / 'transforms.conf').write_text('[kv]\nDELIMS = " ", "="\n', encoding='utf-8')
+		(a / 'eventtypes.conf').write_text('[fw_traffic]\nsearch = sourcetype=fw:traffic logid=13\n', encoding='utf-8')
+		(a / 'tags.conf').write_text('[eventtype=fw_traffic]\nnetwork = enabled\ncommunicate = enabled\n', encoding='utf-8')
+		c = tmp_path / 'cim' / 'default' / 'data' / 'models'
+		os.makedirs(str(c))
+		(c / 'Network_Traffic.json').write_text(json.dumps({'objects': [{'objectName': 'All_Traffic', 'parentName': 'BaseEvent',
+			'constraints': [{'search': 'tag=network tag=communicate'}], 'fields': [{'fieldName': 'src'}, {'fieldName': 'bytes'},
+			{'fieldName': 'action'}], 'calculations': []}]}), encoding='utf-8')
+		(c / 'Email.json').write_text(json.dumps({'objects': [{'objectName': 'All_Email', 'parentName': 'BaseEvent',
+			'constraints': [{'search': 'tag=email'}], 'fields': [{'fieldName': 'subject'}], 'calculations': []}]}), encoding='utf-8')
+		return str(tmp_path / 'addon'), str(tmp_path / 'cim')
+
+	def test_the_closure_over_the_add_on_rules(self, tmp_path):
+		addon, cim = self.addon(tmp_path)
+		needed = fm.needed_fields(addon, cim, ['fw:traffic'])
+		assert {'src', 'srcip', 'bytes', 'rcvd', 'sent', 'action', 'vendor_action', 'act', 'logid'} <= needed
+		# a model the add-on's tags never reach adds nothing
+		assert 'subject' not in needed and 'time' not in needed
+
+	def test_gen_writes_only_the_needed_fields(self, tmp_path):
+		addon, cim = self.addon(tmp_path)
+		tpl = 'logid=$ srcip=$ act=$ rcvd=$ sent=$ time=$ sessionid=$'
+		assert fm.main(['gen', '--rules', 'lookup', '--records', records(tmp_path, [('k', tpl)]), '--reader', 'delims',
+			'--sourcetype', 'tenx_fw', '--rename', 'fw:traffic', '--fields', 'cim', '--addon', addon, '--cim', cim,
+			'--out', str(tmp_path / 'fm')]) == 0
+		row = fm.read_lookup_file(str(tmp_path / 'fm' / 'lookups' / 'tenx_fw_fields.csv.gz'))['k']['f']
+		names = [n for n, _ in fm.parse_meta(row)]
+		assert names == ['logid', 'srcip', 'act', 'rcvd', 'sent', 'tenx_mapped']
+
+	def test_cim_needs_both_folders(self, tmp_path, capsys):
+		assert fm.main(['gen', '--rules', 'lookup', '--records', records(tmp_path, [('k', 'a=$')]), '--reader', 'delims',
+			'--sourcetype', 'tenx_fw', '--rename', 'fw:traffic', '--fields', 'cim', '--out', str(tmp_path / 'fm')]) == 2
+		assert '--fields cim needs --addon and --cim' in capsys.readouterr().err
