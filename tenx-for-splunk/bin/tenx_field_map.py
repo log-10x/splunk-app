@@ -2680,6 +2680,21 @@ def derive_pairs(rule, text, probes=DERIVE_PROBES):
 	return got, False
 
 
+class LeaveOutReader(object):
+	"""A reader without the fields --leave-out names: the map does not write them (each indexed field costs index space,
+	and a field such as classic Windows Message, which an indexed field cannot hold with its line breaks, may not be
+	worth it)."""
+
+	def __init__(self, reader, names):
+		self.reader, self.names = reader, frozenset(names)
+
+	def __getattr__(self, name):
+		return getattr(self.reader, name)
+
+	def pairs(self, text):
+		return [(n, v) for n, v in self.reader.pairs(text) if n not in self.names]
+
+
 class TextRuleReader(object):
 	"""A reader with the pairs of derive_pairs added after its own, for the rules of "Rules the copies cannot read
 	from one field". Counts, per rule, the texts it wrote fields for and the texts it left out."""
@@ -4004,6 +4019,7 @@ def _build(args):
 		'indexed_value_false': None if args.indexed_value_false is None
 			else [f for f in args.indexed_value_false.split(',') if f],
 		'reserved_names': args.reserved_names, 'time_prefix': args.time_prefix, 'time_format': args.time_format,
+		'leave_out': None if args.leave_out is None else [f for f in args.leave_out.split(',') if f],
 	}
 	target = load_target(args.target, overrides)
 	templates, refused = merge_templates([load_templates(p) for p in args.records])
@@ -4025,6 +4041,9 @@ def _build(args):
 			settings = each[0]
 		time_rule = make_time_rule(settings, time_prefix, time_formats, args.time_lookahead)
 	reader, text_rules = READERS[target['reader']](), None
+	leave_out = target.get('leave_out') or []
+	if leave_out:
+		reader = LeaveOutReader(reader, leave_out)
 	if getattr(args, 'addon', None):
 		try:
 			copies, report, derived = addon_text_rules(args.addon, target, templates)
@@ -4070,6 +4089,7 @@ def build_parser():
 		p.add_argument('--transforms-class')
 		p.add_argument('--app-name')
 		p.add_argument('--indexed-value-false', help='comma-separated field names for fields.conf')
+		p.add_argument('--leave-out', help='comma-separated field names the map does not write')
 		p.add_argument('--stanza-names', choices=('indexed', 'hash', 'stable'), default='indexed',
 			help='indexed: <prefix>_<position>_<hash> (default); hash: <prefix>_<hash>, refused on a clash; '
 				'stable: <prefix>_<hash>_<sha1 prefix>, unchanged when templates are added')

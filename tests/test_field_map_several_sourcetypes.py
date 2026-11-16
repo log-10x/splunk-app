@@ -213,3 +213,12 @@ class TestSplitEscape:
 			timestamp_format='', expand_unsafe='', pattern=None)
 		field_map = fm.FieldMap({'h': t}, fm.JsonReader(), 'p', rules=fm.RULES_LOOKUP, mark=fm.MARK_FIELD)
 		assert field_map.transforms == [] and field_map.report()['templates_without_transform'] == {fm.REFUSED_SENTINEL: 1}
+
+
+class TestLeaveOut:
+	def test_named_fields_are_not_written(self, tmp_path):
+		tpl = CLASSIC.replace('bob', '$')
+		assert fm.main(['gen', '--rules', 'lookup', '--records', records(tmp_path, [('w1', tpl)]), '--target',
+			'windows-security-classic', '--leave-out', 'Message,Logon_ID', '--out', str(tmp_path / 'fm_w')]) == 0
+		row = fm.read_lookup_file(str(tmp_path / 'fm_w' / 'lookups' / 'tenx_wincl_fields.csv.gz'))['w1']['f']
+		assert 'Message::' not in row and 'Logon_ID::' not in row and 'Account_Name::"' in row
