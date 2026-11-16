@@ -1218,8 +1218,18 @@ class TenxSearchCommand(TenxSplCommand):
 
 		This can happen for complex queries as we interlace data from variables (encoded events) and
 		templates (coming from the decoding against tenx_dml)
+
+		That search comes after a pipe Splunk cannot fold into the base search, where a word with a
+		wildcard inside it (Se*Privilege) is matched as its prefix alone; such words are first
+		matched as a base search on the index matches them (tenx_prefilter_parser.wildcard_filter,
+		as the `tx` macro does).
 		"""
-		return " | search " + " ".join([item.text for item in self.user_search_terms])
+		import tenx_prefilter_parser
+		terms = " ".join([item.text for item in self.user_search_terms])
+		wild = tenx_prefilter_parser.wildcard_filter(terms)
+		step = (" | eval %s | search %s=1 | fields - %s, tenx_w*" % (
+			wild, tenx_prefilter_parser.WILD_STEP_FIELD, tenx_prefilter_parser.WILD_STEP_FIELD)) if wild else ""
+		return step + " | search " + terms
 
 	def resolved(self):
 		"""
