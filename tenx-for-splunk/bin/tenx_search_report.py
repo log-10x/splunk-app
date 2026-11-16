@@ -92,11 +92,13 @@ README = {
 		'the search-time knowledge of the event\'s original sourcetype, as its add-on defines it',
 	'sourcetype': 'The sourcetype before or after `tx` is the compact sourcetype (`sourcetype=tenx_encoded`); each '
 		'event\'s original sourcetype is in the field `tenx_sourcetype`.',
-	'midword': 'A wildcard inside a word (`Se*Privilege`) is matched as Splunk matches it after a pipe, on the '
-		'characters before its first `*`. Such a word can match more events than on the original lines, and '
-		'under `NOT` fewer.',
-	'term': 'A `TERM()` whose match depends on how Splunk split the original event into terms at index time [...] '
-		'can match different events than on the original lines.',
+	'not_words': 'Under `NOT` through the `tx` and `txf` macros, two kinds of word can return fewer events than on '
+		'the original lines: a wildcard inside a word (`Se*Privilege`), and `TERM()` of part of a longer term [...] '
+		'Outside `NOT`, both match as on the original lines.',
+	'pipe_not': 'Under `NOT` in `| tx`, the same words give the exact opposite of the word, which can be more events '
+		'than Splunk\'s own `NOT` returns on the original lines.',
+	'major_term': '`TERM()` of text that holds a major breaker, outside `NOT`, and `NOT CASE()` can return more events '
+		'than on the original lines, never fewer. Under `NOT` through the macros, such a `TERM()` can return fewer.',
 	'comma': 'A search word after `tx` with a comma outside quotes, such as `4625,` in `4625, 4624`, is matched '
 		'literally by Splunk, so the search stops with a message. Remove the comma, or put the text in quotes.',
 	'punct': '`linecount` and `punct` are computed by Splunk from the compact text it indexes, so on expanded '
@@ -388,9 +390,49 @@ def named(leaves, field):
 	return [v for v in dict.fromkeys(found) if v]
 
 
+# Splunk's default breakers (segmenters.conf [indexing]), as the app's prefilter reads them.
+MAJOR_CHARS = "[]<>(){}|!;,'\"\n\r \t&?+"
+MAJOR_SEQUENCES = ("%2526", "%2520", "%21", "%26", "%3B", "%7C", "%20", "%2B", "%3D", "--", "%5D", "%5B", "%3A",
+	"%0A", "%2C", "%28", "%29")
+MINOR_CHARS = "/:=@.-$#%\\_"
+
+
 def midword_wildcard(word):
-	"""A wildcard between two characters of one word: Se*Privilege, not *Privilege or Se*."""
-	return any(re.search(r'[^\s*]\*+[^\s*]', piece) for piece in word.split())
+	"""A word Splunk matches as its prefix after a pipe: a `*` after its first character and before its last, and no
+	breaker of its own (Se*Privilege; not *Privilege, Se*, 10.0*14)."""
+	if not word or word[0] == '*' or '*' not in word.rstrip('*'):
+		return False
+	return not any(c in MAJOR_CHARS or c in MINOR_CHARS or c.isspace() for c in word)
+
+
+def term_text(node):
+	"""The text inside TERM(...) of a parse node, or None."""
+	m = re.match(r'^TERM\((.*)\)$', node[1], re.S | re.I) if node[0] == 'unknown' else None
+	return m.group(1) if m else None
+
+
+def major_breaker(text):
+	return any(c in MAJOR_CHARS or c.isspace() for c in text) or any(q in text for q in MAJOR_SEQUENCES)
+
+
+def minor_breaker(text):
+	return any(c in MINOR_CHARS for c in text)
+
+
+def word_limits(leaves, pipe_tx=False):
+	"""The README's limits of the words a search gives `tx` or `txf` (`| tx` with pipe_tx): Results."""
+	found = []
+	for negated, n in leaves:
+		term = term_text(n)
+		if term is not None and major_breaker(term):
+			found.append(Result(LIMIT, [readme('major_term')]))
+		elif negated and n[0] == 'unknown' and re.match(r'^CASE\(', n[1], re.I):
+			found.append(Result(LIMIT, [readme('major_term')]))
+		elif negated and ((n[0] == 'text' and midword_wildcard(n[1])) or (term is not None and minor_breaker(term))):
+			found.append(Result(LIMIT, [readme('not_words')]))
+			if pipe_tx:
+				found.append(Result(LIMIT, [readme('pipe_not')]))
+	return found
 
 
 # -------------------------------------------------------------------------------------------
@@ -487,7 +529,7 @@ def classify(search, move, kind='report', expanded=None):
 		return Result(NOT_AFFECTED, ['The search is empty.'])
 	first_written = [p for p in split_commands(search) if p][:1]
 	if MACROS_OF_THE_APP.search(search) or (first_written and command_name(first_written[0]) in APP_COMMANDS):
-		return Result(UNCHANGED, ['It already searches compact events with the app\'s macros or commands.'])
+		return _already_compact(search, first_written[0] if first_written else '')
 	parts = split_commands(text)
 	generating = not parts[0]
 	if generating:
@@ -507,6 +549,21 @@ def classify(search, move, kind='report', expanded=None):
 		return _generating(names[0], command_args(first), parts[1:], move, kind)
 	base = command_args(first) if names[0] == 'search' and re.match(r'^search\b', first) else first
 	return _search(base, parts[1:], move, kind, search, expanded is not None)
+
+
+def _already_compact(search, first):
+	"""A search written for compact events: unchanged, or a limit the README states for the words it gives the app."""
+	found = [Result(UNCHANGED, ['It already searches compact events with the app\'s macros or commands.'])]
+	words = pp.text_after_macro(search)
+	pipe_tx = words is None and command_name(first) == 'tx'
+	if pipe_tx:
+		words = command_args(first)
+	if words is not None:
+		try:
+			found += word_limits(parse_terms(words)[0], pipe_tx)
+		except pp.Unparsed:
+			pass
+	return worst(found)
 
 
 def _generating(name, args, rest, move, kind):
@@ -668,11 +725,7 @@ def _search(base, rest, move, kind, written, expanded):
 	findings = []
 
 	def macro_limits():
-		found = []
-		if any(n[0] == 'text' and midword_wildcard(n[1]) for n in words):
-			found.append(Result(LIMIT, [readme('midword')]))
-		if any(n[0] == 'unknown' and n[1].upper().startswith('TERM(') for n in words):
-			found.append(Result(LIMIT, [readme('term')]))
+		found = word_limits(leaves)
 		if parser.unquoted_comma:
 			found.append(Result(LIMIT, [readme('comma')]))
 		if 'punct' in keys:

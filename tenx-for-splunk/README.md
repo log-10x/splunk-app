@@ -1010,12 +1010,12 @@ time terms before it, every other term after it.
 | not classified | A macro the tool cannot expand, `map`, `savedsearch`, a subsearch that writes search terms, a dashboard token without a default, or a shape not measured |
 | not affected | Reads none of the moved data |
 
-Without a field map, a search of the moved data needs `tx` or `txf`, except one that counts by
-index, host and source, and data models and `tstats` need a field map. With a field map, a search on
-fields runs as written, also where a value is template text; a search on words of the text, a
-search whose later commands read `_raw` (`rex`, `regex`, `spath`, `search` on words), and a report
-that lists events need `txf`. An alert that lists events fires as before: the number of events is
-the same, and its results show the compact text.
+Without a field map, searches of the moved data need `tx` or `txf`, except searches that count by
+index, host and source; data models and `tstats` need a field map. With a field map, searches on
+fields run as written, also where a value is template text. Three kinds still need `txf`: a search
+on words of the text, a search whose later commands read `_raw` (`rex`, `regex`, `spath`, `search`
+on words), and a report that lists events. An alert that lists events fires as before, with the
+same number of events, and its results show the compact text.
 
 Checked on Splunk Enterprise 10.4.3 with the Windows add-on 12.0.0 and CIM 8.8.0, on 63 saved
 searches, 18 of them ESCU detections, and two dashboards, each run on the same events raw and

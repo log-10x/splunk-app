@@ -38,8 +38,8 @@ class TestReadmeQuotes:
 			assert flat(piece) in text
 
 	def test_reason_names_the_readme(self):
-		res = verdict('index=wineventlog Se*Privilege | stats count')
-		assert 'README: "A wildcard inside a word' in res.reason
+		res = verdict('index=wineventlog NOT Se*Privilege EventCode=4672 | stats count')
+		assert 'README: "Under `NOT` through the `tx` and `txf` macros' in res.reason
 
 
 # -------------------------------------------------------------------------------------------
@@ -69,6 +69,7 @@ class TestText:
 	def test_midword_wildcard(self):
 		assert r.midword_wildcard('Se*Privilege')
 		assert not r.midword_wildcard('*Privilege') and not r.midword_wildcard('Se*') and not r.midword_wildcard('*')
+		assert r.midword_wildcard('S*P*e') and not r.midword_wildcard('10.0*14') and not r.midword_wildcard('foo.*.com')
 
 
 # -------------------------------------------------------------------------------------------
@@ -139,15 +140,28 @@ class TestWithoutFieldMap:
 		assert verdict('index=wineventlog tag=authentication | stats count').verdict == r.NEEDS_TXF
 		assert verdict('index=wineventlog eventtype=x | stats count').verdict == r.NEEDS_TXF
 
-	def test_midword_wildcard_is_a_limit_with_an_edit(self):
+	def test_midword_wildcard_outside_not_needs_tx_under_not_is_a_limit(self):
 		res = verdict('index=wineventlog Se*Privilege | stats count')
-		assert res.verdict == r.LIMIT and res.edit == 'index=wineventlog `tx` Se*Privilege | stats count'
+		assert res.verdict == r.NEEDS_TX and res.edit == 'index=wineventlog `tx` Se*Privilege | stats count'
+		res = verdict('index=wineventlog EventCode=4672 NOT Se*Privilege | stats count')
+		assert res.verdict == r.LIMIT and res.edit == 'index=wineventlog `txf` EventCode=4672 NOT Se*Privilege | stats count'
+		assert 'fewer events' in res.reason
+		assert verdict('index=wineventlog NOT (Se*Privilege OR x) | stats count').verdict == r.LIMIT
 
-	def test_term_is_a_limit(self):
-		assert verdict('index=wineventlog TERM(10.9.8.7) | stats count').verdict == r.LIMIT
+	def test_term_outside_not_needs_tx_with_a_minor_breaker_under_not_is_a_limit(self):
+		assert verdict('index=wineventlog TERM(10.9.8.7) | stats count').verdict == r.NEEDS_TX
+		res = verdict('index=wineventlog NOT TERM(10.9.8.7) | stats count')
+		assert res.verdict == r.LIMIT and 'part of a longer term' in res.reason
+		assert verdict('index=wineventlog NOT TERM(plain) | stats count').verdict == r.NEEDS_TX
+		for q in ('index=wineventlog TERM(+0000) | stats count', 'index=wineventlog TERM("a b") | stats count',
+				'index=wineventlog NOT TERM(x%20y) | stats count'):
+			res = verdict(q)
+			assert res.verdict == r.LIMIT and 'major breaker' in res.reason, q
 
 	def test_case_is_not_a_limit(self):
 		assert verdict('index=wineventlog CASE(Kerberos) | stats count').verdict == r.NEEDS_TX
+		res = verdict('index=wineventlog NOT CASE(Kerberos) | stats count')
+		assert res.verdict == r.LIMIT and '`NOT CASE()`' in res.reason
 
 	def test_comma_is_a_limit(self):
 		res = verdict('index=wineventlog 4625, 4624 | stats count')
@@ -331,6 +345,12 @@ class TestOtherVerdicts:
 		res = verdict('`x` y', expanded='!Macro `x` has no definition in what was read.')
 		assert res.verdict == r.NOT_CLASSIFIED and 'no definition' in res.reason
 
+	def test_app_macros_and_commands_with_limited_words(self):
+		assert verdict('index=wineventlog `txf` NOT Se*Privilege').verdict == r.LIMIT
+		res = verdict('| tx index=wineventlog sourcetype=tenx_encoded NOT Se*Privilege')
+		assert res.verdict == r.LIMIT and 'exact opposite' in res.reason
+		assert verdict('| tx index=wineventlog sourcetype=tenx_encoded Se*Privilege').verdict == r.UNCHANGED
+
 	def test_app_macros_and_commands_unchanged(self):
 		assert verdict('index=wineventlog `txf` EventCode=1').verdict == r.UNCHANGED
 		assert verdict('index=wineventlog `txf(XmlWinEventLog)` EventCode=1').verdict == r.UNCHANGED
@@ -489,7 +509,7 @@ class TestDashboards:
 		got = by_name(r.run(FakeSource(saved, dash), NOMAP))
 		assert got['s / b'].kind == 'base search' and got['s / b'].result.verdict == r.NEEDS_TXF
 		assert got['s / Types'].result.verdict == r.NEEDS_TXF
-		assert got['s / term'].result.verdict == r.LIMIT
+		assert got['s / term'].result.verdict == r.NEEDS_TX
 		assert got['s / s'].result.verdict == r.NEEDS_MAP
 		assert got['s / i'].kind == 'input' and got['s / i'].result.verdict == r.UNCHANGED
 
