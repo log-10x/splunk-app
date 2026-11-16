@@ -674,7 +674,8 @@ has its own cap file and its own scheduled `check`.
    Fluent Bit and the Receiver then run as two containers that share Fluent Bit's network:
 
    ```sh
-   docker run -d --name tenx-fluentbit -v <fluent-bit.conf>:/fluent-bit/etc/fluent-bit.conf:ro \
+   docker run -d --name tenx-fluentbit --network <network> --env-file <env file> \
+     -v <fluent-bit.conf>:/fluent-bit/etc/fluent-bit.conf:ro \
      -v <parsers file>:/fluent-bit/etc/win-parsers.conf:ro -v <log folder>:/logs fluent/fluent-bit:5.1.5
    docker run -d --name tenx-receiver --network container:tenx-fluentbit \
      -v <edited compact config.yaml>:/etc/tenx/config/pipelines/run/receive/compact/config.yaml:ro \
@@ -683,8 +684,37 @@ has its own cap file and its own scheduled `check`.
      timestampMaxPerObject 1 compactReceiverLookupFile /etc/tenx/win/compact-cap.csv
    ```
 
-   The tool is then given the cap file's path on the host, and the Receiver the path inside the
-   container. The host folder need not be `/etc/tenx` (creating a folder there needs root).
+   `<network>` is a Docker network from which the HTTP Event Collector is reachable. The env file
+   sets each variable the configuration names, one `NAME=value` per line, such as
+   `HEC_TOKEN=<HEC token>` for `Splunk_Token ${HEC_TOKEN}`. The tool is then given the cap file's
+   path on the host, and the Receiver the path inside the container. The host folder need not be
+   `/etc/tenx` (creating a folder there needs root).
+
+   The Fluent Bit configuration of the mapped source holds:
+
+   - `Parsers_File /fluent-bit/etc/win-parsers.conf` in `[SERVICE]`, and in that file the `win_xml`
+     parser of [Fields of the Original Sourcetype](#fields-of-the-original-sourcetype-txf), step 1;
+   - the source's `tail` input with `multiline.parser win_xml`, as in that step;
+   - the hand-off to the Receiver and the input its events come back on:
+
+     ```
+     [OUTPUT]
+         Name        forward
+         Match       <tag of the source>
+         Host        127.0.0.1
+         Port        24224
+
+     [INPUT]
+         Name        forward
+         Listen      0.0.0.0
+         Port        24225
+         Tag_Prefix  tenx.
+     ```
+
+   - the template output of the [Splunk setup page](https://doc.log10x.com/apps/receiver/compact/splunk/),
+     step 3, with `Match tenx.tenx-template`, which sends the template records to `tenx_dml`;
+   - the `modify` filter and the `splunk` output of the source, as in that step 1, with
+     `event_sourcetype tenx_win` and `event_source XmlWinEventLog:Security` (step 5 below).
 
    Every event arrives whole, with all its fields, until its template is listed. From the first
    event on, send the mapped source with the map's compact sourcetype (`tenx_win` below), so whole
@@ -711,10 +741,11 @@ has its own cap file and its own scheduled `check`.
      --out fm_win
    ```
 
-   `--addon` names a copy of the Windows add-on's folder on this host. `gen` adds a copy of each of
-   its rules that read the event's XML text (dest, src_ip, process_id and the 4688 process fields
-   among them), reading the indexed field instead. Without it, those fields and `src` are missing on
-   mapped events.
+   `--addon` names a copy of the Windows add-on's folder on this host. The add-on downloads as a
+   `.spl` archive; `tar -xzf` on it gives that folder, `Splunk_TA_windows/`. `gen` adds a copy of
+   each of its rules that read the event's XML text (dest, src_ip, process_id and the 4688 process
+   fields among them), reading the indexed field instead. Without it, those fields and `src` are
+   missing on mapped events.
 
    `--target windows-security` reads templates of the rendered XML events above; on other records
    it writes an app with no rule and says so. This writes the apps `fm_win` and `fm_win_floor`
@@ -836,10 +867,12 @@ same at either value.
 Checked with the Windows add-on 12.0.0, the AWS add-on 8.3.1 and CIM 8.8.0 against the same events
 indexed raw; the results are in the
 [listing's checks](https://github.com/log-10x/splunk-app/blob/main/splunkbase/LISTING.md#checks-run-on-this-package).
-Two limits remain. Event types that match words of the original text, such as `err0r` in the Windows
+These limits remain. Event types that match words of the original text, such as `err0r` in the Windows
 add-on and `aws_cloudtrail_delete_events` in the AWS add-on, do not match mapped events. On Windows
 EventID 4798, 5156 and 5157, `dest` is the event's Computer and `src_ip` and `dest_ip` are not
-written.
+written. The add-on's XML block fields `EventData_Xml` and `System_Props_Xml` are not written.
+`vendor_privilege` and `privilege_id` carry `-` on events where the raw event has neither. A value
+that holds line breaks is written with spaces in their place.
 
 ## What to Install on Each Tier
 

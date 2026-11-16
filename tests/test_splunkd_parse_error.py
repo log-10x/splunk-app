@@ -16,8 +16,8 @@ from support.local_search_manager import CsvTemplateStore, LocalSearchManager
 from tenx_alert_compiler import AlertStrategy, TenxAlertCompiler
 from test_tenx_alert_compiler import CONTROLLED_TEMPLATES, make_config
 
-TEXT = ("Error in 'SearchParser': Encountered the following error while validating macro 'txf(fr:none)': txf takes "
-		"one original sourcetype, without quotes (letters, digits and _ . : / -), that has a field replay.")
+TEXT = ("Error in 'SearchParser': Encountered the following error while validating macro 'txf(fr:none)': no field "
+		"replay is written yet for this sourcetype, so the search was not run.")
 
 
 def refused(body=b'{"messages":[{"type":"ERROR","text":"%s","help":""}]}' % TEXT.encode()):

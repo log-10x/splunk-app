@@ -1442,9 +1442,10 @@ TXF_ONE = 'txf(1)'
 TXF_ONE_NAME = 'match(st, "^[A-Za-z0-9_.:/-]+$")'
 # Splunk prints it after "Encountered the following error while validating macro 'txf(<st>)': " and
 # adds the final period.
-TXF_ONE_ERROR = ('txf takes one original sourcetype, without quotes (letters, digits and _ . : / -), that has a field '
-				 'replay. Rebuild Field Replay writes one, within the hour, for each original sourcetype that compact '
-				 'events carry in the field tenx_sourcetype; to write it now, run | tenxreplay over All time')
+TXF_ONE_ERROR = ('no field replay is written yet for this sourcetype, so the search was not run. Rebuild Field '
+				 'Replay When New writes one within five minutes of the sourcetype\'s first compact event being '
+				 'indexed; to write it now, run | tenxreplay over All time. txf takes one original sourcetype, without '
+				 'quotes (letters, digits and _ . : / -)')
 
 
 def txf_one_validation(unit_names):

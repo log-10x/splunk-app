@@ -48,9 +48,10 @@ class TestTxfOfOneSourcetype:
 		conf = macros()
 		assert conf.get('txf(1)', 'validation') == b.txf_one_validation([])
 		assert conf.get('txf(1)', 'errormsg') == b.TXF_ONE_ERROR == (
-			"txf takes one original sourcetype, without quotes (letters, digits and _ . : / -), that has a field "
-			"replay. Rebuild Field Replay writes one, within the hour, for each original sourcetype that compact "
-			"events carry in the field tenx_sourcetype; to write it now, run | tenxreplay over All time")
+			"no field replay is written yet for this sourcetype, so the search was not run. Rebuild Field Replay "
+			"When New writes one within five minutes of the sourcetype's first compact event being indexed; to "
+			"write it now, run | tenxreplay over All time. txf takes one original sourcetype, without quotes "
+			"(letters, digits and _ . : / -)")
 		# the definition is the unit's, as before
 		assert conf.get('txf(1)', 'definition') == b.TXF_ONE_UNIT
 
