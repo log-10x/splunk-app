@@ -522,7 +522,12 @@ class BuildResult:
 	"""
 	def __init__(self, state, resolved, engaged=False, field_terms=None, retryable=False,
 				has_search_terms=False, no_dml_results=False, dml_truncated=False,
-				no_prefilter=False):
+				no_prefilter=False, indexes=None, names_source=True):
+		# indexes: the index values the leading search names ([] for none, None when it cannot
+		# tell); names_source: whether it names a sourcetype or a source at all. Read by
+		# unnamed_compact_probe().
+		self.indexes = indexes
+		self.names_source = names_source
 		self.state = state
 		self.resolved = resolved
 		self.engaged = engaged
@@ -1426,6 +1431,12 @@ class TenxSearchBuilder:
 		no_dml_results = bool(leading_search is not None and leading_search.no_dml_results)
 		dml_truncated = bool(leading_search is not None and leading_search.dml_truncated)
 		no_prefilter = bool(has_search_terms and leading_search.resolved_done and leading_search.resolved_search is None)
+		indexes, names_source = None, True
+		parsed = leading_search.parsed_command if leading_search is not None else None
+		if parsed is not None:
+			indexes = parsed.get_passing_specifiers('index_specifier')
+			names = [parsed.get_passing_specifiers(k) for k in ('sourcetype_specifier', 'source_specifier')]
+			names_source = any(n is None or len(n) > 0 for n in names)
 
 		return BuildResult(
 			spl_commands.resolved_state(),
@@ -1436,7 +1447,9 @@ class TenxSearchBuilder:
 			has_search_terms=has_search_terms,
 			no_dml_results=no_dml_results,
 			dml_truncated=dml_truncated,
-			no_prefilter=no_prefilter)
+			no_prefilter=no_prefilter,
+			indexes=indexes,
+			names_source=names_source)
 
 	def resolve(self, base_search):
 		"""
@@ -1451,3 +1464,57 @@ class TenxSearchBuilder:
 		except Exception as e:
 			logger.warning("Error while resolving {} - {}.".format(base_search, e), exc_info=1)
 			return tenx_util.splunk_message_macro("Failed building tenx search")
+
+
+def _spl_value(value):
+	"""A specifier value as a search term: quoted unless it is a plain run of name characters or a '*' pattern."""
+	value = str(value)
+	if re.match(r'^[A-Za-z0-9_.:*\-]+$', value):
+		return value
+	return '"' + value.replace('\\', '\\\\').replace('"', '\\"') + '"'
+
+
+def unnamed_compact_probe(build_result, tenx_config):
+	"""
+	The search that finds compact events a passthrough would read as compact text, or None when
+	none is needed. The rewrite engages only for a search that names a compact sourcetype or source
+	(check_needs_tenx); one that names neither runs as typed, and over an index holding compact
+	events that is the wrong answer with no sign of it (Splunk Enterprise 10.4.3: `| tx
+	index=sr_compact error` 0 events, 102 with sourcetype=tenx_encoded added, equal to raw). So
+	when a search was not engaged and names no sourcetype or source, this tstats looks for events
+	of the registered compact sourcetypes and sources in the indexes it names (every index the
+	user searches by default when it names none, every index when that cannot be told).
+	"""
+	if build_result is None or build_result.engaged or build_result.names_source:
+		return None
+	config = tenx_config or {}
+	sourcetypes = [t for t in (config.get('tenx_source_types') or []) if t]
+	sources = [t for t in (config.get('tenx_sources') or []) if t]
+	if not sourcetypes and not sources:
+		return None
+	compact = ' OR '.join(['sourcetype=%s' % _spl_value(t) for t in sourcetypes] +
+						  ['source=%s' % _spl_value(t) for t in sources])
+	if build_result.indexes is None:
+		where = 'index=* '
+	elif build_result.indexes:
+		where = '(%s) ' % ' OR '.join('index=%s' % _spl_value(i) for i in sorted(set(build_result.indexes)))
+	else:
+		where = ''
+	return '| tstats count where %s(%s) by index, sourcetype, source' % (where, compact)
+
+
+def unnamed_compact_message(rows, refused=True):
+	"""
+	The message for a search whose probe found compact events (rows of index, sourcetype, source,
+	count): the refusal of the commands and the hook, or (refused=False) the review reason of a
+	compiled alert, which is stored.
+	"""
+	sts = sorted(set(r.get('sourcetype', '') for r in rows if r.get('sourcetype')))
+	ixs = sorted(set(r.get('index', '') for r in rows if r.get('index')))
+	return ("{}this search reads compact events (sourcetype {} in index {}) but names no compact sourcetype "
+			"or source{}: as typed it {} their compact text and {} the wrong events. "
+			"Add the sourcetype to the search, for example sourcetype={}.").format(
+				"10x: " if refused else "", ", ".join(sts) or "?", ", ".join(ixs) or "?",
+				", so it was not run" if refused else "", "would read" if refused else "reads",
+				"return" if refused else "returns",
+				sts[0] if sts else "tenx_encoded")

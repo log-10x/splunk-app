@@ -379,4 +379,16 @@ class TenxAlertCompiler:
 						"- it would otherwise alert on un-inflated compact events").format(
 							", ".join(referenced)))
 
+		# Names no sourcetype or source: an alert over an index holding compact events would read
+		# their compact text on every run. Flagged the same way when the probe finds any.
+		import tenx_search_builder
+		probe = tenx_search_builder.unnamed_compact_probe(result, config)
+		manager = getattr(self.builder, 'search_manager', None)
+		if probe is not None and hasattr(manager, 'run_probe'):
+			rows = manager.run_probe(probe, '0', 'now')
+			if rows:
+				return AlertCompileResult(
+					AlertStrategy.PASSTHROUGH, original, original, result.state,
+					needs_review=True, reason=tenx_search_builder.unnamed_compact_message(rows, refused=False))
+
 		return AlertCompileResult(AlertStrategy.PASSTHROUGH, original, original, result.state)

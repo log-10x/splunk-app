@@ -207,6 +207,19 @@ class TenxSearchHandler(PersistentServerConnectionApplication):
 					return refusal("10x: this search mixes sourcetypes or fields in a way the rewrite cannot "
 						"follow, so it was not run. Put the compact sourcetype in a plain sourcetype=... term.")
 
+				# A search that names no sourcetype or source runs as typed; over an index holding
+				# compact events it would show their compact text, zero events for most words, with no
+				# sign of it. Look for them first (tenx_search_builder.unnamed_compact_probe).
+				#
+				probe = tenx_search_builder.unnamed_compact_probe(build_result, tenx_config)
+
+				if probe is not None:
+					rows = search_manager.run_probe(probe, search_data.get('earliest_time', '0'),
+						search_data.get('latest_time', 'now'))
+
+					if rows:
+						return refusal(tenx_search_builder.unnamed_compact_message(rows))
+
 				if not build_result.engaged:
 					compact_sources = tenx_alert_compiler._referenced_tenx_sources(original_search, tenx_config)
 
