@@ -1017,6 +1017,11 @@ search whose later commands read `_raw` (`rex`, `regex`, `spath`, `search` on wo
 that lists events need `txf`. An alert that lists events fires as before: the number of events is
 the same, and its results show the compact text.
 
+Checked on Splunk Enterprise 10.4.3 with the Windows add-on 12.0.0 and CIM 8.8.0, on 63 saved
+searches, 18 of them ESCU detections, and two dashboards, each run on the same events raw and
+compact, without and with a field map; the results are in the
+[listing's checks](https://github.com/log-10x/splunk-app/blob/main/splunkbase/LISTING.md#checks-run-on-this-package).
+
 ## What to Install on Each Tier
 
 In a distributed deployment, run `$SPLUNK_HOME/bin/slim partition tenx-for-splunk-<version>.tar.gz`

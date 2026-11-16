@@ -34,7 +34,8 @@ class TestReadmeQuotes:
 	def test_each_quoted_sentence_is_in_the_readme(self, key):
 		with open(README_PATH, encoding='utf-8') as f:
 			text = flat(f.read())
-		assert flat(r.README[key]) in text
+		for piece in r.README[key].split(' [...] '):
+			assert flat(piece) in text
 
 	def test_reason_names_the_readme(self):
 		res = verdict('index=wineventlog Se*Privilege | stats count')

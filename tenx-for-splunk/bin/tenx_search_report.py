@@ -81,8 +81,8 @@ VERDICTS = (NOT_CLASSIFIED, LIMIT, NEEDS_MAP, NEEDS_TXF, NEEDS_TX, UNCHANGED, NO
 # The order of the summary line.
 SUMMARY_ORDER = (UNCHANGED, NEEDS_TX, NEEDS_TXF, NEEDS_MAP, LIMIT, NOT_CLASSIFIED, NOT_AFFECTED)
 
-# Sentences of tenx-for-splunk/README.md as written there (line breaks aside); tests/test_tenx_search_report.py
-# checks that each one is in the README.
+# Sentences of tenx-for-splunk/README.md as written there (line breaks aside; " [...] " stands for words left out);
+# tests/test_tenx_search_report.py checks that each one is in the README.
 README = {
 	'words': 'A word that exists only in a template is not in the index, so a plain keyword search over compact '
 		'data finds the events where the word is a value and misses the others.',
@@ -95,9 +95,8 @@ README = {
 	'midword': 'A wildcard inside a word (`Se*Privilege`) is matched as Splunk matches it after a pipe, on the '
 		'characters before its first `*`. Such a word can match more events than on the original lines, and '
 		'under `NOT` fewer.',
-	'term': 'A `TERM()` whose match depends on how Splunk split the original event into terms at index time, such '
-		'as `TERM(10.2.236.94)` inside `client_ip=10.2.236.94`, can match different events than on the original '
-		'lines.',
+	'term': 'A `TERM()` whose match depends on how Splunk split the original event into terms at index time [...] '
+		'can match different events than on the original lines.',
 	'comma': 'A search word after `tx` with a comma outside quotes, such as `4625,` in `4625, 4624`, is matched '
 		'literally by Splunk, so the search stops with a message. Remove the comma, or put the text in quotes.',
 	'punct': '`linecount` and `punct` are computed by Splunk from the compact text it indexes, so on expanded '

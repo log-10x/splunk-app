@@ -82,6 +82,9 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 >   detections read them without `tx`.
 > - Both are checked on Windows Security, AWS CloudTrail and FortiGate events with their
 >   add-ons, against the same events indexed raw.
+> - The search report, `bin/tenx_search_report.py`, lists which saved searches, alerts and
+>   dashboard panels of a search head run unchanged after a source moves to compact events, with
+>   or without a field map, and which need `tx`, `txf` or a field map.
 >
 > **Speed**, on one laptop running Splunk 10.4.3: a `tx` search over 157,228 compact events
 > returns in about 1.5 to 4 seconds, where the same search over the raw lines takes under a
@@ -184,6 +187,7 @@ Paste the block for the version being uploaded. Splunkbase keeps notes per relea
 
 1.2.2:
 
+> - The new search report, `bin/tenx_search_report.py`, reads a search head's saved searches, alerts and dashboards, over REST or from files, and says for each one whether it runs unchanged when a source moves to compact events, needs `tx` or `txf` (with the search edited to hold it), needs a field map, or meets a limit the README states.
 > - Alerts compiled in the Compile Alert view now fire when Splunk runs them. An alert compiled with an earlier version is rewritten by the app within 15 minutes of the upgrade, unless someone edited it since.
 > - The field map's `check` also counts compact events indexed without their fields since its previous run, and fails with the count and the reason. It empties the list when a row or the lookup file fails (`bad_row`, `no_table`), and keeps it for templates the list does not hold (`no_row`) and values a row does not take (`no_match`).
 > - The field map's `check` also counts the compact events Splunk dropped because it could not load the map's lookup file, from Splunk's own log, and empties the list and fails with that count. The new **Field Map Dropped Events** alert, scheduled every five minutes, reports them by node.
@@ -263,6 +267,7 @@ Paste the block for the version being uploaded. Splunkbase keeps notes per relea
 
 | Check | Result |
 |---|---|
+| Search report on Splunk 10.4.3 with the Windows add-on 12.0.0 and CIM 8.8.0: 63 saved searches, 18 of them ESCU detection base searches, and two dashboards, one Simple XML and one Dashboard Studio (78 objects), each run on 8,311 Windows Security events indexed raw and on the same events compact, without and with a field map, as written or with the report's edit | Without a field map, the 3 objects reported unchanged, the 4 that need `tx` and the 47 that need `txf` return what they return on raw; the 6 that need a field map return nothing as written. With one, 48 of the 51 reported unchanged return the same rows and the other 3 the same events at the same times with their text compact (an alert that lists events, as its reason says, and two dashboard base searches whose panels return the same rows); the 8 that need `txf` return the same rows. Of the searches the report gives a limit, those with a wildcard inside a word, `TERM(explorer.exe)`, punct, `tstats` on sourcetype and, through the map, `vendor_privilege` return other results than raw, a comma after the macro stops the search with its message, and the rest return what raw returns on these events. Read over REST and from the files, the report gives the same verdicts and edits on all 78 |
 | 1.2.1 unit tests | 1016 passed, among them the field replay behind `txf`, the field map and its fail-safe, field comparisons written with spaces, the index time of template records, the Consume KV window, and the term that selects a template whose hash contains `*` |
 | 1.2.1 AppInspect 4.4.0: default, cloud, future, private_victoria, private_classic | 0 errors, 0 failures, 0 future failures; warnings 6, 5, 0, 6, 6 in that order |
 | 1.2.1 as packaged on Splunk 10.4.3, upgraded in place over 1.1.7 with Splunk's app install; Windows Security, OpenTelemetry demo and synthetic key=value events with their templates | every stored template kept; 64 of 75 searches unchanged; 10 now equal raw; one, a wildcard inside a word (`Se*Privilege`), follows the limit stated in the README: 3 events on raw, 662 through `tx`; after the upgrade step, records sent with 2022 event times are stored and their events expand (200 of 200) |
