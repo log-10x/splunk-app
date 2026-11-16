@@ -1434,9 +1434,9 @@ MAX_LISTED = MAX_LISTED_SOURCES
 # Enterprise 10.4.3: HTTP 400 with the message in json, csv and xml), where a command that fails
 # while the search runs gives export in json or csv an empty body. tenxreplay rewrites the
 # validation with the units it has written (txf_one_validation()); the shipped one names none.
-# Before the final search of `tx`, `txf` and txf(<sourcetype>): the filter that matches a wildcard inside a
-# word as a base search on the index matches it (tenx_prefilter_parser.wildcard_filter).
-WILD_STEP = ' | eval [| tenxprefilter after=t] | search tenx_keep=1 | fields - tenx_keep, tenx_w*'
+# Before the final search of `tx`, `txf` and txf(<sourcetype>): the step that matches a wildcard inside a
+# word, TERM() and CASE() as a base search on the index matches them (macros.conf [tenx-wild]).
+WILD_STEP = ' | `tenx-wild`'
 TXF_ONE_UNIT = ('"`tenx-events` [| tenxprefilter] | eval tenx_compact_raw=_raw | `tenx-inflate` | fields - _kv | '
 				'`tenx-mapped-hide` | `tenx-replay-u" . substr(md5("$st$"), 1, 12) . "` | `tenx-replay-tags` | '
 				'`tenx-mapped-restore` | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars | '

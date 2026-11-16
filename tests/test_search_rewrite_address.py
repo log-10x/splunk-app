@@ -42,9 +42,12 @@ def test_term_and_case_are_read_and_applied_after_expansion():
 	# Before, the rewrite's parser stopped at "(" and the search was refused ("could not be
 	# rewritten for compact data"). The prefilter requires the pieces inside; the search after
 	# expansion applies TERM() or CASE() itself.
+	# TERM() of a word with a breaker in it is matched as the index matches it (a whole major segment of
+	# the event, tenx_prefilter_parser.wild_plan); after a pipe Splunk finds it inside a longer one too.
 	result, manager = compile_search('sourcetype=tenx_encoded TERM(10.0.1.14) | stats count')
 	assert prefilter(result.resolved) == '("10") AND ("0") AND ("1") AND ("14")'
-	assert result.resolved.endswith('| search TERM(10.0.1.14) | stats count')
+	assert ' | eval tenx_w0=if(match(_raw, "(?i)' in result.resolved
+	assert result.resolved.endswith('"), 1, 0) | search tenx_w0=1 | fields - tenx_w* | stats count')
 	assert manager.probes == []
 	result, manager = compile_search('sourcetype=tenx_encoded CASE(Error)')
 	assert manager.probes == ['"Error"'] and result.resolved.endswith('| search CASE(Error)')

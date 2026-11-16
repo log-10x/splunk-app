@@ -402,6 +402,8 @@ class Parser(object):
 		self.unquoted_comma = False
 		# id() of each ("text", ...) node made from one word or phrase token -> that token's index
 		self.text_at = {}
+		# id() of each TERM() or CASE() node -> (TERM or CASE, its one word or None, first token, last token)
+		self.call_at = {}
 
 	def _peek(self, k=0):
 		return self.tokens[self.i + k] if self.i + k < len(self.tokens) else (None, None)
@@ -515,20 +517,25 @@ class Parser(object):
 			raise Unparsed("%s where a search term should be" % value)
 		following = self._peek()
 		if value in ("TERM", "CASE") and following[0] == "(":
+			first = self.i - 1
 			self._take()
-			inner = []
+			inner, kinds = [], []
 			while self._peek()[0] not in (")", None):
 				kind_, item = self._take()
 				if kind_ not in ("word", "phrase"):
 					raise Unparsed("%s() holding %s" % (value, kind_))
 				inner.append(item)
+				kinds.append(kind_)
 			if self._take()[0] != ")":
 				raise Unparsed("%s( without its closing parenthesis" % value)
 			# `tx` applies the user's words after a pipe, where Splunk tests TERM() and CASE() against
 			# the event's text, which for some arguments differs from the same search on an index
 			# (TERM(pattern=*.log): 0 events on the index, 1,025 after a pipe, Splunk Enterprise 10.4.3).
-			# Which words every such event holds is not certain, so they place no restriction.
-			return ("unknown", "%s(%s)" % (value, " ".join(inner)))
+			# Which words every such event holds is not certain, so they place no restriction on the
+			# prefilter. wild_plan() matches some of them as the index does before the final search.
+			node = ("unknown", "%s(%s)" % (value, " ".join(inner)))
+			self.call_at[id(node)] = (value, inner[0] if kinds == ["word"] else None, first, self.i - 1)
+			return node
 		if following == ("word", "IN"):
 			self._take()
 			if self._peek()[0] != "(":
@@ -992,21 +999,32 @@ def dictionary_from_rows(rows):
 	return dictionary
 
 
-# A wildcard inside a word after `tx` (Splunk Enterprise 10.4.3). `tx` applies the words after it in
-# a `search` after a pipe that Splunk cannot fold into the base search, and there a word with a `*`
-# after its first character (Se*Privilege, le*FO, S*P*e) is matched as its prefix alone: any term
-# starting with "se" (Windows 662 sample: 662 events, the base search on the raw events 3; Se*Zzz
-# also 662). In a base search the same word is matched against the event's terms: the whole word,
-# case-insensitively, `*` standing for any characters, against a major segment (the text between
-# two major breakers) or a minor piece (between any two breakers). A word starting with `*`, or
-# ending with its only `*`, or holding a breaker of its own (10.0*14, foo.*.com), matched after the
-# pipe as on the index on every case measured, so it is left alone.
+# A wildcard inside a word, TERM() and CASE() after `tx` (Splunk Enterprise 10.4.3). `tx` applies the
+# words after it in a `search` after a pipe that Splunk cannot fold into the base search, and there
+# some of them match other events than the same search on the index:
+# - a word with a `*` after its first character (Se*Privilege, le*FO, S*P*e) is matched as its prefix
+#   alone: any term starting with "se" (Windows 662 sample: 662 events, the base search on the raw
+#   events 3; Se*Zzz also 662). On the index the whole word is matched against the event's terms,
+#   case-insensitively, `*` standing for any characters: a major segment (the text between two major
+#   breakers) or a minor piece (between any two breakers). A word starting with `*`, or ending with its
+#   only `*`, or holding a breaker of its own (10.0*14, foo.*.com), matched after the pipe as on the
+#   index on every case measured, so it is left alone.
+# - TERM(x) on the index is a term of the event that is x (`*` as above): a major segment, or, when x
+#   holds no minor breaker, a minor piece; when x holds a major breaker no event has it
+#   (TERM(+0000): 0 events). After the pipe x is found inside a longer term too (TERM(10.2.236.94)
+#   in client_ip=10.2.236.94: 0 on the index, 1 after the pipe). TERM() of a plain word matched
+#   alike both ways and is left alone.
+# - CASE(x) matched alike both ways except when x has a wildcard inside it: after the pipe, a term
+#   starting with x's prefix in its letter case; on the index, an event that holds x as the word above
+#   (any letter case) and also matches CASE(x) as after the pipe (CASE(Se*Privilege) matches
+#   "sexprivilege Seattle" and "SeQPRIVILEGE", not "SEXPRIVILEGE").
 # The breakers of segmenters.conf [indexing] (btool on 10.4.3), the default for every sourcetype here.
 MAJOR_CHARS = "[]<>(){}|!;,'\"*\n\r \t&?+"
 MAJOR_SEQUENCES = ("%2526", "%2520", "%21", "%26", "%3B", "%7C", "%20", "%2B", "%3D", "--", "%5D", "%5B", "%3A",
 				   "%0A", "%2C", "%28", "%29")
 MINOR_CHARS = "/:=@.-$#%\\_"
-WILD_STEP_FIELD = "tenx_keep"
+# The fields wild_plan() sets on each event: tenx_w0, tenx_w1, ...
+WILD_FIELD = "tenx_w"
 
 
 def mid_wildcard(word):
@@ -1016,15 +1034,21 @@ def mid_wildcard(word):
 	return not any(c in MAJOR_CHARS.replace("*", "") or c in MINOR_CHARS or c.isspace() for c in word)
 
 
+def _major_breaker(text):
+	return any(c in MAJOR_CHARS.replace("*", "") or c.isspace() for c in text) or any(s in text for s in MAJOR_SEQUENCES)
+
+
 def _class(chars):
 	return "[" + "".join("\\" + c if c in "]\\^-[" else c for c in chars).replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t") + "]"
 
 
-def term_regex(word):
+def term_regex(word, case=False, major_only=False):
 	"""
 	A regular expression (PCRE, as Splunk's match() reads it, and Python's re alike) that finds `word`
 	in an event's text as a base search on the index finds it: some major segment or minor piece of
 	the text is the word, case-insensitively, each `*` standing for any characters of that term.
+	`case`: the letter case kept. `major_only`: a major segment only (TERM() of a word with a minor
+	breaker in it, which no minor piece can be).
 	"""
 	major = _class(MAJOR_CHARS.replace("*", "") + "*")
 	seq = "|".join(re.escape(s) for s in MAJOR_SEQUENCES)
@@ -1040,38 +1064,48 @@ def term_regex(word):
 		for p in parts[1:]:
 			text += inner + "*?" + re.escape(p)
 		return start + text + (end if tail else "")
-	return "(?i)(?:%s|%s)" % (
-		pattern("(?:^|%s)" % brk, in_major, "(?=%s|$)" % brk),
-		pattern("(?:^|%s|%s)" % (brk, minor), in_minor, "(?=%s|%s|$)" % (brk, minor)))
+	whole = pattern("(?:^|%s)" % brk, in_major, "(?=%s|$)" % brk)
+	piece = pattern("(?:^|%s|%s)" % (brk, minor), in_minor, "(?=%s|%s|$)" % (brk, minor))
+	return ("" if case else "(?i)") + "(?:%s)" % (whole if major_only else whole + "|" + piece)
 
 
 def _eval_string(text):
 	return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def _plain_term(word):
-	"""A word the filter can match as a term itself: no breaker but `*`, not starting with `*`."""
-	return bool(word) and word[0] != "*" and not any(
-		c in MAJOR_CHARS.replace("*", "") or c in MINOR_CHARS or c.isspace() for c in word)
-
-
-def wildcard_filter(text):
+def _atom_test(name, word):
 	"""
-	The eval expression the `tx` macro runs before its final search (`eval [| tenxprefilter after=t]`,
-	then `search tenx_keep=1`): tenx_keep set on the events whose words with a wildcard inside them
-	(mid_wildcard()) match as a base search on the index would match them; None when there is none
-	(or the words are not read with certainty), and every event is kept. The final search still
-	applies every word, so the filter only has to be right where the final search is too broad:
-	- a word with a wildcard inside it that is one of the search's top-level AND terms, alone or
-	  quoted, is its term_regex() match;
-	- a top-level AND term made only of such words and plain words (no breaker, no leading `*`,
-	  under AND, OR and NOT) is evaluated whole, each word by term_regex(); a plain word or a word
-	  with a trailing `*` matches after the pipe as on the index, and term_regex() gives the same;
-	- any other place (next to a phrase, a field comparison, a word with a breaker or a leading
-	  `*`) is left to the final search, as before.
-	A word with a wildcard inside it under NOT is left alone: on the Windows 662 sample the base
-	search on the index tests its prefix too (NOT Se*Privilege: 0 events on the index, as after the
-	pipe), so its NOT is the prefix one (term_regex of the prefix and `*`).
+	The eval condition that matches the atom as a base search on the index (see above), or None
+	when it matches alike after the pipe or is not read with certainty: name is None for a word or
+	a quoted word, TERM or CASE.
+	"""
+	if not word:
+		return None
+	if name is None:
+		return ("match(_raw, %s)" % _eval_string(term_regex(word))) if mid_wildcard(word) else None
+	if name == "CASE":
+		return ("match(_raw, %s)" % _eval_string(term_regex(word))) if mid_wildcard(word) else None
+	if _major_breaker(word):
+		return "false()"
+	minor = any(c in MINOR_CHARS for c in word)
+	if not minor and not mid_wildcard(word):
+		return None
+	return "match(_raw, %s)" % _eval_string(term_regex(word, major_only=minor))
+
+
+def wild_plan(text):
+	"""
+	The words after `tx` (`text`) with every word that matches other events after a pipe than on
+	the index (see above) put as a field the step before computes: (eval, search), where `eval` sets
+	tenx_w0, tenx_w1, ... to 1 on the events whose text holds that word as the index does, and
+	`search` is `text` with each such word replaced by tenx_wN=1 (CASE(x) by (tenx_wN=1 CASE(x)), see
+	above). `| eval <eval> | search <search>` then keeps the events the base search on the index would
+	keep for those words, under AND, OR and NOT alike (on the index, NOT CASE() ignores the letter
+	case, so it is not the opposite of CASE(); this gives the opposite), and every other word as
+	`search` after a pipe keeps them. None when no word needs it, or when the text is not read with
+	certainty (a subsearch, a macro, parentheses that do not close).
+
+	A word written right against another word or phrase (no space) is left as it is.
 	"""
 	tokens = tokenize(text)
 	if any(kind == "subsearch" for kind, _ in tokens):
@@ -1081,55 +1115,44 @@ def wildcard_filter(text):
 		tree = reader.parse()
 	except Unparsed:
 		return None
-	marks, steps = {}, []
+	marks, steps, edits = {}, [], []
 
-	def mark(word):
-		if word not in marks:
-			marks[word] = "tenx_w%d" % len(marks)
-			steps.append("%s=if(match(_raw, %s), 1, 0)" % (marks[word], _eval_string(term_regex(word))))
-		return marks[word] + "=1"
+	def glued_to_text(first, last):
+		before = first in tokens.glued and tokens[first - 1][0] in ("word", "phrase")
+		after = (last + 1) in tokens.glued and tokens[last + 1][0] in ("word", "phrase")
+		return before or after
 
-	def selects(node, positive=True):
-		"""Whether `node` holds a word with a wildcard inside it where it selects events."""
-		if node[0] == "text":
-			return positive and id(node) in reader.text_at and mid_wildcard(node[1])
-		if node[0] == "not":
-			return selects(node[1], not positive)
-		if node[0] in ("and", "or"):
-			return any(selects(c, positive) for c in node[1])
-		return False
-
-	def whole(node, positive=True, build=True):
-		"""`node` as an eval condition from term_regex() alone, or None when it holds anything else."""
+	def visit(node):
 		kind = node[0]
-		if kind == "text":
-			index = reader.text_at.get(id(node))
-			if index is None or tokens[index][0] != "word" or not _plain_term(node[1]):
-				return None
-			word = node[1]
-			if mid_wildcard(word) and not positive:
-				word = word[:word.index("*") + 1]
-			return mark(word) if build else word
-		if kind == "not":
-			inner = whole(node[1], not positive, build)
-			return None if inner is None else "NOT (%s)" % inner
 		if kind in ("and", "or"):
-			parts = [whole(c, positive, build) for c in node[1]]
-			if any(p is None for p in parts):
-				return None
-			return "(%s)" % (" %s " % kind.upper()).join(parts)
-		return None
+			for child in node[1]:
+				visit(child)
+			return
+		if kind == "not":
+			visit(node[1])
+			return
+		if kind == "text" and id(node) in reader.text_at:
+			index = reader.text_at[id(node)]
+			name, word, first, last = None, node[1], index, index
+			if tokens[index][0] == "phrase" and (not word or any(c.isspace() for c in word)):
+				return
+		elif kind == "unknown" and id(node) in reader.call_at:
+			name, word, first, last = reader.call_at[id(node)]
+		else:
+			return
+		test = _atom_test(name, word)
+		if test is None or glued_to_text(first, last):
+			return
+		if test not in marks:
+			marks[test] = "%s%d" % (WILD_FIELD, len(marks))
+			steps.append("%s=%s" % (marks[test], "0" if test == "false()" else "if(%s, 1, 0)" % test))
+		start, end = tokens.spans[first][0], tokens.spans[last][1]
+		edits.append((start, end, "(%s=1 %s)" % (marks[test], text[start:end]) if name == "CASE" else marks[test] + "=1"))
 
-	conditions = []
-	for term in (tree[1] if tree[0] == "and" else [tree]):
-		if not selects(term):
-			continue
-		if term[0] == "text":
-			conditions.append(mark(term[1]))
-			continue
-		if whole(term, build=False) is not None:
-			conditions.append(whole(term))
-	if not conditions:
+	visit(tree)
+	if not edits:
 		return None
-	steps.append("%s=if(%s, 1, null())" % (WILD_STEP_FIELD, " AND ".join(conditions)))
-	return ", ".join(steps)
+	search = text
+	for start, end, mark in sorted(edits, reverse=True):
+		search = search[:start] + mark + search[end:]
+	return ", ".join(steps), search.strip()

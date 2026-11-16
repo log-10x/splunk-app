@@ -1220,16 +1220,17 @@ class TenxSearchCommand(TenxSplCommand):
 		templates (coming from the decoding against tenx_dml)
 
 		That search comes after a pipe Splunk cannot fold into the base search, where a word with a
-		wildcard inside it (Se*Privilege) is matched as its prefix alone; such words are first
-		matched as a base search on the index matches them (tenx_prefilter_parser.wildcard_filter,
-		as the `tx` macro does).
+		wildcard inside it (Se*Privilege) is matched as its prefix alone, and TERM() or CASE() of some
+		words other than on the index. Such a word is replaced by a field the eval before it sets where
+		the event holds the word as the index does (tenx_prefilter_parser.wild_plan), so under AND, OR
+		and NOT alike the search keeps what the base search on the index keeps.
 		"""
 		import tenx_prefilter_parser
 		terms = " ".join([item.text for item in self.user_search_terms])
-		wild = tenx_prefilter_parser.wildcard_filter(terms)
-		step = (" | eval %s | search %s=1 | fields - %s, tenx_w*" % (
-			wild, tenx_prefilter_parser.WILD_STEP_FIELD, tenx_prefilter_parser.WILD_STEP_FIELD)) if wild else ""
-		return step + " | search " + terms
+		plan = tenx_prefilter_parser.wild_plan(terms)
+		if plan:
+			return " | eval %s | search %s | fields - %s*" % (plan[0], plan[1], tenx_prefilter_parser.WILD_FIELD)
+		return " | search " + terms
 
 	def resolved(self):
 		"""

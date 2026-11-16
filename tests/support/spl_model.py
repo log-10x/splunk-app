@@ -236,6 +236,10 @@ def evaluate(node, event):
 	raise Unsupported(kind)
 
 
+# What `tenx-wild` stands for in a pipeline the model runs (see Model.step).
+WILD_STEP = 'tenx_wild_step'
+
+
 class Model(object):
 	"""
 	Runs pipelines. `commands` maps a command name (extract, spath, typer, tags) or a full
@@ -257,21 +261,17 @@ class Model(object):
 
 	def expand(self, text):
 		for _ in range(5):
-			new = re.sub(r'`([^`]+)`', lambda m: self.macros[m.group(1)], text)
+			new = re.sub(r'`([^`]+)`', lambda m: WILD_STEP if m.group(1) == 'tenx-wild' else self.macros[m.group(1)], text)
 			if new == text:
 				return text
 			text = new
 		raise Unsupported('macro recursion')
 
 	def step(self, step, events):
-		if step == 'eval [| tenxprefilter after=t]':
-			# The wildcard filter of the tx macros (tenx_prefilter_parser.wildcard_filter): for words
-			# without a wildcard inside them it keeps every event.
-			for event in events:
-				event['tenx_keep'] = '1'
-			return
-		if step == 'search tenx_keep=1':
-			events[:] = [e for e in events if e.get('tenx_keep') == '1']
+		if step == WILD_STEP:
+			# The step before the final search of the tx macros (macros.conf [tenx-wild]): with no word
+			# with a wildcard inside it, TERM() or CASE() that needs it, the prefilter stores nothing, and
+			# the step marks nothing and searches `*`.
 			return
 		word = step.split(None, 1)[0]
 		rest = step[len(word):].strip()

@@ -18,10 +18,12 @@ instead where the search would silently miss events: a time modifier after `tx`,
 comma after `tx`, and a sourcetype= term naming an original sourcetype, which the compact events
 carry in tenx_sourcetype (they are indexed as the compact sourcetype).
 
-`tx` and `txf` call it a second time right before their final search (`after=t`): it returns the
-eval that keeps the events a wildcard inside a word (Se*Privilege) matches as a base search on the
-index matches it, since the final search, after a pipe, matches such a word as its prefix alone
-(tenx_prefilter_parser.wildcard_filter).
+Some words match other events in that final search, after a pipe, than on the index: a wildcard
+inside a word (Se*Privilege is matched as its prefix alone), and TERM() or CASE() of some words
+(tenx_prefilter_parser.wild_plan). For those, this command also stores on the running job two
+custom fields, custom.tenx_wild_eval and custom.tenx_wild_search: an eval that marks the events
+holding each such word as the index does, and the words with each such word replaced by its mark.
+`tx` and `txf` read them back in the step before their final search (macros.conf [tenx-wild]).
 """
 import json
 import os
@@ -38,7 +40,7 @@ apphome = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.join(apphome, 'bin'))
 sys.path.append(os.path.join(apphome, 'lib'))
 
-from splunklib.searchcommands import dispatch, Configuration, GeneratingCommand, Option, validators
+from splunklib.searchcommands import dispatch, Configuration, GeneratingCommand
 
 import tenx_prefilter_parser as parser
 
@@ -55,13 +57,7 @@ SUBSEARCH_SID = re.compile(r"^subsearch_(.+)_\d+\.\d+$")
 @Configuration()
 class TenxPrefilterCommand(GeneratingCommand):
 
-	# The second call the `tx` and `txf` macros make, right before their final search
-	# (`eval [| tenxprefilter after=t] | search tenx_keep=1`): the eval that keeps the events a
-	# wildcard inside a word matches as a base search on the index would match them
-	# (tenx_prefilter_parser.wildcard_filter). No check and no template lookup runs in it.
-	after = Option(require=False, validate=validators.Boolean(), default=False)
-
-	def _rest(self, path, data=None):
+	def _rest(self, path, data=None, answer=True):
 		info = self._metadata.searchinfo
 		context = ssl.create_default_context()
 		context.check_hostname = False
@@ -72,12 +68,14 @@ class TenxPrefilterCommand(GeneratingCommand):
 			method="POST" if data else "GET",
 			headers={"Authorization": "Splunk " + info.session_key})
 		with urllib.request.urlopen(request, context=context, timeout=60) as response:
-			return json.loads(response.read().decode())
+			body = response.read().decode()
+			return json.loads(body) if answer else None
 
 	def _search_text(self):
 		match = SUBSEARCH_SID.match(self._metadata.searchinfo.sid or "")
 		if not match:
 			return None
+		self.parent = match.group(1)
 		job = self._rest("/services/search/jobs/%s?output_mode=json" % urllib.parse.quote(match.group(1), safe=""))
 		search = job["entry"][0]["content"].get("search", "")
 		self.before = parser.macro_call(search)
@@ -125,22 +123,25 @@ class TenxPrefilterCommand(GeneratingCommand):
 		names = [n.strip() for n in str(entry.get("fields_not_in_text", "") or "").split(",") if n.strip()]
 		return parser.text_field_predicate(names)
 
-	def _after_filter(self):
-		"""The eval for `after=t`: tenx_keep=1 on every event unless a wildcard word needs a filter."""
-		keep_all = parser.WILD_STEP_FIELD + "=1"
+	def _store_wild_plan(self, text):
+		"""
+		Stores on the running job what the step before the final search of `tx` and `txf` applies
+		(macros.conf [tenx-wild]). Nothing when no word needs it: that step then marks nothing and
+		searches `*`. If it cannot be stored, such a word is matched as after any pipe.
+		"""
 		try:
-			text = self._search_text()
-			return (parser.wildcard_filter(text) if text is not None else None) or keep_all
+			plan = parser.wild_plan(text)
+			if plan is None:
+				return
+			self._rest("/services/search/jobs/%s?output_mode=json" % urllib.parse.quote(self.parent, safe=""),
+					   {"custom.tenx_wild_eval": plan[0], "custom.tenx_wild_search": plan[1]}, answer=False)
 		except Exception as e:
-			self.logger.warning("tx: the wildcard filter could not be built: %s", e)
-			self.write_warning("tx: could not read the words after tx for a wildcard inside a word; such a word is "
-							   "matched as its prefix alone.")
-			return keep_all
+			self.logger.warning("tx: storing the wildcard plan failed: %s", e)
+			self.write_warning("tx: a word with a wildcard inside it, TERM() or CASE() is matched in this search as after a "
+							   "pipe, which can differ from the same search on the index: the step that matches it as the "
+							   "index does could not be prepared.")
 
 	def generate(self):
-		if self.after:
-			yield {"search": self._after_filter()}
-			return
 		try:
 			text = self._search_text()
 		except Exception as e:
@@ -163,6 +164,7 @@ class TenxPrefilterCommand(GeneratingCommand):
 		if reader.unquoted_comma:
 			self.error_exit(RuntimeError("comma after tx"),
 				"tx: a comma after `tx` is matched literally, so this search would miss events. Remove it, or put the text in quotes.")
+		self._store_wild_plan(text)
 		rows, macro = self._original_sourcetype_rows(tree)
 		if rows:
 			self.error_exit(RuntimeError("original sourcetype"), parser.original_sourcetype_message(rows, macro))
