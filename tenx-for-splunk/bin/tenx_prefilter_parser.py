@@ -1088,6 +1088,9 @@ def _atom_test(name, word, positive=True):
 		return ("match(_raw, %s)" % _eval_string(term_regex(word))) if mid_wildcard(word) else None
 	if name == "CASE":
 		return ("match(_raw, %s)" % _eval_string(term_regex(word))) if mid_wildcard(word) else None
+	if "\\" in word:
+		# Splunk applies the escape first (TERM(\resource) matched what TERM(resource) matches, 1,161 events)
+		return None
 	if _major_breaker(word):
 		return None if positive else "false()"
 	minor = any(c in MINOR_CHARS for c in word)

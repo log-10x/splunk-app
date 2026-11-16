@@ -125,7 +125,9 @@ class TestThePlan:
 		plan = p.wild_plan('TERM(Se*Privilege)')
 		assert plan[1] == 'tenx_w0=1' and regex_of(plan, 'tenx_w0') == p.term_regex('Se*Privilege')
 		# a plain word matches alike after the pipe; a phrase inside is not read
-		for text in ('TERM(root)', 'TERM(Se*)', 'TERM(*foo)', 'TERM("a.b")', 'TERM(a b)'):
+		# a backslash: Splunk applies the escape before it matches (TERM(\\resource): what TERM(resource) matches)
+		for text in ('TERM(root)', 'TERM(Se*)', 'TERM(*foo)', 'TERM("a.b")', 'TERM(a b)', 'TERM(\\resource)', 'TERM(a\\.b)',
+					 'NOT TERM(\\dial)'):
 			assert p.wild_plan(text) is None, text
 
 	def test_case(self):
