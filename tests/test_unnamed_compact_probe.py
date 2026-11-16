@@ -143,18 +143,18 @@ class TestTheMacroPath:
 			'NOT (sourcetype="df:kv" OR sourcetype="tenx*") by tenx_sourcetype')
 		assert pp.original_sourcetype_probe([], ['df']) is None
 		assert pp.original_sourcetype_message([{'tenx_sourcetype': 'df:kv', 'count': '3'}], '`tx`') == (
-			"tx: the search was not run. Write tenx_sourcetype=df:kv before `tx`, or use `txf`, which gives each "
-			"event its original sourcetype. sourcetype=df:kv selects no compact events: they carry it in "
-			"tenx_sourcetype.")
+			"tx: the search was not run. Write sourcetype=df:kv after `txf` for the add-on's fields; "
+			"tenx_sourcetype=df:kv before `tx` gives only the fields in their text. sourcetype=df:kv matches no "
+			"compact event.")
 		assert pp.original_sourcetype_message([{'tenx_sourcetype': 'df:kv', 'count': '3'}], '`txf`') == (
 			"txf: the search was not run. Write tenx_sourcetype=df:kv before `txf`, or the sourcetype after it: "
 			"`txf` gives each event its original sourcetype. sourcetype=df:kv selects no compact events: "
 			"they carry it in tenx_sourcetype.")
 		two = [{'tenx_sourcetype': 'df:kv', 'count': '3'}, {'tenx_sourcetype': 'df:json', 'count': '1'}]
 		assert pp.original_sourcetype_message(two, '`tx`') == (
-			"tx: the search was not run. Write (tenx_sourcetype=df:json OR tenx_sourcetype=df:kv) before `tx`, or "
-			"use `txf`, which gives each event its original sourcetype. sourcetype=df:json and sourcetype=df:kv "
-			"select no compact events: they carry them in tenx_sourcetype.")
+			"tx: the search was not run. Write (sourcetype=df:json OR sourcetype=df:kv) after `txf` for the add-ons' "
+			"fields; (tenx_sourcetype=df:json OR tenx_sourcetype=df:kv) before `tx` gives only the fields in their "
+			"text. sourcetype=df:json and sourcetype=df:kv match no compact event.")
 
 
 class TestTheStopsArriveWhole:
@@ -169,7 +169,7 @@ class TestTheStopsArriveWhole:
 		original = [{'index': index, 'sourcetype': 'tenx_encoded', 'tenx_sourcetype': sourcetype, 'count': '1'}]
 		return {'| tx, | tenxsearch': (sb.unnamed_compact_message(compact), 'Add the sourcetype to it, for example sourcetype=tenx_encoded'),
 				'| tx sourcetype=': (sb.original_sourcetype_message(original), 'Write sourcetype=tenx_encoded tenx_sourcetype=%s instead.' % sourcetype),
-				'`tx`': (pp.original_sourcetype_message(original, '`tx`'), 'or use `txf`, which gives each event its original sourcetype.'),
+				'`tx`': (pp.original_sourcetype_message(original, '`tx`'), "Write sourcetype=%s after `txf` for the add-on's fields;" % sourcetype),
 				'`txf`': (pp.original_sourcetype_message(original, '`txf`'), '`txf` gives each event its original sourcetype.')}
 
 	def test_whole_with_names_of_common_length(self):

@@ -298,9 +298,14 @@ def original_sourcetype_message(rows, macro):
 	write = " OR ".join("tenx_sourcetype=%s" % st for st in sts)
 	write = write if len(sts) == 1 else "(%s)" % write
 	if name == "tx":
-		do = "Write %s before `tx`, or use `txf`, which gives each event its original sourcetype." % write
-	else:
-		do = "Write %s before `%s`, or the sourcetype after it: `txf` gives each event its original sourcetype." % (write, name)
+		# `txf` first: `tx` gives only the fields in an event's text, so a field an add-on defines matches
+		# nothing after `tx` (tenx_sourcetype=XmlWinEventLog `tx` EventCode=4624: 0 events, raw 21).
+		original = " OR ".join("sourcetype=%s" % st for st in sts)
+		original = original if len(sts) == 1 else "(%s)" % original
+		return ("tx: the search was not run. Write %s after `txf` for the %s fields; %s before `tx` gives only the "
+				"fields in their text. %s %s no compact event."
+				% (original, "add-on's" if len(sts) == 1 else "add-ons'", write, named, "matches" if len(sts) == 1 else "match"))
+	do = "Write %s before `%s`, or the sourcetype after it: `txf` gives each event its original sourcetype." % (write, name)
 	if len(sts) == 1:
 		why = "%s selects no compact events: they carry it in tenx_sourcetype." % named
 	else:
