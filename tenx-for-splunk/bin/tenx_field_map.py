@@ -231,10 +231,20 @@ RESERVED_PREFIXES = ('_', 'tag::', 'date_')
 # Put in a reader's output where text cannot be decoded without the value that follows it (a
 # JSON backslash in template text, the escaped character in the value). FORMAT refuses it.
 UNDECODABLE = "\x01"
+# The lookup rule writes such a field: the backslash is a token delimiter of the Receiver, so "abc\/def="
+# in a JSON string is template text "abc", the backslash, and a value "/def=" (CloudTrail sessionToken). The
+# row's recipe holds SPLIT_ESCAPE where the backslash was; after the replace() the rule decodes it with the
+# value's first character: "/" reads as itself, "n", "t" and "r" as a space (as a line break or tab in any
+# indexed value), and a field holding any other escape is left out. A private-use character no template
+# text holds (gen refuses a template that does).
+SPLIT_ESCAPE = "\ue000"
+SPLIT_ESCAPE_KEEP = "/"
+SPLIT_ESCAPE_SPACE = "ntr"
 
 REFUSED_UNSAFE = "the app does not expand this template (expand_unsafe: %s)"
 REFUSED_CONFLICT = "two different templates under one hash"
 REFUSED_COUNT = "number of values unknown (no timestamp, no text before the first value, no pattern)"
+REFUSED_SENTINEL = "the template text holds U+E000, which the lookup rule uses to mark a split escape"
 REFUSED_NO_FIELDS = "the reader found no field"
 
 # Why a template's row has no event time recipe (see "Event time").
@@ -1472,6 +1482,12 @@ def lookup_eval_text(lookup_def, time_rule=None, trim=False):
 		'%s=if(len(%s) > 0, replace(_raw, "(?s)^~[^,]*,([^,|]*).*$", "\\1"), "")' % (e, t),
 		'%s=if(%s == 1, _raw . "|" . %s . %s, null())' % (x, ok, ts, tail),
 		'%s=if(isnull(%s), null(), replace(%s, %s, %s))' % (m, x, x, regex, f),
+		# A JSON escape the Receiver split at its backslash (see SPLIT_ESCAPE): decoded with the value's first character,
+		# and a field that holds any other escape is left out.
+		'%s=if(isnull(%s) OR %s==%s, %s, replace(replace(replace(%s, "%s([%s])", "\\1"), "%s[%s]", " "), '
+		'"[^ ]+::" . %s . "([^" . %s . urldecode("%%5C") . "]|" . urldecode("%%5C") . ".)*%s([^" . %s . urldecode("%%5C") . '
+		'"]|" . urldecode("%%5C") . ".)*" . %s . " ?", ""))' % (m, m, m, x, m, m, SPLIT_ESCAPE, SPLIT_ESCAPE_KEEP, SPLIT_ESCAPE,
+			SPLIT_ESCAPE_SPACE, quote, quote, SPLIT_ESCAPE, quote, quote),
 	] + ([
 		'%s=if(isnull(%s) OR %s==%s, %s, replace(replace(%s, "::" . %s . "[[:cntrl:]]+", "::" . %s), '
 		'"[[:cntrl:]]+" . %s, %s))' % (mt, m, m, x, m, m, quote, quote, quote, quote),
@@ -1585,10 +1601,20 @@ def apply_lookup_row(transform, compact_line, trim=False):
 	groups = _lookup_groups(transform, compact_line)
 	if groups is None:
 		return None
-	text = splunk_replace_expand(transform.recipe, groups)
+	text = split_escape_decode(splunk_replace_expand(transform.recipe, groups))
 	if trim:
 		text = LOOKUP_EDGE_SPACE_PY[1].sub('"', LOOKUP_EDGE_SPACE_PY[0].sub('::"', text))
 	return [(n, v) for n, v in parse_meta(text) if n != MARK_FIELD]
+
+
+_SPLIT_KEEP = re.compile(SPLIT_ESCAPE + '([' + re.escape(SPLIT_ESCAPE_KEEP) + '])')
+_SPLIT_SPACE = re.compile(SPLIT_ESCAPE + '[' + SPLIT_ESCAPE_SPACE + ']')
+_SPLIT_LEFT = re.compile(r'[^ ]+::"([^"\\]|\\.)*' + SPLIT_ESCAPE + r'([^"\\]|\\.)*" ?')
+
+
+def split_escape_decode(text):
+	"""The lookup rule's decoding of SPLIT_ESCAPE in index-time field text, as Python reads it."""
+	return _SPLIT_LEFT.sub('', _SPLIT_SPACE.sub(' ', _SPLIT_KEEP.sub(r'\1', text)))
 
 
 def apply_lookup_time(transform, compact_line, rule):
@@ -1646,6 +1672,8 @@ class FieldMap(object):
 		self.reserved_names = reserved_names
 		self.reserved_prefix = reserved_prefix
 		self.reserved = collections.Counter()
+		# Fields written with a JSON escape split by a value (see SPLIT_ESCAPE), per field name.
+		self.split_escapes = collections.Counter()
 		# Spaces and tabs at the ends of a value come only from template text (a compact value never
 		# holds one), so trimming the marked text trims the value Splunk would see. A compact value can
 		# end with the carriage return of a CR LF line end; the lookup rule trims that at index time.
@@ -1689,6 +1717,9 @@ class FieldMap(object):
 				text, n = marked_text(t)
 			except ValueError as e:
 				self.refused[key] = str(e)
+				continue
+			if SPLIT_ESCAPE in text:
+				self.refused[key] = REFUSED_SENTINEL
 				continue
 
 			stanza = stanza_name(prefix, position, key, stanza_names)
@@ -1802,8 +1833,13 @@ class FieldMap(object):
 			if self.trim_values:
 				value_expr = value_expr.strip(self.trim_chars)
 			if UNDECODABLE in value_expr:
-				self._skip(key, stanza, 'value: ' + WHY_SPLIT_ESCAPE, name_expr)
-				continue
+				# The escaped character is the first one of the value right after it: the rule decodes it (see SPLIT_ESCAPE).
+				if all(MARK_RE.match(value_expr, i + 1) for i, c in enumerate(value_expr) if c == UNDECODABLE):
+					value_expr = value_expr.replace(UNDECODABLE, SPLIT_ESCAPE)
+					self.split_escapes[_shown(name_expr)] += 1
+				else:
+					self._skip(key, stanza, 'value: ' + WHY_SPLIT_ESCAPE, name_expr)
+					continue
 			if value_expr == '' and not self.keeps_empty:
 				continue
 			carries_ts = bool(fmt) and (MARK % 0) in value_expr
@@ -1954,6 +1990,7 @@ class FieldMap(object):
 				('templates_per_field', dict(self.eval_fields)),
 				('forms_per_field', dict(collections.Counter(name for name, _, _ in self.forms))),
 				('working_fields_per_event_max', max([sum(1 + len(g) for _, _, g in t.evals) for t in self.transforms] or [0]))])),
+			('fields_with_a_split_escape', dict(self.split_escapes)),
 			('reserved_field_names', collections.OrderedDict([
 				('action', 'left out' if self.reserved_names == 'skip' else (
 					'written as %s<name>' % self.reserved_prefix if self.reserved_names == 'prefix' else

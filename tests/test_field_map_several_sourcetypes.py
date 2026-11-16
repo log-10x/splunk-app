@@ -185,3 +185,31 @@ class TestClassicWordRules:
 		assert 'SOURCE_KEY = tenx_wincl_fr_pid_rule_process_id\nREGEX = \\A(\\S+)\nFORMAT = process_id::$1\n' in transforms
 		row = fm.read_lookup_file(str(tmp_path / 'fm_w' / 'lookups' / 'tenx_wincl_fields.csv.gz'))['w1']['f']
 		assert 'tenx_wincl_fr_pid_rule_process_id::"' in row
+
+
+class TestSplitEscape:
+	# The Receiver cuts a token at a backslash, so "abc\/def=" in a JSON string is text "abc", the backslash and a value
+	# "/def=" (CloudTrail responseElements.credentials.sessionToken).
+	def tpl(self):
+		return fm.Template(key='h', written_hash='h', parts=['", "b": "x\\'], part_0='{"a": "', terminator='"}',
+			timestamp_format='', expand_unsafe='', pattern=None)
+
+	def test_the_field_is_written_and_decoded_with_the_value(self):
+		field_map = fm.FieldMap({'h': self.tpl()}, fm.JsonReader(), 'p', rules=fm.RULES_LOOKUP, mark=fm.MARK_FIELD)
+		[t] = field_map.transforms
+		assert field_map.report()['fields_with_a_split_escape'] == {'b': 1}
+		assert dict(fm.apply_lookup_row(t, '~h,1,/def=')) == {'a': '1', 'b': 'x/def='}
+		# a line break or tab escape reads as a space, as in any indexed value
+		assert dict(fm.apply_lookup_row(t, '~h,1,ndef')) == {'a': '1', 'b': 'x def'}
+		# any other escape leaves the field out, not the event's other fields
+		assert dict(fm.apply_lookup_row(t, '~h,1,u00e9')) == {'a': '1'}
+
+	def test_the_transforms_rules_still_leave_it_out(self):
+		field_map = fm.FieldMap({'h': self.tpl()}, fm.JsonReader(), 'p', mark=fm.MARK_FIELD)
+		assert field_map.report()['skipped'] == {'value: ' + fm.WHY_SPLIT_ESCAPE: 1}
+
+	def test_a_template_holding_the_marker_is_refused(self):
+		t = fm.Template(key='h', written_hash='h', parts=[], part_0='{"a": "' + fm.SPLIT_ESCAPE, terminator='"}',
+			timestamp_format='', expand_unsafe='', pattern=None)
+		field_map = fm.FieldMap({'h': t}, fm.JsonReader(), 'p', rules=fm.RULES_LOOKUP, mark=fm.MARK_FIELD)
+		assert field_map.transforms == [] and field_map.report()['templates_without_transform'] == {fm.REFUSED_SENTINEL: 1}

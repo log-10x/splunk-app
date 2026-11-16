@@ -889,7 +889,7 @@ class TestLookupRules:
 		assert text.startswith('$pd:tenx_fm_row$=if(substr(_raw, 1, 1)=="~", lookup("tenx_fw_fields", ')
 		# every intermediate value is a pd: key; only _meta is written
 		assert [e.split('=', 1)[0] for e in re.split(r', (?=\$pd:tenx_fm_\w+\$=|_meta=)', text)] == \
-			['$pd:tenx_fm_%s$' % k for k in ('row', 'f', 't', 'n', 'ok', 'e', 'x', 'm')] + ['_meta'] + \
+			['$pd:tenx_fm_%s$' % k for k in ('row', 'f', 't', 'n', 'ok', 'e', 'x', 'm', 'm')] + ['_meta'] + \
 			['$pd:tenx_fm_why$'] * 2 + ['_meta']
 
 	def test_the_rule_builds_a_regex_only_from_a_row_it_can_use(self):
