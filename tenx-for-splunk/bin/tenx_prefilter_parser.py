@@ -287,23 +287,25 @@ def original_sourcetype_probe(sourcetypes, indexes):
 
 
 def original_sourcetype_message(rows, macro):
-	"""The message that stops a `tx` or `txf` search naming the original sourcetype of compact events (`rows` of the probe)."""
+	"""
+	The message that stops a `tx` or `txf` search naming the original sourcetype of compact events (`rows` of the
+	probe). Splunk keeps the first 256 characters of a search command's message, so the message says what to write
+	first and stays within that length for sourcetype names of common length.
+	"""
 	sts = sorted(set(r.get("tenx_sourcetype", "") for r in rows if r.get("tenx_sourcetype"))) or ["<sourcetype>"]
 	name = macro.strip("`").split("(")[0]
 	named = " and ".join("sourcetype=%s" % st for st in sts)
-	if len(sts) == 1:
-		head = ("%s: %s selects none of the compact events of that sourcetype: they are indexed as the compact "
-				"sourcetype and carry %s in the field tenx_sourcetype, so this search was not run." % (name, named, sts[0]))
-	else:
-		head = ("%s: %s select none of the compact events of those sourcetypes: they are indexed as the compact "
-				"sourcetype and carry the original one in the field tenx_sourcetype, so this search was not run."
-				% (name, named))
 	write = " OR ".join("tenx_sourcetype=%s" % st for st in sts)
+	write = write if len(sts) == 1 else "(%s)" % write
 	if name == "tx":
-		return head + (" Write %s before `tx`, or use `txf`, which gives each event its original sourcetype."
-					   % (write if len(sts) == 1 else "(%s)" % write))
-	return head + (" Write %s before `%s`, or the sourcetype after it: `txf` gives each event its original sourcetype."
-				   % (write if len(sts) == 1 else "(%s)" % write, name))
+		do = "Write %s before `tx`, or use `txf`, which gives each event its original sourcetype." % write
+	else:
+		do = "Write %s before `%s`, or the sourcetype after it: `txf` gives each event its original sourcetype." % (write, name)
+	if len(sts) == 1:
+		why = "%s selects no compact events: they carry it in tenx_sourcetype." % named
+	else:
+		why = "%s select no compact events: they carry them in tenx_sourcetype." % named
+	return "%s: the search was not run. %s %s" % (name, do, why)
 
 
 def tokenize(text):

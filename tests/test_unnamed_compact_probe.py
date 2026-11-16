@@ -42,9 +42,9 @@ class TestTheProbe:
 
 	def test_the_message_says_what_is_missing(self):
 		msg = sb.unnamed_compact_message([{'index': 'sr_compact', 'sourcetype': 'tenx_encoded', 'source': 'a', 'count': '102'}])
-		assert msg == ("10x: this search reads compact events (sourcetype tenx_encoded in index sr_compact) but names "
-					   "no compact sourcetype or source, so it was not run: as typed it would read their compact text and "
-					   "return the wrong events. Add the sourcetype to the search, for example sourcetype=tenx_encoded.")
+		assert msg == ("10x: the search was not run. Add the sourcetype to it, for example sourcetype=tenx_encoded: it "
+					   "reads compact events (sourcetype tenx_encoded in index sr_compact) and names no compact sourcetype "
+					   "or source, so it would return the wrong events.")
 
 
 class TestACompiledAlert:
@@ -53,9 +53,9 @@ class TestACompiledAlert:
 		compiler.builder.search_manager.probe_rows = [{'index': 'sr_compact', 'sourcetype': 'tenx_encoded', 'count': '3'}]
 		got = compiler.compile('index=sr_compact error')
 		assert got.strategy == AlertStrategy.PASSTHROUGH and got.needs_review
-		assert got.reason == ("this search reads compact events (sourcetype tenx_encoded in index sr_compact) but names "
-							  "no compact sourcetype or source: as typed it reads their compact text and returns the wrong "
-							  "events. Add the sourcetype to the search, for example sourcetype=tenx_encoded.")
+		assert got.reason == ("Add the sourcetype to the search, for example sourcetype=tenx_encoded: it reads compact "
+							  "events (sourcetype tenx_encoded in index sr_compact) and names no compact sourcetype or "
+							  "source, so it returns the wrong events.")
 		assert compiler.builder.search_manager.probes == [
 			'| tstats count where (index=sr_compact) (sourcetype=tenx_encoded) by index, sourcetype, source']
 
@@ -88,20 +88,20 @@ class TestTheOriginalSourcetype:
 	def test_the_message(self):
 		rows = [{'index': 'df', 'sourcetype': 'tenx_encoded', 'tenx_sourcetype': 'df:kv', 'count': '10000'}]
 		assert sb.original_sourcetype_message(rows) == (
-			"10x: this search names sourcetype df:kv, which its compact events carry in the field tenx_sourcetype "
-			"(they are indexed as tenx_encoded), so it was not run: as typed it would return none of them. Write "
-			"sourcetype=tenx_encoded tenx_sourcetype=df:kv instead.")
+			"10x: the search was not run. Write sourcetype=tenx_encoded tenx_sourcetype=df:kv instead. The compact "
+			"events are indexed as tenx_encoded and carry df:kv in tenx_sourcetype, so as typed it would return none "
+			"of them.")
 		rows.append({'index': 'df', 'sourcetype': 'tenx_encoded', 'tenx_sourcetype': 'df:json', 'count': '7'})
 		assert sb.original_sourcetype_message(rows) == (
-			"10x: this search names sourcetypes df:json and df:kv, which its compact events carry in the field "
-			"tenx_sourcetype (they are indexed as tenx_encoded), so it was not run: as typed it would return none of "
-			"them. Write sourcetype=tenx_encoded (tenx_sourcetype=df:json OR tenx_sourcetype=df:kv) instead.")
+			"10x: the search was not run. Write sourcetype=tenx_encoded (tenx_sourcetype=df:json OR "
+			"tenx_sourcetype=df:kv) instead. The compact events are indexed as tenx_encoded and carry df:json and "
+			"df:kv in tenx_sourcetype, so as typed it would return none of them.")
 
 	def test_a_compiled_alert_is_flagged(self):
 		compiler = make_compiler()
 		compiler.builder.search_manager.probe_rows = [{'index': 'df', 'sourcetype': 'tenx_encoded', 'tenx_sourcetype': 'df:kv', 'count': '5'}]
 		got = compiler.compile('index=df sourcetype=df:kv error')
-		assert got.needs_review and got.reason.startswith('this search names sourcetype df:kv')
+		assert got.needs_review and got.reason.startswith('Write sourcetype=tenx_encoded tenx_sourcetype=df:kv instead.')
 
 
 class TestTheMacroPath:
@@ -143,17 +143,40 @@ class TestTheMacroPath:
 			'NOT (sourcetype="df:kv" OR sourcetype="tenx*") by tenx_sourcetype')
 		assert pp.original_sourcetype_probe([], ['df']) is None
 		assert pp.original_sourcetype_message([{'tenx_sourcetype': 'df:kv', 'count': '3'}], '`tx`') == (
-			"tx: sourcetype=df:kv selects none of the compact events of that sourcetype: they are indexed as the "
-			"compact sourcetype and carry df:kv in the field tenx_sourcetype, so this search was not run. Write "
-			"tenx_sourcetype=df:kv before `tx`, or use `txf`, which gives each event its original sourcetype.")
+			"tx: the search was not run. Write tenx_sourcetype=df:kv before `tx`, or use `txf`, which gives each "
+			"event its original sourcetype. sourcetype=df:kv selects no compact events: they carry it in "
+			"tenx_sourcetype.")
 		assert pp.original_sourcetype_message([{'tenx_sourcetype': 'df:kv', 'count': '3'}], '`txf`') == (
-			"txf: sourcetype=df:kv selects none of the compact events of that sourcetype: they are indexed as the "
-			"compact sourcetype and carry df:kv in the field tenx_sourcetype, so this search was not run. Write "
-			"tenx_sourcetype=df:kv before `txf`, or the sourcetype after it: `txf` gives each event its original "
-			"sourcetype.")
+			"txf: the search was not run. Write tenx_sourcetype=df:kv before `txf`, or the sourcetype after it: "
+			"`txf` gives each event its original sourcetype. sourcetype=df:kv selects no compact events: "
+			"they carry it in tenx_sourcetype.")
 		two = [{'tenx_sourcetype': 'df:kv', 'count': '3'}, {'tenx_sourcetype': 'df:json', 'count': '1'}]
 		assert pp.original_sourcetype_message(two, '`tx`') == (
-			"tx: sourcetype=df:json and sourcetype=df:kv select none of the compact events of those sourcetypes: they "
-			"are indexed as the compact sourcetype and carry the original one in the field tenx_sourcetype, so this "
-			"search was not run. Write (tenx_sourcetype=df:json OR tenx_sourcetype=df:kv) before `tx`, or use `txf`, "
-			"which gives each event its original sourcetype.")
+			"tx: the search was not run. Write (tenx_sourcetype=df:json OR tenx_sourcetype=df:kv) before `tx`, or "
+			"use `txf`, which gives each event its original sourcetype. sourcetype=df:json and sourcetype=df:kv "
+			"select no compact events: they carry them in tenx_sourcetype.")
+
+
+class TestTheStopsArriveWhole:
+	"""Splunk keeps the first 256 characters of a search command's message (Splunk Enterprise 9.4.15, 10.4.3 and
+	10.6.0.5: a longer message arrived cut, here before the sourcetype to add). Each stop says what to do first, and
+	with names of common length the whole message fits."""
+	LIMIT = 256
+
+	def messages(self, sourcetype, index):
+		import tenx_prefilter_parser as pp
+		compact = [{'index': index, 'sourcetype': 'tenx_encoded', 'source': 'a', 'count': '1'}]
+		original = [{'index': index, 'sourcetype': 'tenx_encoded', 'tenx_sourcetype': sourcetype, 'count': '1'}]
+		return {'| tx, | tenxsearch': (sb.unnamed_compact_message(compact), 'Add the sourcetype to it, for example sourcetype=tenx_encoded'),
+				'| tx sourcetype=': (sb.original_sourcetype_message(original), 'Write sourcetype=tenx_encoded tenx_sourcetype=%s instead.' % sourcetype),
+				'`tx`': (pp.original_sourcetype_message(original, '`tx`'), 'or use `txf`, which gives each event its original sourcetype.'),
+				'`txf`': (pp.original_sourcetype_message(original, '`txf`'), '`txf` gives each event its original sourcetype.')}
+
+	def test_whole_with_names_of_common_length(self):
+		for st, index in (('XmlWinEventLog', 'wineventlog'), ('aws:cloudtrail', 'my_compact_index'), ('fortigate_traffic', 'fw')):
+			for path, (message, _) in self.messages(st, index).items():
+				assert len(message) <= self.LIMIT, (path, st, len(message))
+
+	def test_the_instruction_comes_first_with_long_names(self):
+		for path, (message, instruction) in self.messages('a_very_long_original_sourcetype:name', 'an_index_with_a_long_name').items():
+			assert instruction in message[:self.LIMIT], path

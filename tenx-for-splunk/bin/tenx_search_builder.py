@@ -1512,17 +1512,18 @@ def original_sourcetype_probe(build_result, tenx_config):
 
 
 def original_sourcetype_message(rows, refused=True):
-	"""The message for a search whose original-sourcetype probe found compact events."""
+	"""
+	The message for a search whose original-sourcetype probe found compact events. Splunk keeps the first 256
+	characters of a search command's message, so the message says what to write first.
+	"""
 	named = sorted(set(r.get('tenx_sourcetype', '') for r in rows if r.get('tenx_sourcetype'))) or ['<sourcetype>']
 	compact = sorted(set(r.get('sourcetype', '') for r in rows if r.get('sourcetype')))
 	st = compact[0] if compact else 'tenx_encoded'
 	field = ' OR '.join('tenx_sourcetype=%s' % n for n in named)
-	return ("{}this search names {} {}, which its compact events carry in the field tenx_sourcetype "
-			"(they are indexed as {}){}: as typed it {} none of them. Write sourcetype={} {} "
-			"instead.").format("10x: " if refused else "", 'sourcetype' if len(named) == 1 else 'sourcetypes',
-							   ' and '.join(named), st, ", so it was not run" if refused else "",
-							   "would return" if refused else "returns", st,
-							   field if len(named) == 1 else '(%s)' % field)
+	return ("{}Write sourcetype={} {} instead. The compact events are indexed as {} and carry {} in "
+			"tenx_sourcetype, so as typed {} none of them.").format(
+				"10x: the search was not run. " if refused else "", st, field if len(named) == 1 else '(%s)' % field,
+				st, ' and '.join(named), "it would return" if refused else "it returns")
 
 
 def compact_probe(build_result, tenx_config):
@@ -1569,14 +1570,13 @@ def unnamed_compact_message(rows, refused=True):
 	"""
 	The message for a search whose probe found compact events (rows of index, sourcetype, source,
 	count): the refusal of the commands and the hook, or (refused=False) the review reason of a
-	compiled alert, which is stored.
+	compiled alert, which is stored. Splunk keeps the first 256 characters of a search command's
+	message, so the message says what to add first.
 	"""
 	sts = sorted(set(r.get('sourcetype', '') for r in rows if r.get('sourcetype')))
 	ixs = sorted(set(r.get('index', '') for r in rows if r.get('index')))
-	return ("{}this search reads compact events (sourcetype {} in index {}) but names no compact sourcetype "
-			"or source{}: as typed it {} their compact text and {} the wrong events. "
-			"Add the sourcetype to the search, for example sourcetype={}.").format(
-				"10x: " if refused else "", ", ".join(sts) or "?", ", ".join(ixs) or "?",
-				", so it was not run" if refused else "", "would read" if refused else "reads",
-				"return" if refused else "returns",
-				sts[0] if sts else "tenx_encoded")
+	return ("{}Add the sourcetype to {}, for example sourcetype={}: it reads compact events (sourcetype {} in index {}) "
+			"and names no compact sourcetype or source, so it {} the wrong events.").format(
+				"10x: the search was not run. " if refused else "", "it" if refused else "the search",
+				sts[0] if sts else "tenx_encoded", ", ".join(sts) or "?", ", ".join(ixs) or "?",
+				"would return" if refused else "returns")
