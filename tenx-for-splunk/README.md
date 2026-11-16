@@ -416,13 +416,13 @@ their SPL. To cover another app's dashboards, copy the file into that app's
   of one event.
 
 When `tx` or `txf` stops a search, the search fails with a message. The search bar, dashboard panels
-and Jobs show it; a REST job ends FAILED with it, and a oneshot job returns it. The REST export
-endpoint returns it with `output_mode=xml`; with `json` or `csv` it returns HTTP 200 and an empty
-body, as Splunk does for any search that fails while running, so treat an empty export as a failure.
-A scheduled alert that stops does not fire, and its job holds the message. `txf(<sourcetype>)` for a
-sourcetype without a field replay is refused before the search runs, on every path. A saved search
-with such a macro cannot be saved, and one whose replay is removed later is skipped, with the
-message in the scheduler log.
+and Jobs show it; a REST job holds it (on Splunk 10.4 and 10.6 the job also ends FAILED), and a
+oneshot job returns it. The REST export endpoint returns it with `output_mode=xml`; with `csv`, and
+on Splunk 10.4 and 10.6 with `json`, it returns HTTP 200 and an empty body, as Splunk does for any
+search that fails while running, so treat an empty export as a failure. A scheduled alert that stops
+does not fire, and its job holds the message. `txf(<sourcetype>)` for a sourcetype without a field
+replay is refused before the search runs, on every path. A saved search with such a macro cannot be
+saved, and one whose replay is removed later is skipped, with the message in the scheduler log.
 
 **How `tx` chooses the events to expand.** Its subsearch runs `tenxprefilter` once per
 search. The command reads the search's own text, takes the words after `tx`, finds which
