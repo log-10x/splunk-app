@@ -572,13 +572,15 @@ To set it up:
    Windows Security events reach the Receiver as the rendered XML of each event, one event per
    record: the form the Windows add-on's `XmlWinEventLog` sourcetype holds. For events in files,
    Fluent Bit's `tail` input with a multiline parser that starts a record at `<Event` gives that
-   form, the parser in a parsers file named by `Parsers_File` in `[SERVICE]`:
+   form, the parser in a parsers file named by `Parsers_File` in `[SERVICE]`. Set `storage.path` in
+   `[SERVICE]` as well and `storage.type filesystem` on the input, so a record the parser completes
+   while the input is paused waits on disk:
 
    ```
    [MULTILINE_PARSER]
        name          win_xml
        type          regex
-       flush_timeout 2000
+       flush_timeout 30000
        rule          "start_state"  "/^<Event/"       "cont"
        rule          "cont"         "/^(?!<Event)/"   "cont"
 
@@ -590,6 +592,7 @@ To set it up:
        Buffer_Chunk_Size 64k
        Buffer_Max_Size   2M
        multiline.parser  win_xml
+       storage.type      filesystem
    ```
 2. Install the add-on of each original sourcetype on the search head, as for raw data.
 3. Run `| tenxreplay` once, or wait for the **Rebuild Field Replay When New** saved search, which
@@ -619,12 +622,16 @@ At its default of 10M, while a file is read faster than records are sent, the fi
 records under their original tag with no error, and they arrive without `tenx_sourcetype`.
 
 ```
+[SERVICE]
+    storage.path      <folder for Fluent Bit's buffer>
+
 [INPUT]
     Name              tail
     Path              <FortiGate log file>
     DB                <FortiGate log file>.db
     Tag               src.fgt
     Read_from_Head    true
+    storage.type      filesystem
 
 [FILTER]
     Name                   rewrite_tag
@@ -692,7 +699,7 @@ time and supplies the date, so a compact FortiGate event's `_time` can fall on a
 
 ## Data Models and Detections: the Field Map
 
-Needs the Receiver at release 1.1.180 or later.
+Needs the Receiver at release 1.1.181 or later.
 
 Data models, their accelerations, `tstats` and saved searches that do not use `tx` read the
 fields Splunk stored with an event. The field map writes a compact event's original fields while
@@ -737,7 +744,7 @@ has its own cap file and its own scheduled `check`.
    with these arguments:
 
    ```
-   @run/input/forwarder/fluentbit @apps/receiver varMaxRecurIndexes 0 timestampZone UTC timestampMaxPerObject 1 compactReceiverLookupFile /etc/tenx/win/compact-cap.csv
+   @run/input/forwarder/fluentbit @apps/receiver varMaxRecurIndexes 0 timestampZone UTC timestampMaxPerObject 1 groupJoinLines false compactReceiverLookupFile /etc/tenx/win/compact-cap.csv
    ```
 
    Leave `receiverOptimize true` out of them: with it the Receiver compacts every template, listed or
@@ -748,7 +755,7 @@ has its own cap file and its own scheduled `check`.
    These lines copy the shipped file out of the image:
 
    ```sh
-   docker create --name tenx-config log10x/edge-10x:1.1.180
+   docker create --name tenx-config log10x/edge-10x:1.1.181
    docker cp tenx-config:/etc/tenx/config/pipelines/run/receive/compact/config.yaml compact-config.yaml
    docker rm tenx-config
    ```
@@ -761,9 +768,9 @@ has its own cap file and its own scheduled `check`.
      -v <parsers file>:/fluent-bit/etc/win-parsers.conf:ro -v <log folder>:/logs fluent/fluent-bit:5.1.5
    docker run -d --name tenx-receiver --network container:tenx-fluentbit \
      -v <edited compact config.yaml>:/etc/tenx/config/pipelines/run/receive/compact/config.yaml:ro \
-     -v <host folder of the cap file>:/etc/tenx/win log10x/edge-10x:1.1.180 \
+     -v <host folder of the cap file>:/etc/tenx/win log10x/edge-10x:1.1.181 \
      @run/input/forwarder/fluentbit @apps/receiver varMaxRecurIndexes 0 timestampZone UTC \
-     timestampMaxPerObject 1 compactReceiverLookupFile /etc/tenx/win/compact-cap.csv
+     timestampMaxPerObject 1 groupJoinLines false compactReceiverLookupFile /etc/tenx/win/compact-cap.csv
    ```
 
    `<network>` is a Docker network from which the HTTP Event Collector is reachable. The env file
@@ -774,9 +781,11 @@ has its own cap file and its own scheduled `check`.
 
    The Fluent Bit configuration of the mapped source holds:
 
-   - `Parsers_File /fluent-bit/etc/win-parsers.conf` in `[SERVICE]`, and in that file the `win_xml`
-     parser of [Fields of the Original Sourcetype](#fields-of-the-original-sourcetype-txf), step 1;
-   - the source's `tail` input with `multiline.parser win_xml`, as in that step;
+   - `Parsers_File /fluent-bit/etc/win-parsers.conf` and `storage.path /logs/flb-storage` in
+     `[SERVICE]`, and in that file the `win_xml` parser of
+     [Fields of the Original Sourcetype](#fields-of-the-original-sourcetype-txf), step 1;
+   - the source's `tail` input with `multiline.parser win_xml` and `storage.type filesystem`, as in
+     that step;
    - the hand-off to the Receiver and the input its events come back on:
 
      ```
@@ -1003,7 +1012,7 @@ of the Log10x documentation describes, so that they send:
    - Format: `~<hash>,<var0>,<var1>,...`
 
 3. **Receiver settings** this app relies on: the arguments `receiverOptimize true`,
-   `varMaxRecurIndexes 0`, `timestampZone UTC` and `timestampMaxPerObject 1`. The [repository README](https://github.com/log-10x/splunk-app/blob/main/README.md#receiver-side-configuration)
+   `varMaxRecurIndexes 0`, `timestampZone UTC`, `timestampMaxPerObject 1` and `groupJoinLines false`. The [repository README](https://github.com/log-10x/splunk-app/blob/main/README.md#receiver-side-configuration)
    explains each one.
 
 ### Step 2: Verify Template Ingestion
