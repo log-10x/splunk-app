@@ -283,6 +283,66 @@ class TestWithFieldMap:
 
 
 # -------------------------------------------------------------------------------------------
+# Sources whose compact events can carry another _time
+
+FGT = r.Move(['fortigate_*', 'fgt_*'], ['fw'])
+CT = r.Move(['aws:cloudtrail'], ['aws'])
+CT_MAP = r.Move(['aws:cloudtrail'], ['aws'], ['aws:cloudtrail'])
+
+
+class TestEventTime:
+	@pytest.mark.parametrize('search', [
+		'index=fw sourcetype=fortigate_traffic | timechart count',
+		'index=fw sourcetype=fortigate_traffic action=deny',
+		'index=fw sourcetype=fortigate_traffic | stats min(_time) by srcip',
+		'index=fw sourcetype=fortigate_traffic | stats latest(action) by srcip',
+		'index=fw earliest=-1d sourcetype=fortigate_utm | stats count',
+		'index=fw sourcetype=fortigate_event | head 10 | stats count by logid',
+		'| tstats count where index=fw by _time span=1h',
+	])
+	def test_fortigate_time_is_a_limit(self, search):
+		res = verdict(search, FGT)
+		assert res.verdict == r.LIMIT and 'can fall on another day' in res.reason
+
+	def test_fortigate_counts_over_all_time_are_not(self):
+		assert verdict('index=fw sourcetype=fortigate_traffic | stats count by action', FGT).verdict == r.NEEDS_TXF
+		assert verdict('| tstats count where index=fw by host', FGT).verdict == r.UNCHANGED
+
+	def test_a_time_range_is_a_limit(self):
+		assert r.classify('index=fw sourcetype=fortigate_traffic | stats count by action', FGT, 'alert', None,
+			'-24h').verdict == r.LIMIT
+		assert r.classify('index=fw sourcetype=fortigate_traffic | stats count by action', FGT, 'alert', None,
+			None).verdict == r.LIMIT
+		assert r.classify('index=fw sourcetype=fortigate_traffic | stats count by action', FGT, 'alert', None,
+			'0').verdict == r.NEEDS_TXF
+
+	def test_other_sourcetypes_of_the_index_are_not_time_limited(self):
+		move = r.Move(['fortigate_*', 'XmlWinEventLog'], ['fw'])
+		assert verdict('index=fw sourcetype=XmlWinEventLog | timechart count', move).verdict == r.NEEDS_TXF
+		assert verdict('index=fw | timechart count', move).verdict == r.LIMIT
+
+	def test_cloudtrail_without_a_map_with_one_not(self):
+		res = verdict('index=aws sourcetype=aws:cloudtrail | timechart count by eventName', CT)
+		assert res.verdict == r.LIMIT and 'creationDate' in res.reason
+		assert verdict('index=aws sourcetype=aws:cloudtrail | timechart count by eventName', CT_MAP).verdict == r.UNCHANGED
+		assert verdict('index=aws sourcetype=aws:cloudtrail | stats count by eventName', CT).verdict == r.NEEDS_TXF
+
+	def test_windows_has_no_time_limit(self):
+		assert verdict('index=wineventlog EventCode=1 | timechart count').verdict == r.NEEDS_TXF
+
+	def test_dashboard_windows(self):
+		xml = """<dashboard><label>t</label><search id="b"><query>index=fw sourcetype=fortigate_traffic | fields action</query>
+		  <earliest>0</earliest></search>
+		  <row><panel><table><search base="b"><query>| stats count by action</query></search></table></panel>
+		  <panel><table><search><query>index=fw sourcetype=fortigate_utm | stats count</query></search></table></panel>
+		  <panel><table><search><query>index=fw sourcetype=fortigate_utm | stats count by logid</query>
+		  <earliest>0</earliest></search></table></panel></row></dashboard>"""
+		got = r.run(FakeSource([], r.dashboard_items('t', 'a', 'o', xml)), FGT)
+		verdicts = [i.result.verdict for i in got]
+		assert verdicts == [r.NEEDS_TXF, r.NEEDS_TXF, r.LIMIT, r.NEEDS_TXF]
+
+
+# -------------------------------------------------------------------------------------------
 # Not affected, not classified, already written for compact events
 
 class TestOtherVerdicts:

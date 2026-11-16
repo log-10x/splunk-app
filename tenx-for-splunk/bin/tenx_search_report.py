@@ -120,6 +120,11 @@ README = {
 	'session_token': 'On CloudTrail, `responseElements.credentials.sessionToken` is not written.',
 	'long_value': 'A plain search shows a mapped field longer than 1,000 characters, such as a PowerShell '
 		'`ScriptBlockText`, cut to its first 1,000',
+	'ct_time': 'A compact event\'s `_time` is the first timestamp the Receiver found in the line. In a CloudTrail record '
+		'that can be `userIdentity.sessionContext.attributes.creationDate`, which comes before `eventTime`. A CloudTrail '
+		'field map built with `--time-props` (below) gives every compact CloudTrail event the raw event\'s `_time`.',
+	'fgt_date': 'A FortiGate line has its date and time in two fields, `date=` and `time=`. The Receiver reads the time '
+		'and supplies the date, so a compact FortiGate event\'s `_time` can fall on another day.',
 	'date_fields': 'Mapped events carry no `date_*` fields (`date_hour`, `date_wday` and the others), which Splunk '
 		'gives raw events it reads from a file, so a detection that reads them, such as a business-hours one, '
 		'matches no mapped event.',
@@ -172,6 +177,14 @@ LIMIT_FIELDS = (
 	(re.compile(r'^responseElements\.credentials\.sessionToken$'), 'session_token'),
 	(re.compile(r'^ScriptBlockText$'), 'long_value'),
 )
+# Sources whose compact events can carry another `_time` than their raw events (README): patterns of the original
+# sourcetype, the README sentence, and whether a field map (built with --time-props, as the README says) removes it.
+TIME_SOURCES = ((('fortigate_*', 'fgt_*'), 'fgt_date', False), (('aws:cloudtrail',), 'ct_time', True))
+# Commands and functions whose results depend on the events' times or their order.
+TIME_COMMANDS = frozenset(('timechart', 'bin', 'bucket', 'transaction', 'streamstats', 'head', 'tail', 'dedup', 'reverse',
+	'delta', 'autoregress', 'trendline', 'predict', 'timewrap', 'concurrency', 'localize', 'sitimechart', 'accum'))
+TIME_FUNCTIONS = re.compile(r'(?<![A-Za-z0-9_])(?:earliest|latest|earliest_time|latest_time|first|last|rate|per_second|'
+	r'per_minute|per_hour|per_day)\s*\(', re.I)
 EVENTTYPE_WORDS = frozenset(('err0r', 'aws_cloudtrail_delete_events'))
 DEST_FIELDS = frozenset(('dest', 'src_ip', 'dest_ip'))
 DEST_EVENTS = re.compile(r'(?<![0-9])(?:4798|5156|5157)(?![0-9])')
@@ -516,11 +529,58 @@ def edit_with_macro(search, macro):
 # -------------------------------------------------------------------------------------------
 # One search
 
-def classify(search, move, kind='report', expanded=None):
+def classify(search, move, kind='report', expanded=None, window=''):
 	"""
 	The verdict for one search. `search` is the search as written; `expanded` the same with its macros expanded,
-	None when it holds none, or a reason starting with "!" when they could not be expanded.
+	None when it holds none, or a reason starting with "!" when they could not be expanded. `window` is the earliest
+	time it runs over: '' or 0 for all time, None when it is not known (a dashboard's time picker).
 	"""
+	result = _classify(search, move, kind, expanded)
+	if result.verdict in (NOT_AFFECTED, NOT_CLASSIFIED):
+		return result
+	text = strip_comments(expanded if expanded is not None and not expanded.startswith('!') else search or '')
+	quote = _time_source(text, move)
+	if quote and _reads_time(text, window, kind):
+		result = worst([result, Result(LIMIT, [readme(quote)])])
+	return result
+
+
+def _time_source(text, move):
+	"""The README sentence of a moved source whose compact events can carry another _time, when the search reads it."""
+	first = split_commands(text)
+	first = first[1] if not first[0] and len(first) > 1 else first[0]
+	try:
+		named_st = named(parse_terms(command_args(first) if re.match(r'^(?:search|tstats)\b', first) else first)[0],
+			'sourcetype')
+	except pp.Unparsed:
+		named_st = []
+	read = [s for s in named_st if Move.match(s, move.sourcetypes)] if move.sourcetypes else []
+	read = read or move.sourcetypes
+	for patterns, quote, map_removes in TIME_SOURCES:
+		hit = [s for s in read if any(fnmatch.fnmatchcase(s.lower(), p) or fnmatch.fnmatchcase(p, s.lower())
+			for p in patterns)]
+		if hit and not (map_removes and move.is_mapped(hit)):
+			return quote
+	return None
+
+
+def _reads_time(text, window, kind):
+	"""Whether a search's results depend on the events' _time: its time range, a time term, _time, a command or a
+	function of time or order, or the events it returns."""
+	if window is None or str(window).strip() not in ('', '0', '1'):
+		return True
+	plain = without_quotes(text)
+	if re.search(r'(?<![A-Za-z0-9_])(?:%s)\s*=' % '|'.join(sorted(TIME_FIELDS)), plain) or '_time' in identifiers(text):
+		return True
+	parts = [p for p in split_commands(text) if p]
+	if any(command_name(p) in TIME_COMMANDS for p in parts[1:]) or TIME_FUNCTIONS.search(plain):
+		return True
+	if text.lstrip().startswith('|'):
+		return False
+	return _pipeline(parts[1:])['returns_events']
+
+
+def _classify(search, move, kind='report', expanded=None):
 	search = strip_comments(search or '').strip()
 	if expanded is not None and expanded.startswith('!'):
 		return Result(NOT_CLASSIFIED, [expanded[1:]])
@@ -922,9 +982,9 @@ def saved_search_kind(settings):
 class Item(object):
 	"""One object of the report: a saved search, or one search of a dashboard."""
 
-	def __init__(self, name, app, owner, kind, search, ref=None, base_id=None, sid=None):
+	def __init__(self, name, app, owner, kind, search, ref=None, base_id=None, sid=None, window=''):
 		self.name, self.app, self.owner, self.kind, self.search = name, app, owner, kind, search
-		self.ref, self.base_id, self.sid = ref, base_id, sid
+		self.ref, self.base_id, self.sid, self.window = ref, base_id, sid, window
 		self.base, self.post, self.result = None, [], None
 
 
@@ -954,9 +1014,11 @@ def dashboard_items(name, app, owner, xml_text):
 	parents = dict((c, p) for p in root.iter() for c in p)
 	items, number = [], 0
 	for el in root.iter():
+		window = None
 		if el.tag == 'search':
-			q = el.find('query')
+			q, e = el.find('query'), el.find('earliest')
 			query, ref, base_id, sid = (q.text if q is not None else None), el.get('ref'), el.get('base'), el.get('id')
+			window = substitute(e.text, defaults) if e is not None and e.text is not None else None
 		elif el.tag in ('searchString', 'searchTemplate'):
 			query, ref, base_id, sid = el.text, None, None, None
 		elif el.tag == 'searchName':
@@ -973,7 +1035,8 @@ def dashboard_items(name, app, owner, xml_text):
 				title = t.text.strip()
 			p = parents.get(p)
 		label = '%s / %s' % (name, title or ('search %s' % sid if sid else 'search %d' % number))
-		items.append(Item(label, app, owner, kind, substitute(query, defaults), ref=ref, base_id=base_id, sid=sid))
+		items.append(Item(label, app, owner, kind, substitute(query, defaults), ref=ref, base_id=base_id, sid=sid,
+			window=window))
 	return _link_bases(items)
 
 
@@ -996,11 +1059,13 @@ def studio_items(name, app, owner, definition):
 		opts = ds.get('options') or {}
 		label = '%s / %s' % (name, titles.get(ds_id) or ds.get('name') or ds_id)
 		kind = 'input' if ds_id in input_ds else 'panel'
+		window = (opts.get('queryParameters') or {}).get('earliest')
+		window = substitute(str(window), defaults) if window is not None else None
 		if ds.get('type') == 'ds.search':
-			items.append(Item(label, app, owner, kind, substitute(opts.get('query'), defaults), sid=ds_id))
+			items.append(Item(label, app, owner, kind, substitute(opts.get('query'), defaults), sid=ds_id, window=window))
 		elif ds.get('type') == 'ds.chain':
 			items.append(Item(label, app, owner, kind, substitute(opts.get('query'), defaults), base_id=opts.get('extend'),
-				sid=ds_id))
+				sid=ds_id, window=window))
 		elif ds.get('type') == 'ds.savedSearch':
 			items.append(Item(label, app, owner, kind, None, ref=opts.get('ref'), sid=ds_id))
 	return _link_bases(items)
@@ -1096,8 +1161,8 @@ class DirSource(object):
 					continue
 				if isinstance(definition, dict) and 'dataSources' in definition:
 					self.dashboards += studio_items(os.path.splitext(base)[0], app, owner, definition)
-		self.saved = [Item(stanza, app, owner, saved_search_kind(s), s.get('search', ''))
-			for (app, owner, stanza), s in sorted(saved.items()) if 'search' in s]
+		self.saved = [Item(stanza, app, owner, saved_search_kind(s), s.get('search', ''),
+			window=s.get('dispatch.earliest_time', '')) for (app, owner, stanza), s in sorted(saved.items()) if 'search' in s]
 
 	def items(self):
 		return self.saved, self.dashboards
@@ -1125,7 +1190,7 @@ class RestSource(object):
 		for e in self._entries('/servicesNS/-/-/saved/searches'):
 			c, acl = e.get('content', {}), e.get('acl', {})
 			saved.append(Item(e.get('name'), acl.get('app', '-'), acl.get('owner', '-'), saved_search_kind(c),
-				c.get('search', '')))
+				c.get('search', ''), window=c.get('dispatch.earliest_time', '')))
 		for e in self._entries('/servicesNS/-/-/data/ui/views'):
 			c, acl = e.get('content', {}), e.get('acl', {})
 			if str(c.get('isDashboard', '1')).strip().lower() in ('0', 'false'):
@@ -1171,6 +1236,17 @@ def _http_message(e):
 # -------------------------------------------------------------------------------------------
 # The report
 
+def _window(item):
+	"""The earliest time a search runs over: its own, else its base search's (a post-process runs on its base's events)."""
+	seen = set()
+	while item is not None and id(item) not in seen:
+		seen.add(id(item))
+		if item.base is None or item.window not in (None, ''):
+			return item.window
+		item = item.base
+	return None
+
+
 def full_search(item, seen=None):
 	"""A dashboard search with the base searches it post-processes in front of it."""
 	if item.base is None:
@@ -1203,7 +1279,7 @@ def classify_item(source, item, move):
 		return Result(NOT_CLASSIFIED, ['It has no search text.'])
 	if text.startswith('!'):
 		return Result(NOT_CLASSIFIED, [text[1:]])
-	result = classify(text, move, item.kind, source.expand(item, text))
+	result = classify(text, move, item.kind, source.expand(item, text), _window(item))
 	if item.base is not None:
 		where = ('; the edit goes in the base search, and the edit column shows the two together' if result.edit else '')
 		result.reasons.insert(0, '%s%s.' % (POST_PROCESS % (item.base.sid or item.base.name), where))
@@ -1223,7 +1299,7 @@ def run(source, move):
 			elif item.ref in by_name:
 				r = by_name[item.ref].result
 				item.result = Result(r.verdict, ['It runs saved search "%s": %s' % (item.ref, r.reason)], r.edit)
-				item.search = by_name[item.ref].search
+				item.search, item.window = by_name[item.ref].search, by_name[item.ref].window
 				if item.post:
 					item.result = None
 			else:
