@@ -1023,9 +1023,10 @@ its compact text holds the word. On
 Windows EventID 4798, 5156 and 5157, `dest` is the event's Computer and `src_ip` and `dest_ip` are
 not written. The add-on's XML block fields `EventData_Xml` and `System_Props_Xml` are not written.
 `vendor_privilege` and `privilege_id` carry `-` on events where the raw event has neither. A value
-that holds line breaks and tabs is written with spaces in their place. On CloudTrail,
-`responseElements.credentials.sessionToken` is not written. A plain search shows a mapped field
-longer than 1,000 characters, such as a PowerShell `ScriptBlockText`, cut to its first 1,000;
+that holds line breaks and tabs is written with spaces in their place. A JSON string whose escape
+the Receiver split before a value is written for `\/` (a CloudTrail `sessionToken`), and for `\n`,
+`\t` and `\r` with a space; with any other escape there, that field is not written. A plain search
+shows a mapped field longer than 1,000 characters, such as a PowerShell `ScriptBlockText`, cut to its first 1,000;
 `tstats` on the field reads it whole. A template with more than 984 values
 gets no row, and its events arrive whole. An event whose compact value holds a line feed or another
 control character, such as a NUL byte in a FortiGate line, gets no fields and is marked
