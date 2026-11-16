@@ -94,7 +94,7 @@ compact data by eventtype, index alone or macro compiles as PASSTHROUGH without 
 ## Time
 
 The alert's time range selects on `_time`, which for a compact event is the time Splunk
-indexed it. See [Event time on compact events](README.md#event-time-on-compact-events).
+indexed it. See [Event time on compact events](docs/REFERENCE.md#event-time-on-compact-events).
 
 ## Permissions
 

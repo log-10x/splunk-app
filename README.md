@@ -2,152 +2,40 @@
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
-Search and visualize [compact](https://doc.log10x.com/run/transform/#compact) events in Splunk. This open-source [Log10x](https://www.log10x.com/?utm_source=github&utm_medium=readme&utm_campaign=splunk-app&utm_content=hero) app expands compact events back to their original lines at search time, while the ingested volume, and with it the license bill, stays reduced. It runs on Splunk Enterprise 9.4 through 10.6, and the package passes AppInspect's Splunk Cloud checks.
+Splunk indexes shorter events and searches them as the original text. The [10x Receiver](https://doc.log10x.com/apps/receiver/) compacts each event beside your forwarder, and this open-source app rebuilds it in Splunk at search time.
 
-> **Blog:** [Search compact logs in Splunk using the 10x app](https://www.log10x.com/blog/cutting-splunk-log-storage/?utm_source=github&utm_medium=readme&utm_campaign=splunk-app&utm_content=blog). How Splunk stores fewer bytes and still returns the original log lines.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/where-10x-runs-dark.svg">
+  <img src="docs/img/where-10x-runs-light.svg" alt="Log lines go from your apps to your forwarder. The 10x Receiver runs as a sidecar in the forwarder's pod and compacts each event. The forwarder sends compact events to Splunk, where the 10x app rebuilds them for your searches, dashboards and alerts." width="880">
+</picture>
 
-To find optimization opportunities in your existing Splunk data, point the [Log10x MCP server](https://doc.log10x.com/apps/mcp/) at your Splunk backend with read-only credentials and ask it to run a cost POC. It pulls a representative sample via SPL, runs the 10x engine locally to rank message types, and returns a per-pattern cost and savings report with drop/compact/offload actions. Install with `claude mcp add --transport stdio --env LOG10X_API_KEY=your-api-key log10x -- npx -y log10x-mcp`.
+## One event
 
-## How It Works
+Repeated text is stored once, as a template, and each event is sent as its values.
 
-A [compact event](https://doc.log10x.com/run/transform/#compact) carries a template hash and its variable values; the constant words live in the KV Store, and the app puts them back at search time. A word that exists only in a template is not in the index, so a plain keyword search over compact data finds the events where the word is a value and misses the others. To search by what the lines say, write the `tx` macro in front of the search terms, after the index and any metadata or time terms: ``index=app_logs `tx` error "payment failed"``. The words after it are ordinary SPL, applied to the expanded lines. Classic dashboards keep their panel SPL unchanged: `dashboard.js` routes each panel's search through the app's REST endpoint. An alert created in the app's **Compile Alert** view compiles once into a native saved search.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/one-event-dark.svg">
+  <img src="docs/img/one-event-light.svg" alt="One log line is split into a template stored once and a compact event sent each time. At search time the app joins them back into the identical line." width="880">
+</picture>
 
-### Ingestion Flow
+## Search
 
-The [Receiver](https://doc.log10x.com/apps/receiver/) running in [Compact mode](https://doc.log10x.com/apps/receiver/compact/) [compacts](https://doc.log10x.com/run/transform/#compact) events at the edge, and Splunk ingests them at reduced size:
+Searches, dashboards and alerts run on the original text. A search puts the `tx` macro in front of its terms:
 
-```
-Receiver  -->  Ingest (HEC)  -->  KV Store (Templates)
-                             -->  Index (compact events, metadata as indexed fields)
-```
-
-### Search Flow
-
-Each path selects the compact events that can match, then [expands](https://doc.log10x.com/run/transform/#expand) them and applies the search to the original lines:
-
-```
-Search bar, Dashboard Studio, saved search:  `tx` macro  -->  prefilter (tenxprefilter)  --\
-                                                                                           +-->  Expand  -->  Full results
-Classic dashboard panel:  dashboard.js hook  -->  /tenx-search rewrite  -------------------/
+```spl
+index=app_logs `tx` error "payment failed"
 ```
 
-On one laptop running Splunk 10.4.3, a `tx` search over 157,228 compact events returned in about 1.5 to 4 seconds, where the same search over the raw lines took under a second; the `| tx` command, which writes every event out itself, took two to five times as long as the macro.
+Classic dashboards keep their SPL. An alert created in the **Compile Alert** view is compiled once into an ordinary saved search.
 
-Scheduled alerts run server-side, where the browser hook never fires. An alert created in the **Compile Alert** view, or through the `/tenx-alert` endpoint, is **compiled once at save time** into native SPL, a template hash prefilter plus the inflate macro, so the scheduler runs an ordinary saved search. This is handled by the `/tenx-alert` REST endpoint and the **Compile Alert** view (with a recompile pass that converts `| tx` and `| tenxsearch` alerts and refreshes prefilters as templates appear). See [SAVE_TIME_ALERTS.md](SAVE_TIME_ALERTS.md).
+## Security Sources
 
-## Receiver-side configuration
+The `txf` macro gives expanded events the fields, event types and tags of their original sourcetype, and the field map tool makes compact events readable by data models and detections. Setup: [Fields of the Original Sourcetype](tenx-for-splunk/README.md#fields-of-the-original-sourcetype-txf), [the Field Map](tenx-for-splunk/README.md#data-models-and-detections-the-field-map), [What to Install on Each Tier](tenx-for-splunk/README.md#what-to-install-on-each-tier).
 
-Start the Receiver with four arguments for any deployment that feeds this app.
-`receiverOptimize true` makes it send events compact. The other three are options of the
-Receiver's configuration; from engine 1.1.89 they can also follow the app on the command line,
-which replaces the values the app's configuration sets. With the published image, beside a Fluent
-Bit container:
-
-```
-docker run -d --name tenx-receiver --network container:<Fluent Bit container> log10x/edge-10x:1.1.180 \
-  @run/input/forwarder/fluentbit @apps/receiver receiverOptimize true varMaxRecurIndexes 0 \
-  timestampZone UTC timestampMaxPerObject 1
-```
-
-The first argument names the input module for the forwarder in use, here Fluent Bit; the
-[forwarder inputs](https://doc.log10x.com/run/input/forwarder/) page lists the others.
-
-The three options live in two files of the Receiver's config folder (`$TENX_CONFIG`, mounted at
-`/etc/tenx/config` in the container image):
-
-```yaml
-# pipelines/run/template/config.yaml
-var:
-  maxRecurIndexes: 0
-
-# pipelines/run/transform/timestamp/config.yaml
-timestamp:
-  maxPerObject: 1
-  zone: UTC
-```
-
-With the shipped configuration, these arguments start the Receiver with these values.
-Setting them in these files instead works as well.
-
-### Back-references
-
-**Set `varMaxRecurIndexes: 0`.** The app expands templates whose values all travel in the event.
-The Receiver's [`varMaxRecurIndexes`](https://doc.log10x.com/run/template/#varmaxrecurindexes)
-setting lets a template refer back to an earlier value (`$N`) instead. The setting applies to the
-whole Receiver process. At 0, modeled compression is about half a percentage point lower on a
-Kubernetes/OTel dataset, and every event expands exactly.
-
-A Receiver that also feeds Elasticsearch applies the setting there too. The
-[elasticsearch-plugin](https://github.com/log-10x/elasticsearch-plugin) decodes either form, and
-that traffic compresses about half a point less.
-
-### Timestamps
-
-**Set `timestampZone: UTC`.**
-
-A timestamp that carries no zone marker of its own, `2025-10-02 06:35:34,498`,
-is only a time once something decides which zone it was written in. The Receiver
-decides, and by default it uses the clock of the host it runs on. That choice is
-not recorded in the compact event, so this app cannot recover it: the same line
-compacted on a host in New York and on a host in UTC produces two different
-events, and nothing downstream can tell them apart.
-
-Pinning the Receiver to UTC makes that choice fixed and knowable, and this app's
-inflate macro renders in UTC to match. Without it, expansion returns a time
-shifted by the difference between the Receiver's host clock and UTC.
-
-Timestamps that carry their own zone, anything ending in `Z` or an offset, are unaffected.
-
-### One timestamp per event
-
-**Set `maxPerObject: 1`** in the Receiver's timestamp configuration (`timestamp.maxPerObject`).
-
-The Receiver records every timestamp it finds in an event as its own slot. This app stores one
-timestamp format per template, so a template with two slots cannot render both. At `1` the first
-timestamp keeps its slot and any later one becomes an ordinary variable whose text round-trips
-unchanged.
-
-### Store-time checks
-
-Back-references, multi-timestamp templates and two different templates under one template hash
-are detected when stored. Their events stay compact and carry `tenx_expand_refused` naming the
-reason, `back-reference`, `multiple-timestamps` or `hash-conflict`, so every expanded line is the
-original line. The Diagnostics dashboard lists every refused template. To clear a `hash-conflict`
-after deciding which template is right, delete that key from the `tenx_dml` collection and run the
-backfill search in Step 5. A Receiver's clock zone leaves no trace in the data, so
-`timestampZone: UTC` is required rather than checked.
-
-### Event time on compact events
-
-A compact event's `_time` is the time in its original log line wherever the Receiver wrote
-one, and the time Splunk indexed it otherwise. The Receiver writes a template's timestamp as
-an epoch in the event's first variable, 13 digits for milliseconds or 19 for nanoseconds.
-The `tenx-event-time` transform sets `_time` from a first variable of that shape while the
-event is parsed, when it falls inside Splunk's own timestamp window: 2,000 days back and 2
-days ahead, the defaults for `MAX_DAYS_AGO` and `MAX_DAYS_HENCE`. Any other first variable
-keeps the index time. Searches and alerts over a time range select late and replayed logs by
-the time in the line.
-
-Measured on Splunk 9.4.15, 10.4.3 and 10.6.0.5, the same on each, with the OpenTelemetry demo
-sample, 157,228 compact events: of the
-134,668 whose original line carries a timestamp Splunk recognizes, 134,340 get that time as
-`_time` to the second and 133,658 to the millisecond. The other 328 are lines without a full
-date, which the Receiver and Splunk complete differently (glog lines carry no year, and three
-lines carry only a time of day), and three lines where Splunk reads a number as a time. Where
-a template's timestamp stops at whole seconds, `_time` does too.
-
-The transform adds no licence-metered bytes: in the E21 licence run on Splunk 10.4.3 the
-compact events metered exactly their raw text, 74,338,244 bytes, with it on. It is a parsing
-setting, so it runs where compact events are parsed (see Step 1).
-
-### Timestamps in expanded lines
-
-Every timestamp renders in UTC for every viewer, at every hour of the year. Checked on Splunk
-9.4.15, 10.4.3 and 10.6.0.5 with 10,708 events at 2,677 instants, among them every ten minutes for 14 hours either
-side of the 2026 daylight-saving transitions, expanded by viewers in eight zones (UTC,
-America/New_York, Europe/London, Australia/Sydney, Pacific/Chatham, America/Adak,
-Asia/Kolkata, Etc/GMT-4): every line is the UTC text. A zone in the timestamp format prints
-`+0000` or `UTC`.
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/img/sources-dark.svg">
+  <img src="docs/img/sources-light.svg" alt="Application logs and security logs both reach your forwarder, where the 10x Receiver compacts them. In Splunk, the 10x app rebuilds events for your searches, add-on fields, tags and detections." width="880">
+</picture>
 
 ## Quickstart
 
@@ -194,7 +82,7 @@ Create an index named `tenx_dml` for templates, then two HTTP Event Collector to
 
 ### Step 3: Configure the Receiver and Forwarder
 
-Start the Receiver with `receiverOptimize true`, `varMaxRecurIndexes 0`, `timestampZone UTC` and `timestampMaxPerObject 1` (see [Receiver-side configuration](#receiver-side-configuration)), and point your forwarder at both tokens: templates to `tenx_dml`, and each compact event as the message with the record's metadata as indexed fields. The [setup guide](https://doc.log10x.com/apps/receiver/compact/splunk/) has the Fluent Bit and Fluentd configuration.
+Start the Receiver with `receiverOptimize true`, `varMaxRecurIndexes 0`, `timestampZone UTC` and `timestampMaxPerObject 1` (see [Receiver settings](docs/REFERENCE.md#receiver-side-configuration)), and point your forwarder at both tokens: templates to `tenx_dml`, and each compact event as the message with the record's metadata as indexed fields. The [setup guide](https://doc.log10x.com/apps/receiver/compact/splunk/) has the Fluent Bit and Fluentd configuration.
 
 ### Step 4: Point the Dashboards at Your Index
 
@@ -229,80 +117,20 @@ index=tenx_dml sourcetype=tenx_dml_raw_json | head 10
 index=your_logs_index `tx` | head 10
 ```
 
-## Security Sources
+<a id="receiver-side-configuration"></a>
 
-The `txf` macro gives expanded events the fields, event types and tags of their original sourcetype, and the field map tool makes compact events readable by data models and detections. Setup: [Fields of the Original Sourcetype](tenx-for-splunk/README.md#fields-of-the-original-sourcetype-txf), [the Field Map](tenx-for-splunk/README.md#data-models-and-detections-the-field-map), [What to Install on Each Tier](tenx-for-splunk/README.md#what-to-install-on-each-tier).
+## More
 
-## Analytics Dashboard
-
-The Analytics dashboard finds compact events through the `tenx-events` macro.
-
-| Panel | Description |
-|--------|-------------|
-| **Total Encoded Events** | Compact events indexed |
-| **Active Templates** | Templates in the KV Store |
-| **Compression Ratio** | Original size over compact size, on the latest 5,000 events |
-| **Estimated Storage Savings** | Bytes saved and percentage reduction, on the latest 10,000 events |
-| **Event Volume, Last 7 Days** | Compact events per hour |
-| **Top 10 Templates by Usage** | Template hashes with the most events |
-| **Inflation Success Rate** | Share of the latest 1,000 events that expand |
-
-## Components
-
-| Component | Description |
-|-----------|-------------|
-| **Search Hook** | `dashboard.js`, routing each classic dashboard panel's search to the Search Handler |
-| **Search Handler** | `/tenx-search` REST endpoint rewriting a search for compact events |
-| **tx Macro** | Written in front of a search to search compact events by what the lines say, from the search bar, Dashboard Studio, saved searches and alerts |
-| **txf Macro** | `tx` with the search-time fields of the original sourcetype; see [Fields of the Original Sourcetype](tenx-for-splunk/README.md#fields-of-the-original-sourcetype-txf) |
-| **tenxreplay Command** | Writes the replay macros `txf` runs, from the search head's props; run by the Rebuild Field Replay saved searches |
-| **Field Map Tool** | `bin/tenx_field_map.py`: generates the app that writes compact events' original fields at index time; see [the Field Map](tenx-for-splunk/README.md#data-models-and-detections-the-field-map) |
-| **tenxprefilter Command** | Run once per search by the `tx` macro; reads the search, looks up the templates that carry its words, and selects the compact events to expand |
-| **tx and tenxsearch Commands** | `\| tx <search>` and `\| tenxsearch searchstring="..."`: generating commands that write every event out through Python, kept so saved searches written with them keep working |
-| **tenxrecompile Command** | Recompiles every compiled alert so it picks up new templates |
-| **Alert Compiler** | `/tenx-alert` REST endpoint compiling a search into a native scheduled alert at save time (with a recompile/migrate pass) |
-| **Compile Alert View** | UI to compile, review, and recompile save-time alerts |
-| **KV Store** | Template patterns for event reconstruction |
-| **Inflate Macro** | SPL macro joining events with templates |
-| **Consume KV Search** | Scheduled search storing new templates in the KV Store |
-| **Backfill KV Search** | The same template load over 30 days, for templates indexed before the app was installed |
-| **Recompile Compiled Alerts Search** | Runs `tenxrecompile` every 15 minutes |
-| **Rebuild Field Replay Searches** | Run `tenxreplay` every hour, and every five minutes for sourcetypes not yet covered |
-| **Field Map Events Without Fields Search** | Not scheduled; where a field map is installed, counts compact events indexed without their fields by index, sourcetype and reason |
-| **Analytics Dashboard** | Compression and template metrics |
-| **Diagnostics Dashboard** | Troubleshooting and verification tools |
-
-## Documentation
-
-For complete documentation including troubleshooting, advanced configuration, and integration guides, see:
-
-- [Log10x App documentation](https://doc.log10x.com/apps/receiver/compact/splunk/)
-- [Save-time alert compilation](SAVE_TIME_ALERTS.md): how scheduled alerts on compact data are compiled and kept current
-- [Receiver Documentation](https://doc.log10x.com/apps/receiver/)
-- [Log10x Documentation](https://doc.log10x.com/)
+- [Setup guide](https://doc.log10x.com/apps/receiver/compact/splunk/): forwarder configuration and troubleshooting
+- [Reference](docs/REFERENCE.md): Receiver settings, how search works, dashboards and components
+- [Save-time alerts](SAVE_TIME_ALERTS.md): how alerts on compact events are compiled and kept current
+- [License usage benchmark](https://github.com/log-10x/benchmarks/tree/main/splunk-license): the same logs sent to Splunk as written and compact
+- [Blog post](https://www.log10x.com/blog/cutting-splunk-log-storage/?utm_source=github&utm_medium=readme&utm_campaign=splunk-app&utm_content=blog): search compact logs in Splunk using the 10x app
+- [Log10x MCP server](https://doc.log10x.com/apps/mcp/): a cost report per log pattern from a sample of your own Splunk data
 
 ## License
 
-This repository is licensed under the [MIT License](LICENSE).
-
-### Log10x Receiver license
-
-This repository contains a Splunk app for expanding Log10x compact events. The app is open source. The Log10x Receiver that produces compact events runs on the built-in Free tier with no license token on up to 10 nodes, with no expiry; above 10 nodes it takes a paid license.
-
-| Component | License |
-|-----------|---------|
-| This repository (Splunk app) | MIT (open source) |
-| Log10x Receiver | Free tier on up to 10 nodes; paid license above 10 |
-
-**What this means:**
-- You can freely use, modify, and distribute this Splunk app
-- The Log10x Receiver runs with no license token on up to 10 nodes
-- Above 10 nodes, the Receiver takes a paid license
-
-**Get Started:**
-- [Log10x Pricing](https://www.log10x.com/pricing?utm_source=github&utm_medium=readme&utm_campaign=splunk-app&utm_content=footer)
-- [Documentation](https://doc.log10x.com)
-- [Contact Sales](mailto:sales@log10x.com)
+The app is open source under the [MIT License](LICENSE). The 10x Receiver is free on up to 10 nodes, with no license token and no expiry; above 10 nodes it takes a paid license ([pricing](https://www.log10x.com/pricing?utm_source=github&utm_medium=readme&utm_campaign=splunk-app&utm_content=footer)).
 
 ## Contributing
 
@@ -310,6 +138,4 @@ Contributions are welcome as pull requests to this repository.
 
 ## Support
 
-For issues and feature requests:
-- Open an issue on [GitHub](https://github.com/log-10x/splunk-app/issues)
-- Contact the Log10x team at [support@log10x.com](mailto:support@log10x.com)
+Open an issue on [GitHub](https://github.com/log-10x/splunk-app/issues), or write to [support@log10x.com](mailto:support@log10x.com).

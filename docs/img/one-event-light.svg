@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="880" height="318" viewBox="0 0 880 318" role="img" aria-label="One log line is split into a template stored once and a compact event sent each time. At search time the app joins them back into the identical line."><style>
+.b{fill:#ffffff;stroke:#cdd6d1;stroke-width:1.3}
+.ba{fill:#e2f3e8;stroke:#15803d;stroke-width:1.5}
+.t{fill:#0b0e12;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;font-size:13.5px;font-weight:600}
+.s{fill:#56606c;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;font-size:11.5px}
+.cap{fill:#56606c;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;font-size:10.5px;letter-spacing:.1em}
+.m{fill:#14181e;font-family:ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;font-size:12.5px}
+.v{fill:#15803d;font-weight:500}
+.r{fill:#56606c}
+.a{stroke:#56606c;stroke-width:1.4;fill:none}
+.h{fill:#56606c}
+.g{stroke:#cdd6d1;stroke-width:1;fill:none}
+.pod{fill:none;stroke:#56606c;stroke-width:1.2;stroke-dasharray:6 5}
+.podlab{fill:#56606c;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;font-size:10.5px;letter-spacing:.1em}
+.th{fill:#15803d;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;font-size:13.5px;font-weight:600}
+.wm{fill:#0b0e12;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;font-size:17px;font-weight:700}
+.wm tspan{fill:#15803d}
+.pill{fill:none;stroke:#cdd6d1;stroke-width:1.2}
+.bar0{fill:#b5bec4}
+.bar1{fill:#15803d}
+.num{fill:#0b0e12;font-family:-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;font-size:14px;font-weight:700}
+</style>
+        <defs><marker id="ah2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto"><path d="M0 0 L10 5 L0 10 z" class="h"/></marker></defs>
+        <text class="cap" x="440" y="14" text-anchor="middle">EVENT AS THE APPLICATION WROTE IT</text>
+        <rect class="b" x="170" y="24" width="540" height="34" rx="6"/>
+        <text class="m" x="440" y="46" text-anchor="middle"><tspan class="v">2026-04-14 10:23:01</tspan><tspan class="r"> INFO </tspan><tspan class="v">admin</tspan><tspan class="r"> logged in from </tspan><tspan class="v">192.168.1.1</tspan></text>
+        <line class="a" x1="330" y1="60" x2="232" y2="102" marker-end="url(#ah2)"/>
+        <line class="a" x1="550" y1="60" x2="648" y2="102" marker-end="url(#ah2)"/>
+        <rect class="b" x="20" y="106" width="400" height="98" rx="8"/>
+        <text class="t" x="40" y="132">Template, stored once</text>
+        <text class="m" x="40" y="160"><tspan class="v">‹time›</tspan><tspan class="r"> INFO </tspan><tspan class="v">‹value›</tspan><tspan class="r"> logged in from </tspan><tspan class="v">‹value›</tspan></text>
+        <text class="s" x="40" y="186">the text the code repeats, kept under the key ~x7Kp2m</text>
+        <rect class="ba" x="460" y="106" width="400" height="98" rx="8"/>
+        <text class="t" x="480" y="132">Compact event, sent every time</text>
+        <text class="m" x="480" y="160"><tspan class="r">~x7Kp2m,</tspan><tspan class="v">1776162181000</tspan><tspan class="r">,</tspan><tspan class="v">admin</tspan><tspan class="r">,</tspan><tspan class="v">192.168.1.1</tspan></text>
+        <text class="s" x="480" y="186">the template key, then the time and the two values</text>
+        <line class="a" x1="232" y1="206" x2="330" y2="248" marker-end="url(#ah2)"/>
+        <line class="a" x1="648" y1="206" x2="550" y2="248" marker-end="url(#ah2)"/>
+        <rect class="b" x="170" y="252" width="540" height="34" rx="6"/>
+        <text class="m" x="440" y="274" text-anchor="middle"><tspan class="v">2026-04-14 10:23:01</tspan><tspan class="r"> INFO </tspan><tspan class="v">admin</tspan><tspan class="r"> logged in from </tspan><tspan class="v">192.168.1.1</tspan></text>
+        <text class="cap" x="440" y="308" text-anchor="middle">REBUILT BY THE APP AT SEARCH TIME, IDENTICAL TEXT</text>
+      </svg>
