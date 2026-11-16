@@ -14,12 +14,17 @@ stand for nothing (SePrivilege) as the index does.
 The tables (wildcard_measured.py) are 96 words on 40 events and 78 TERM() and CASE() words on 26
 more, measured on the index, after a pipe, and through the plan.
 """
+import hashlib
 import re
 
 import pytest
 
 import tenx_prefilter_parser as p
 from wildcard_measured import EVENTS, MEASURED
+from wildcard_plan_measured import TC_EVENTS, TERM_CASE, WORDS as PLAN_WORDS
+
+# NOT CASE() on the index (see TestOnTheIndex)
+NOT_CASE = {'NOT CASE(root)', 'NOT CASE(Root)', 'NOT CASE(Se*Privilege)', 'NOT CASE(se*privilege)', 'NOT (CASE(root) OR TERM(0000))'}
 
 INSIDE = [(w, base) for w, base, _ in MEASURED if len(w.strip('"').split()) == 1 and p.mid_wildcard(w.strip('"'))]
 # words with none such inside them (a word among others that has one is in neither list)
@@ -161,3 +166,50 @@ class TestTheSearchRewrite:
 	def test_other_words_are_not(self):
 		got = self.resolved('search index=x sourcetype=tenx_encoded error Se*')
 		assert 'tenx_w' not in got and got.endswith('| search error Se*')
+
+
+class TestOnTheIndex:
+	"""The plans measured on Splunk Enterprise 10.4.3 (wildcard_plan_measured.py): 96 words and 78 TERM() and CASE()
+	words, each on the index, after a pipe, through the search rewrite's plan and through the tx macros' plan."""
+
+	ROWS = PLAN_WORDS + TERM_CASE
+
+	@pytest.mark.parametrize("word, base, pipe, search, digest, rewrite, macro", ROWS)
+	def test_the_plan_is_the_one_measured(self, word, base, pipe, search, digest, rewrite, macro):
+		plan = p.wild_plan(word)
+		assert (plan[1] if plan else None) == search
+		assert (hashlib.sha1(plan[0].encode()).hexdigest()[:12] if plan else None) == digest
+
+	@pytest.mark.parametrize("word, base, pipe, search, digest, rewrite, macro", ROWS)
+	def test_the_rewrite_keeps_what_the_index_keeps(self, word, base, pipe, search, digest, rewrite, macro):
+		if word in NOT_CASE:
+			# on the index NOT CASE(x) drops the letter case (NOT CASE(Root) leaves out root and ROOT too), so it is
+			# not the opposite of CASE(x); the plan gives the opposite: more events, never fewer
+			assert set(rewrite) > set(base)
+			return
+		assert rewrite == base
+
+	@pytest.mark.parametrize("word, base, pipe, search, digest, rewrite, macro", ROWS)
+	def test_the_macros_keep_it_except_under_not(self, word, base, pipe, search, digest, rewrite, macro):
+		if word in NOT_CASE:
+			assert set(macro) > set(base)
+		elif 'NOT ' in word and search is not None:
+			# the final search after the pipe still excludes on the prefix (or on TERM() found inside a longer
+			# term): fewer events where the word holds there, the limit named in the README
+			assert set(macro) <= set(base), word
+		else:
+			assert macro == base
+
+	def test_the_tables_cover_term_and_case(self):
+		planned = [r for r in TERM_CASE if r[3] is not None]
+		assert len(TERM_CASE) == 78 and len(planned) >= 50 and len(PLAN_WORDS) == 96
+		# TERM() of a word with a breaker, alone: the regular expression itself gives the index's events
+		for word, base, pipe, search, digest, rewrite, macro in TERM_CASE:
+			m = re.fullmatch(r'TERM\(([^ ()"]+)\)', word)
+			if m and search == 'tenx_w0=1':
+				x = m.group(1)
+				if p._major_breaker(x):
+					assert base == [] and p.wild_plan(word)[0] == 'tenx_w0=0', word
+					continue
+				rx = re.compile(p.term_regex(x, major_only=any(c in p.MINOR_CHARS for c in x)))
+				assert [n for n, e in enumerate(EVENTS + TC_EVENTS) if rx.search(e)] == base, word
