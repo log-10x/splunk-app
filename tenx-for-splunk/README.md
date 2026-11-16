@@ -845,8 +845,8 @@ has its own cap file and its own scheduled `check`.
    trust, add `--tls-ca-file <PEM file of that authority>`.
    `<token>` is a Splunk authentication token of a user
    whose role holds the capabilities `search` and `list_all_objects` and may search the probe
-   index and the indexes that hold the map's compact events; with `--probe-hec`, `edit_tcp` is not
-   needed. `TENX_SPLUNKD_AUTH=<user>:<password>` works as well. `activate` sends one
+   index, the indexes that hold the map's compact events, and `_internal`; with `--probe-hec`,
+   `edit_tcp` is not needed. `TENX_SPLUNKD_AUTH=<user>:<password>` works as well. `activate` sends one
    small probe event per new template through the HTTP Event Collector into the probe index, an
    index to keep out of data model and detection index lists. Probe events count against the
    Splunk licence like any indexed event: one compact line each, 194 to 787 bytes for the Windows
@@ -854,7 +854,7 @@ has its own cap file and its own scheduled `check`.
    fields, that template moves from `compact-cap.csv.pending` into `compact-cap.csv`, and the
    Receiver, which rereads the file, then compacts its events. Nothing is restarted.
 
-7. Schedule `check` with the arguments of `activate`, for example from cron:
+7. Schedule `check` every minute with the arguments of `activate`, for example from cron:
 
    ```sh
    TENX_SPLUNKD_TOKEN=<token> TENX_PROBE_HEC_TOKEN=<HEC token> python3 \
@@ -890,7 +890,10 @@ floor app or not, until `check` empties the list. Splunk's index-time `lookup()`
 such a file, and no rule can catch it. `check` counts the dropped events from Splunk's own log and
 fails with that count. A row Splunk cannot use, an empty file, or a hash the file does not hold
 keeps the event, marked `tenx_unmapped`. Keep the lookup files readable by the user Splunk runs as,
-and change them only with the tool. After an upgrade of this app, `gen` can also write a new static rule;
+and change them only with the tool. With `check` run every minute, the list is empty within 80
+seconds of the first dropped event, and the Receiver sends the map's events whole from 10 seconds
+after that. Once a good file is back, Splunk reads it at once, except a file without a `hash` column
+that Splunk read when it started: for that one, restart the instance that parses the events. After an upgrade of this app, `gen` can also write a new static rule;
 `activate` then refuses the map until both apps are installed again whole, as in step 5.
 
 Where several instances parse the compact events (indexer cluster peers, or several heavy
