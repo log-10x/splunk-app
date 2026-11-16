@@ -614,9 +614,9 @@ so on expanded events they differ from the raw event's.
 For FortiGate, the sender sets `tenx_sourcetype` to `fortigate_traffic`, `fortigate_utm`,
 `fortigate_event` or `fortigate_anomaly` by the line's `type=`. With Fluent Bit, a `rewrite_tag`
 filter gives each type its own tag before the hand-off to the Receiver, and a `modify` filter per
-type adds the field to the records that come back. Set `Emitter_Mem_Buf_Limit` on `rewrite_tag`:
-at its default of 10M, while a file is read faster than records are sent, the filter leaves
-records under their original tag, with no error, and they arrive without `tenx_sourcetype`.
+type adds the field to the records that come back. Set `Emitter_Mem_Buf_Limit` on `rewrite_tag`.
+At its default of 10M, while a file is read faster than records are sent, the filter leaves
+records under their original tag with no error, and they arrive without `tenx_sourcetype`.
 
 ```
 [INPUT]
