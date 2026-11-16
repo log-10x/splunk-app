@@ -809,8 +809,8 @@ has its own cap file and its own scheduled `check`.
    it writes an app with no rule and says so. This writes the apps `fm_win` and `fm_win_floor`
    and the file `compact-cap.csv.pending`, and
    prints the line step 5 adds to `tenx-events`. The compact sourcetype is `tenx_win`. The floor app
-   holds a one-row lookup that Splunk reads if the field map's own file is missing, so events are
-   kept and marked `tenx_unmapped` instead of dropped.
+   holds a one-row lookup that Splunk reads when the field map's own file is missing, so events
+   are kept and marked `tenx_unmapped=no_table` instead of dropped.
 
 5. Copy `fm_win` and `fm_win_floor` to every instance that parses the compact events, and `fm_win`
    to the search head (see [What to Install on Each Tier](#what-to-install-on-each-tier)), add
@@ -882,9 +882,12 @@ only the lookup file: copy `lookups/` of both apps over the installed ones (on a
 changes; a file put back with the time it had when Splunk last read it stays unread. A standalone
 instance or heavy forwarder rereads the file within its `ingest_lookup_refresh_period_secs` (60
 seconds by default) with no reload or restart, and a change to the lookup file alone reloads cluster
-peers without a restart. While the lookup file a parsing instance reads cannot be read by the user
-Splunk runs as, is not gzip, or has no `hash` column, Splunk drops the map's compact events, floor
-app or not, until `check` empties the list. After an upgrade of this app, `gen` can also write a new static rule;
+peers without a restart. A lookup file that Splunk finds but cannot load, because the user Splunk runs as
+cannot read it, it is not gzip, or it has no `hash` column, makes Splunk drop the map's compact
+events, floor app or not, from the next time Splunk reads the file until `check` empties the list:
+Splunk's index-time `lookup()` fails on such a file and drops the event, and no rule can catch that.
+A row Splunk cannot use, an empty file, or a hash the file does not hold keeps the event, marked
+`tenx_unmapped`. Keep the lookup files readable by the user Splunk runs as. After an upgrade of this app, `gen` can also write a new static rule;
 `activate` then refuses the map until both apps are installed again whole, as in step 5.
 
 Where several instances parse the compact events (indexer cluster peers, or several heavy
