@@ -968,13 +968,16 @@ python3 tenx-for-splunk/bin/tenx_field_map.py gen \
 
 **Windows Security as classic text** (sourcetype `WinEventLog:Security`: a date line, then
 `name=value` lines and the `Message=` block, not rendered XML) has its own map, Receiver and cap file,
-`/etc/tenx/wincl/compact-cap.csv`. Fluent Bit starts a record at the event's date line:
+`/etc/tenx/wincl/compact-cap.csv`. Fluent Bit starts a record at the event's date line, and ends it
+only after 10 seconds without a new line (with 2 seconds, a host under load cut 1 event of 100,000
+in two). Give the `tail` input a `Mem_Buf_Limit` it does not reach (`512M` here): a paused input
+joined parts of 2 events of 100,000 at `64M`:
 
 ```
 [MULTILINE_PARSER]
     name          win_classic
     type          regex
-    flush_timeout 2000
+    flush_timeout 10000
     rule          "start_state"  "/^\d{2}\/\d{2}\/\d{4} \d{2}:\d{2}:\d{2} [AP]M$/"       "cont"
     rule          "cont"         "/^(?!\d{2}\/\d{2}\/\d{4} \d{2}:\d{2}:\d{2} [AP]M$)/"  "cont"
 ```
