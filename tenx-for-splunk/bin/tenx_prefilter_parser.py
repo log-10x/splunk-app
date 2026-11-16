@@ -1049,7 +1049,8 @@ def term_regex(word, case=False, major_only=False):
 	"""
 	A regular expression (PCRE, as Splunk's match() reads it, and Python's re alike) that finds `word`
 	in an event's text as a base search on the index finds it: some major segment or minor piece of
-	the text is the word, case-insensitively, each `*` standing for any characters of that term.
+	the text is the word, case-insensitively, each `*` standing for any characters of that term (as
+	the index places the parts, see pattern()).
 	`case`: the letter case kept. `major_only`: a major segment only (TERM() of a word with a minor
 	breaker in it, which no minor piece can be).
 	"""
@@ -1063,9 +1064,17 @@ def term_regex(word, case=False, major_only=False):
 	tail = parts[-1] != ""
 
 	def pattern(start, inner, end):
+		# The index takes each part after a `*` at its first place in the rest of the term, and the last
+		# part, when the word does not end with `*`, again only after the end of each place it found
+		# that does not end the term: 19*44 matches 19.2.3.4.44 and 198/544 but not 19.2.3.444 or
+		# 198/55444 (the second 44 overlaps the first), x*ab matches xabab (Splunk Enterprise 10.4.3).
 		text = re.escape(parts[0])
-		for p in parts[1:]:
-			text += inner + "*?" + re.escape(p)
+		for k, p in enumerate(parts[1:], 1):
+			if not p:
+				text += inner + "*?"
+				continue
+			first = "(?:(?!%s)%s)*%s" % (re.escape(p), inner, re.escape(p))
+			text += "(?:%s)+" % first if tail and k == len(parts) - 1 else first
 		return start + text + (end if tail else "")
 	whole = pattern("(?:^|%s)" % brk, in_major, "(?=%s|$)" % brk)
 	piece = pattern("(?:^|%s|%s)" % (brk, minor), in_minor, "(?=%s|%s|$)" % (brk, minor))
