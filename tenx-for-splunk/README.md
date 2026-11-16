@@ -872,8 +872,8 @@ has its own cap file and its own scheduled `check`.
    the Receiver compacts before it rereads the file, within about 10 seconds, are kept and marked
    `tenx_unmapped`; every later event of that source arrives whole. `check` also counts the compact
    events of the map's sourcetype indexed without their fields since its previous run, and when
-   there are any it fails and names the count and the reason. For `no_row` (a template the cap
-   file does not list arrived compact) and `no_match` (an event held values its row does not take),
+   there are any it fails and names the count and the reason. For `no_row` (a template the lookup
+   file has no row for arrived compact) and `no_match` (an event held values its row does not take),
    the list is left as it is; for `bad_row` and `no_table` it is emptied as above. The saved search **Field Map Events Without Fields** counts such events for
    every map by index, sourcetype and reason; schedule it where a field map is installed.
 

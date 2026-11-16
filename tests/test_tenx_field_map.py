@@ -1539,7 +1539,7 @@ class TestCapFile:
 		finally:
 			fake.close()
 		assert rc == 1 and read(str(cap)) == before and not os.path.exists(str(cap) + '.pending')
-		assert '(no_match 1, no_row 1): templates the cap file does not list arrive compact' in out
+		assert '(no_match 1, no_row 1): templates the lookup file has no row for arrived compact' in out
 		assert 'events of listed templates hold values their row does not take (a value with a line feed); ' \
 			'the cap file is left as it was' in out
 

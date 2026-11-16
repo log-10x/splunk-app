@@ -3702,8 +3702,9 @@ def check_unmapped(cap_file, splunkd, sourcetype, clock, out):
 		return 1
 	causes = []
 	if WHY_NO_ROW in got:
-		causes.append('templates the cap file does not list arrive compact, so the Receiver compacts them '
-			'(receiverOptimize true in its arguments, or another map\'s cap file)')
+		causes.append('templates the lookup file has no row for arrived compact: the Receiver compacts templates the '
+			'cap file does not list (receiverOptimize true in its arguments, or another map\'s cap file), or the lookup '
+			'file Splunk holds lacks their rows')
 	if WHY_NO_MATCH in got:
 		causes.append('events of listed templates hold values their row does not take (a value with a line feed)')
 	out.write('check: %s: %s; the cap file is left as it was\n' % (what, '; '.join(causes) or 'the cap file lists no template'))
