@@ -73,6 +73,20 @@ def without_empty_guard(text):
 	return text.replace(EMPTY_GUARD, '').replace(' | fields  - tenx_text, ', ' | fields  - ')
 
 
+# The first step of tenx-inflate and tenx-inflate-debug (test_inflate_values_from_raw.py), which reads the values
+# from _raw, and the comment above the macros that says why.
+VALUES_STEP = 'eval tenx_vars=if(match(_raw, "^~?[^,]+,[^,]+,[\\s\\S]"), replace(_raw, "^~?[^,]+,[^,]+,", ""), tenx_vars) | '
+
+
+def without_values_from_raw(text):
+	lines = text.split('\n')
+	if '# Values are read from the compact text itself. The search-time extraction of tenx_vars' in lines:
+		start = lines.index('# Values are read from the compact text itself. The search-time extraction of tenx_vars')
+		end = lines.index('#', start)
+		lines = lines[:start] + lines[end + 1:]
+	return '\n'.join(lines).replace('definition = ' + VALUES_STEP, 'definition = ')
+
+
 def macros():
 	conf = configparser.RawConfigParser(strict=False)
 	conf.read(MACROS)
@@ -151,10 +165,12 @@ class TestTxIsTheShippedMacro:
 		assert without_guard(macros().get('tx', 'definition')).replace(REFUSED_STEP, '').replace(b.WILD_STEP, '') == (
 			shipped.get('tx', 'definition'))
 		# every other stanza shipped at e12ec4e is unchanged, its comments included; the two inflate
-		# macros differ by the empty-expansion guard alone (test_inflate_one_row_no_silent_empty.py)
+		# macros differ by the empty-expansion guard (test_inflate_one_row_no_silent_empty.py) and by the
+		# values read from _raw (test_inflate_values_from_raw.py) alone
 		for name in shipped.sections():
 			if name != 'tx':
-				assert without_empty_guard(stanza_text(ours, name)) == stanza_text(base.stdout, name), name
+				assert without_values_from_raw(without_empty_guard(stanza_text(ours, name))) == (
+					stanza_text(base.stdout, name)), name
 
 	def test_tx_runs_no_replay(self):
 		assert 'tenx-replay' not in macros().get('tx', 'definition')
