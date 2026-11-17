@@ -1639,22 +1639,51 @@ class TestCapFile:
 		assert read(str(cap) + '.pending') == 'pattern_hash,value\n"k1",true\n"k2",true\n"keep",false\n'
 		assert 'without its fields (tenx_unmapped=no_row)' in out
 
-	def test_check_empties_the_list_when_a_probe_is_not_indexed(self, tmp_path):
+	def test_a_probe_not_indexed_in_time_leaves_the_list_when_splunk_logged_no_drop(self, tmp_path):
+		# a probe behind an indexing backlog, or right after a restart, is not a failed proof
+		cap = self.listed(tmp_path, ['k1', 'k2'], '"keep",false\n')
+		before = read(str(cap))
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		fake.drop = True
+		try:
+			rc, out = self.check(tmp_path, cap, fake, timeout=20, poll=5, sample=2)
+		finally:
+			fake.close()
+		assert rc == 2 and read(str(cap)) == before and not os.path.exists(str(cap) + '.pending')
+		assert '2 of 2 probes not indexed within 20 s' in out and "not checked: 'k1', 'k2'" in out
+		assert 'cap file left as it was' in out
+
+	def test_check_empties_the_list_when_a_probe_is_not_indexed_and_splunk_logged_dropping_it(self, tmp_path):
 		cap = self.listed(tmp_path, ['k1'])
 		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
 		fake.drop = True
+		try:
+			# Splunk drops the probe at index time and logs it (DROP_SEARCH), as a lookup file it cannot load does
+			# (check's clock here runs 0, 5, 10, ...: the probe is sent at about 10 and waited for to about 40)
+			fake.dropped.append(('idx1', fm.lookup_app(str(tmp_path / 'fm_fw')).sourcetype, 15))
+			rc, out = self.check(tmp_path, cap, fake, timeout=20, poll=5)
+		finally:
+			fake.close()
+		assert rc == 1 and read(str(cap)) == 'pattern_hash,value\n'
+		assert read(str(cap) + '.pending') == 'pattern_hash,value\n"k1",true\n'
+
+	def test_check_empties_the_list_when_a_probe_is_not_indexed_and_internal_cannot_be_read(self, tmp_path):
+		cap = self.listed(tmp_path, ['k1'])
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		fake.drop, fake.internal = True, False
 		try:
 			rc, out = self.check(tmp_path, cap, fake, timeout=20, poll=5)
 		finally:
 			fake.close()
 		assert rc == 1 and read(str(cap)) == 'pattern_hash,value\n' and '1 of 1 probes not indexed within 20 s' in out
-		assert read(str(cap) + '.pending') == 'pattern_hash,value\n"k1",true\n'
 
 	def test_after_check_activate_lists_the_templates_again_once_they_have_fields(self, tmp_path):
 		cap = self.listed(tmp_path, ['k1', 'k2'])
 		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
 		try:
 			fake.drop = True
+			# the probe is dropped at index time and Splunk logs it, so check empties the list
+			fake.dropped.append(('idx1', fm.lookup_app(str(tmp_path / 'fm_fw')).sourcetype, 15))
 			assert self.check(tmp_path, cap, fake, timeout=20, poll=5)[0] == 1
 			assert self.activate(tmp_path, cap, fake, timeout=0)[0] == 1 and read(str(cap)) == 'pattern_hash,value\n'
 			fake.drop = False
@@ -1692,6 +1721,8 @@ class TestCapFile:
 		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
 		try:
 			fake.drop = True
+			# the probe is dropped at index time and Splunk logs it, so check empties the list
+			fake.dropped.append(('idx1', fm.lookup_app(str(tmp_path / 'fm_fw')).sourcetype, 15))
 			assert self.check(tmp_path, cap, fake, timeout=20, poll=5)[0] == 1
 			os.utime(str(cap), (1000000000, 1000000000))
 			os.utime(str(cap) + '.pending', (1000000000, 1000000000))

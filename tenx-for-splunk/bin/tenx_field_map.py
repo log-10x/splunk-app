@@ -3959,9 +3959,10 @@ def verify(templates, field_map, encoded_path, raw_path, raw_split=None, out=sys
 # * check proves the converse for templates already listed: it fails at once when a listed template
 #   has no row in the app's lookup file, else it sends probe events of a few listed templates on the
 #   same probe stream, and when one of them is indexed without its fields, or is not indexed within its
-#   --timeout (an index-time error drops an event), it empties the list at once (rows that do not start
-#   with `true` are kept) and leaves every listed template pending, so the Receiver sends them whole
-#   until activate has proven them again. The loop runs it on every turn, and activate runs it on every
+#   --timeout while Splunk logs dropping the map's events (an index-time error drops an event), it empties
+#   the list at once (rows that do not start with `true` are kept) and leaves every listed template
+#   pending, so the Receiver sends them whole until activate has proven them again. A probe not indexed in
+#   time with no such log (a backlog, a restart) leaves the list as it is and check returns 2. The loop runs it on every turn, and activate runs it on every
 #   probe round (--check-timeout), so activating new templates never holds up the check of the listed
 #   ones: a lookup that stops giving rows while activate waits is found within one round.
 #
@@ -4503,10 +4504,12 @@ def check(app_dir, cap_file, splunkd, app_name=None, probe_index=None, sample=1,
 	Probes `sample` listed templates, chosen at random. When every probe is indexed with its fields, or nothing
 	is listed, counts the compact events of the map's sourcetype indexed without their fields since the previous
 	check and returns 0 when there are none, else 1 (check_unmapped says when the list is emptied). When one is
-	indexed without them or is not indexed within `timeout` seconds, the cap
-	file keeps only its rows that do not start with true, every listed template is left pending
-	(<cap file>.pending, merged with a pending list already there), and returns 1: the Receiver sends
-	those templates whole until activate proves them again.
+	indexed without them, the cap file keeps only its rows that do not start with true, every listed template
+	is left pending (<cap file>.pending, merged with a pending list already there), and returns 1: the Receiver
+	sends those templates whole until activate proves them again. When one is not indexed within `timeout`
+	seconds, the same happens only if Splunk logged dropping events of the map's sourcetype in that time, or
+	_internal cannot be read; otherwise the list is left as it was, the templates not checked are named, and it
+	returns 2.
 
 	With one HEC endpoint per parsing node (splunkd.nodes), the probes go to every node, and the answer of
 	each node that took them counts; a node that cannot be reached is left out. When no node takes them,
@@ -4562,10 +4565,20 @@ def check(app_dir, cap_file, splunkd, app_name=None, probe_index=None, sample=1,
 					len(probed), len(listed), '' if up == [None] else ' on %d nodes' % len(up), clock() - start, away))
 				return check_unmapped(cap_file, splunkd, sourcetype, clock, out, layout.field)
 			if clock() - start > timeout:
-				late = [n for (h, n), g in zip(pairs, got) if g is None]
+				late = [(h, n) for (h, n), g in zip(pairs, got) if g is None]
 				why = '%d of %d probes not indexed within %.0f s%s' % (len(late), len(pairs), timeout,
-					'' if up == [None] else ' (%s)' % ', '.join(sorted(set(late))))
-				break
+					'' if up == [None] else ' (%s)' % ', '.join(sorted(set(n for _, n in late))))
+				# A probe that has not come back is not a failed proof: behind an indexing backlog, or right after a
+				# restart, it is indexed later (measured: a check right after an indexer restart, and one behind a HEC
+				# backlog, emptied lists whose rows worked). It is one when Splunk dropped it, which its own log says
+				# (DROP_SEARCH); without that log (no _internal for the role) it is taken as one, as before. A drop
+				# logged after this window is counted by the next check (check_dropped), whose window starts here.
+				drops = dropped_since(splunkd, sourcetype, start - 1, clock() + 1)
+				if drops is None or drops:
+					break
+				out.write('check: %s and Splunk logged no dropped event of %s; not checked: %s; cap file left as it '
+					'was, run check again\n' % (why, sourcetype, ', '.join(sorted(set(repr(h) for h, _ in late)))))
+				return 2
 	withdraw(cap_file, why, out)
 	return 1
 
