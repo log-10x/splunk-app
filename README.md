@@ -156,6 +156,8 @@ America/New_York, Europe/London, Australia/Sydney, Pacific/Chatham, America/Adak
 Asia/Kolkata, Etc/GMT-4): every line is the UTC text. A zone in the timestamp format prints
 `+0000` or `UTC`.
 
+A timestamp later than 12:00 UTC on 2029-12-31 that is written to the second or the millisecond, such as a certificate's expiry date used as an event's timestamp, does not decode to its original text: it comes back as a date in 1970.
+
 ## Quickstart
 
 ### Prerequisites

@@ -2,12 +2,12 @@
 The DML resolution search, which is how a term in the original text becomes a set of
 template hashes.
 
-This is one assertion and it is worth a file. Splunk searches only a user's default
-indexes when a search names none, and that default is `main`. While the app wrote its
-template events to `main` the omission was invisible. Pointed at any other index, every
-term resolved to zero hashes, the search ran with the user's terms still in front of the
-inflate macro, and it returned nothing at all, with no error anywhere: the words being
-searched for live in the original line, not in the compact event.
+It reads the KV store of templates, the store tenx-inflate expands from. It read the searchable
+copies in the template index before, and two things went wrong there. While the search named no
+index, Splunk searched only the user's default indexes (`main`), so with the templates kept
+anywhere else every term resolved to zero hashes and the search returned nothing, with no error.
+And a template whose copy the Consume KV alert action had not written yet expanded its events but
+was in no copy, so a word in its text selected none of them (test_rewrite_dictionary_from_kv.py).
 """
 
 import os
@@ -46,24 +46,31 @@ def manager():
 	return TenxSearchManager(RecordingConnection(), dict(CONFIG))
 
 
-def test_resolution_search_names_the_index(manager, monkeypatch):
+def test_resolution_search_reads_the_kv_store(manager, monkeypatch):
 	captured = {}
 	monkeypatch.setattr(manager, 'create_search_job', lambda data: captured.update(data))
 
-	manager.create_dml_search('ProducerStateManager')
+	manager.create_dml_search('"ProducerStateManager"')
 
 	assert captured['search'] == (
-		'search index=tenx_dml (sourcetype=tenx_dml_pure OR source=tenx_dml_pure) ProducerStateManager | stats count by dml_hash')
+		'| inputlookup tenx-dml-lookup | fields _key, pattern_hash, pattern_search, pattern'
+		' | eval tenx_t=lower(coalesce(pattern_search, replace(pattern, "[\\x{24}]", "")))'
+		' | where match(tenx_t, "(^|[^\\p{L}\\p{N}])producerstatemanager([^\\p{L}\\p{N}]|$)")'
+		' | eval dml_hash=coalesce(pattern_hash, _key) | stats count by dml_hash')
+	assert captured['rf'] == 'dml_hash'
 
 
-def test_resolution_search_follows_a_relocated_index(manager, monkeypatch):
+def test_resolution_search_reads_no_index(manager, monkeypatch):
+	# The KV store is the same wherever the template index is kept, and holds templates whose
+	# searchable copy is not written yet.
 	manager.tenx_config['dest_dml_index'] = 'somewhere_else'
 	captured = {}
 	monkeypatch.setattr(manager, 'create_search_job', lambda data: captured.update(data))
 
-	manager.create_dml_search('error')
+	manager.create_dml_search('"error"')
 
-	assert captured['search'].startswith('search index=somewhere_else (sourcetype=tenx_dml_pure OR source=tenx_dml_pure) ')
+	assert 'index=' not in captured['search'] and 'tenx_dml_pure' not in captured['search']
+	assert 'somewhere_else' not in captured['search']
 
 
 def test_resolution_search_covers_all_time(manager, monkeypatch):
@@ -72,10 +79,29 @@ def test_resolution_search_covers_all_time(manager, monkeypatch):
 	captured = {}
 	monkeypatch.setattr(manager, 'create_search_job', lambda data: captured.update(data))
 
-	manager.create_dml_search('error')
+	manager.create_dml_search('"error"')
 
 	assert captured['earliest_time'] == '0'
 	assert captured['latest_time'] == 'now'
+
+
+def test_a_lookup_that_reports_cut_rows_or_an_error_is_truncated():
+	class Cut(ResultsConnection):
+		def __init__(self, messages):
+			ResultsConnection.__init__(self, [{'dml_hash': 'h_a'}], result_count=1)
+			self.messages = messages
+
+		def get(self, url, params=None, **kwargs):
+			if url.endswith('/results'):
+				return {'results': self.rows}
+			return {'entry': [{'content': {'resultCount': 1, 'messages': self.messages}}]}
+
+	for messages, cut in (([], False), ([{'type': 'INFO', 'text': 'ok'}], False),
+						  ([{'type': 'WARN', 'text': 'output will be truncated at 50000 results'}], True),
+						  ([{'type': 'WARN', 'text': 'Search exceeded the memory limit'}], True),
+						  ([{'type': 'ERROR', 'text': 'KV Store is not available'}], True)):
+		hashes, truncated = TenxSearchManager(Cut(messages), dict(CONFIG)).get_dml_results('sid')
+		assert hashes == ['h_a'] and truncated is cut, messages
 
 
 class ResultsConnection(RecordingConnection):
