@@ -218,6 +218,10 @@ STATE_RECORDS = 'records'
 # compared with what this version builds from them (see reconcile).
 STATE_VERSION = 'version'
 STATE_REFRESH_UNTIL = 'refresh_until'
+# When this host's clock last saw loaded_through move, and whether the records just before it have
+# been read again since OVERLAP_SECONDS had passed (then a run starts at loaded_through itself).
+STATE_ADVANCED_AT = 'advanced_at'
+STATE_RECHECKED = 'rechecked'
 STATUS_CURRENT = 'current'
 STATUS_LOADING = 'loading'
 STATUS_FAILED = 'failed'
@@ -537,7 +541,11 @@ def load_since(server_connection, store, state_intf, dml_intf, source, start_fro
 		start = max(0, int(float(start_from)))
 		refresh_until = max(refresh_until, end)
 	elif state.get(STATE_LOADED_THROUGH) is not None and state.get(STATE_VERSION) == app_version():
-		start = max(0, int(float(state[STATE_LOADED_THROUGH])) - OVERLAP_SECONDS)
+		# The records indexed just before the checkpoint are read again, until one run that
+		# starts OVERLAP_SECONDS after the checkpoint last moved has read them; then nothing is
+		# read twice while no new record arrives.
+		through = int(float(state[STATE_LOADED_THROUGH]))
+		start = through if str(state.get(STATE_RECHECKED)) in ('1', '1.0', 'True', 'true') else max(0, through - OVERLAP_SECONDS)
 	else:
 		# First run of this version (a new install, or an upgrade): every template record in the
 		# index, so a template an earlier version skipped is stored, and every stored record takes
@@ -599,6 +607,11 @@ def load_since(server_connection, store, state_intf, dml_intf, source, start_fro
 		if index == len(slices) - 1 or (through is not None and through >= refresh_until):
 			# The pass that compares stored records with this version's has gone past them.
 			fields[STATE_REFRESH_UNTIL] = 0
+		previous_through = float(state.get(STATE_LOADED_THROUGH) or 0)
+		if through is not None and through > previous_through:
+			fields[STATE_ADVANCED_AT], fields[STATE_RECHECKED] = now, 0
+		elif index == len(slices) - 1 and now - float(state.get(STATE_ADVANCED_AT) or 0) >= OVERLAP_SECONDS + LAG_SECONDS:
+			fields[STATE_RECHECKED] = 1
 		write_state(state_intf, state, **fields)
 
 	return read

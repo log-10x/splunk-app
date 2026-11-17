@@ -540,3 +540,39 @@ def test_save_many_writes_every_batch_when_calls_run_at_once():
 	kv = tenx_kv_intf.TenxKVInterface('tenx_dml', Conn(), 'nobody', 'tenx-for-splunk')
 	assert kv.save_many([{'_key': 'k%d' % i} for i in range(10500)], limits=(1000, 50.0))
 	assert sorted(seen) == sorted('k%d' % i for i in range(10500))
+
+
+def test_an_idle_run_reads_the_records_before_the_checkpoint_again_once(monkeypatch, tmp_path):
+	base = int(time.time()) - 3600
+	splunk, kv, state = FakeSplunk(flood(200, base)), StoreKV(), StoreKV()
+	consume(monkeypatch, tmp_path, splunk, kv, state)
+	reads = lambda: [q for q in splunk.searches if 'fields templateHash' in q]
+
+	# the checkpoint moved an hour ago (this host's clock): the next run reads the overlap once
+	state.records['consume_kv']['advanced_at'] = int(time.time()) - 3600
+	splunk.searches.clear()
+	consume(monkeypatch, tmp_path, splunk, kv, state)
+	assert len(reads()) == 1
+	assert state.records['consume_kv']['rechecked'] == 1
+
+	splunk.searches.clear()
+	consume(monkeypatch, tmp_path, splunk, kv, state)
+	assert reads() == []
+
+	# a record an indexer makes visible late, before the checkpoint, after an outage of Consume KV
+	state.records['consume_kv']['rechecked'] = 0
+	splunk.records.append((state.records['consume_kv']['loaded_through'] - 100, '-Late', TEMPLATE_A))
+	consume(monkeypatch, tmp_path, splunk, kv, state)
+	assert '-Late' in kv.records
+
+
+def test_the_overlap_is_read_again_while_the_checkpoint_moved_recently(monkeypatch, tmp_path):
+	base = int(time.time()) - 3600
+	splunk, kv, state = FakeSplunk(flood(200, base)), StoreKV(), StoreKV()
+	consume(monkeypatch, tmp_path, splunk, kv, state)
+	splunk.searches.clear()
+
+	consume(monkeypatch, tmp_path, splunk, kv, state)
+
+	assert len([q for q in splunk.searches if 'fields templateHash' in q]) == 1
+	assert state.records['consume_kv']['rechecked'] == 0
