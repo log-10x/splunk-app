@@ -60,6 +60,19 @@ def without_guard(definition):
 	return definition
 
 
+# The empty-expansion guard of tenx-inflate and tenx-inflate-debug (test_inflate_one_row_no_silent_empty.py),
+# as the expansion was written before it: the text went straight to _raw.
+EMPTY_GUARD = (' | eval tenx_expand_refused=if(isnotnull(tenx_log_term) AND coalesce(len(tenx_text),0)==0,'
+	' if(len(mvjoin(tenx_expand_refused,""))>0, tenx_expand_refused, "empty-expansion"), tenx_expand_refused),'
+	' _raw=if(len(tenx_text)>0, tenx_text, _raw)')
+
+
+def without_empty_guard(text):
+	text = text.replace('eval tenx_text=if(isnull(tenx_log_term) OR coalesce(tenx_expand_refused,"")!="", null(), ',
+						'eval _raw=if(isnull(tenx_log_term) OR coalesce(tenx_expand_refused,"")!="", _raw, ')
+	return text.replace(EMPTY_GUARD, '').replace(' | fields  - tenx_text, ', ' | fields  - ')
+
+
 def macros():
 	conf = configparser.RawConfigParser(strict=False)
 	conf.read(MACROS)
@@ -137,10 +150,11 @@ class TestTxIsTheShippedMacro:
 		assert macros().get('tx', 'definition') != shipped.get('tx', 'definition')
 		assert without_guard(macros().get('tx', 'definition')).replace(REFUSED_STEP, '').replace(b.WILD_STEP, '') == (
 			shipped.get('tx', 'definition'))
-		# every other stanza shipped at e12ec4e is unchanged, its comments included
+		# every other stanza shipped at e12ec4e is unchanged, its comments included; the two inflate
+		# macros differ by the empty-expansion guard alone (test_inflate_one_row_no_silent_empty.py)
 		for name in shipped.sections():
 			if name != 'tx':
-				assert stanza_text(ours, name) == stanza_text(base.stdout, name), name
+				assert without_empty_guard(stanza_text(ours, name)) == stanza_text(base.stdout, name), name
 
 	def test_tx_runs_no_replay(self):
 		assert 'tenx-replay' not in macros().get('tx', 'definition')
