@@ -49,6 +49,12 @@ class TestSplit:
 		assert split('a,d\tns,c') == ['a', 'd\tns', 'c']
 		assert split('a,1 ') == ['a', '1']
 
+	def test_an_escaped_quote_outside_quotes_is_text(self):
+		# Splunk Enterprise 10.4.3 on an elastic panw decryption fixture line
+		assert fm.CsvReader.split('4,\\"used-by-malware,able,pervasive-use\\",,ssl') == ['4', '"used-by-malware', 'able',
+			'pervasive-use"', '', 'ssl']
+		assert fm.CsvReader.split('frothly.local\\amber.turing,x') == ['frothly.local\\amber.turing', 'x']
+
 	def test_a_quote_never_closed_takes_the_rest(self):
 		assert fm.CsvReader.split('x,"abc,frothly,,dns,1 ') == ['x', '"abc,frothly,,dns,1']
 		assert fm.CsvReader.split('x,a"b,frothly,,dns') == ['x', 'a"b,frothly,,dns']
@@ -164,3 +170,12 @@ class TestBlankColumns:
 		assert out['EVAL-url'] == 'if(match(tenx_blank, "(^| )(misc)( |$)"), null(), \'url\')'
 		assert out['EVAL-misc_host'] == 'if(match(tenx_blank, "(^| )(misc)( |$)"), null(), \'misc_host\')'
 		assert out['EVAL-src'] == 'if(match(tenx_blank, "(^| )(src)( |$)"), null(), \'src\')'
+
+	def test_tenx_blank_on_every_compact_event_and_a_reserved_column(self, tmp_path):
+		a = addon(tmp_path)
+		props, transforms = fm.read_addon(a)
+		out = dict(fm.blank_overrides(props, transforms, TRAFFIC, ['head', 'when', 'timestamp', 'src'], 'extracted_'))
+		# timestamp is written as extracted_timestamp; on a compact event that is the value, whatever the rule read
+		assert out['EVAL-timestamp'] == "if(isnotnull(tenx_blank), 'extracted_timestamp', 'timestamp')"
+		r = fm.BlankFieldReader(fm.CsvReader([(None, ['a', 'b'], ',')]), fm.CsvReader([(None, ['a', 'b'], ',')]))
+		assert r.pairs('x,y') == [('a', 'x'), ('b', 'y'), (fm.BLANK_FIELD, '-')]

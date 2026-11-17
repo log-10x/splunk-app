@@ -899,6 +899,9 @@ class CsvReader(object):
 	* a value that opens with a double quote runs to the next double quote followed by a delimiter or the end of
 	  the text and loses those two quotes: "Client,Server" gave Client,Server and "a""b,c" gave a""b,c; inside
 	  it a backslash before a double quote or a backslash goes ("a\"b,c" gave a"b,c);
+	* outside quotes too, a backslash before a double quote or a backslash goes and the quote is text:
+	  \"used-by-malware,able-to-transfer-file\" gave "used-by-malware and able-to-transfer-file" (an elastic panw
+	  decryption fixture line);
 	* a double quote with no such closing quote, opening a value ("abc,...) or inside one (a"b,...), takes the
 	  rest of the text as that value, quotes kept, and no later value is read;
 	* a tab inside a value stays.
@@ -960,8 +963,13 @@ class CsvReader(object):
 					return out
 				pos = closed + 1
 				continue
-			k = j
+			k, buf = j, []
 			while k < n and text[k] not in delims and text[k] != '"':
+				if text[k] == '\\' and k + 1 < n and text[k + 1] in '"\\':
+					buf.append(text[k + 1])
+					k += 2
+					continue
+				buf.append(text[k])
 				k += 1
 			if k < n and text[k] == '"':
 				m = k + 1
@@ -984,7 +992,7 @@ class CsvReader(object):
 					return out
 				pos = e + 1
 				continue
-			out.append(text[start:k].strip(' '))
+			out.append((text[start:j] + ''.join(buf)).strip(' '))
 			if k == n:
 				return out
 			pos = k + 1
@@ -1052,8 +1060,9 @@ class BlankFieldReader(object):
 		for name in names[:len(set(MARK_RE.findall(text))) + 1]:
 			if name and name not in written and name not in blank:
 				blank.append(name)
-		if blank:
-			out.append((BLANK_FIELD, ' '.join(blank)))
+		# Always written, '-' when no column is blank: its presence marks a compact event of a csv map, which the
+		# rules for reserved names read (see blank_overrides).
+		out.append((BLANK_FIELD, ' '.join(blank) or '-'))
 		return out
 
 
@@ -2388,7 +2397,7 @@ def csv_layouts(addon_dir, sourcetypes, by_sourcetype=False):
 	return (layouts, report, names_of) if by_sourcetype else (layouts, report)
 
 
-def blank_overrides(props, transforms, stanza, columns):
+def blank_overrides(props, transforms, stanza, columns, reserved_prefix=None):
 	"""
 	The search-time settings the map writes in [stanza] so that what the add-on's DELIMS rule reads
 	from a compact line where the map wrote no field (tenx_blank names those columns) is null, as on the raw event, with
@@ -2447,7 +2456,17 @@ def blank_overrides(props, transforms, stanza, columns):
 		return 'match(%s, "(^| )(%s)( |$)")' % (BLANK_FIELD, '|'.join(regex_escape(c) for c in cols))
 
 	def guarded(name):
+		if name in restored:
+			# Written as <prefix><name> and given back at search time after the add-on's rule, which reads the compact
+			# line under the name first: on a compact event the written value is the one.
+			return 'if(isnotnull(%s), \'%s%s\', \'%s\')' % (BLANK_FIELD, reserved_prefix, name, name)
 		return 'if(%s, null(), \'%s\')' % (cond(name), name)
+
+	# Columns the map writes under the reserved prefix that a search-time rule can still set: Splunk keeps its own
+	# host, source, sourcetype, index and splunk_server over an extraction (a userid line's source column left
+	# source as it was), and assigns eventtype and tag itself.
+	restored = set(c for c in taint if reserved_prefix and reserved_name(c) and not c.startswith(RESERVED_PREFIXES)
+		and c.lower() not in ('host', 'source', 'sourcetype', 'index', 'splunk_server', 'eventtype', 'tag'))
 
 	out, own = [], set()
 	for key, value in settings.items():
@@ -4659,8 +4678,9 @@ def _build(args):
 			_, _, by_sourcetype = csv_layouts(args.addon, renames(target), by_sourcetype=True)
 		else:
 			props, transforms, by_sourcetype = {}, {}, collections.OrderedDict((st, header) for st in renames(target))
+		prefix = args.reserved_prefix if target.get('reserved_names') == 'restore' else None
 		target['blank_evals'] = collections.OrderedDict(
-			(st, blank_overrides(props, transforms, st, columns)) for st, columns in by_sourcetype.items())
+			(st, blank_overrides(props, transforms, st, columns, prefix)) for st, columns in by_sourcetype.items())
 	leave_out = target.get('leave_out') or []
 	if leave_out:
 		reader = LeaveOutReader(reader, leave_out)
