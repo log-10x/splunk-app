@@ -452,10 +452,12 @@ saved, and one whose replay is removed later is skipped, with the message in the
 **How `tx` chooses the events to expand.** Its subsearch runs `tenxprefilter` once per
 search. The command reads the search's own text, takes the words after `tx`, finds which
 templates carry each word, and selects the compact events that carry each word as a value
-or through their template. A word a rendered timestamp could print, a word with a character
-outside a-z and 0-9, and a word carried by more than 5,000 templates select nothing on their
-own, and a `NOT`, a field comparison, or an `OR` with any of these selects every event in
-range. The search after `tx` then applies the full terms, so the selection may be wider than
+or through their template. Templates are read from the KV store the expansion uses. A word a
+rendered timestamp could print, a word with a character outside a-z and 0-9, and a word carried
+by more than 5,000 templates select nothing on their own, and a `NOT`, a field comparison, or an
+`OR` with any of these selects every event in range. A run of digits narrows unless a stored
+template's timestamp could print it (a year, two digits of a time, a fraction of that length).
+The search after `tx` then applies the full terms, so the selection may be wider than
 the result, never narrower.
 
 **The `tx` and `tenxsearch` commands.** `| tx index=myindex sourcetype=tenx_encoded error`
@@ -644,6 +646,12 @@ index=wineventlog `txf(XmlWinEventLog)` EventCode=4625 | stats count by user
 `txf(<sourcetype>)` applies the rules of that one sourcetype and starts faster. `txf` applies the
 rules of every original sourcetype the app has recorded in the compact indexes.
 
+A field comparison after `txf` reads every compact event in range. When the value is written in the
+event (an event code, a user name), write it as a word too (`EventCode=4625 4625`): the same events,
+read from those holding it. With the Windows add-on, a comparison on a Windows field does not narrow
+the search, because the add-on computes or renames those fields; write the value as a word too, as
+above.
+
 To set it up:
 
 1. Give every compact event the indexed field `tenx_sourcetype` with its original sourcetype: in
@@ -771,6 +779,11 @@ fields Splunk stored with an event. The field map writes a compact event's origi
 it is indexed, so these searches read them. With a field map, the index is larger than raw on disk, by
 about 10% to 70% depending on the source, while license goes down; without one, the index is smaller
 than raw.
+
+Put field terms before the macro (`` index=wineventlog EventCode=4625 `txf(XmlWinEventLog)` ``) and run
+statistics, time charts and detections without it: Splunk answers from indexed fields. Use `tx` for
+words.
+
 `tenx_field_map.py`, in the app's `bin` folder, generates a Splunk app for one compact sourcetype.
 For each template it holds one row of a lookup file; one static index-time rule reads the row and
 writes the original event's fields as indexed fields, then renames the event to its original
