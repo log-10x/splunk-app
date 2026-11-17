@@ -41,6 +41,13 @@ own search text, and this module
    tx-inflate prints it again, so no digit of such a form is a term of the compact event: the
    936 of "20:11:45.936" is three digits, which the first test alone kept, and the search found
    none of the events that hold it.
+   A run of digits (4625, 54849625) is the one exception the stored templates can settle: a token
+   that starts with a digit is always a value of the compact event (FORMAT_SPEC S3.2), so the
+   timestamp is the only text that prints digits the compact event does not hold. tenxprefilter
+   reads the timestamp formats of the stored templates (FORMATS_SEARCH), and a run of digits that
+   none of them can print (timestamp_prints()) is used like any other piece; one that some format
+   can print (a year, the two digits of a minute, a fraction of the same length) is not. When the
+   formats cannot be read, no run of digits is used.
 
    Field narrowing is off unless tenx_config.conf [config] says field_narrowing = true, and
    then only once tenxreplay has written the list it needs; off, field comparisons place no
@@ -865,6 +872,176 @@ def usable(piece):
 			and not TIMESTAMP_PIECE.match(piece) and not timestamp_could_print(piece))
 
 
+# A run of digits the search holds: a piece that usable() refuses only because a rendered timestamp
+# prints runs of digits. Every other run of digits of an event is a value of its compact event: a
+# token that starts with a digit is never template text (FORMAT_SPEC.md S3.2, rule 2), except "-1"
+# (S2.2), which the template dictionary finds in the template's text. So such a piece narrows once no
+# timestamp format of the stored templates can print it (digit_pieces_cleared()).
+DIGIT_PIECE = re.compile(r"[0-9]+")
+# The directives a stored timestamp_format holds (tenx_dml_builder.to_splunk_time_format), as
+# tenx-inflate prints them: (fewest digits, most digits, lowest value, highest value, zero-padded).
+# The year is printed from the first 10 digits of the epoch (tenx-inflate tenx_ts_sec), so it is
+# between 1969 and 2286; 1900 to 2299 is used. A seconds field is the epoch's second of the minute.
+TS_NUMBER = {
+	"Y": (4, 4, 1900, 2299, True), "y": (2, 2, 0, 99, True),
+	"m": (2, 2, 1, 12, True), "-m": (1, 2, 1, 12, False),
+	"d": (2, 2, 1, 31, True), "-d": (1, 2, 1, 31, False),
+	"j": (3, 3, 1, 366, True), "-j": (1, 3, 1, 366, False), "V": (2, 2, 1, 53, True),
+	"H": (2, 2, 0, 23, True), "-H": (1, 2, 0, 23, False),
+	"I": (2, 2, 1, 12, True), "-I": (1, 2, 1, 12, False),
+	"M": (2, 2, 0, 59, True), "-M": (1, 2, 0, 59, False),
+	"S": (2, 2, 0, 59, True), "-S": (1, 2, 0, 59, False),
+}
+# Directives that print letters only (AM/PM, month and day names, UTC), and the zone offsets, which
+# tenx-inflate prints as these literal characters.
+TS_LETTERS = frozenset(("p", "b", "B", "a", "A", "Z"))
+TS_ZONES = {"z": "+0000", ":z": "+00:00", ":::z": "+00"}
+TS_DIRECTIVE = re.compile(r"%(-?)(:*)([0-9]*)([A-Za-z%])")
+EPOCH_PASSTHROUGH = "__TENX_EPOCH__"
+# Per stored timestamp_format: whether a digit can stand right before (lg) or right after (rg) the
+# rendered timestamp, so that Splunk reads them as one run with it. A digit of the template text, or
+# a value (the placeholder at the start or the end of a part): counted as one. The placeholder is the
+# literal tenx-inflate replaces.
+FORMATS_SEARCH = (
+	'| inputlookup tenx-dml-lookup | fields timestamp_format, part_0, pattern_parts, pattern_terminator'
+	' | eval tenx_tp=mvfilter(match(mvappend(part_0, pattern_parts, pattern_terminator), "__TENX_TS__"))'
+	' | where isnotnull(tenx_tp)'
+	' | eval lg=if(isnotnull(mvfind(tenx_tp, "(^|[0-9])__TENX_TS__")), 1, 0),'
+	' rg=if(isnotnull(mvfind(tenx_tp, "__TENX_TS__([0-9]|$)")), 1, 0)'
+	' | fillnull value="" timestamp_format | stats count by timestamp_format, lg, rg'
+)
+
+
+def timestamp_elements(fmt):
+	"""
+	What a stored timestamp_format prints, in order: ("lit", character), ("num", *TS_NUMBER entry),
+	("any", fewest, most or None) for digits of any value, ("letters",). A directive this does not
+	know prints any digits, which can only make a piece unusable.
+	"""
+	out, i = [], 0
+	qs = len(re.findall(r"%[0-9]+Q", fmt))
+	while i < len(fmt):
+		if fmt[i] != "%":
+			out.append(("lit", fmt[i]))
+			i += 1
+			continue
+		m = TS_DIRECTIVE.match(fmt, i)
+		if not m:
+			out.append(("any", 1, None))
+			i += 1
+			continue
+		dash, colons, width, letter = m.groups()
+		i = m.end()
+		key = dash + colons + letter
+		if letter == "%" and not (dash or colons or width):
+			out.append(("lit", "%"))
+		elif letter == "Q" and width and not (dash or colons):
+			# tenx-inflate prints every %<n>Q with the digit count of the last one; one is exact
+			n = int(width)
+			out.append(("any", n, n) if qs == 1 and 1 <= n <= 9 else ("any", 1, None))
+		elif width:
+			out.append(("any", 1, None))
+		elif key in TS_NUMBER:
+			out.append(("num",) + TS_NUMBER[key])
+		elif key in TS_ZONES:
+			out.extend(("lit", c) for c in TS_ZONES[key])
+		elif key in TS_LETTERS:
+			out.append(("letters",))
+		else:
+			out.append(("any", 1, None))
+	return out
+
+
+def timestamp_prints(piece, fmt, glued_left=True, glued_right=True):
+	"""
+	Whether a timestamp rendered with the stored timestamp_format `fmt` can print a run between
+	Splunk's breakers equal to `piece`, a run of digits. Every character that is not a letter or a
+	digit is taken as a breaker (more runs than Splunk sees, so more pieces refused, never fewer).
+	`glued_left`/`glued_right`: digits may stand right before or after the timestamp (FORMATS_SEARCH),
+	so the first or last run may carry any digits before or after what the format prints. A format
+	that writes the epoch back as it is (EPOCH_PASSTHROUGH) prints the compact event's own value, so
+	it can print a piece the compact event does not hold only when glued to digits.
+	"""
+	if not DIGIT_PIECE.fullmatch(piece):
+		return True
+	if fmt == EPOCH_PASSTHROUGH:
+		return glued_left or glued_right
+	elements = timestamp_elements(fmt)
+	n = len(piece)
+	runs, start = [], 0
+	for k, e in enumerate(elements + [("lit", " ")]):
+		if e[0] == "lit" and not e[1].isalnum():
+			if k > start:
+				runs.append((start, k))
+			start = k + 1
+
+	def prints(run, left, right):
+		memo = {}
+
+		def go(i, k):
+			if (i, k) in memo:
+				return memo[(i, k)]
+			if k == len(run):
+				ok = i == n or right
+			else:
+				e = run[k]
+				ok = False
+				if e[0] == "lit":
+					ok = i < n and piece[i] == e[1] and go(i + 1, k + 1)
+				elif e[0] == "any":
+					most = n - i if e[2] is None else min(e[2], n - i)
+					ok = any(go(i + w, k + 1) for w in range(e[1], most + 1))
+				elif e[0] == "num":
+					_, fewest, most, low, high, padded = e
+					for w in range(fewest, min(most, n - i) + 1):
+						s = piece[i:i + w]
+						if low <= int(s) <= high and (padded or s == str(int(s))) and go(i + w, k + 1):
+							ok = True
+							break
+			memo[(i, k)] = ok
+			return ok
+		return any(go(i, 0) for i in (range(n) if left else (0,)))
+
+	for a, b in runs:
+		run = elements[a:b]
+		if any(e[0] == "letters" or (e[0] == "lit" and not e[1].isdigit()) for e in run):
+			continue
+		if prints(run, glued_left and a == 0, glued_right and b == len(elements)):
+			return True
+	return False
+
+
+def formats_from_rows(rows):
+	"""The (timestamp_format, glued_left, glued_right) of each row of FORMATS_SEARCH."""
+	return [(str(r.get("timestamp_format") or ""), str(r.get("lg")) != "0", str(r.get("rg")) != "0") for r in rows]
+
+
+def digit_candidates(node, text_field=None):
+	"""The runs of digits the prefilter would use if no rendered timestamp could print them."""
+	found = set()
+	node = as_text(node, text_field) or node
+	if node[0] == "text":
+		in_address = {p for a in addresses_of(node[1]) for p in pieces_of(a)} | set(prefix_parts(node[1]))
+		found.update(p for p in (pieces_outside_times(node[1]) if text_field is None else pieces_kept(node[1]))
+					 if DIGIT_PIECE.fullmatch(p) and not usable(p) and p not in in_address)
+	elif node[0] in ("and", "or"):
+		for child in node[1]:
+			found |= digit_candidates(child, text_field)
+	return found
+
+
+def digit_pieces_cleared(candidates, formats):
+	"""
+	The candidates (digit_candidates()) no stored timestamp format can print (timestamp_prints()):
+	those narrow like any other piece. `formats` is formats_from_rows() of every template that has a
+	timestamp. No formats is taken as not known (the read failed or found no template), and then no
+	run of digits narrows.
+	"""
+	if not formats:
+		return frozenset()
+	return frozenset(p for p in candidates if not any(timestamp_prints(p, f, lg, rg) for f, lg, rg in formats))
+
+
 def addresses_of(text):
 	"""The IPv4 addresses written in a word or phrase, in order, without repeats."""
 	found = []
@@ -894,26 +1071,30 @@ def prefix_parts(text):
 	return found
 
 
-def lookup_pieces(node, found=None, text_field=None):
+def lookup_pieces(node, found=None, text_field=None, digits=frozenset()):
 	"""Every usable piece the prefilter would look up in the template dictionary. The parts of an
-	address are not looked up: a part is digits only, so never template text (FORMAT_SPEC S3.2)."""
+	address are not looked up: a part is digits only, so never template text (FORMAT_SPEC S3.2).
+	`digits`: runs of digits no stored timestamp format prints (digit_pieces_cleared()); they are
+	looked up, because "-1" is template text (S2.2)."""
 	found = set() if found is None else found
 	node = as_text(node, text_field) or node
 	if node[0] == "text":
 		in_address = {p for a in addresses_of(node[1]) for p in pieces_of(a)} | set(prefix_parts(node[1]))
 		found.update(p for p in (pieces_outside_times(node[1]) if text_field is None else pieces_kept(node[1]))
-					 if usable(p) and p not in in_address)
+					 if (usable(p) or p in digits) and p not in in_address)
 	elif node[0] in ("and", "or"):
 		for child in node[1]:
-			lookup_pieces(child, found, text_field)
+			lookup_pieces(child, found, text_field, digits)
 	return found
 
 
-def prefilter(node, dictionary, text_field=None):
+def prefilter(node, dictionary, text_field=None, digits=frozenset()):
 	"""
 	The prefilter for a parsed search, or None for no restriction. `dictionary` maps a piece to
 	(number of templates carrying it, [TERM(...) clauses for those templates]). `text_field`
 	(see text_field_predicate) decides which field comparisons may restrict; None: none do.
+	`digits`: runs of digits that narrow because no stored timestamp format prints them
+	(digit_pieces_cleared()); empty, no run of digits narrows.
 	"""
 	node = as_text(node, text_field) or node
 	kind = node[0]
@@ -923,7 +1104,7 @@ def prefilter(node, dictionary, text_field=None):
 		prefixed = [p for p in prefix_parts(node[1]) if p not in {q for a in addresses for q in address_parts(a)}]
 		in_address = {p for a in addresses for p in pieces_of(a)} | set(prefixed)
 		for piece in (pieces_outside_times(node[1]) if text_field is None else pieces_kept(node[1])):
-			if not usable(piece) or piece in in_address:
+			if not (usable(piece) or piece in digits) or piece in in_address:
 				continue
 			count, terms = dictionary.get(piece, (0, []))
 			if count > MAX_TEMPLATES:
@@ -934,10 +1115,10 @@ def prefilter(node, dictionary, text_field=None):
 		clauses.extend("TERM(%s)" % part for part in prefixed)
 		return "(" + " AND ".join(clauses) + ")" if clauses else None
 	if kind == "and":
-		clauses = [c for c in (prefilter(child, dictionary, text_field) for child in node[1]) if c is not None]
+		clauses = [c for c in (prefilter(child, dictionary, text_field, digits) for child in node[1]) if c is not None]
 		return "(" + " AND ".join(clauses) + ")" if clauses else None
 	if kind == "or":
-		clauses = [prefilter(child, dictionary, text_field) for child in node[1]]
+		clauses = [prefilter(child, dictionary, text_field, digits) for child in node[1]]
 		return None if any(c is None for c in clauses) else "(" + " OR ".join(clauses) + ")"
 	return None
 

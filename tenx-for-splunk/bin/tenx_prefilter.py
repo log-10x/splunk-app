@@ -138,6 +138,26 @@ class TenxPrefilterCommand(GeneratingCommand):
 		names = [n.strip() for n in str(entry.get("fields_not_in_text", "") or "").split(",") if n.strip()]
 		return parser.text_field_predicate(names)
 
+	def _digits(self, candidates):
+		"""
+		The runs of digits of the search that narrow: those no timestamp format of the stored
+		templates can print (tenx_prefilter_parser.digit_pieces_cleared). Read only when the search
+		has such a run. If the formats cannot be read, none narrows, as before.
+		"""
+		if not candidates:
+			return frozenset()
+		try:
+			result = self._rest(
+				"/servicesNS/%s/%s/search/jobs" % (urllib.parse.quote(self._metadata.searchinfo.username), APP_NAME),
+				{"search": parser.FORMATS_SEARCH, "exec_mode": "oneshot", "output_mode": "json", "count": "0",
+				 "earliest_time": "0", "latest_time": "now"})
+			if any(m.get("type") in ("ERROR", "FATAL") for m in result.get("messages", []) or []):
+				return frozenset()
+			return parser.digit_pieces_cleared(candidates, parser.formats_from_rows(result.get("results", [])))
+		except Exception as e:
+			self.logger.warning("tx: reading the timestamp formats failed: %s", e)
+			return frozenset()
+
 	def _store_wild_plan(self, text):
 		"""
 		Stores on the running job what the step before the final search of `tx` and `txf` applies
@@ -199,8 +219,9 @@ class TenxPrefilterCommand(GeneratingCommand):
 			self.error_exit(RuntimeError("original sourcetype"), parser.original_sourcetype_message(rows, macro))
 		# The setting is read only when it can change the prefilter (see narrowing_matters).
 		text_field = self._text_field() if parser.narrowing_matters(tree) else None
+		digits = self._digits(parser.digit_candidates(tree, text_field))
 		dictionary = {}
-		pieces = parser.lookup_pieces(tree, text_field=text_field)
+		pieces = parser.lookup_pieces(tree, text_field=text_field, digits=digits)
 		if pieces:
 			try:
 				result = self._rest(
@@ -215,7 +236,7 @@ class TenxPrefilterCommand(GeneratingCommand):
 				self.write_warning("tx: the template lookup did not complete; every compact event in range is expanded.")
 				yield {"search": EVERY_EVENT}
 				return
-		yield {"search": parser.prefilter(tree, dictionary, text_field) or EVERY_EVENT}
+		yield {"search": parser.prefilter(tree, dictionary, text_field, digits) or EVERY_EVENT}
 
 
 dispatch(TenxPrefilterCommand, sys.argv, sys.stdin, sys.stdout, __name__)
