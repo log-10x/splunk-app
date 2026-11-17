@@ -557,6 +557,8 @@ docker run -d --name tenx-fluentbit-back --network container:tenx-fluentbit-in -
   -v <fluent-bit-back.conf>:/fluent-bit/etc/fluent-bit.conf:ro -v <log folder>:/logs fluent/fluent-bit:5.1.5
 ```
 
+`groupJoinLines false` keeps each forwarder record one Splunk event; without it, the Receiver joins a
+record that reads as a continuation line, such as a line of a stack trace, to the event before it.
 `<network>` is a Docker network from which the HEC is reachable. The env file sets
 `HEC_TOKEN=<HEC token>`, for a token that may write to `tenx_dml` and the compact index. The Receiver
 and the second process run in the first one's network, so restart them after each restart of the
