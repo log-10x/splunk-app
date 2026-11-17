@@ -632,6 +632,12 @@ def as_first_files(text):
 	return ''.join(l for l in text.splitlines(True) if not l.startswith('ADD_EXTRA_TIME_FIELDS ='))
 
 
+def first_names(text, sourcetype):
+	# The first files named every stanza and class after the target (tenx_win); a generated app now names them after its
+	# compact sourcetype, so two maps of one target coexist on one instance (test_field_map_two_maps.py).
+	return text.replace('TRANSFORMS-%s =' % sourcetype, 'TRANSFORMS-tenx_win =').replace(sourcetype + '_', 'tenx_win_')
+
+
 @needs_samples
 class TestGoldenWindows:
 	def test_662_event_sample_equals_the_first_files(self, tmp_path):
@@ -648,8 +654,9 @@ class TestGoldenWindows:
 		out = generate(tmp_path, 'b2_4663', ['--records', sample('data', 'b2_kv_rows_all.json'),
 			'--only-hashes-in', sample(*T4663 + ('templates.json',)), '--target', 'windows-security',
 			'--sourcetype', 'tenx_win4663'] + FIRST_FILES)
-		assert as_first_files(read(str(out / 'default' / 'props.conf'))) == read(sample('conf', 'b2_4663', 'props.conf'))
-		assert read(str(out / 'default' / 'transforms.conf')).split('\n', 1)[1] == \
+		assert first_names(as_first_files(read(str(out / 'default' / 'props.conf'))), 'tenx_win4663') == \
+			read(sample('conf', 'b2_4663', 'props.conf'))
+		assert first_names(read(str(out / 'default' / 'transforms.conf')).split('\n', 1)[1], 'tenx_win4663') == \
 			read(sample('conf', 'b2_4663', 'transforms.conf')).split('\n', 1)[1]
 
 		def stanzas(path):
