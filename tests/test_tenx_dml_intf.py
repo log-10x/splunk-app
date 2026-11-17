@@ -117,3 +117,34 @@ def test_a_store_that_ignores_skip_ends_the_read():
 
 	assert writer(conn).write_pending() == 2
 	assert len(conn.reads) == 2
+
+
+class FindingConnection(FakeConnection):
+	"""Also answers batch_find, from the records it holds."""
+
+	def post(self, url, data, params=None, output_mode="json", read_result=True):
+		if url.endswith('/batch_find'):
+			keys = json.loads(data)[0]['query']['_key']['$in']
+			return [[dict(r) for r in self.pending if r['_key'] in keys]]
+		return FakeConnection.post(self, url, data, params, output_mode, read_result)
+
+
+def test_records_the_caller_just_wrote_are_marked_without_reading_the_collection():
+	held = [record('k%d' % i) for i in range(3)]
+	earlier = record('old1')
+	conn = FindingConnection(held + [earlier])
+
+	assert writer(conn).write_pending(known=held) == 4
+
+	assert conn.reads == []
+	marked = {r['_key']: r['search_copy'] for batch in conn.batches for r in batch}
+	assert marked == {'k0': 'written', 'k1': 'written', 'k2': 'written', 'old1': 'written'}
+
+
+def test_records_the_copy_search_missed_stay_pending():
+	held = [record('k%d' % i) for i in range(3)]
+	conn = FindingConnection(held, copied=['k0', 'k2'])
+
+	assert writer(conn).write_pending(known=held) == 2
+	marked = {r['_key'] for batch in conn.batches for r in batch}
+	assert marked == {'k0', 'k2'}

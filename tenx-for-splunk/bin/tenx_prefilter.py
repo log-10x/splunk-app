@@ -30,6 +30,7 @@ import os
 import re
 import ssl
 import sys
+import time
 import urllib.parse
 import urllib.request
 
@@ -141,7 +142,21 @@ class TenxPrefilterCommand(GeneratingCommand):
 							   "pipe, which can differ from the same search on the index: the step that matches it as the "
 							   "index does could not be prepared.")
 
+	def _store_check(self):
+		"""
+		Warns when the template store can lack templates the events need: Consume KV failed, is
+		still loading, or has not run for fifteen minutes (tenx_prefilter_parser.store_warning).
+		One read of one KV record; nothing when it cannot be read.
+		"""
+		try:
+			note = parser.store_warning(self._rest(parser.STORE_STATE_PATH), time.time())
+		except Exception:
+			return
+		if note:
+			self.write_warning(note)
+
 	def generate(self):
+		self._store_check()
 		try:
 			text = self._search_text()
 		except Exception as e:

@@ -39,6 +39,7 @@ See Also
 
 import json
 import logging
+import time
 import urllib.parse
 
 import tenx_dml_builder
@@ -49,8 +50,7 @@ SEARCH_COPY = "search_copy"
 SEARCH_COPY_PENDING = "pending"
 SEARCH_COPY_WRITTEN = "written"
 
-# The KV store's default limit on documents per batch_save call is 1,000.
-BATCH_SIZE = 500
+# Records marked written are saved with TenxKVInterface.save_many, within the KV store's batch limits.
 
 # One read of a collection returns no more than limits.conf [kvstore] max_rows_per_query rows (50,000)
 # and max_size_per_result_mb (50 MB) of them, whatever limit asks for (Splunk Enterprise 10.4.3: one
@@ -112,28 +112,43 @@ class TenxDmlInterface:
 			records.extend(new)
 			keys.update(r.get('_key') for r in new)
 
-	def write_pending(self):
+	def write_pending(self, known=None):
 		"""
 		Writes the searchable copy of every pending template and marks those records written.
+
+		known: the pending records the caller just wrote, whole; the collection is then not read
+		for them (a read of every pending record pages through the collection). A record the copy
+		search copied that is not among them, pending from an earlier run, is read by its key.
 
 		Returns the number of templates copied, or -1 when the copy could not be written; the
 		records then stay pending for the next run.
 		"""
 		try:
-			pending = self.pending_records()
+			pending = self.pending_records() if known is None else list(known)
 		except Exception as e:
 			logger.error("Could not read pending templates - {}".format(e), exc_info=1)
 			return -1
 
-		if not pending:
+		if not pending and known is None:
 			return 0
 
+		began = time.time()
 		copied_keys = self.run_copy_search()
+		searched = time.time() - began
 
 		if copied_keys is None:
 			return -1
 
 		copied = set(copied_keys)
+		held = {r.get('_key') for r in pending}
+		others = [k for k in copied if k not in held]
+
+		if others:
+			try:
+				pending.extend(self.kv_intf.find_many(others).values())
+			except Exception as e:
+				logger.warning("Could not read {} templates copied from an earlier run; they are copied again later - {}".format(len(others), e))
+
 		done = []
 
 		for record in pending:
@@ -142,10 +157,9 @@ class TenxDmlInterface:
 				record[SEARCH_COPY] = SEARCH_COPY_WRITTEN
 				done.append(record)
 
-		for start in range(0, len(done), BATCH_SIZE):
-			if not self.kv_intf.save_batch(done[start:start + BATCH_SIZE]):
-				return -1
+		if not self.kv_intf.save_many(done):
+			return -1
 
-		logger.info("Wrote the searchable copy of {} templates.".format(len(done)))
+		logger.info("Wrote the searchable copy of {} templates ({:.1f} s searching, {:.1f} s marking).".format(len(done), searched, time.time() - began - searched))
 
 		return len(done)
