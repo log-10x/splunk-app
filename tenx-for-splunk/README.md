@@ -790,7 +790,7 @@ FortiGate field map (below) gives every compact FortiGate event the raw event's 
 
 A timestamp without a year takes its year from the time the event is processed, so a replayed or
 backfilled file from an earlier year gets the wrong year. Splunk guesses the year for such lines
-too, and the two guesses can differ.
+too, and the two guesses can differ. The Receiver sends an event of 65,535 characters or more whole, without a template: it is licensed at its full size, its `_time` is the time its sender gave it rather than a time in its text, and a field map writes no index-time fields for it, so data models and `tstats` do not count it.
 
 ## Data Models and Detections: the Field Map
 
@@ -1230,7 +1230,7 @@ and for `\u003c`, `\u003e`, `\u0026`, `\u003d` and `\u0027` as the character eac
 `\n`, `\t` and `\r` with a space; with any other escape there, that field is not written. A plain search
 shows a mapped field longer than 1,000 characters, such as a PowerShell `ScriptBlockText`, cut to its first 1,000;
 `tstats` on the field reads it whole. A template with more than 984 values
-gets no row, and its events arrive whole. An event whose compact value holds a line feed or another
+gets no row, and its events arrive whole, and an event of 65,535 characters or more arrives whole for the same reason. An event whose compact value holds a line feed or another
 control character, such as a NUL byte in a FortiGate line, gets no fields and is marked
 `tenx_unmapped=no_match`. In Linux audit records that add interpreted fields after a group separator (0x1D), the field map writes no fields; those events are kept, marked `tenx_unmapped=no_match`, and counted by `check`. With `--reserved-names restore`, a mapped CloudTrail
 event carries `extracted_eventType` beside `eventType`, and a mapped FortiGate UTM event
