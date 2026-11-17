@@ -89,9 +89,12 @@ class PureCopies:
 		self.writes = 0
 		PureCopies.last = self
 
-	def write_pending(self, known=None):
+	def write_pending(self, known=None, deadline=None):
 		self.writes += 1
 		return 0
+
+	def any_pending(self):
+		return False
 
 
 def fill(monkeypatch, tmp_path, records, kv=None):
@@ -595,3 +598,96 @@ def test_a_checkpoint_that_cannot_be_read_is_not_taken_for_a_first_run(monkeypat
 
 	assert splunk.searches == []
 	assert state.records['consume_kv']['loaded_through'] == through
+
+
+class KVCopies:
+	"""The searchable copy over a StoreKV: copies every pending record and marks it written."""
+
+	def __init__(self, kv):
+		self.kv = kv
+		self.copied = []
+
+	def __call__(self, *args, **kwargs):
+		return self
+
+	def any_pending(self):
+		return any(r.get('search_copy') == 'pending' for r in self.kv.records.values())
+
+	def write_pending(self, known=None, deadline=None):
+		keys = [k for k, r in self.kv.records.items() if r.get('search_copy') == 'pending']
+		for k in keys:
+			self.kv.records[k] = dict(self.kv.records[k], search_copy='written')
+		self.copied.extend(keys)
+		return len(keys)
+
+
+def test_a_run_with_no_new_records_writes_the_copies_an_earlier_run_left(monkeypatch, tmp_path):
+	base = int(time.time()) - 3600
+	splunk, kv, state = FakeSplunk(flood(3000, base)), StoreKV(), StoreKV()
+	# a run that stored the templates and stopped before writing any copy
+	consume(monkeypatch, tmp_path, splunk, kv, state)
+	assert all(r['search_copy'] == 'pending' for r in kv.records.values())
+	state.records['consume_kv']['rechecked'] = 1  # nothing to read again: no new record either
+
+	copies = KVCopies(kv)
+	monkeypatch.setattr(tenx_dml_to_kv.tenx_dml_intf, 'TenxDmlInterface', copies)
+	config = dict(tenx_consts.DEFAULT_CONFIG)
+	import gzip
+	path = tmp_path / 'trigger2.csv.gz'
+	with gzip.open(path, 'wt') as f:
+		f.write('_time\n1794850000\n')
+	splunk.searches.clear()
+	read = tenx_dml_to_kv.update_kv_store({'server_uri': 'https://x', 'session_key': 'k', 'results_file': str(path), 'configuration': {}})
+
+	assert read == 0
+	assert [q for q in splunk.searches if 'fields templateHash' in q] == []
+	assert len(copies.copied) == 3000
+	assert state.records['consume_kv']['status'] == 'current'
+
+
+def test_a_run_stopped_from_outside_is_reported_by_the_next(monkeypatch, tmp_path, caplog):
+	base = int(time.time()) - 3600
+	splunk, kv, state = FakeSplunk(flood(100, base)), StoreKV(), StoreKV()
+	consume(monkeypatch, tmp_path, splunk, kv, state)
+	# a run that started and never ended
+	state.records['consume_kv']['run_started'] = state.records['consume_kv']['run_ended'] + 60
+
+	consume(monkeypatch, tmp_path, splunk, kv, state)
+
+	assert any('did not finish' in r.getMessage() for r in caplog.records if r.levelname == 'WARNING')
+	assert 'did not finish' in state.records['consume_kv']['last_cut']
+	assert state.records['consume_kv']['run_ended'] >= state.records['consume_kv']['run_started']
+
+
+def test_a_run_that_ends_with_copies_pending_does_not_say_current(monkeypatch, tmp_path):
+	class Stuck(PureCopies):
+		def any_pending(self):
+			return True
+
+	monkeypatch.setattr(tenx_dml_to_kv.tenx_dml_intf, 'TenxDmlInterface', Stuck)
+	base = int(time.time()) - 3600
+	splunk, kv, state = FakeSplunk(flood(100, base)), StoreKV(), StoreKV()
+	import gzip
+	path = tmp_path / 't.csv.gz'
+	with gzip.open(path, 'wt') as f:
+		f.write('_time\n1\n')
+	config = dict(tenx_consts.DEFAULT_CONFIG)
+	config[tenx_util.CONFIG_LOADED] = True
+	monkeypatch.setattr(tenx_util, 'get_tenx_config', lambda **kwargs: config)
+	monkeypatch.setattr(tenx_util, 'ServerConnection', lambda **kwargs: splunk)
+	monkeypatch.setattr(tenx_dml_to_kv.tenx_kv_intf, 'TenxKVInterface',
+		lambda collection_name, **k: state if collection_name == 'tenx_kv_state' else kv)
+	tenx_dml_to_kv.update_kv_store({'server_uri': 'https://x', 'session_key': 'k', 'results_file': str(path), 'configuration': {}})
+
+	assert state.records['consume_kv']['status'] == 'loading'
+	assert 'searchable copies are still pending' in state.records['consume_kv']['detail']
+
+
+def test_the_action_sets_limits_above_splunks_defaults():
+	import configparser, os
+	conf = configparser.RawConfigParser(strict=False, interpolation=None)
+	conf.read(os.path.join(os.path.dirname(__file__), '..', 'tenx-for-splunk', 'default', 'alert_actions.conf'))
+	assert int(conf.get('tenx_dml_to_kv', 'maxresults')) >= 1000000
+	assert conf.get('tenx_dml_to_kv', 'maxtime') == '10m'
+	# a run stops itself, with its last slice and copies, well inside maxtime
+	assert tenx_dml_to_kv.RUN_BUDGET_SECONDS + tenx_dml_to_kv.COPY_GRACE_SECONDS + 120 < 600

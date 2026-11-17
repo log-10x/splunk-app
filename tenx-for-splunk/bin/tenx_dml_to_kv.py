@@ -222,6 +222,12 @@ STATE_REFRESH_UNTIL = 'refresh_until'
 # been read again since OVERLAP_SECONDS had passed (then a run starts at loaded_through itself).
 STATE_ADVANCED_AT = 'advanced_at'
 STATE_RECHECKED = 'rechecked'
+# When the last run started and when the last run ended, this host's clock: a run that started
+# and never ended was stopped from outside (the alert action's maxtime, a restart).
+STATE_RUN_STARTED = 'run_started'
+STATE_RUN_ENDED = 'run_ended'
+# The last run stopped from outside, as the next run found it; kept for Diagnostics.
+STATE_LAST_CUT = 'last_cut'
 STATUS_CURRENT = 'current'
 STATUS_LOADING = 'loading'
 STATUS_FAILED = 'failed'
@@ -236,16 +242,18 @@ OVERLAP_SECONDS = 300
 LAG_SECONDS = 30
 # Template records read and stored between two checkpoint writes.
 SLICE_RECORDS = 25000
-# A run starts no new slice after this long, so it ends well inside the alert action's maxtime
-# (alert_actions.conf); the next run resumes from the checkpoint.
+# A run starts no new slice after this long, so with its last slice and copies it ends well inside
+# the alert action's maxtime (alert_actions.conf, 10m); the next run resumes from the checkpoint.
 RUN_BUDGET_SECONDS = 240
+# After the budget, copies already pending are still written for this long before the run ends.
+COPY_GRACE_SECONDS = 60
 # Records handed to the KV store together (one batch_find, then batch_save calls).
 CHUNK_RECORDS = 2000
 # New templates whose searchable copy is written together: one copy search returns at most
 # 50,000 keys (limits.conf [restapi] maxresultrows), so it is run before that many are pending,
 # and at the end of a run. A record a run stored and did not copy stays pending in the
 # collection, and the next copy search copies it.
-COPY_EVERY = 40000
+COPY_EVERY = 20000
 
 
 def reconcile(dml_builder, existing, record_key, pattern, refresh=True):
@@ -401,20 +409,20 @@ class TemplateStore:
 			else:
 				self.pending.pop(key, None)
 
-	def copy_pending(self, dml_intf):
+	def copy_pending(self, dml_intf, deadline=None):
 		"""
-		Writes the searchable copy of the templates stored since the last call (and of any other
-		record still pending) and marks them written. A copy that fails leaves them pending for
-		the next run.
+		Writes the searchable copy of the templates stored since the last call, and of any other
+		record still pending (a run that stopped before copying), and marks them written, batch by
+		batch (tenx_dml_intf.write_pending). A copy that fails leaves them pending for the next
+		run. Returns what write_pending returns.
 		"""
-		if not self.pending:
-			return
 		known, self.pending = list(self.pending.values()), {}
 		began = time.time()
-		copied = dml_intf.write_pending(known)
+		copied = dml_intf.write_pending(known, deadline=deadline)
 		self.seconds['copy'] += time.time() - began
 		if copied < 0:
 			logger.warning("The searchable copy of new templates was not written; they stay pending for the next run.")
+		return copied
 
 	def summary(self):
 		return "added={}, refreshed={}, replaced={}, conflicts={}, unchanged={}, invalid={}; seconds find={:.1f} build={:.1f} save={:.1f} copy={:.1f}".format(
@@ -556,7 +564,20 @@ def load_since(server_connection, store, state_intf, dml_intf, source, start_fro
 		write_state(state_intf, state, **{STATE_VERSION: app_version(), STATE_REFRESH_UNTIL: end, STATE_LOADED_THROUGH: 0,
 			STATE_STATUS: STATUS_LOADING, STATE_DETAIL: 'reading every template record for version {}'.format(app_version())}, reset=True)
 
+	started, ended = float(state.get(STATE_RUN_STARTED) or 0), float(state.get(STATE_RUN_ENDED) or 0)
+	marker = {STATE_RUN_STARTED: now}
+	if started > ended:
+		cut = ("the run that started at {} did not finish (stopped by the alert action's maxtime or a restart); "
+			"this run continues from the checkpoint").format(time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(started)))
+		logger.warning(cut[0].upper() + cut[1:] + ".")
+		marker.update({STATE_STATUS: STATUS_LOADING, STATE_DETAIL: cut, STATE_LAST_CUT: cut})
+	write_state(state_intf, state, **marker)
+
+	# Copies an earlier run left pending go first, whether or not new records arrived.
+	store.copy_pending(dml_intf, deadline=began + budget)
+
 	if end <= start:
+		write_state(state_intf, state, **{STATE_RUN_ENDED: int(time.time()), STATE_STATUS: STATUS_CURRENT, STATE_DETAIL: ''})
 		return 0
 
 	slices = plan_slices(index_time_plan(server_connection, source, start, end), start, end, SLICE_RECORDS)
@@ -564,9 +585,10 @@ def load_since(server_connection, store, state_intf, dml_intf, source, start_fro
 
 	for index, (a, b, planned) in enumerate(slices):
 		if index and time.time() - began > budget:
-			store.copy_pending(dml_intf)
-			write_state(state_intf, state, status=STATUS_LOADING, detail="stopped after {} s with records indexed from {} left".format(int(time.time() - began), a))
-			logger.info("Stopped after {} s; the next run continues from index time {}.".format(int(time.time() - began), a))
+			store.copy_pending(dml_intf, deadline=began + budget + COPY_GRACE_SECONDS)
+			stopped = "stopped after {} s with records indexed from {} left; the next run continues".format(int(time.time() - began), a)
+			write_state(state_intf, state, **{STATE_STATUS: STATUS_LOADING, STATE_DETAIL: stopped, STATE_RUN_ENDED: int(time.time())})
+			logger.warning("Consume KV " + stopped + ".")
 			return read
 
 		last = None
@@ -591,8 +613,6 @@ def load_since(server_connection, store, state_intf, dml_intf, source, start_fro
 						store.copy_pending(dml_intf)
 			store.store(chunk, refresh)
 			count += len(chunk)
-		if index == len(slices) - 1:
-			store.copy_pending(dml_intf)
 		read += count
 		if planned:
 			logger.info("Index time {} to {}: {} records read and stored in {:.1f} s ({}).".format(int(a), int(b), count, time.time() - slice_began, store.summary()))
@@ -600,7 +620,7 @@ def load_since(server_connection, store, state_intf, dml_intf, source, start_fro
 		# The last slice ends at the newest record seen, not at this host's clock, so a record
 		# an indexer stamps with a clock behind this one's is still read by the next run.
 		through = b if index < len(slices) - 1 else (min(b, last + 1) if last is not None else None)
-		fields = {STATE_STATUS: STATUS_CURRENT if index == len(slices) - 1 else STATUS_LOADING, STATE_DETAIL: '', STATE_RECORDS: read}
+		fields = {STATE_STATUS: STATUS_LOADING, STATE_RECORDS: read}
 		if through is not None:
 			fields[STATE_LOADED_THROUGH] = through
 		elif state.get(STATE_LOADED_THROUGH) is None:
@@ -614,6 +634,15 @@ def load_since(server_connection, store, state_intf, dml_intf, source, start_fro
 		elif index == len(slices) - 1 and now - float(state.get(STATE_ADVANCED_AT) or 0) >= OVERLAP_SECONDS + LAG_SECONDS:
 			fields[STATE_RECHECKED] = 1
 		write_state(state_intf, state, **fields)
+
+	copied = store.copy_pending(dml_intf, deadline=began + budget + COPY_GRACE_SECONDS)
+	done = {STATE_RUN_ENDED: int(time.time())}
+	if copied is not None and copied >= 0 and not dml_intf.any_pending():
+		done.update({STATE_STATUS: STATUS_CURRENT, STATE_DETAIL: ''})
+	else:
+		done.update({STATE_STATUS: STATUS_LOADING, STATE_DETAIL: 'searchable copies are still pending; the next run writes them'})
+		logger.warning("Consume KV ended with searchable copies pending; the next run writes them.")
+	write_state(state_intf, state, **done)
 
 	return read
 
@@ -718,7 +747,7 @@ def update_kv_store(settings):
 		logger.error("Unexpected error in tenx dml to kv handler - {}.".format(e), exc_info=1)
 		if state_intf is not None:
 			try:
-				write_state(state_intf, read_state(state_intf), status=STATUS_FAILED, detail=str(e)[:500])
+				write_state(state_intf, read_state(state_intf), **{STATE_STATUS: STATUS_FAILED, STATE_DETAIL: str(e)[:500], STATE_RUN_ENDED: int(time.time())})
 			except Exception:
 				logger.warning("The checkpoint record could not be marked failed.", exc_info=1)
 		return -1

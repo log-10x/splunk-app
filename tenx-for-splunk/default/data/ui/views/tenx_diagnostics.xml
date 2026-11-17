@@ -108,7 +108,7 @@
         <search>
           <query>| inputlookup tenx-kv-state-lookup
 | eval loaded_through=strftime(loaded_through, "%Y-%m-%d %H:%M:%S"), last_run=strftime(updated, "%Y-%m-%d %H:%M:%S")
-| table loaded_through, last_run, status, detail</query>
+| table loaded_through, last_run, status, detail, last_cut</query>
           <earliest>0</earliest>
           <latest></latest>
         </search>
