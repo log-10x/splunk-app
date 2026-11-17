@@ -1056,6 +1056,7 @@ the same events indexed raw and mapped, each index merged to one index file:
 | FortiGate traffic, 100,000 | 13.6 MB | 22.6 MB | 20.0 MB (`time`) | 19.9 MB |
 | Windows Security XML, 8,311 | 1.5 MB | 3.4 MB | 2.5 MB (`SystemTime`, `EventRecordID`) | 3.4 MB |
 | Windows Security classic, 100,000 | 16.4 MB | 176 MB | 17.9 MB (`Message`) | 17.3 MB |
+| Palo Alto traffic and system, 100,000 | 10.7 MB | 36.9 MB | 25.6 MB (four time columns) | 24.5 MB |
 
 Data model, `tstats` and detection results were the same in every column. A plain search shows only
 the written fields on a mapped event; `--fields cim` leaves out more of them (FortiGate's `vd`,
@@ -1063,7 +1064,10 @@ the written fields on a mapped event; `--fields cim` leaves out more of them (Fo
 events carry neither `Message` nor `body`. On Windows XML,
 `SystemTime` is the heavy field and `--fields cim` writes it, because the add-on's `event_time` comes
 from it and the Endpoint data model reads that on event 5154 (none among these events); without
-`SystemTime`, mapped events carry no `event_time`.
+`SystemTime`, mapped events carry no `event_time`. A Palo Alto line holds five date and time columns;
+`--leave-out generated_time,receive_time,future_use3,start_time` leaves out the four nothing reads,
+and the fifth, the syslog header (`future_use1`), is read by the add-on for authentication events.
+Bloom filters are left out of the Palo Alto row.
 
 `tstats` reads the indexed sourcetype, which stays the compact one with or without a field map, so
 `tstats` by or on the original sourcetype counts no compact event; `tenx_sourcetype` holds the
