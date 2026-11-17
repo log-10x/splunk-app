@@ -1098,8 +1098,9 @@ class FakeSplunkd(object):
 		import urllib.parse as up
 		self.on_disk, self.app_name, self.cap_file = on_disk, app_name, cap_file
 		self.calls, self.events, self.rows = [], [], set()
-		# drop: probe events are not indexed (a lookup that throws); floor: the instance holds the floor app
-		self.drop, self.floor = False, True
+		# drop: probe events are not indexed (a lookup that throws); floor: the instance holds the floor app;
+		# absent_404: an app the instance does not hold answers 404, as Splunk Enterprise 10.4.3 does for its namespace
+		self.drop, self.floor, self.absent_404 = False, True, False
 		# hec_unmapped: events sent through HEC are parsed where the app is not installed (no fields)
 		self.hec_unmapped = False
 		# splunkd.log lines of events Splunk dropped: (node, sourcetype, index time); internal: whether _internal is readable
@@ -1198,14 +1199,19 @@ class FakeSplunkd(object):
 				if path == '/services/configs/conf-limits/lookup':
 					if outer.limits is not None:
 						entries = [{'name': 'lookup', 'content': outer.limits}]
-				elif '/conf-' in path and outer.loaded:
+				elif '/conf-' in path:
 					conf = path.rsplit('/conf-', 1)[1]
 					app = up.unquote(path.split('/servicesNS/nobody/', 1)[1].split('/', 1)[0])
-					folder = outer.loaded if app == outer.app_name else (fm.floor_dir(outer.loaded)
-						if app == outer.app_name + fm.FLOOR_SUFFIX and outer.floor else None)
+					folder = None if not outer.loaded else outer.loaded if app == outer.app_name else (
+						fm.floor_dir(outer.loaded) if app == outer.app_name + fm.FLOOR_SUFFIX and outer.floor else None)
 					if folder:
 						entries = [{'name': n, 'content': dict((k, '1' if v == 'true' else v) for k, v in c.items()),
 							'acl': {'app': app}} for n, c in fm.read_conf(os.path.join(folder, 'default', conf + '.conf')).items()]
+					elif outer.absent_404:
+						self.send_response(404)
+						self.send_header('Content-Length', '0')
+						self.end_headers()
+						return
 				self._send({'entry': entries})
 
 		self.server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
@@ -1456,6 +1462,62 @@ class TestCapFile:
 			fake.close()
 		assert rc == 1 and 'floor app fm_fw_floor' in out and fake.events == []
 		assert read(str(cap)) == 'pattern_hash,value\n'
+
+	def test_activate_stops_cleanly_on_an_instance_without_the_floor_app_at_all(self, tmp_path):
+		# Splunk answers 404 for an app namespace it does not hold; the probes are parsed on this instance.
+		cap = tmp_path / 'compact-cap.csv'
+		assert self.gen(tmp_path, ['k1'], cap) == 0
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		fake.floor, fake.absent_404 = False, True
+		try:
+			rc, out = self.activate(tmp_path, cap, fake)
+		finally:
+			fake.close()
+		assert rc == 1 and 'does not hold the floor app fm_fw_floor' in out and fake.events == []
+		assert read(str(cap)) == 'pattern_hash,value\n'
+
+	def test_activate_says_when_the_app_is_not_on_the_instance(self, tmp_path):
+		cap = tmp_path / 'compact-cap.csv'
+		assert self.gen(tmp_path, ['k1'], cap) == 0
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap), loaded=False)
+		fake.absent_404 = True
+		try:
+			rc, out = self.activate(tmp_path, cap, fake)
+		finally:
+			fake.close()
+		assert rc == 1 and "does not hold app fm_fw as generated (1 stanzas, first app fm_fw is not on the instance)" in out
+		assert fake.events == [] and read(str(cap)) == 'pattern_hash,value\n'
+
+	def test_a_search_head_apart_from_the_parsing_instances_needs_no_floor_app(self, tmp_path):
+		# --splunkd names a search head; the probes go to another host's HTTP Event Collector, where the compact events
+		# are parsed. The floor app acts only there, so its absence on the search head does not stop activate.
+		cap = tmp_path / 'compact-cap.csv'
+		assert self.gen(tmp_path, ['k1'], cap) == 0
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		fake.floor, fake.absent_404 = False, True
+		hec = fake.url.replace('127.0.0.1', 'localhost')
+		out = io.StringIO()
+		try:
+			rc = fm.activate(str(tmp_path / 'fm_fw'), str(cap), fm.Splunkd(fake.url, hec_url=hec, hec_token='t'), out=out,
+				probe_index='probes', sleep=lambda s: None)
+		finally:
+			fake.close()
+		out = out.getvalue()
+		assert rc == 0, out
+		assert ('activate: the floor app fm_fw_floor was not checked: it is needed on each instance that parses the '
+			'compact events (%s), not on %s' % (hec.split('//')[1], fake.url.split('//')[1])) in out
+		assert read(str(cap)) == 'pattern_hash,value\n"k1",true\n'
+
+	@pytest.mark.parametrize('splunkd,hec,parsed', [
+		('https://sh:8089', None, True),
+		('https://splunk:8089', 'https://splunk:8088', True),
+		('https://SH.example:8089', 'https://sh.example:8088', True),
+		('https://sh:8089', 'https://idx1:8088', False),
+		('https://sh:8089', ['https://idx1:8088', 'https://idx2:8088'], False),
+		('https://idx1:8089', ['https://idx1:8088', 'https://idx2:8088'], True),
+	])
+	def test_where_the_probes_are_parsed(self, splunkd, hec, parsed):
+		assert fm.probes_parsed_on(fm.Splunkd(splunkd, hec_url=hec, hec_token='t')) is parsed
 
 	def listed(self, tmp_path, hashes, kept=''):
 		cap = tmp_path / 'compact-cap.csv'
