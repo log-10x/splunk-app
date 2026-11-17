@@ -749,7 +749,9 @@ With the Receiver on each host, before the heavy forwarder, the heavy forwarder'
 do not apply to compact events: index overrides, masks (`SEDCMD`, `_raw` rewrites), `nullQueue`
 filters and index-time fields. A value such a mask hides on raw events is readable after expansion,
 and events such a filter drops are indexed and counted against the license. To keep these rules,
-[place the Receiver after the heavy forwarder's parsing](#receiver-beside-a-heavy-forwarder).
+[place the Receiver after the heavy forwarder's parsing](#receiver-beside-a-heavy-forwarder). The
+same holds for the index-time rules of the original sourcetype on the indexers; `tenxreplay` names
+such a mask in `masked_at_index_time`.
 
 Through `txf`, a field whose name holds `*`, such as the JSON key `"a*"`, has each value twice on an
 event the sender passed whole; on a compact event it is as on the raw event.
