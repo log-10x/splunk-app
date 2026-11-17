@@ -21,9 +21,16 @@ carry in tenx_sourcetype (they are indexed as the compact sourcetype).
 Some words match other events in that final search, after a pipe, than on the index: a wildcard
 inside a word (Se*Privilege is matched as its prefix alone), and TERM() or CASE() of some words
 (tenx_prefilter_parser.wild_plan). For those, this command also stores on the running job two
-custom fields, custom.tenx_wild_eval and custom.tenx_wild_search: an eval that marks the events
-holding each such word as the index does, and the words with each such word replaced by its mark.
-`tx` and `txf` read them back in the step before their final search (macros.conf [tenx-wild]).
+custom fields, custom.tenx_wild_marks and custom.tenx_wild_search: the regular expressions that
+find each such word as the index does (tenx_prefilter_parser.wild_marks), and the words with each
+such word replaced by its mark. `tx` and `txf` read them back in the step before their final
+search (macros.conf [tenx-wild]).
+
+Every `tx` and `txf` of a search runs this command and reads the same search text. When the text
+holds more than one, the words after the first would choose the compact events of every other one
+(the second arm of a multisearch or union kept too few events), so this command then selects every
+compact event in range and stores no word plan: each one's own words are applied to the expanded
+text.
 """
 import json
 import os
@@ -94,6 +101,7 @@ class TenxPrefilterCommand(GeneratingCommand):
 		job = self._rest("/services/search/jobs/%s?output_mode=json" % urllib.parse.quote(match.group(1), safe=""))
 		search = job["entry"][0]["content"].get("search", "")
 		self.before = parser.macro_call(search)
+		self.calls = parser.macro_calls(search)
 		return parser.text_after_macro(search)
 
 	def _original_sourcetype_rows(self, tree):
@@ -145,11 +153,11 @@ class TenxPrefilterCommand(GeneratingCommand):
 		searches `*`. If it cannot be stored, such a word is matched as after any pipe.
 		"""
 		try:
-			plan = parser.wild_plan(text)
+			plan = parser.wild_marks(text)
 			if plan is None:
 				return
 			self._rest("/services/search/jobs/%s?output_mode=json" % urllib.parse.quote(self.parent, safe=""),
-					   {"custom.tenx_wild_eval": plan[0], "custom.tenx_wild_search": plan[1]}, answer=False)
+					   {"custom.tenx_wild_marks": plan[0], "custom.tenx_wild_search": plan[1]}, answer=False)
 		except Exception as e:
 			self.logger.warning("tx: storing the wildcard plan failed: %s", e)
 			self.write_warning("tx: a word with a wildcard inside it, TERM() or CASE() is matched in this search as after a "
@@ -193,10 +201,16 @@ class TenxPrefilterCommand(GeneratingCommand):
 		if reader.unquoted_comma:
 			self.error_exit(RuntimeError("comma after tx"),
 				"tx: a comma after `tx` is matched literally, so this search would miss events. Remove it, or put the text in quotes.")
-		self._store_wild_plan(text)
+		several = getattr(self, "calls", 1) > 1
+		if not several:
+			self._store_wild_plan(text)
 		rows, macro = self._original_sourcetype_rows(tree)
 		if rows:
 			self.error_exit(RuntimeError("original sourcetype"), parser.original_sourcetype_message(rows, macro))
+		if several:
+			self.write_warning("tx: this search holds more than one tx or txf; every compact event in range is expanded.")
+			yield {"search": EVERY_EVENT}
+			return
 		# The setting is read only when it can change the prefilter (see narrowing_matters).
 		text_field = self._text_field() if parser.narrowing_matters(tree) else None
 		# Runs of digits are looked up like words; the same read of the KV store returns the stored

@@ -164,6 +164,14 @@ class TenxSearchCommandBase(GeneratingCommand):
 				self.logger.error("Failed getting original search {} details.".format(original_job_sid))
 				return
 
+			# The search's time range. A job that runs inside another search (a subsearch of append,
+			# join or union) has no request block; its range is searchEarliestTime and
+			# searchLatestTime, epoch seconds, the first absent over all time (Splunk 10.4.3).
+			#
+			request = job_details.get('request') or {}
+			earliest = request.get('earliest_time', job_details.get('searchEarliestTime', ''))
+			latest = request.get('latest_time', job_details.get('searchLatestTime', ''))
+
 			search_builder = tenx_search_builder.TenxSearchBuilder(
 						server_connection=server_connection,
 						tenx_config=tenx_config,
@@ -211,8 +219,7 @@ class TenxSearchCommandBase(GeneratingCommand):
 			probe, message = tenx_search_builder.compact_probe(build_result, tenx_config)
 
 			if probe is not None:
-				rows = search_manager.run_probe(probe, job_details['request'].get('earliest_time', '0'),
-					job_details['request'].get('latest_time', 'now'))
+				rows = search_manager.run_probe(probe, earliest or '0', latest or 'now')
 
 				if rows:
 					self.write_error(message(rows))
@@ -236,9 +243,9 @@ class TenxSearchCommandBase(GeneratingCommand):
 			actual_search = searchstring if new_search is None else new_search
 
 			search_data = {
-				"earliest_time": job_details['request'].get('earliest_time', ''),
-				"latest_time": job_details['request'].get('latest_time', ''),
-				'rf': job_details['request'].get('rf', '*'),
+				"earliest_time": earliest,
+				"latest_time": latest,
+				'rf': request.get('rf', '*'),
 				"search": actual_search,
 				"auto_cancel": NESTED_AUTO_CANCEL_S
 			}
@@ -351,6 +358,10 @@ class TenxSearchCommandBase(GeneratingCommand):
 
 		except Exception as e:
 			self.logger.error("Unexpected error running tenxsearch - {}.".format(e), exc_info=1)
+			# Nothing returned here would look like "no matches". It is not.
+			#
+			self.write_error("10x: this search stopped on an unexpected error ({}), so it returned no results, which is "
+				"not the same as no matches. See tenx_search_command.log.".format(e))
 
 		finally:
 			if search_sid is not None and not finished:
