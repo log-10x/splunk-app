@@ -172,3 +172,49 @@ class TestExpansion:
 		template, raw, event = LF_CASES[case]
 		assert expand(raw, template, extracted(raw).get('tenx_vars')) == event
 		assert expand(raw, template, values_from_raw(raw)) == event
+
+
+def first_value_step(name):
+	"""The second step of the macro: eval tenx_var_0=if(match(_raw, A), replace(_raw, B, C), tenx_var_0)."""
+	step = macro(name).split(' | ')[1]
+	strings = re.findall(r'"((?:[^"\\]|\\.)*)"', step)
+	return step, strings[0], strings[1], strings[2]
+
+
+def first_value_from_raw(raw, name='tenx-inflate'):
+	_, match, pattern, group = first_value_step(name)
+	if re.match(match, raw):
+		return re.sub(pattern, group.replace('\\1', r'\1'), raw, count=1)
+	return extracted(raw).get('tenx_var_0')
+
+
+class TestFirstValueFromRaw:
+	"""On a template without a timestamp the first value is text of the event, not an epoch: trimmed by the
+	extraction, a first value ending in CR lost it, and one of white space only was absent, so the macro took
+	the branch for a template with no value at all."""
+
+	@pytest.mark.parametrize('name', MACROS)
+	def test_the_macro_reads_the_first_value_before_makemv(self, name):
+		step, _, _, _ = first_value_step(name)
+		assert step.startswith('eval tenx_var_0=if(match(_raw, ')
+		assert step.endswith(', tenx_var_0)')
+		assert macro(name).index(step) < macro(name).index('makemv delim="," tenx_vars')
+
+	@pytest.mark.parametrize('raw, value', [
+		('~h,1794744431000,a,b', '1794744431000'),
+		('~h,a\r,b', 'a\r'),
+		('~h, ,b', ' '),
+		('~h,\t', '\t'),
+		('~h,  x  ', '  x  '),
+		('~h,caf\u00e9\r', 'caf\u00e9\r'),
+	])
+	def test_the_first_value_keeps_its_characters(self, raw, value):
+		assert first_value_from_raw(raw) == value
+
+	@pytest.mark.parametrize('raw', ['~h', '~h,', '~h,,b'])
+	def test_no_first_value_keeps_the_extraction(self, raw):
+		assert first_value_from_raw(raw) == extracted(raw).get('tenx_var_0')
+
+	def test_a_timestamp_template_reads_the_same_epoch(self):
+		for template, raw, _ in list(CASES.values()) + list(LF_CASES.values()):
+			assert first_value_from_raw(raw) == extracted(raw)['tenx_var_0']

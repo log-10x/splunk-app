@@ -75,7 +75,8 @@ def without_empty_guard(text):
 
 # The first step of tenx-inflate and tenx-inflate-debug (test_inflate_values_from_raw.py), which reads the values
 # from _raw, and the comment above the macros that says why.
-VALUES_STEP = 'eval tenx_vars=if(match(_raw, "^~?[^,]+,[^,]+,[\\s\\S]"), replace(_raw, "^~?[^,]+,[^,]+,", ""), tenx_vars) | '
+VALUES_STEP = 'eval tenx_vars=if(match(_raw, "^~?[^,]+,[^,]+,[\\s\\S]"), replace(_raw, "^~?[^,]+,[^,]+,", ""), tenx_vars) | ' \
+	'eval tenx_var_0=if(match(_raw, "^~?[^,]+,[^,]"), replace(_raw, "^~?[^,]+,([^,]*)[\\s\\S]*$", "\\1"), tenx_var_0) | '
 
 
 def without_values_from_raw(text):
