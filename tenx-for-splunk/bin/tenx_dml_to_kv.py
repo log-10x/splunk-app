@@ -235,7 +235,7 @@ RUN_BUDGET_SECONDS = 240
 CHUNK_RECORDS = 2000
 # New templates whose searchable copy is written together: one copy search returns at most
 # 50,000 keys (limits.conf [restapi] maxresultrows), so it is run before that many are pending.
-COPY_EVERY = 20000
+COPY_EVERY = 40000
 
 
 def reconcile(dml_builder, existing, record_key, pattern):
@@ -332,6 +332,8 @@ class TemplateStore:
 		self.written = 0
 		# Records written with their searchable copy pending since the last copy (copy_pending).
 		self.pending = {}
+		# Seconds spent reading the store, building records, writing them, and writing copies.
+		self.seconds = dict.fromkeys(('find', 'build', 'save', 'copy'), 0.0)
 
 	def store(self, records):
 		"""
@@ -353,7 +355,10 @@ class TemplateStore:
 		if not valid:
 			return
 
+		began = time.time()
 		current = self.kv_intf.find_many([self.kv_intf.kv_key(k) for k, _ in valid])
+		self.seconds['find'] += time.time() - began
+		began = time.time()
 		writes = {}
 
 		for record_key, pattern in valid:
@@ -367,8 +372,11 @@ class TemplateStore:
 				current[key] = record
 				writes[key] = record
 
+		self.seconds['build'] += time.time() - began
+		began = time.time()
 		if writes and not self.kv_intf.save_many(list(writes.values()), self.limits):
 			raise RuntimeError("the KV store did not take {} template records".format(len(writes)))
+		self.seconds['save'] += time.time() - began
 
 		self.written += len(writes)
 		for key, record in writes.items():
@@ -386,13 +394,17 @@ class TemplateStore:
 		if not self.pending:
 			return
 		known, self.pending = list(self.pending.values()), {}
-		if dml_intf.write_pending(known) < 0:
+		began = time.time()
+		copied = dml_intf.write_pending(known)
+		self.seconds['copy'] += time.time() - began
+		if copied < 0:
 			logger.warning("The searchable copy of new templates was not written; they stay pending for the next run.")
 
 	def summary(self):
-		return "added={}, refreshed={}, replaced={}, conflicts={}, unchanged={}, invalid={}".format(
+		return "added={}, refreshed={}, replaced={}, conflicts={}, unchanged={}, invalid={}; seconds find={:.1f} build={:.1f} save={:.1f} copy={:.1f}".format(
 			self.counts[RECONCILE_CREATED], self.counts[RECONCILE_REFRESHED], self.counts[RECONCILE_REPLACED],
-			self.counts[RECONCILE_CONFLICT], self.counts[RECONCILE_SAME], self.invalid)
+			self.counts[RECONCILE_CONFLICT], self.counts[RECONCILE_SAME], self.invalid,
+			self.seconds['find'], self.seconds['build'], self.seconds['save'], self.seconds['copy'])
 
 	def changed(self):
 		return self.counts[RECONCILE_CREATED] + self.counts[RECONCILE_REFRESHED] + self.counts[RECONCILE_REPLACED]
