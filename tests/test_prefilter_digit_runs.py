@@ -148,3 +148,24 @@ class TestThePrefilter:
 					 "EventCode=4625", "4625 2023", "x=1 4625"):
 			new, old = plan(text), p.prefilter(tree(text), D)
 			assert selects_at_least(new, old), text
+
+
+class TestTheFormatsComeWithTheDictionary:
+	"""One read of the KV store answers both: which templates carry each piece, and every stored timestamp format."""
+
+	def test_the_search_returns_the_formats_of_every_record(self):
+		s = p.dictionary_search({"4625", "error"}, formats=True)
+		assert s.startswith("| inputlookup tenx-dml-lookup ") and s.endswith(", values(tenx_fk) as tenx_formats")
+		assert " | where " not in s  # every record reaches the stats, a record without the pieces too
+		assert "timestamp_format, part_0, pattern_parts, pattern_terminator" in s
+		assert p.FORMAT_KEY_STEPS in s
+		assert " | where " in p.dictionary_search({"error"}) and "tenx_formats" not in p.dictionary_search({"error"})
+
+	def test_reading_the_formats_back(self):
+		rows = [{"n0": "1", "hs0": "TERM(~a)", "tenx_formats": ["00|%H:%M:%S", "10|%Y-%m-%dT%H:%M:%S.%7QZ", "01|a|b"]}]
+		assert p.formats_from_rows(rows) == [("%H:%M:%S", False, False), ("%Y-%m-%dT%H:%M:%S.%7QZ", True, False), ("a|b", False, True)]
+		assert p.formats_from_rows([{"n0": "1", "tenx_formats": "00|%H:%M:%S"}]) == [("%H:%M:%S", False, False)]
+		# no formats in the answer: not known, so no run of digits narrows
+		assert p.formats_from_rows([{"n0": "1"}]) is None
+		assert p.digit_pieces_cleared({"4625"}, p.formats_from_rows([{"n0": "1"}])) == frozenset()
+		assert p.digit_pieces_cleared({"4625"}, p.formats_from_rows(rows)) == {"4625"}

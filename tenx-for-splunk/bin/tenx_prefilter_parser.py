@@ -44,7 +44,8 @@ own search text, and this module
    A run of digits (4625, 54849625) is the one exception the stored templates can settle: a token
    that starts with a digit is always a value of the compact event (FORMAT_SPEC S3.2), so the
    timestamp is the only text that prints digits the compact event does not hold. tenxprefilter
-   reads the timestamp formats of the stored templates (FORMATS_SEARCH), and a run of digits that
+   reads the timestamp formats of the stored templates (FORMAT_KEY_STEPS, in the same read of the
+   KV store as the template dictionary), and a run of digits that
    none of them can print (timestamp_prints()) is used like any other piece; one that some format
    can print (a year, the two digits of a minute, a fraction of the same length) is not. When the
    formats cannot be read, no run of digits is used.
@@ -898,17 +899,15 @@ TS_LETTERS = frozenset(("p", "b", "B", "a", "A", "Z"))
 TS_ZONES = {"z": "+0000", ":z": "+00:00", ":::z": "+00"}
 TS_DIRECTIVE = re.compile(r"%(-?)(:*)([0-9]*)([A-Za-z%])")
 EPOCH_PASSTHROUGH = "__TENX_EPOCH__"
-# Per stored timestamp_format: whether a digit can stand right before (lg) or right after (rg) the
-# rendered timestamp, so that Splunk reads them as one run with it. A digit of the template text, or
-# a value (the placeholder at the start or the end of a part): counted as one. The placeholder is the
-# literal tenx-inflate replaces.
-FORMATS_SEARCH = (
-	'| inputlookup tenx-dml-lookup | fields timestamp_format, part_0, pattern_parts, pattern_terminator'
+# Per stored record: its timestamp_format and whether a digit can stand right before (lg) or right
+# after (rg) the rendered timestamp, so that Splunk reads them as one run with it. A digit of the
+# template text, or a value (the placeholder at the start or the end of a part): counted as one. The
+# placeholder is the literal tenx-inflate replaces. dictionary_search(formats=True) returns the
+# distinct "<lg><rg>|<timestamp_format>" of every record that has a timestamp, in tenx_formats.
+FORMAT_KEY_STEPS = (
 	' | eval tenx_tp=mvfilter(match(mvappend(part_0, pattern_parts, pattern_terminator), "__TENX_TS__"))'
-	' | where isnotnull(tenx_tp)'
-	' | eval lg=if(isnotnull(mvfind(tenx_tp, "(^|[0-9])__TENX_TS__")), 1, 0),'
-	' rg=if(isnotnull(mvfind(tenx_tp, "__TENX_TS__([0-9]|$)")), 1, 0)'
-	' | fillnull value="" timestamp_format | stats count by timestamp_format, lg, rg'
+	' | eval tenx_fk=if(isnull(tenx_tp), null(), if(isnotnull(mvfind(tenx_tp, "(^|[0-9])__TENX_TS__")), "1", "0")'
+	' . if(isnotnull(mvfind(tenx_tp, "__TENX_TS__([0-9]|$)")), "1", "0") . "|" . coalesce(timestamp_format, ""))'
 )
 
 
@@ -957,7 +956,7 @@ def timestamp_prints(piece, fmt, glued_left=True, glued_right=True):
 	Whether a timestamp rendered with the stored timestamp_format `fmt` can print a run between
 	Splunk's breakers equal to `piece`, a run of digits. Every character that is not a letter or a
 	digit is taken as a breaker (more runs than Splunk sees, so more pieces refused, never fewer).
-	`glued_left`/`glued_right`: digits may stand right before or after the timestamp (FORMATS_SEARCH),
+	`glued_left`/`glued_right`: digits may stand right before or after the timestamp (FORMAT_KEY_STEPS),
 	so the first or last run may carry any digits before or after what the format prints. A format
 	that writes the epoch back as it is (EPOCH_PASSTHROUGH) prints the compact event's own value, so
 	it can print a piece the compact event does not hold only when glued to digits.
@@ -1012,8 +1011,21 @@ def timestamp_prints(piece, fmt, glued_left=True, glued_right=True):
 
 
 def formats_from_rows(rows):
-	"""The (timestamp_format, glued_left, glued_right) of each row of FORMATS_SEARCH."""
-	return [(str(r.get("timestamp_format") or ""), str(r.get("lg")) != "0", str(r.get("rg")) != "0") for r in rows]
+	"""
+	The (timestamp_format, glued_left, glued_right) of every stored template with a timestamp, from the
+	tenx_formats of dictionary_search(formats=True). None when the answer carries no tenx_formats.
+	"""
+	found = None
+	for row in rows:
+		keys = row.get("tenx_formats")
+		if keys is None:
+			continue
+		found = found or []
+		for key in ([keys] if isinstance(keys, str) else keys):
+			key = str(key)
+			if len(key) >= 3 and key[2] == "|":
+				found.append((key[3:], key[0] != "0", key[1] != "0"))
+	return found
 
 
 def digit_candidates(node, text_field=None):
@@ -1159,7 +1171,7 @@ def piece_regex(piece):
 	return "(^|%s)%s(%s|$)" % (NOT_WORD, piece.replace("*", "[\\p{L}\\p{N}]*"), NOT_WORD)
 
 
-def dictionary_search(pieces):
+def dictionary_search(pieces, formats=False):
 	"""
 	The search that answers, for each piece, which templates carry it in their text, as the
 	TERM() clause of each template's hash_term.
@@ -1178,24 +1190,33 @@ def dictionary_search(pieces):
 	breakers, and the longest run of at least two characters with a letter or a digit is taken,
 	else the first run. One row comes back, n<i> and hs<i> for the i-th piece of sorted(pieces);
 	no command in it caps the rows it passes on (no mvexpand, head or subsearch).
+
+	formats: also return, in tenx_formats, the timestamp format of every stored template with its
+	glue (FORMAT_KEY_STEPS), for the runs of digits (digit_pieces_cleared()). Every record then reaches
+	the stats; the term is computed only on records that hold some piece.
 	"""
 	plist = sorted(pieces)
 	marks = ", ".join('m%d=if(match(tenx_t, "%s"), 1, null())' % (i, piece_regex(piece)) for i, piece in enumerate(plist))
 	counts = ", ".join('values(eval(if(m%d=1, h, null()))) as hs%d, count(m%d) as n%d' % (i, i, i, i)
 					   for i in range(len(plist)))
+	prune = 'match(tenx_t, "(^|' + NOT_WORD + ')(' + "|".join(p.replace("*", "[\\p{L}\\p{N}]*") for p in plist) + ')(' + NOT_WORD + '|$)")'
+	if formats:
+		head = (' | eval tenx_any=if(' + prune + ', 1, null())' + FORMAT_KEY_STEPS +
+				' | eval dml_hash=if(isnotnull(tenx_any), coalesce(pattern_hash, _key), null())')
+	else:
+		head = ' | where ' + prune + ' | eval dml_hash=coalesce(pattern_hash, _key)'
 	return (
 		'| inputlookup tenx-dml-lookup | fields _key, pattern_hash, pattern_search, pattern'
+		+ (', timestamp_format, part_0, pattern_parts, pattern_terminator' if formats else '') +
 		' | eval tenx_t=lower(coalesce(pattern_search, replace(pattern, "[$]", "")))'
-		' | where match(tenx_t, "(^|' + NOT_WORD + ')(' + "|".join(p.replace("*", "[\\p{L}\\p{N}]*") for p in plist)
-		+ ')(' + NOT_WORD + '|$)")'
+		+ head +
 		' | eval ' + marks +
-		' | eval dml_hash=coalesce(pattern_hash, _key)'
 		' | eval segs=split(replace(replace(replace("~" . dml_hash, "--|%[0-9A-Fa-f]{2}", " "),'
 		' "(?<=\\*)[^ !;<>{}|&?+\\[\\]*,()\'\\"]+(?=\\*)", " "), "[ !;<>{}|&?+\\[\\]*,()\'\\"]", " "), " ")'
 		' | eval cand=mvfilter(len(segs) >= 2 AND match(segs, "[\\p{L}\\p{N}]"))'
 		' | eval best=substr(mvindex(mvsort(mvmap(cand, printf("%03d", len(cand)) . cand)), -1), 4)'
 		' | eval h="TERM(" . coalesce(best, mvindex(segs, 0)) . ")"'
-		' | stats ' + counts
+		' | stats ' + counts + (', values(tenx_fk) as tenx_formats' if formats else '')
 	)
 
 
