@@ -572,13 +572,15 @@ To set it up:
    Windows Security events reach the Receiver as the rendered XML of each event, one event per
    record: the form the Windows add-on's `XmlWinEventLog` sourcetype holds. For events in files,
    Fluent Bit's `tail` input with a multiline parser that starts a record at `<Event` gives that
-   form, the parser in a parsers file named by `Parsers_File` in `[SERVICE]`:
+   form, the parser in a parsers file named by `Parsers_File` in `[SERVICE]`. Set `storage.path` in
+   `[SERVICE]` as well and `storage.type filesystem` on the input, so a record the parser completes
+   while the input is paused waits on disk:
 
    ```
    [MULTILINE_PARSER]
        name          win_xml
        type          regex
-       flush_timeout 2000
+       flush_timeout 30000
        rule          "start_state"  "/^<Event/"       "cont"
        rule          "cont"         "/^(?!<Event)/"   "cont"
 
@@ -590,6 +592,7 @@ To set it up:
        Buffer_Chunk_Size 64k
        Buffer_Max_Size   2M
        multiline.parser  win_xml
+       storage.type      filesystem
    ```
 2. Install the add-on of each original sourcetype on the search head, as for raw data.
 3. Run `| tenxreplay` once, or wait for the **Rebuild Field Replay When New** saved search, which
@@ -612,7 +615,94 @@ on expanded events. `linecount` and `punct` are computed by Splunk from the comp
 so on expanded events they differ from the raw event's.
 
 For FortiGate, the sender sets `tenx_sourcetype` to `fortigate_traffic`, `fortigate_utm`,
-`fortigate_event` or `fortigate_anomaly` by the line's `type=`.
+`fortigate_event` or `fortigate_anomaly` by the line's `type=`. Fluent Bit runs as two processes,
+each with its buffer on disk, as in the [setup guide](https://doc.log10x.com/apps/receiver/compact/splunk/).
+In the one that reads the file, a `rewrite_tag` filter gives each type its own tag before the
+hand-off to the Receiver. In the one that takes the records back, a `modify` filter per type adds
+the field. Give `rewrite_tag` `Emitter_Storage.type filesystem` and `Emitter_Mem_Buf_Limit 0`. With
+the emitter in memory, or with any emitter limit, while a file is read faster than records are
+sent, the filter leaves records under their original tag with no error, and they arrive without
+`tenx_sourcetype`.
+
+```
+[SERVICE]
+    HTTP_Server       On
+    HTTP_Port         2020
+    storage.path      <folder for Fluent Bit's buffer>
+
+[INPUT]
+    Name              tail
+    Path              <FortiGate log file>
+    DB                <FortiGate log file>.db
+    Tag               src.fgt
+    Read_from_Head    true
+    storage.type      filesystem
+
+[FILTER]
+    Name                   rewrite_tag
+    Match                  src.fgt
+    Rule                   $log \btype="?(traffic|utm|event|anomaly)\b src.fgt.$1 false
+    Emitter_Name           re_fgt
+    Emitter_Storage.type   filesystem
+    Emitter_Mem_Buf_Limit  0
+
+[OUTPUT]
+    Name              forward
+    Match             src.*
+    Host              127.0.0.1
+    Port              24224
+    Retry_Limit       False
+```
+
+```
+[SERVICE]
+    HTTP_Server       On
+    HTTP_Port         2021
+    storage.path      <another folder for Fluent Bit's buffer>
+
+[INPUT]
+    Name              forward
+    Listen            0.0.0.0
+    Port              24225
+    Tag_Prefix        tenx.
+    storage.type      filesystem
+
+[FILTER]
+    Name    modify
+    Match   tenx.src.fgt.traffic
+    Add     tenx_sourcetype fortigate_traffic
+
+[FILTER]
+    Name    modify
+    Match   tenx.src.fgt.utm
+    Add     tenx_sourcetype fortigate_utm
+
+[FILTER]
+    Name    modify
+    Match   tenx.src.fgt.event
+    Add     tenx_sourcetype fortigate_event
+
+[FILTER]
+    Name    modify
+    Match   tenx.src.fgt.anomaly
+    Add     tenx_sourcetype fortigate_anomaly
+
+[OUTPUT]
+    Name              splunk
+    Match             tenx.src.fgt*
+    Host              <HEC host>
+    Port              8088
+    Splunk_Token      ${HEC_TOKEN}
+    TLS               On
+    event_index       <compact index>
+    event_sourcetype  tenx_encoded
+    event_key         $log
+    event_field       tenx_sourcetype $tenx_sourcetype
+    Retry_Limit       False
+```
+
+The template records go out as in the [setup guide](https://doc.log10x.com/apps/receiver/compact/splunk/),
+with `Match tenx.tenx-template`.
 
 A compact event's `_time` is the first timestamp the Receiver found in the line. In a CloudTrail
 record that can be `userIdentity.sessionContext.attributes.creationDate`, which comes before
@@ -624,7 +714,7 @@ time and supplies the date, so a compact FortiGate event's `_time` can fall on a
 
 ## Data Models and Detections: the Field Map
 
-Needs the Receiver at release 1.1.180 or later.
+Needs the Receiver at release 1.1.181 or later.
 
 Data models, their accelerations, `tstats` and saved searches that do not use `tx` read the
 fields Splunk stored with an event. The field map writes a compact event's original fields while
@@ -669,7 +759,7 @@ has its own cap file and its own scheduled `check`.
    with these arguments:
 
    ```
-   @run/input/forwarder/fluentbit @apps/receiver varMaxRecurIndexes 0 timestampZone UTC timestampMaxPerObject 1 compactReceiverLookupFile /etc/tenx/win/compact-cap.csv
+   @run/input/forwarder/fluentbit @apps/receiver varMaxRecurIndexes 0 timestampZone UTC timestampMaxPerObject 1 groupJoinLines false compactReceiverLookupFile /etc/tenx/win/compact-cap.csv
    ```
 
    Leave `receiverOptimize true` out of them: with it the Receiver compacts every template, listed or
@@ -680,7 +770,7 @@ has its own cap file and its own scheduled `check`.
    These lines copy the shipped file out of the image:
 
    ```sh
-   docker create --name tenx-config log10x/edge-10x:1.1.180
+   docker create --name tenx-config log10x/edge-10x:1.1.181
    docker cp tenx-config:/etc/tenx/config/pipelines/run/receive/compact/config.yaml compact-config.yaml
    docker rm tenx-config
    ```
@@ -693,9 +783,9 @@ has its own cap file and its own scheduled `check`.
      -v <parsers file>:/fluent-bit/etc/win-parsers.conf:ro -v <log folder>:/logs fluent/fluent-bit:5.1.5
    docker run -d --name tenx-receiver --network container:tenx-fluentbit \
      -v <edited compact config.yaml>:/etc/tenx/config/pipelines/run/receive/compact/config.yaml:ro \
-     -v <host folder of the cap file>:/etc/tenx/win log10x/edge-10x:1.1.180 \
+     -v <host folder of the cap file>:/etc/tenx/win log10x/edge-10x:1.1.181 \
      @run/input/forwarder/fluentbit @apps/receiver varMaxRecurIndexes 0 timestampZone UTC \
-     timestampMaxPerObject 1 compactReceiverLookupFile /etc/tenx/win/compact-cap.csv
+     timestampMaxPerObject 1 groupJoinLines false compactReceiverLookupFile /etc/tenx/win/compact-cap.csv
    ```
 
    `<network>` is a Docker network from which the HTTP Event Collector is reachable. The env file
@@ -706,9 +796,11 @@ has its own cap file and its own scheduled `check`.
 
    The Fluent Bit configuration of the mapped source holds:
 
-   - `Parsers_File /fluent-bit/etc/win-parsers.conf` in `[SERVICE]`, and in that file the `win_xml`
-     parser of [Fields of the Original Sourcetype](#fields-of-the-original-sourcetype-txf), step 1;
-   - the source's `tail` input with `multiline.parser win_xml`, as in that step;
+   - `Parsers_File /fluent-bit/etc/win-parsers.conf` and `storage.path /logs/flb-storage` in
+     `[SERVICE]`, and in that file the `win_xml` parser of
+     [Fields of the Original Sourcetype](#fields-of-the-original-sourcetype-txf), step 1;
+   - the source's `tail` input with `multiline.parser win_xml` and `storage.type filesystem`, as in
+     that step;
    - the hand-off to the Receiver and the input its events come back on:
 
      ```
@@ -935,7 +1027,7 @@ of the Log10x documentation describes, so that they send:
    - Format: `~<hash>,<var0>,<var1>,...`
 
 3. **Receiver settings** this app relies on: the arguments `receiverOptimize true`,
-   `varMaxRecurIndexes 0`, `timestampZone UTC` and `timestampMaxPerObject 1`. The [repository README](https://github.com/log-10x/splunk-app/blob/main/README.md#receiver-side-configuration)
+   `varMaxRecurIndexes 0`, `timestampZone UTC`, `timestampMaxPerObject 1` and `groupJoinLines false`. The [repository README](https://github.com/log-10x/splunk-app/blob/main/README.md#receiver-side-configuration)
    explains each one.
 
 ### Step 2: Verify Template Ingestion

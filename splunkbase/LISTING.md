@@ -104,7 +104,7 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 >    compact events.
 > 4. Deploy the 10x Receiver (https://doc.log10x.com/apps/receiver/deploy/) and point it at
 >    both tokens, started with the arguments `receiverOptimize true`, `varMaxRecurIndexes 0`,
->    `timestampZone UTC` and `timestampMaxPerObject 1`.
+>    `timestampZone UTC`, `timestampMaxPerObject 1` and `groupJoinLines false`.
 > 5. Set the `tenx-events` macro to your compact index: Settings > Advanced search > Search
 >    macros, for example `index=my_compact_index sourcetype::tenx_encoded` (the indexed form `sourcetype::`, as every `tx` search starts with this macro).
 > 6. If templates were indexed before the app was installed, run this search once:
