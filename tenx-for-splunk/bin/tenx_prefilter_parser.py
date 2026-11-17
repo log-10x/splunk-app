@@ -903,9 +903,11 @@ EPOCH_PASSTHROUGH = "__TENX_EPOCH__"
 # after (rg) the rendered timestamp, so that Splunk reads them as one run with it. A digit of the
 # template text, or a value (the placeholder at the start or the end of a part): counted as one. The
 # placeholder is the literal tenx-inflate replaces. dictionary_search(formats=True) returns the
-# distinct "<lg><rg>|<timestamp_format>" of every record that has a timestamp, in tenx_formats.
+# distinct "<lg><rg>|<timestamp_format>" of every record that has a timestamp, in tenx_formats. mvfilter() takes
+# one field (Splunk 10.4.3 refuses mvfilter(match(mvappend(...), ...)) as invalid arguments), hence two evals.
 FORMAT_KEY_STEPS = (
-	' | eval tenx_tp=mvfilter(match(mvappend(part_0, pattern_parts, pattern_terminator), "__TENX_TS__"))'
+	' | eval tenx_tp=mvappend(part_0, pattern_parts, pattern_terminator)'
+	' | eval tenx_tp=mvfilter(match(tenx_tp, "__TENX_TS__"))'
 	' | eval tenx_fk=if(isnull(tenx_tp), null(), if(isnotnull(mvfind(tenx_tp, "(^|[0-9])__TENX_TS__")), "1", "0")'
 	' . if(isnotnull(mvfind(tenx_tp, "__TENX_TS__([0-9]|$)")), "1", "0") . "|" . coalesce(timestamp_format, ""))'
 )

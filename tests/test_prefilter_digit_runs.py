@@ -159,6 +159,11 @@ class TestTheFormatsComeWithTheDictionary:
 		assert " | where " not in s  # every record reaches the stats, a record without the pieces too
 		assert "timestamp_format, part_0, pattern_parts, pattern_terminator" in s
 		assert p.FORMAT_KEY_STEPS in s
+		# mvfilter() takes a single field: Splunk 10.4.3 rejects an expression of several (FATAL, invalid arguments)
+		import re
+		for arg in re.findall(r"mvfilter\((.*?)\)\)", s):
+			assert len(set(re.findall(r"\b(?!match\b|len\b)[a-z_]+\b(?=[,)])", arg + ")"))) <= 1, arg
+		assert 'mvfilter(match(tenx_tp, "__TENX_TS__"))' in s
 		assert " | where " in p.dictionary_search({"error"}) and "tenx_formats" not in p.dictionary_search({"error"})
 
 	def test_reading_the_formats_back(self):
