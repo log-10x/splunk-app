@@ -8,8 +8,10 @@ the template's timestamp slot, and eventTime cut into plain values because the e
 (creationDate) took the slot. In both, the text the rule reads the time from must equal the raw event's
 text after TIME_PREFIX, cut to MAX_TIMESTAMP_LOOKAHEAD, which is what Splunk reads it from.
 """
+import configparser
 import io
 import json
+import os
 
 import pytest
 
@@ -164,13 +166,26 @@ class TestTimeRuleText:
 		assert ', $pd:tenx_fm_w$), 1, 28))' in text
 		assert ('$pd:tenx_fm_tt$=if(isnull($pd:tenx_fm_wt$), null(), coalesce(strptime($pd:tenx_fm_wt$, '
 			'"%Y-%m-%dT%H:%M:%S%Z"), strptime($pd:tenx_fm_wt$, "%Y-%m-%dT%H:%M:%S.%6N%Z")))') in text
-		assert text.endswith('_time=if(isnotnull($pd:tenx_fm_tt$) AND $pd:tenx_fm_tt$ >= time() - 172800000 AND '
-			'$pd:tenx_fm_tt$ <= time() + 172800, $pd:tenx_fm_tt$, _time)')
+		assert text.endswith('_time=if(tenx_time=="sender", _time, if(isnotnull($pd:tenx_fm_tt$) AND '
+			'$pd:tenx_fm_tt$ >= time() - 172800000 AND $pd:tenx_fm_tt$ <= time() + 172800, $pd:tenx_fm_tt$, _time))')
 		# Splunk 10.4.3 rejects now() in INGEST_EVAL and skips the whole transform
 		assert 'now()' not in text
 		# the lines the rule had before are all still there, in the same order
 		before = fm.lookup_eval_text('t').replace('json_array("n", "t", "f"))', 'json_array("n", "t", "f", "w"))')
 		assert text.startswith(before + ', ')
+
+	def test_an_event_its_sender_marks_keeps_the_senders_time(self):
+		# A heavy forwarder that reads the compact events back from files (the app's tenx-record-unwrap) marks each
+		# tenx_time=sender with the _time it parsed for the raw event; the rule keeps it, as tenx-event-time does.
+		# The comparison is the outer test: on an event without the field it is null, and if() then takes its
+		# third argument, the rule as before.
+		text = fm.lookup_eval_text('t', aws_rule())
+		last = text.split(', _time=', 1)[1]
+		assert last.startswith('if(tenx_time=="sender", _time, if(isnotnull($pd:tenx_fm_tt$)')
+		assert text.count('tenx_time') == 1
+		app = configparser.RawConfigParser(strict=False, interpolation=None)
+		app.read(os.path.join(os.path.dirname(__file__), '..', 'tenx-for-splunk', 'default', 'transforms.conf'))
+		assert app.get('tenx-event-time', 'INGEST_EVAL').startswith('_time=if(tenx_time=="sender", _time, ')
 
 	def test_one_format_is_read_by_strptime_alone(self):
 		# Splunk Enterprise 10.4.3 refuses to compile coalesce() of one argument in an INGEST_EVAL
@@ -219,7 +234,7 @@ class TestGenAndVerify:
 		out = tmp_path / 'fm'
 		assert fm.main(['gen'] + self.files(tmp_path) + ['--out', str(out)]) == 0
 		transforms = (out / 'default' / 'transforms.conf').read_text()
-		assert '_time=if(isnotnull($pd:tenx_fm_tt$)' in transforms
+		assert '_time=if(tenx_time=="sender", _time, if(isnotnull($pd:tenx_fm_tt$)' in transforms
 		assert '\nTRANSFORMS-tenx_ct = tenx-event-time, tenx_ct_sourcetype, tenx_ct_fields_eval\n' in \
 			(out / 'default' / 'props.conf').read_text()
 		rows = fm.read_lookup_file(str(out / 'lookups' / 'tenx_ct_fields.csv.gz'))

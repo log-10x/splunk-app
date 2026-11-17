@@ -29,7 +29,8 @@ while the event is indexed:
   this: a renamed event runs only the target's search-time rules (Splunk Enterprise 10.4.3: a
   REPORT-tenx in the compact stanza gave tenx_hash on 0 of 662 renamed events; this one gives it
   on 662 of 662, and on 0 of 662 uncompacted events of the target sourcetype, whose text never
-  starts with "~").
+  starts with "~"). With several targets, the compact sourcetype's stanza holds it as well, for an
+  event that keeps the compact sourcetype because its tenx_sourcetype names none of them.
 * every FORMAT also writes tenx_mapped::"1" (--mark), so an event whose template had a transform
   is told apart from one indexed before its transform existed: `sourcetype::<compact>
   NOT tenx_mapped::1` counts the latter. `tx` hides an event with tenx_mapped from its `extract`
@@ -1373,7 +1374,9 @@ Transform = collections.namedtuple('Transform',
 # it wins) and sets _time when the result lies within MAX_DAYS_AGO and MAX_DAYS_HENCE of the time the
 # event is indexed. Every other event keeps the _time it had. The rule runs after tenx-event-time: gen
 # puts the copied TRANSFORMS- of [tenx_encoded] first in its own list, which Splunk applies in list
-# order (props.conf.spec, TRANSFORMS-<class>).
+# order (props.conf.spec, TRANSFORMS-<class>). An event with the indexed field tenx_time=sender keeps the
+# time its sender gave it, as tenx-event-time keeps it: a heavy forwarder that reads the compact events
+# back from files (the app's [tenx-record-unwrap]) gives each the _time it parsed for the raw event.
 #
 # Measured on Splunk Enterprise 10.4.3 with the AWS add-on 8.3.1 (aws:cloudtrail: TIME_PREFIX
 # \"eventTime\"\s*\:\s*\", TIME_FORMAT %Y-%m-%dT%H:%M:%S%Z, MAX_TIMESTAMP_LOOKAHEAD 28), on 25,566 raw
@@ -1746,7 +1749,9 @@ def lookup_eval_text(lookup_def, time_rule=None, trim=False):
 			# One format is strptime() alone: Splunk Enterprise 10.4.3 refuses to compile an INGEST_EVAL that calls
 			# coalesce() with one argument ("Invalid function argument") and then writes none of the transform's fields.
 			'%s=if(isnull(%s), null(), %s)' % (tt, wt, time_parse_text(wt, time_rule.formats)),
-			'_time=if(isnotnull(%s) AND %s >= time() - %d AND %s <= time() + %d, %s, _time)' % (
+			# tenx_time=="sender" is null, not false, on an event without the field, so it is tested first, as in the
+			# app's tenx-event-time.
+			'_time=if(tenx_time=="sender", _time, if(isnotnull(%s) AND %s >= time() - %d AND %s <= time() + %d, %s, _time))' % (
 				tt, tt, time_rule.max_days_ago * 86400, tt, time_rule.max_days_hence * 86400, tt),
 		]
 	return ', '.join(exprs)
@@ -3556,6 +3561,12 @@ def props_text(target, field_map, settings, search_hash=True, sourcetype_field=S
 	lines.append('TRANSFORMS-%s = %s' % (target['transforms_class'], ', '.join(names)))
 	if not several(target):
 		lines.append('rename = %s' % target['rename'])
+	elif search_hash:
+		# An event whose rename field names none of the targets keeps this sourcetype (FortiGate: a line the add-on
+		# does not type stays fgt_log) and runs this stanza's search-time rules.
+		lines += ['# Search-time, for `tx`: the hash and values of an event that keeps this sourcetype because its',
+			'# %s names none of the sourcetypes below.' % target['rename_field'],
+			'REPORT-%s = %s' % (hash_stanza(target), hash_stanza(target))]
 	restored = restored_names(field_map)
 	by_stanza = text_rule_props(text_rules)
 	note = ('# Search-time: the add-on\'s rules that read the event\'s text, as copies that read the field the map\n'
