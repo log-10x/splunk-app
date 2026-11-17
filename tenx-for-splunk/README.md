@@ -790,7 +790,7 @@ FortiGate field map (below) gives every compact FortiGate event the raw event's 
 
 A timestamp without a year takes its year from the time the event is processed, so a replayed or
 backfilled file from an earlier year gets the wrong year. Splunk guesses the year for such lines
-too, and the two guesses can differ. A timestamp later than 12:00 UTC on 2029-12-31 that is written to the second or the millisecond, such as a certificate's expiry date used as an event's timestamp, does not decode to its original text: it comes back as a date in 1970.
+too, and the two guesses can differ.
 
 ## Data Models and Detections: the Field Map
 
