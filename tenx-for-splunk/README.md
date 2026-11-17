@@ -1014,6 +1014,7 @@ a line the add-on's rules do not route keeps `pan:log`:
     Match                  pan
     Rule                   $log ^[^,]+,[^,]+,[^,]+,(TRAFFIC|THREAT|SYSTEM|CONFIG|HIPMATCH|CORRELATION|USERID|GLOBALPROTECT|DECRYPTION), pan.$1 false
     Emitter_Name           pan_type
+    Emitter_Storage.type   filesystem
 [FILTER]
     Name    modify
     Match   tenx.pan.TRAFFIC
@@ -1021,7 +1022,10 @@ a line the add-on's rules do not route keeps `pan:log`:
 ```
 
 with one `modify` per type (`tenx.pan.THREAT` adds `pan:threat`, and so on) and one for `tenx.pan`
-that adds `pan:log`, and sends the compact events with `event_sourcetype tenx_pan`. Step 4:
+that adds `pan:log`, and sends the compact events with `event_sourcetype tenx_pan`. The emitter
+buffers on disk (`storage.path` set under `[SERVICE]`): with memory only, while the HTTP Event
+Collector was slow to accept, it passed 122,726 of 1,902,151 lines on untouched, stored as `pan:log`.
+Step 4:
 
 ```sh
 python3 tenx-for-splunk/bin/tenx_field_map.py gen \
