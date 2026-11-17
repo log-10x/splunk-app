@@ -615,14 +615,19 @@ on expanded events. `linecount` and `punct` are computed by Splunk from the comp
 so on expanded events they differ from the raw event's.
 
 For FortiGate, the sender sets `tenx_sourcetype` to `fortigate_traffic`, `fortigate_utm`,
-`fortigate_event` or `fortigate_anomaly` by the line's `type=`. With Fluent Bit, a `rewrite_tag`
-filter gives each type its own tag before the hand-off to the Receiver, and a `modify` filter per
-type adds the field to the records that come back. Set `Emitter_Mem_Buf_Limit` on `rewrite_tag`.
-At its default of 10M, while a file is read faster than records are sent, the filter leaves
-records under their original tag with no error, and they arrive without `tenx_sourcetype`.
+`fortigate_event` or `fortigate_anomaly` by the line's `type=`. Fluent Bit runs as two processes,
+each with its buffer on disk, as in the [setup guide](https://doc.log10x.com/apps/receiver/compact/splunk/).
+In the one that reads the file, a `rewrite_tag` filter gives each type its own tag before the
+hand-off to the Receiver. In the one that takes the records back, a `modify` filter per type adds
+the field. Give `rewrite_tag` `Emitter_Storage.type filesystem` and `Emitter_Mem_Buf_Limit 0`. With
+the emitter in memory, or with any emitter limit, while a file is read faster than records are
+sent, the filter leaves records under their original tag with no error, and they arrive without
+`tenx_sourcetype`.
 
 ```
 [SERVICE]
+    HTTP_Server       On
+    HTTP_Port         2020
     storage.path      <folder for Fluent Bit's buffer>
 
 [INPUT]
@@ -638,7 +643,8 @@ records under their original tag with no error, and they arrive without `tenx_so
     Match                  src.fgt
     Rule                   $log \btype="?(traffic|utm|event|anomaly)\b src.fgt.$1 false
     Emitter_Name           re_fgt
-    Emitter_Mem_Buf_Limit  512M
+    Emitter_Storage.type   filesystem
+    Emitter_Mem_Buf_Limit  0
 
 [OUTPUT]
     Name              forward
@@ -646,12 +652,20 @@ records under their original tag with no error, and they arrive without `tenx_so
     Host              127.0.0.1
     Port              24224
     Retry_Limit       False
+```
+
+```
+[SERVICE]
+    HTTP_Server       On
+    HTTP_Port         2021
+    storage.path      <another folder for Fluent Bit's buffer>
 
 [INPUT]
     Name              forward
     Listen            0.0.0.0
     Port              24225
     Tag_Prefix        tenx.
+    storage.type      filesystem
 
 [FILTER]
     Name    modify
@@ -684,6 +698,7 @@ records under their original tag with no error, and they arrive without `tenx_so
     event_sourcetype  tenx_encoded
     event_key         $log
     event_field       tenx_sourcetype $tenx_sourcetype
+    Retry_Limit       False
 ```
 
 The template records go out as in the [setup guide](https://doc.log10x.com/apps/receiver/compact/splunk/),
