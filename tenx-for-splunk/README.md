@@ -1327,15 +1327,64 @@ Where Universal Forwarders send to a heavy forwarder, the Receiver can run on th
 host, and the Universal Forwarders stay as they are. The heavy forwarder parses the events with its
 add-ons and writes the chosen sourcetypes to its ingest actions file destination, one JSON line per
 event with its time, host, source, sourcetype and index. Fluent Bit reads those files, hands each
-event to the Receiver and sends what comes back to the indexers' HTTP Event Collector, so the heavy
-forwarder's index-time rules apply before compaction. The steps are in the Log10x documentation:
+event to the Receiver, and writes what comes back to a folder of its own, again one JSON line per
+event. The heavy forwarder reads that folder and sends the compact events to the indexers with its
+own outputs, so the heavy forwarder's index-time rules apply before compaction, and no HTTP Event
+Collector or token is needed. The steps are in the Log10x documentation:
 [Receiver beside a heavy forwarder](https://doc.log10x.com/run/input/forwarder/splunkUF/#receiver-beside-a-heavy-forwarder).
-In that arrangement, a customer's `WRITE_META` fields must be named on the Fluent Bit output; route
-by sourcetype when an index override runs first.
 
-An event sent with the indexed field `tenx_time=sender` keeps the time its sender gave it, even when its
-template has a timestamp slot. On the return leg, add a `modify` filter with `Add tenx_time sender` on
-the Receiver's output tag, and `event_field tenx_time $tenx_time` on the `splunk` output.
+The `_indexers` package holds the rule that reads those lines, `[tenx-record-unwrap]` in
+`transforms.conf`. It gives each event back the host, source, index and time its line holds, sets
+`tenx_sourcetype` to the original sourcetype, and makes the compact text the event. `props.conf` runs
+it on the files under `/opt/tenx/compact/events/`. For another folder, add a stanza for it to
+`local/props.conf` of the app on the heavy forwarder:
+
+```
+[source::<folder>/events/...]
+TRANSFORMS-00_tenx_unwrap = tenx-record-unwrap
+```
+
+Every compact event keeps the `_time` the heavy forwarder gave the raw event, with a field map or
+without one: the rule marks it with the indexed field `tenx_time=sender`, and the app and a field
+map keep the time of an event so marked, even when its template has a timestamp slot. An HTTP Event
+Collector sender can set the same field. A line the rule cannot read is indexed as it is, marked
+`tenx_unwrap=failed`. The route to the file destination takes only events without
+`tenx_sourcetype`, so an event read back from the folder is never routed again; route by sourcetype
+when a rule of the heavy forwarder's own sets the index first.
+
+In this arrangement the heavy forwarder parses the compact events: it takes the `_indexers` package,
+the add-ons, and the field map apps with their floor apps, and the indexers take only the indexes
+(`tenx_dml`, `tenx_probe` and the compact indexes). Run `activate` and `check` with `--splunkd`
+naming the heavy forwarder and without `--probe-hec`: the probes are then parsed on the heavy
+forwarder, and `activate` checks the floor app there. Create `tenx_probe` on the heavy forwarder as
+well, and add the indexers as its search peers (`splunk add search-server`), since the tool searches
+the probe index and `_internal` through it:
+
+```sh
+TENX_SPLUNKD_TOKEN=<token> python3 tenx-for-splunk/bin/tenx_field_map.py activate \
+  --app fm_win --cap-file /opt/tenx/receiver/win/compact-cap.csv \
+  --splunkd https://<heavy forwarder>:8089 --probe-index tenx_probe
+
+TENX_SPLUNKD_TOKEN=<token> python3 tenx-for-splunk/bin/tenx_field_map.py check \
+  --app fm_win --cap-file /opt/tenx/receiver/win/compact-cap.csv \
+  --splunkd https://<heavy forwarder>:8089 --probe-index tenx_probe --timeout 20 --poll 5
+```
+
+`<token>` is a token of a user on the heavy forwarder whose role is as in step 6 of the field map;
+without `--probe-hec`, that role also holds `edit_tcp`.
+
+These limits apply to this arrangement:
+
+- With indexer acknowledgement on the heavy forwarder's output (`useACK = true`), an indexer restart
+  loses no compact event; a block whose acknowledgement is lost in the restart is sent again, and its
+  events are indexed twice.
+- A file of the folder deleted before the heavy forwarder has read it loses its events. The clean-up
+  job in the documentation deletes only the files the heavy forwarder reports as finished reading.
+- After the Receiver is stopped and started, Fluent Bit sends the records that waited on its retry
+  schedule, whose wait between tries grows, so their compact events can arrive minutes after the
+  Receiver is back.
+- A field map's index-time rules run on the heavy forwarder and use its CPU instead of the indexers'.
+- Fields a rule of the heavy forwarder's own writes with `WRITE_META` are not on the compact events.
 
 ## Getting Started
 
