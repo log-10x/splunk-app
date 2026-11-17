@@ -2464,6 +2464,30 @@ def blank_overrides(props, transforms, stanza, columns, reserved_prefix=None):
 	restored = set(c for c in taint if reserved_prefix and reserved_name(c) and not c.startswith(RESERVED_PREFIXES)
 		and c.lower() not in ('host', 'source', 'sourcetype', 'index', 'splunk_server', 'eventtype', 'tag'))
 
+	def guard_expr(value):
+		# mvfilter() takes an expression of one field, so tenx_blank inside it is not a valid expression and Splunk
+		# drops the calculated field, the add-on's own included, since the map's takes its name (measured: Invalid eval
+		# expression, The arguments to the 'mvfilter' function are invalid). Such a call is guarded whole instead:
+		# mvfilter() of a field that is not there is null, so the result is the same.
+		parts, pos, held = [], 0, []
+		for start, inner, end in call_spans(value, 'mvfilter'):
+			if start < pos:
+				continue
+			call = value[start:end]
+			names = sorted(expr_fields(value[inner:end - 1]) & set(taint))
+			if names and names[0] in restored:
+				call = 'if(isnotnull(%s), %s, %s)' % (BLANK_FIELD, rewrite_expr_fields(call,
+					lambda n: "'%s%s'" % (reserved_prefix, n) if n == names[0] else None), call)
+			elif names:
+				call = 'if(%s, null(), %s)' % (' OR '.join(cond(n) for n in names), call)
+			parts += [value[pos:start], '"\x00%d\x00"' % len(held)]
+			held.append(call)
+			pos = end
+		text = rewrite_expr_fields(''.join(parts) + value[pos:], lambda n: guarded(n) if n in taint else None)
+		for i, call in enumerate(held):
+			text = text.replace('"\x00%d\x00"' % i, call)
+		return text
+
 	out, own = [], set()
 	for key, value in settings.items():
 		if not key.startswith('EVAL-'):
@@ -2471,10 +2495,26 @@ def blank_overrides(props, transforms, stanza, columns, reserved_prefix=None):
 		own.add(key[len('EVAL-'):])
 		if not (expr_fields(value) & set(taint)):
 			continue
-		out.append((key, rewrite_expr_fields(value, lambda n: guarded(n) if n in taint else None)))
+		out.append((key, guard_expr(value)))
 	for name in taint:
 		if name not in own:
 			out.append(('EVAL-%s' % name, guarded(name)))
+	return out
+
+
+def call_spans(expr, function):
+	"""(start, start of the arguments, end) of each call to an eval function in an expression, outside string literals
+	and quoted names, in order; a call inside another comes after it."""
+	masked = re.sub(r'"(?:[^"\\]|\\.)*"|\'[^\']*\'', lambda m: m.group(0)[0] + 'x' * (len(m.group(0)) - 2) + m.group(0)[0],
+		expr)
+	out = []
+	for m in re.finditer(r'(?<![A-Za-z0-9_.:{}])%s\s*\(' % re.escape(function), masked, re.I):
+		depth = 0
+		for j in range(m.end() - 1, len(masked)):
+			depth += {'(': 1, ')': -1}.get(masked[j], 0)
+			if depth == 0:
+				out.append((m.start(), m.end(), j + 1))
+				break
 	return out
 
 

@@ -171,6 +171,23 @@ class TestBlankColumns:
 		assert out['EVAL-misc_host'] == 'if(match(tenx_blank, "(^| )(misc)( |$)"), null(), \'misc_host\')'
 		assert out['EVAL-src'] == 'if(match(tenx_blank, "(^| )(src)( |$)"), null(), \'src\')'
 
+	def test_an_mvfilter_call_is_guarded_whole(self, tmp_path):
+		# mvfilter() takes an expression of one field: the add-on for Palo Alto Networks normalizes pan:threat's severity
+		# with it, and a guard inside the call made the expression invalid, so Splunk dropped the calculated field.
+		a = addon(tmp_path)
+		with open(os.path.join(a, 'default', 'props.conf'), 'a', encoding='utf-8') as f:
+			f.write('\n[%s]\nEVAL-src = mvindex(mvfilter(match(src, "^(a|b)$")), 0)\n'
+				'EVAL-pair = coalesce(mvfilter(dst != "x"), \'when\', "(none)")\n' % TRAFFIC)
+		props, transforms = fm.read_addon(a)
+		out = dict(fm.blank_overrides(props, transforms, TRAFFIC, ['head', 'when', 'src', 'dst']))
+		assert out['EVAL-src'] == ('mvindex(if(match(tenx_blank, "(^| )(src)( |$)"), null(), mvfilter(match(src, '
+			'"^(a|b)$"))), 0)')
+		assert out['EVAL-pair'] == ('coalesce(if(match(tenx_blank, "(^| )(dst)( |$)"), null(), mvfilter(dst != "x")), '
+			'if(match(tenx_blank, "(^| )(when)( |$)"), null(), \'when\'), "(none)")')
+		for v in (out['EVAL-src'], out['EVAL-pair']):
+			for start, inner, end in fm.call_spans(v, 'mvfilter'):
+				assert fm.expr_fields(v[inner:end - 1]) - {'tenx_blank'} and 'tenx_blank' not in v[inner:end - 1]
+
 	def test_tenx_blank_on_every_compact_event_and_a_reserved_column(self, tmp_path):
 		a = addon(tmp_path)
 		props, transforms = fm.read_addon(a)
