@@ -47,6 +47,22 @@ class TestFortigateTarget:
 		out = capsys.readouterr().out
 		assert 'sender: set tenx_sourcetype on every event of tenx_fgt to its original sourcetype' in out
 
+	def test_an_event_that_keeps_the_compact_sourcetype_gets_its_hash_for_tx(self, tmp_path):
+		# A FortiGate line the add-on does not type keeps tenx_sourcetype fgt_log, which names none of the four
+		# targets, so the last rule leaves it under tenx_fgt; without the hash extraction there, `tx` returned it
+		# compact, marked no-template (161 of a 239-line file, Splunk Enterprise 10.4.3).
+		assert gen(tmp_path, '--target', 'fortigate') == 0
+		props = read(tmp_path / 'fm_fgt' / 'default' / 'props.conf')
+		compact = props.split('[tenx_fgt]\n')[1].split('\n[')[0]
+		assert 'REPORT-tenx_fgt_hash_vars = tenx_fgt_hash_vars\n' in compact
+		assert '[tenx_fgt_hash_vars]\n' in read(tmp_path / 'fm_fgt' / 'default' / 'transforms.conf')
+
+	def test_one_target_keeps_the_hash_out_of_the_compact_stanza(self, tmp_path):
+		# With rename =, every event is stored under the target, and the compact stanza's search-time rules never run.
+		assert gen(tmp_path, '--reader', 'delims', '--sourcetype', 'tenx_fgt', '--rename', 'fortigate_traffic') == 0
+		props = read(tmp_path / 'fm_fgt' / 'default' / 'props.conf')
+		assert 'REPORT-' not in props.split('[tenx_fgt]\n')[1].split('\n[')[0]
+
 	def test_the_target_carries_the_time_rule_and_restores_eventtype(self, tmp_path):
 		assert gen(tmp_path, '--target', 'fortigate') == 0
 		report = json.loads(read(tmp_path / 'fm_fgt_report.json'))
