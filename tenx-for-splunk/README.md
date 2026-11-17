@@ -671,7 +671,9 @@ Needs the Receiver at release 1.1.180 or later.
 
 Data models, their accelerations, `tstats` and saved searches that do not use `tx` read the
 fields Splunk stored with an event. The field map writes a compact event's original fields while
-it is indexed, so these searches read them.
+it is indexed, so these searches read them. With a field map, the index is larger than raw on disk, by
+about 10% to 70% depending on the source, while license goes down; without one, the index is smaller
+than raw.
 `tenx_field_map.py`, in the app's `bin` folder, generates a Splunk app for one compact sourcetype.
 For each template it holds one row of a lookup file; one static index-time rule reads the row and
 writes the original event's fields as indexed fields, then renames the event to its original
@@ -804,9 +806,13 @@ has its own cap file and its own scheduled `check`.
    ```sh
    python3 tenx-for-splunk/bin/tenx_field_map.py gen \
      --records kv_0.json --records kv_1.json --target windows-security --rules lookup \
-     --addon Splunk_TA_windows --app-name fm_win --cap-file /etc/tenx/win/compact-cap.csv \
-     --out fm_win
+     --addon Splunk_TA_windows --leave-out SystemTime,EventRecordID --app-name fm_win \
+     --cap-file /etc/tenx/win/compact-cap.csv --out fm_win
    ```
+
+   `--leave-out SystemTime,EventRecordID` leaves out the two fields that take most of the map's
+   index space; a plain search of a mapped event then lacks them, and the add-on's `event_time`,
+   which it reads from `SystemTime`, is not on mapped events.
 
    `--cap-file` takes the cap file's path on this host, not the path inside the Receiver's container.
 
@@ -948,8 +954,12 @@ TENX_SPLUNKD_TOKEN=<token> TENX_PROBE_HEC_TOKEN=<HEC token> python3 \
   --probe-index tenx_probe --timeout 20 --poll 5
 ```
 
-**Fortinet FortiGate** has one map for all its log types, with its own Receiver and cap file,
-`/etc/tenx/fgt/compact-cap.csv`, set up as in step 1. The add-on keeps the rules of each log type
+FortiGate: one field map covers every log type. Events are stored under the add-on's own
+sourcetype, and the Network_Traffic data model, tstats and the ESCU detections give the same results
+as on raw events.
+
+**Fortinet FortiGate** has its own Receiver and cap file, `/etc/tenx/fgt/compact-cap.csv`, set up as
+in step 1. The add-on keeps the rules of each log type
 under its own sourcetype (`fortigate_traffic`, `fortigate_utm`, `fortigate_event`,
 `fortigate_anomaly`), so the sender sets `tenx_sourcetype` by the line's `type=`, with the Fluent Bit
 lines of [Fields of the Original Sourcetype](#fields-of-the-original-sourcetype-txf) for FortiGate,
@@ -960,9 +970,12 @@ Security, with the app `fm_fgt` and `tenx_compact_st::tenx_fgt` in `tenx-events`
 
 ```sh
 python3 tenx-for-splunk/bin/tenx_field_map.py gen \
-  --records kv_0.json --records kv_1.json --target fortigate --rules lookup \
+  --records kv_0.json --records kv_1.json --target fortigate --rules lookup --leave-out time \
   --app-name fm_fgt --cap-file /etc/tenx/fgt/compact-cap.csv --out fm_fgt
 ```
+
+`--leave-out time` leaves out the `time` field, which takes most of the map's index space; a plain
+search of a mapped event then lacks it, and `_time` is set as before.
 
 `--target fortigate` reads the add-on's key=value extraction and sets `_time` from the line's
 `date=` and `time=`, as Splunk reads them on the raw event. Steps 6 and 7 take `--app fm_fgt
@@ -1000,8 +1013,8 @@ python3 tenx-for-splunk/bin/tenx_field_map.py gen \
 rules that read a section of the text (`Subject_Account_Name`, `Target_Account_Name`,
 `process_id` and others) for every template where their result does not depend on a value.
 `--mixed-names` writes the field names the Receiver split into text and a value
-(`Token_Elevation_Type`). `--leave-out Message` keeps the index near the raw index's size (see
-Index size below). Steps 6 and 7 take `--app fm_wincl --cap-file
+(`Token_Elevation_Type`). `--leave-out Message` leaves out the message text, which takes most of the map's index space; a
+plain search of a mapped event then lacks `Message` and `body`. Steps 6 and 7 take `--app fm_wincl --cap-file
 /etc/tenx/wincl/compact-cap.csv`.
 
 **Palo Alto Networks** (the Splunk Add-on for Palo Alto Networks; PAN-OS syslog in as `pan:log`) has
@@ -1046,32 +1059,6 @@ longer for it: about twice as long for a `stats` over six fields of 100,000 even
 when every field of every event is read. Steps 6 and 7 take `--app fm_pan --cap-file
 /etc/tenx/pan/compact-cap.csv`. Another source whose add-on reads positional values (`DELIMS` with
 `FIELDS`) takes `--reader csv`, with `--addon` or `--columns` for the names.
-
-**Index size.** Indexed fields take index space beside the event's text, most of all a field whose
-value differs on nearly every event. `--leave-out a,b` leaves out the fields named. `--fields cim`,
-with `--addon` and `--cim <folder of Splunk_SA_CIM>`, writes only the fields that the CIM data models
-and the add-on's event types read, directly or through the add-on's own search-time rules. Measured on
-the same events indexed raw and mapped, each index merged to one index file:
-
-| Events | Raw | Every field | Heavy field left out | `--fields cim` |
-|---|---|---|---|---|
-| FortiGate traffic, 100,000 | 13.6 MB | 22.6 MB | 20.0 MB (`time`) | 19.9 MB |
-| Windows Security XML, 8,311 | 1.5 MB | 3.4 MB | 2.5 MB (`SystemTime`, `EventRecordID`) | 3.4 MB |
-| Windows Security classic, 100,000 | 16.4 MB | 176 MB | 17.9 MB (`Message`) | 17.3 MB |
-| Palo Alto traffic and system, 100,000 | 10.7 MB | 36.9 MB | 25.6 MB (four time columns) | 24.5 MB |
-
-Data model, `tstats` and detection results were the same in every column. A plain search shows only
-the written fields on a mapped event; `--fields cim` leaves out more of them (FortiGate's `vd`,
-`appid` and `osname` among others) than one heavy field does. Without `Message`, classic Windows
-events carry neither `Message` nor `body`. On Windows XML,
-`SystemTime` is the heavy field and `--fields cim` writes it, because the add-on's `event_time` comes
-from it and the Endpoint data model reads that on event 5154 (none among these events); without
-`SystemTime`, mapped events carry no `event_time`. A Palo Alto line holds five date and time columns;
-`--leave-out generated_time,receive_time,future_use3,start_time` leaves out the four nothing reads,
-and the fifth, the syslog header (`future_use1`), is read by the add-on for authentication events.
-`--fields cim` leaves out 21 Palo Alto columns, `session_flags` among them, and the add-on's `flags`,
-calculated from it, then lists every flag on a mapped event. Bloom filters are left out of the Palo
-Alto row.
 
 `tstats` reads the indexed sourcetype, which stays the compact one with or without a field map, so
 `tstats` by or on the original sourcetype counts no compact event; `tenx_sourcetype` holds the
