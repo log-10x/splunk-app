@@ -196,11 +196,12 @@ Paste the block for the version being uploaded. Splunkbase keeps notes per relea
 > - The Consume KV search stores every template record indexed since the last one it stored, a burst of new templates included, and its first run after an install or an upgrade reads every template record in the index. `tx` and `txf` warn when Consume KV failed, is still loading, or has not run for fifteen minutes.
 > - Alerts compiled in the Compile Alert view find their events when the scheduler runs them, including events of templates whose hash contains `$`. The recompile pass rewrites alerts compiled with an earlier version within 15 minutes of the upgrade, unless someone has edited them since.
 > - An epoch-seconds timestamp with a fraction, such as `msg=audit(1723042099.699:13369)`, expands as written and sets the event's time.
-> - Requires the Log10x Receiver at release 1.1.181 or later and Splunk Enterprise 9.4 through 10.6. After upgrading where a field map is installed, give the role of the token `activate` and `check` use search access to `_internal`, and schedule `check` every minute. A map that `gen` generates again after the upgrade can carry a new index-time rule; install both of its apps again whole before running `activate`.
+> - Beside a heavy forwarder, the Receiver can write compact events to files that the heavy forwarder reads and sends to the indexers with its own outputs, with no HTTP Event Collector or token. The `_indexers` package gives each event back its host, source, index and time, and field maps run on the heavy forwarder.
+> - `tx` expands the events a FortiGate field map leaves under the compact sourcetype, such as FortiGate lines the add-on does not type, and a field map keeps the time of an event marked `tenx_time=sender`.
 > - `tx` and `txf` run inside `| union [...]`, in a search, a dashboard panel and a saved search, as they do inside `multisearch`, `append` and `join`.
 > - A search that holds more than one `tx` or `txf`, such as two arms of a `multisearch` or `union`, finds every event of each arm.
 > - `| tx` and `| tenxsearch` return their events inside `append`, `join` and `union`, and an unexpected error shows on the search instead of an empty result.
-<!-- the heavy-forwarder bullet is added here when that branch is merged -->
+> - Requires the Log10x Receiver at release 1.1.181 or later and Splunk Enterprise 9.4 through 10.6. After upgrading where a field map is installed, give the role of the token `activate` and `check` use search access to `_internal`, and schedule `check` every minute. A map that `gen` generates again after the upgrade can carry a new index-time rule; install both of its apps again whole before running `activate`.
 
 1.2.2:
 
