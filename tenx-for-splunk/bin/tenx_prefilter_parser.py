@@ -85,6 +85,7 @@ so it may select more than the search keeps, never fewer.
 import fnmatch
 import re
 import time
+import urllib.parse
 
 MACRO = "`tx`"
 # The macros whose subsearch runs tenxprefilter: `tx`, `txf` and `txf(<sourcetype>)`.
@@ -218,6 +219,27 @@ def macro_call(search):
 			return search[:i], MACRO_CALL.match(search, i).group(0)
 		i += 1
 	return None
+
+
+def macro_calls(search):
+	"""How many `tx`, `txf` or `txf(...)` calls `search` holds outside quotes."""
+	i, n, quoted, count = 0, len(search), False, 0
+	while i < n:
+		c = search[i]
+		if quoted:
+			if c == "\\":
+				i += 2
+				continue
+			if c == '"':
+				quoted = False
+		elif c == '"':
+			quoted = True
+		elif c == "`" and MACRO_CALL.match(search, i):
+			count += 1
+			i = MACRO_CALL.match(search, i).end()
+			continue
+		i += 1
+	return count
 
 
 def _specifiers(before, name):
@@ -1267,7 +1289,8 @@ MAJOR_CHARS = "[]<>(){}|!;,'\"*\n\r \t&?+"
 MAJOR_SEQUENCES = ("%2526", "%2520", "%21", "%26", "%3B", "%7C", "%20", "%2B", "%3D", "--", "%5D", "%5B", "%3A",
 				   "%0A", "%2C", "%28", "%29")
 MINOR_CHARS = "/:=@.-$#%\\_"
-# The fields wild_plan() sets on each event: tenx_w0, tenx_w1, ...
+# The fields wild_plan() sets on each event: tenx_w0, tenx_w1, ... (the search rewrite); the tx macros set one
+# field, tenx_w, to the numbers of the marks the event matches (wild_marks).
 WILD_FIELD = "tenx_w"
 
 
@@ -1326,42 +1349,51 @@ def _eval_string(text):
 	return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
 
 
-def _atom_test(name, word, positive=True):
+# The regular expression that stands for false() in the marks the tx macros read (wild_marks): it matches nothing.
+NEVER = "(?!)"
+
+
+def _atom_regex(name, word, positive=True):
 	"""
-	The eval condition that matches the atom as a base search on the index (see above), or None
-	when it matches alike after the pipe or is not read with certainty: name is None for a word or
-	a quoted word, TERM or CASE; positive is False where the atom stands under NOT.
+	The regular expression that finds the atom in an event's text as a base search on the index does
+	(see above), NEVER where the atom is taken as matching nothing, or None when it matches alike after
+	the pipe or is not read with certainty: name is None for a word or a quoted word, TERM or CASE;
+	positive is False where the atom stands under NOT.
 	"""
 	if not word:
 		return None
-	if name is None:
-		return ("match(_raw, %s)" % _eval_string(term_regex(word))) if mid_wildcard(word) else None
-	if name == "CASE":
-		return ("match(_raw, %s)" % _eval_string(term_regex(word))) if mid_wildcard(word) else None
+	if name is None or name == "CASE":
+		return term_regex(word) if mid_wildcard(word) else None
 	if "\\" in word:
 		# Splunk applies the escape first (TERM(\resource) matched what TERM(resource) matches, 1,161 events)
 		return None
 	if _major_breaker(word):
-		return None if positive else "false()"
+		return None if positive else NEVER
 	minor = any(c in MINOR_CHARS for c in word)
 	if not minor and not mid_wildcard(word):
 		return None
-	return "match(_raw, %s)" % _eval_string(term_regex(word, major_only=minor))
+	return term_regex(word, major_only=minor)
 
 
-def wild_plan(text):
+def _atom_test(name, word, positive=True):
 	"""
-	The words after `tx` (`text`) with every word that matches other events after a pipe than on
-	the index (see above) put as a field the step before computes: (eval, search), where `eval` sets
-	tenx_w0, tenx_w1, ... to 1 on the events whose text holds that word as the index does, and
-	`search` is `text` with each such word replaced by tenx_wN=1 (CASE(x) by (tenx_wN=1 CASE(x)), see
-	above). `| eval <eval> | search <search>` then keeps the events the base search on the index would
-	keep for those words, under AND, OR and NOT alike (on the index, NOT CASE() ignores the letter
-	case, so it is not the opposite of CASE(); this gives the opposite), and every other word as
-	`search` after a pipe keeps them. None when no word needs it, or when the text is not read with
-	certainty (a subsearch, a macro, parentheses that do not close).
+	The eval condition that matches the atom as a base search on the index (see above), or None
+	when it matches alike after the pipe or is not read with certainty (_atom_regex).
+	"""
+	rx = _atom_regex(name, word, positive)
+	if rx is None:
+		return None
+	return "false()" if rx == NEVER else "match(_raw, %s)" % _eval_string(rx)
 
-	A word written right against another word or phrase (no space) is left as it is.
+
+def _wild_atoms(text):
+	"""
+	The words after `tx` (`text`) that match other events after a pipe than on the index (see above),
+	as (regexes, edits): `regexes` holds one regular expression per distinct test, in order (the mark
+	of the n-th is n), and `edits` holds (start, end, n, CASE or not) for each place in `text` that
+	such a word takes. None when no word needs it, or when the text is not read with certainty (a
+	subsearch, a macro, parentheses that do not close). A word written right against another word or
+	phrase (no space) is left as it is.
 	"""
 	tokens = tokenize(text)
 	if any(kind == "subsearch" for kind, _ in tokens):
@@ -1371,7 +1403,7 @@ def wild_plan(text):
 		tree = reader.parse()
 	except Unparsed:
 		return None
-	marks, steps, edits = {}, [], []
+	marks, regexes, edits = {}, [], []
 
 	def glued_to_text(first, last):
 		before = first in tokens.glued and tokens[first - 1][0] in ("word", "phrase")
@@ -1396,22 +1428,67 @@ def wild_plan(text):
 			name, word, first, last = reader.call_at[id(node)]
 		else:
 			return
-		test = _atom_test(name, word, positive)
-		if test is None or glued_to_text(first, last):
+		rx = _atom_regex(name, word, positive)
+		if rx is None or glued_to_text(first, last):
 			return
-		if test not in marks:
-			marks[test] = "%s%d" % (WILD_FIELD, len(marks))
-			steps.append("%s=%s" % (marks[test], "0" if test == "false()" else "if(%s, 1, 0)" % test))
-		start, end = tokens.spans[first][0], tokens.spans[last][1]
-		edits.append((start, end, "(%s=1 %s)" % (marks[test], text[start:end]) if name == "CASE" else marks[test] + "=1"))
+		if rx not in marks:
+			marks[rx] = len(regexes)
+			regexes.append(rx)
+		edits.append((tokens.spans[first][0], tokens.spans[last][1], marks[rx], name == "CASE"))
 
 	visit(tree)
-	if not edits:
-		return None
+	return (regexes, edits) if edits else None
+
+
+def _wild_search(text, edits, mark):
+	"""`text` with each place in `edits` replaced by mark(n), CASE(x) by (mark(n) CASE(x))."""
 	search = text
-	for start, end, mark in sorted(edits, reverse=True):
-		search = search[:start] + mark + search[end:]
-	return ", ".join(steps), search.strip()
+	for start, end, n, case in sorted(edits, reverse=True):
+		search = search[:start] + ("(%s %s)" % (mark(n), text[start:end]) if case else mark(n)) + search[end:]
+	return search.strip()
+
+
+def wild_plan(text):
+	"""
+	The words after `tx` (`text`) with every word that matches other events after a pipe than on
+	the index (see above) put as a field the step before computes: (eval, search), where `eval` sets
+	tenx_w0, tenx_w1, ... to 1 on the events whose text holds that word as the index does, and
+	`search` is `text` with each such word replaced by tenx_wN=1 (CASE(x) by (tenx_wN=1 CASE(x)), see
+	above). `| eval <eval> | search <search>` then keeps the events the base search on the index would
+	keep for those words, under AND, OR and NOT alike (on the index, NOT CASE() ignores the letter
+	case, so it is not the opposite of CASE(); this gives the opposite), and every other word as
+	`search` after a pipe keeps them. None when no word needs it, or when the text is not read with
+	certainty (a subsearch, a macro, parentheses that do not close). The search rewrite writes this
+	eval into the search it runs; the tx macros take the same marks through wild_marks().
+
+	A word written right against another word or phrase (no space) is left as it is.
+	"""
+	atoms = _wild_atoms(text)
+	if atoms is None:
+		return None
+	regexes, edits = atoms
+	steps = ["%s%d=%s" % (WILD_FIELD, n, "0" if rx == NEVER else "if(match(_raw, %s), 1, 0)" % _eval_string(rx))
+			 for n, rx in enumerate(regexes)]
+	return ", ".join(steps), _wild_search(text, edits, lambda n: "%s%d=1" % (WILD_FIELD, n))
+
+
+def wild_marks(text):
+	"""
+	The same marks as wild_plan() in the form the tx macros read back from the job (macros.conf
+	[tenx-wild]): (marks, search). `marks` is "0:<regex>,1:<regex>,..." with each regular expression
+	percent-encoded (letters, digits and _.-~ kept), so it holds no quote, comma, colon or backslash
+	and goes into the search text as one quoted value; the macro step sets the field tenx_w to the
+	numbers of the expressions the event's text matches (urldecode, match). `search` is `text` with
+	each such word replaced by tenx_w=N (CASE(x) by (tenx_w=N CASE(x))). The step carries no
+	subsearch inside eval, which Splunk's union refuses in its datasets ("The expression is
+	malformed", Splunk Enterprise 10.4.3). None when wild_plan() is None.
+	"""
+	atoms = _wild_atoms(text)
+	if atoms is None:
+		return None
+	regexes, edits = atoms
+	marks = ",".join("%d:%s" % (n, urllib.parse.quote(rx, safe="")) for n, rx in enumerate(regexes))
+	return marks, _wild_search(text, edits, lambda n: "%s=%d" % (WILD_FIELD, n))
 
 
 # The record the Consume KV alert action keeps of how far it has stored template records

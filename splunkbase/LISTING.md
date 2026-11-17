@@ -166,7 +166,7 @@ Repository name: `log-10x/splunk-app`. Repository URL: https://github.com/log-10
 
 | Field | Value |
 |---|---|
-| Version | 1.2.2, read from the package |
+| Version | 1.2.3, read from the package |
 | Splunk platform compatibility | Splunk Enterprise 9.4, 10.0, 10.2, 10.4, 10.6 |
 | CIM | None |
 
@@ -184,6 +184,24 @@ Splunkbase requires a release to run on every version it names.
 **Release notes**
 
 Paste the block for the version being uploaded. Splunkbase keeps notes per release.
+
+1.2.3:
+
+> - The field map tool generates maps for Windows Security as classic text (`WinEventLog:Security`), FortiGate and Palo Alto Networks, beside Windows Security as rendered XML and CloudTrail. With a FortiGate map, the Network_Traffic data model, `tstats` and the Splunk Security Content (ESCU) detections give the same results as on raw events. With a Palo Alto map, the Network_Traffic and Change data models, `tstats` and ESCU detections give the same results on compact PAN-OS traffic and system events as on raw ones; threat events are passed whole.
+> - The field map's `check` also counts the compact events indexed without their fields and those Splunk dropped because it could not load the map's lookup file, and fails with the count. When its probe arrives late, `check` keeps the template list unless Splunk's log shows events of the map dropped. The new Field Map Dropped Events alert reports dropped events by node every five minutes.
+> - The new search report, `bin/tenx_search_report.py`, reads a search head's saved searches, alerts and dashboards and says which run unchanged when a source moves to compact events, which need `tx`, `txf` or a field map, and which meet a limit the README states. The report changes nothing and starts no search.
+> - Word searches through `tx`, dashboards and compiled alerts find the events of every stored template, including templates stored in the last few minutes. Outside `NOT`, a wildcard inside a word (`Se*Privilege`), `TERM()` of part of a longer term and `CASE()` of a word with a wildcard inside it match as on the original lines.
+> - `tx` and `txf` expand an event whose values begin or end with white space or a carriage return, such as a Windows event with CR LF line ends, to its full text, and a carriage return inside an event comes back in place.
+> - `tx` expands events whose template appears twice in the indexers' copy of the template collection. An event `tx` cannot expand keeps its compact text and says why in `tenx_expand_refused`.
+> - The Consume KV search stores every template record indexed since the last one it stored, a burst of new templates included, and its first run after an install or an upgrade reads every template record in the index. `tx` and `txf` warn when Consume KV failed, is still loading, or has not run for fifteen minutes.
+> - Alerts compiled in the Compile Alert view find their events when the scheduler runs them, including events of templates whose hash contains `$`. The recompile pass rewrites alerts compiled with an earlier version within 15 minutes of the upgrade, unless someone has edited them since.
+> - An epoch-seconds timestamp with a fraction, such as `msg=audit(1723042099.699:13369)`, expands as written and sets the event's time.
+> - Beside a heavy forwarder, the Receiver can write compact events to files that the heavy forwarder reads and sends to the indexers with its own outputs, with no HTTP Event Collector or token. The `_indexers` package gives each event back its host, source, index and time, and field maps run on the heavy forwarder.
+> - `tx` expands the events a FortiGate field map leaves under the compact sourcetype, such as FortiGate lines the add-on does not type, and a field map keeps the time of an event marked `tenx_time=sender`.
+> - `tx` and `txf` run inside `| union [...]`, in a search, a dashboard panel and a saved search, as they do inside `multisearch`, `append` and `join`.
+> - A search that holds more than one `tx` or `txf`, such as two arms of a `multisearch` or `union`, finds every event of each arm.
+> - `| tx` and `| tenxsearch` return their events inside `append`, `join` and `union`, and an unexpected error shows on the search instead of an empty result.
+> - Requires the Log10x Receiver at release 1.1.181 or later and Splunk Enterprise 9.4 through 10.6. After upgrading where a field map is installed, give the role of the token `activate` and `check` use search access to `_internal`, and schedule `check` every minute. A map that `gen` generates again after the upgrade can carry a new index-time rule; install both of its apps again whole before running `activate`.
 
 1.2.2:
 
@@ -331,7 +349,7 @@ From the repository root:
 rm -rf /tmp/sbpkg && mkdir -p /tmp/sbpkg
 rsync -a --exclude 'local/' --exclude '__pycache__/' --exclude '*.pyc' --exclude '*.pyo' --exclude '.*' \
   tenx-for-splunk/ /tmp/sbpkg/tenx-for-splunk/
-cd /tmp/sbpkg && COPYFILE_DISABLE=1 tar --format ustar -czf tenx-for-splunk-1.2.2.tar.gz tenx-for-splunk
+cd /tmp/sbpkg && COPYFILE_DISABLE=1 tar --format ustar -czf tenx-for-splunk-1.2.3.tar.gz tenx-for-splunk
 ```
 
 ## Submitting

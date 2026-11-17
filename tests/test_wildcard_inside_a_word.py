@@ -261,15 +261,31 @@ class TestTheMacroStep:
 	def test_the_fields_and_the_job(self):
 		step = self.definition()
 		prefilter = open(os.path.join(APP, 'bin', 'tenx_prefilter.py')).read()
-		for field in ('custom.tenx_wild_eval', 'custom.tenx_wild_search'):
+		for field in ('custom.tenx_wild_marks', 'custom.tenx_wild_search'):
 			assert field in step and '"%s"' % field in prefilter
+		assert 'custom.tenx_wild_eval' not in step and 'custom.tenx_wild_eval' not in prefilter
 		assert step.count('replace(info_sid, "^subsearch_(.+)_\\d+\\.\\d+$", "\\1")') == 2
 		assert 'SUBSEARCH_SID = re.compile(r"^subsearch_(.+)_\\d+\\.\\d+$")' in prefilter
-		assert step.startswith('eval [') and '| search [' in step and step.endswith('| fields - tenx_w*')
+		assert step.startswith('fillnull [') and '| search [' in step and step.endswith('| fields - tenx_w*')
+
+	def test_no_subsearch_inside_eval_where_or_rex(self):
+		# Splunk's union checks each dataset's commands before it runs the subsearches in them, and there eval, where
+		# and rex refuse a subsearch argument ("The expression is malformed", Splunk Enterprise 10.4.3): `tx` and `txf`
+		# inside | union [...] failed on 1.2.2. search and fillnull accept one.
+		import configparser
+		conf = configparser.RawConfigParser(strict=False)
+		conf.read(os.path.join(APP, 'default', 'macros.conf'))
+		for name in conf.sections():
+			for command in re.split(r'\|', conf.get(name, 'definition')):
+				words = command.split()
+				if words and words[0] in ('eval', 'where', 'rex'):
+					# outside quoted strings, a bracket in these commands can only open a subsearch
+					assert '[' not in re.sub(r'"(?:[^"\\]|\\.)*"', '""', command), (name, command)
 
 	def test_nothing_stored_marks_nothing(self):
 		step = self.definition()
-		assert "coalesce('custom.tenx_wild_eval', \"tenx_w=0\")" in step and "coalesce('custom.tenx_wild_search', \"*\")" in step
+		assert "coalesce('custom.tenx_wild_marks', \"-\")" in step and "coalesce('custom.tenx_wild_search', \"*\")" in step
+		assert 'eval search="value=\\"" . coalesce(' in step and 'tenx_wild=if(tenx_wild=="-", null(), split(tenx_wild, ","))' in step
 		assert step.count('appendpipe [stats count | where count=0]') == 2
 
 	def test_every_tx_macro_runs_it_before_the_final_search(self):
