@@ -3,20 +3,23 @@ Tenx DML to KV Store Alert Action
 ================================
 
 This module implements the alert action that populates the KV store with parsed
-template data. It is triggered by the "Consume KV" saved search, which runs every
-5 minutes to process new template definitions.
+template data. It is started by the "Consume KV" saved search every 5 minutes.
 
 Data Flow
 ---------
 1. 10x pipeline sends template definitions to Splunk with sourcetype `tenx_dml_raw_json`
-2. "Consume KV" saved search finds new templates and triggers this alert action
-3. This script reads the search results (JSON template definitions)
-4. For each template:
-   a. Check whether the KV store already holds it (see reconcile_existing for a different
-      template under the same key)
-   b. Parse template into structured format using TenxDMLBuilder
-   c. Create entry in `tenx_dml` KV store collection, its searchable copy pending
+2. "Consume KV" (`| makeresults`) starts this alert action on every run
+3. The action reads the template records indexed since its checkpoint (the index time it has
+   loaded through, kept in the `tenx_kv_state` collection) with its own export searches, in
+   slices of index time, and moves the checkpoint after each slice (load_since)
+4. For each chunk of records:
+   a. Read what the KV store holds under their keys, in one batch_find
+   b. Reconcile each record with it (reconcile: new, same, cut, conflict, refreshed)
+   c. Write the records that change with batch_save, new ones with their searchable copy pending
 5. Write the searchable copy of every pending template with `collect` (tenx_dml_intf.py)
+
+A search that returns template records, piped to `| sendalert tenx_dml_to_kv`, has exactly
+those records stored instead (the results carry a templateHash column).
 
 Input Format
 ------------
@@ -58,6 +61,10 @@ The script reads a JSON payload from stdin containing:
 
 Configuration
 -------------
+Alert action parameters (alert_actions.conf):
+    - source: the event search that finds template records
+    - from: an index time to load from instead of the checkpoint (0: all)
+
 Settings are loaded from tenx_config.conf via tenx_util.get_tenx_config():
     - variable_separator: Character separating variables in templates (default: $)
     - timestamp_placeholder: Placeholder for timestamp in patterns (default: __TENX_TS__)
@@ -80,6 +87,7 @@ See Also
 
 import os
 import sys
+import time
 import logging
 import json
 import gzip
@@ -191,38 +199,49 @@ def get_result_parts(result):
 
 LOOKUP_NAME = 'tenx-dml-lookup'
 
+RECONCILE_CREATED = "created"
 RECONCILE_SAME = "same"
 RECONCILE_REPLACED = "replaced"
 RECONCILE_CONFLICT = "conflict"
 RECONCILE_REFRESHED = "refreshed"
 
+# Where Consume KV has loaded template records up to: one record in its own collection
+# (collections.conf [tenx_kv_state]), which is not replicated to the indexers.
+STATE_COLLECTION = 'tenx_kv_state'
+STATE_KEY = 'consume_kv'
+STATE_LOADED_THROUGH = 'loaded_through'
+STATE_UPDATED = 'updated'
+STATE_STATUS = 'status'
+STATE_DETAIL = 'detail'
+STATE_RECORDS = 'records'
+STATUS_CURRENT = 'current'
+STATUS_LOADING = 'loading'
+STATUS_FAILED = 'failed'
 
-def refresh_existing(kv_intf, dml_builder, existing, record_key, pattern):
-	"""Rewrites a stored record whose derived fields differ from what its text builds today."""
-	rebuilt = dml_builder.build_kv_record_data(record_key, pattern)
-
-	if existing.get(tenx_dml_builder.RECORD_EXPAND_UNSAFE) == tenx_dml_builder.UNSAFE_HASH_CONFLICT:
-		rebuilt[tenx_dml_builder.RECORD_EXPAND_UNSAFE] = tenx_dml_builder.UNSAFE_HASH_CONFLICT
-
-	stale = [k for k, v in rebuilt.items() if existing.get(k) != v]
-
-	if not stale:
-		logger.debug("Already has entry for {}, skipping.".format(record_key))
-		return RECONCILE_SAME
-
-	if tenx_dml_intf.SEARCH_COPY in existing:
-		rebuilt[tenx_dml_intf.SEARCH_COPY] = existing[tenx_dml_intf.SEARCH_COPY]
-
-	if kv_intf.update_entry(record_key, rebuilt):
-		logger.info("Refreshed the stored record for {}: {}.".format(record_key, ", ".join(sorted(stale))))
-		return RECONCILE_REFRESHED
-
-	return RECONCILE_SAME
+# The event search that finds template records, when the alert action is given none.
+DEFAULT_SOURCE = 'index=tenx_dml sourcetype=tenx_dml_raw_json'
+# A record is read again for this long after the index time loaded through: a record an indexer
+# writes with a clock behind another indexer's, or one that becomes searchable late, is still read.
+# Reading a stored template again writes nothing.
+OVERLAP_SECONDS = 300
+# Records indexed in the last seconds are left to the next run.
+LAG_SECONDS = 30
+# Template records read and stored between two checkpoint writes.
+SLICE_RECORDS = 25000
+# A run starts no new slice after this long, so it ends well inside the alert action's maxtime
+# (alert_actions.conf); the next run resumes from the checkpoint.
+RUN_BUDGET_SECONDS = 240
+# Records handed to the KV store together (one batch_find, then batch_save calls).
+CHUNK_RECORDS = 2000
 
 
-def reconcile_existing(kv_intf, dml_builder, existing, record_key, pattern):
+def reconcile(dml_builder, existing, record_key, pattern):
 	"""
-	Decides what an incoming template means for the record already stored under its key.
+	Decides what an incoming template means for the record stored under its key, and returns
+	(outcome, record): one of the RECONCILE_* outcomes, and the whole record to write, or None
+	when nothing is written.
+
+	No stored record: the template is stored, its searchable copy pending.
 
 	The key is the template hash, trimmed. The same key with the same text is a template sent
 	again, which is normal: every Receiver sends each template once per start. The same key
@@ -238,11 +257,11 @@ def reconcile_existing(kv_intf, dml_builder, existing, record_key, pattern):
 	The same text sent again is rebuilt, and the record is rewritten when a field derived from
 	the text differs, as it does after an upgrade that changes how a field is derived (a
 	timestamp format, say). The searchable copy and a hash-conflict mark are kept.
-
-	Returns RECONCILE_SAME, RECONCILE_REFRESHED, RECONCILE_REPLACED or RECONCILE_CONFLICT.
 	"""
 	if not isinstance(existing, dict):
-		return RECONCILE_SAME
+		record = dml_builder.build_kv_record_data(record_key, pattern)
+		record[tenx_dml_intf.SEARCH_COPY] = tenx_dml_intf.SEARCH_COPY_PENDING
+		return RECONCILE_CREATED, record
 
 	stored_hash = existing.get(tenx_dml_builder.RECORD_PATTERN_HASH)
 	stored_pattern = existing.get(tenx_dml_builder.RECORD_PATTERN)
@@ -251,63 +270,269 @@ def reconcile_existing(kv_intf, dml_builder, existing, record_key, pattern):
 	same_pattern = stored_pattern is None or stored_pattern == pattern
 
 	if same_hash and same_pattern:
-		return refresh_existing(kv_intf, dml_builder, existing, record_key, pattern)
+		rebuilt = dml_builder.build_kv_record_data(record_key, pattern)
+
+		if existing.get(tenx_dml_builder.RECORD_EXPAND_UNSAFE) == tenx_dml_builder.UNSAFE_HASH_CONFLICT:
+			rebuilt[tenx_dml_builder.RECORD_EXPAND_UNSAFE] = tenx_dml_builder.UNSAFE_HASH_CONFLICT
+
+		stale = [k for k, v in rebuilt.items() if existing.get(k) != v]
+
+		if not stale:
+			return RECONCILE_SAME, None
+
+		if tenx_dml_intf.SEARCH_COPY in existing:
+			rebuilt[tenx_dml_intf.SEARCH_COPY] = existing[tenx_dml_intf.SEARCH_COPY]
+
+		logger.info("Refreshed the stored record for {}: {}.".format(record_key, ", ".join(sorted(stale))))
+		return RECONCILE_REFRESHED, rebuilt
 
 	if same_hash and stored_pattern.startswith(pattern):
 		logger.info("Template {} arrived cut ({} of {} characters); the stored whole one is kept.".format(
 			record_key, len(pattern), len(stored_pattern)))
-		return RECONCILE_SAME
+		return RECONCILE_SAME, None
 
 	if same_hash and pattern.startswith(stored_pattern):
 		whole = dml_builder.build_kv_record_data(record_key, pattern)
 		whole[tenx_dml_intf.SEARCH_COPY] = tenx_dml_intf.SEARCH_COPY_PENDING
-
-		if kv_intf.update_entry(record_key, whole):
-			logger.info("Replaced the cut template stored for {} ({} of {} characters) with the whole one.".format(
-				record_key, len(stored_pattern), len(pattern)))
-			return RECONCILE_REPLACED
-
-		return RECONCILE_SAME
+		logger.info("Replaced the cut template stored for {} ({} of {} characters) with the whole one.".format(
+			record_key, len(stored_pattern), len(pattern)))
+		return RECONCILE_REPLACED, whole
 
 	if existing.get(tenx_dml_builder.RECORD_EXPAND_UNSAFE) == tenx_dml_builder.UNSAFE_HASH_CONFLICT:
-		return RECONCILE_SAME
+		return RECONCILE_SAME, None
 
 	flagged = {k: v for k, v in existing.items() if not k.startswith('_')}
 	flagged[tenx_dml_builder.RECORD_EXPAND_UNSAFE] = tenx_dml_builder.UNSAFE_HASH_CONFLICT
 
-	if not kv_intf.update_entry(record_key, flagged):
-		return RECONCILE_SAME
-
 	logger.warning("Template hash conflict on key {!r}: stored hash {!r} with {} characters of text, incoming hash {!r} with {} characters of different text. "
 		"Events under this key now stay compact, marked hash-conflict.".format(
-			kv_intf.kv_key(record_key), stored_hash, len(stored_pattern or ''), record_key, len(pattern)))
+			record_key.strip(), stored_hash, len(stored_pattern or ''), record_key, len(pattern)))
 
-	return RECONCILE_CONFLICT
+	return RECONCILE_CONFLICT, flagged
+
+
+class TemplateStore:
+	"""
+	Stores template records in the KV store in chunks: one batch_find reads what is stored under
+	the chunk's keys, each record is reconciled in arrival order against what is stored (or what
+	an earlier record of the chunk made of it), and the records that change are written with
+	batch_save. A template stored already is read and not written, so loading a record twice
+	changes nothing.
+	"""
+	def __init__(self, kv_intf, dml_builder):
+		self.kv_intf = kv_intf
+		self.dml_builder = dml_builder
+		self.limits = kv_intf.batch_limits()
+		self.counts = dict.fromkeys((RECONCILE_CREATED, RECONCILE_SAME, RECONCILE_REPLACED,
+			RECONCILE_CONFLICT, RECONCILE_REFRESHED), 0)
+		self.invalid = 0
+		self.written = 0
+
+	def store(self, records):
+		"""
+		records: (template hash, template) pairs in arrival order. Raises when the KV store
+		cannot be read or written, so a caller does not move its checkpoint past them.
+		"""
+		for start in range(0, len(records), CHUNK_RECORDS):
+			self._store_chunk(records[start:start + CHUNK_RECORDS])
+
+	def _store_chunk(self, records):
+		valid = []
+		for record_key, pattern in records:
+			record_key, pattern = get_result_parts({'templateHash': record_key, 'template': pattern})
+			if record_key is None:
+				self.invalid += 1
+				continue
+			valid.append((record_key, pattern))
+
+		if not valid:
+			return
+
+		current = self.kv_intf.find_many([self.kv_intf.kv_key(k) for k, _ in valid])
+		writes = {}
+
+		for record_key, pattern in valid:
+			key = self.kv_intf.kv_key(record_key)
+			outcome, record = reconcile(self.dml_builder, current.get(key), record_key, pattern)
+			self.counts[outcome] += 1
+
+			if record is not None:
+				record = dict(record)
+				record[self.kv_intf.KV_KEY] = key
+				current[key] = record
+				writes[key] = record
+
+		if writes and not self.kv_intf.save_many(list(writes.values()), self.limits):
+			raise RuntimeError("the KV store did not take {} template records".format(len(writes)))
+
+		self.written += len(writes)
+
+	def summary(self):
+		return "added={}, refreshed={}, replaced={}, conflicts={}, unchanged={}, invalid={}".format(
+			self.counts[RECONCILE_CREATED], self.counts[RECONCILE_REFRESHED], self.counts[RECONCILE_REPLACED],
+			self.counts[RECONCILE_CONFLICT], self.counts[RECONCILE_SAME], self.invalid)
+
+	def changed(self):
+		return self.counts[RECONCILE_CREATED] + self.counts[RECONCILE_REFRESHED] + self.counts[RECONCILE_REPLACED]
+
+
+def export_results(server_connection, search):
+	"""
+	Runs search to completion through search/jobs/export, over all event time, and yields its
+	results as they stream. The export endpoint returns every result: it is not held to the
+	50,000 rows of a oneshot search nor to an alert action's maxresults. Raises on an error
+	message from the search.
+	"""
+	url = '/servicesNS/nobody/{}/search/jobs/export'.format(APP_NAME)
+	data = {'search': search, 'earliest_time': '0', 'latest_time': '+10y', 'preview': 'false'}
+	response = server_connection.post(url, data, read_result=False)
+
+	for line in response:
+		line = line.strip()
+		if not line:
+			continue
+		message = json.loads(line)
+		if 'result' in message:
+			yield message['result']
+		for note in message.get('messages') or []:
+			if note.get('type') in ('ERROR', 'FATAL'):
+				raise RuntimeError("search failed: {}".format(note.get('text')))
+
+
+def index_time_minutes(server_connection, source, start, end):
+	"""
+	The number of template records indexed in each minute of [start, end), as sorted
+	(minute, count) pairs.
+	"""
+	search = ('search {} _index_earliest={} _index_latest={}'
+		' | eval tenx_kv_minute=_indextime-(_indextime%60) | stats count by tenx_kv_minute').format(source, int(start), int(end))
+	minutes = [(int(float(r['tenx_kv_minute'])), int(float(r['count'])))
+		for r in export_results(server_connection, search) if r.get('tenx_kv_minute') not in (None, '')]
+	return sorted(minutes)
+
+
+def plan_slices(minutes, start, end, slice_records=None):
+	"""
+	Splits [start, end) of index time into consecutive [a, b) slices at minute boundaries, each
+	with about slice_records records or one minute. Returns [(a, b, records)].
+	"""
+	slice_records = SLICE_RECORDS if slice_records is None else slice_records
+	slices, a, n = [], start, 0
+	for minute, count in minutes:
+		if n and n + count > slice_records and minute > a:
+			slices.append((a, minute, n))
+			a, n = minute, 0
+		n += count
+	slices.append((a, end, n))
+	return slices
+
+
+def read_state(state_intf):
+	state = state_intf.get_entry(STATE_KEY)
+	return state if isinstance(state, dict) else {}
+
+
+def write_state(state_intf, previous, **fields):
+	"""Writes the checkpoint record; loaded_through never moves back."""
+	state = {k: v for k, v in previous.items() if not k.startswith('_')}
+	state.update(fields)
+	if previous.get(STATE_LOADED_THROUGH) is not None and state.get(STATE_LOADED_THROUGH) is not None:
+		state[STATE_LOADED_THROUGH] = max(float(previous[STATE_LOADED_THROUGH]), float(state[STATE_LOADED_THROUGH]))
+	state[STATE_UPDATED] = int(time.time())
+	state[state_intf.KV_KEY] = STATE_KEY
+	if not state_intf.save_batch([state]):
+		raise RuntimeError("the checkpoint could not be written")
+	previous.clear()
+	previous.update(state)
+	return state
+
+
+def load_since(server_connection, store, state_intf, dml_intf, source, start_from=None, now=None, budget=None):
+	"""
+	Loads every template record indexed since the checkpoint (or since start_from, an index time)
+	into the KV store, slice by slice in index-time order, and moves the checkpoint after each
+	slice, so a run that stops is resumed by the next one. Returns the number of records read.
+	"""
+	now = int(now if now is not None else time.time())
+	budget = RUN_BUDGET_SECONDS if budget is None else budget
+	began = time.time()
+	state = read_state(state_intf)
+
+	if start_from is not None:
+		start = max(0, int(float(start_from)))
+	elif state.get(STATE_LOADED_THROUGH) is not None:
+		start = max(0, int(float(state[STATE_LOADED_THROUGH])) - OVERLAP_SECONDS)
+	else:
+		# First run (a new install, or an upgrade from a version without the checkpoint): every
+		# template record in the index, so a template an earlier version skipped is stored too.
+		start = 0
+
+	end = now - LAG_SECONDS
+	if end <= start:
+		return 0
+
+	slices = plan_slices(index_time_minutes(server_connection, source, start, end), start, end, SLICE_RECORDS)
+	read = 0
+
+	for index, (a, b, planned) in enumerate(slices):
+		if index and time.time() - began > budget:
+			write_state(state_intf, state, status=STATUS_LOADING, detail="stopped after {} s with records indexed from {} left".format(int(time.time() - began), a))
+			logger.info("Stopped after {} s; the next run continues from index time {}.".format(int(time.time() - began), a))
+			return read
+
+		records = []
+		last = None
+		if planned:
+			search = 'search {} _index_earliest={} _index_latest={} | fields templateHash, template, _indextime | fields - _raw'.format(source, int(a), int(b))
+			for result in export_results(server_connection, search):
+				records.append((result.get('templateHash'), result.get('template')))
+				try:
+					seen = int(float(result.get('_indextime')))
+					last = seen if last is None else max(last, seen)
+				except (TypeError, ValueError):
+					pass
+
+		changed_before = store.changed()
+		store.store(records)
+		read += len(records)
+
+		if store.changed() > changed_before and dml_intf.write_pending() < 0:
+			logger.warning("The searchable copy of new templates was not written; they stay pending for the next run.")
+
+		# The last slice ends at the newest record seen, not at this host's clock, so a record
+		# an indexer stamps with a clock behind this one's is still read by the next run.
+		through = b if index < len(slices) - 1 else (min(b, last + 1) if last is not None else None)
+		fields = {STATE_STATUS: STATUS_CURRENT if index == len(slices) - 1 else STATUS_LOADING, STATE_DETAIL: '', STATE_RECORDS: read}
+		if through is not None:
+			fields[STATE_LOADED_THROUGH] = through
+		elif state.get(STATE_LOADED_THROUGH) is None:
+			fields[STATE_LOADED_THROUGH] = start
+		write_state(state_intf, state, **fields)
+
+	return read
 
 
 def update_kv_store(settings):
 	"""
-	Updates the KV store and the searchable copy from the "raw" DML data which is forwarded into splunk.
+	Stores template records in the KV store and writes the searchable copy of new templates.
 
-	This script is configured via a periodic cron based alert which fires with all new events inserted into the "raw" DML.
+	Two ways in:
 
-	Default config is to run this every 5 minutes over the last 7 minutes of new events, so a template that
-	arrives between two runs is not missed.
+	- Records in the results: a search that returns template records, piped to
+	  `| sendalert tenx_dml_to_kv`, has exactly those records stored.
+	- Anything else (the scheduled Consume KV search is `| makeresults`): every template record
+	  indexed since the checkpoint is read by this action itself and stored, and the checkpoint
+	  moves past them (load_since). The parameter `from` (an index time; 0 for all) loads from
+	  there instead: `| makeresults | sendalert tenx_dml_to_kv param.from=0`.
 
-	This config can be changed by modifying the savedsearches.conf file, either manually, via API, or Splunk's UI.
-
-	The process runs over all the given results of the search, checks for their existence in the KV store, adds
-	the missing ones, and then writes the searchable copy of every template still pending.
-
-	Because the process checks existance before placing new items, duplicate items should be reduced to a minimum.
-	They can still happen due to certain race conditions, as we don't actually "lock" or CAS data, but this is a
-	relatively rare event, which we can live with.
-
-	Returns the number of successful updates, or -1 in case of unexpected errors.
+	Returns the number of records read, or -1 in case of unexpected errors.
 	"""
+	state_intf = None
+	state = {}
 	try:
 		server_uri = settings.get('server_uri')
 		token = settings.get('session_key')
+		configuration = settings.get('configuration') or {}
 
 		tenx_config = tenx_util.get_tenx_config(server_uri=server_uri, token=token)
 
@@ -351,52 +576,45 @@ def update_kv_store(settings):
 			# Logging already happens inside get_results_reader
 			return -1
 
-		# Counters for observability
-		updates_performed = 0
-		skipped_invalid = 0
-		skipped_existing = 0
-		skipped_dml_error = 0
-		conflicts_marked = 0
+		store = TemplateStore(kv_intf, dml_builder)
 
-		for result in reader:
-			record_key, pattern = get_result_parts(result)
+		if 'templateHash' in (reader.fieldnames or []):
+			records = []
+			for result in reader:
+				records.append((result.get('templateHash'), result.get('template')))
+				if len(records) >= SLICE_RECORDS:
+					store.store(records)
+					records = []
+			store.store(records)
+			read = sum(store.counts.values()) + store.invalid
 
-			if record_key is None:
-				# Logging already happens inside get_result_parts
-				skipped_invalid += 1
-				continue
+			if dml_intf.write_pending() < 0:
+				logger.warning("The searchable copy of new templates was not written; they stay pending for the next run.")
+		else:
+			source = (configuration.get('source') or DEFAULT_SOURCE).strip()
+			if source.startswith('|'):
+				logger.error("The source parameter must be an event search, not {!r}; no templates were stored.".format(source))
+				return -1
 
-			existing = kv_intf.get_entry(record_key)
-			if existing:
-				outcome = reconcile_existing(kv_intf, dml_builder, existing, record_key, pattern)
+			state_intf = tenx_kv_intf.TenxKVInterface(
+				collection_name=STATE_COLLECTION,
+				server_connection=server_connection,
+				app_name=APP_NAME,
+				owner='nobody')
 
-				if outcome == RECONCILE_CONFLICT:
-					conflicts_marked += 1
-				elif outcome in (RECONCILE_REPLACED, RECONCILE_REFRESHED):
-					updates_performed += 1
-				else:
-					skipped_existing += 1
+			start_from = str(configuration.get('from') or '').strip() or None
+			read = load_since(server_connection, store, state_intf, dml_intf, source, start_from=start_from)
 
-				continue
+		logger.info("Processing summary: read={}, written={}, {}".format(read, store.written, store.summary()))
 
-			record_data = dml_builder.build_kv_record_data(record_key, pattern)
-			record_data[tenx_dml_intf.SEARCH_COPY] = tenx_dml_intf.SEARCH_COPY_PENDING
-
-			if kv_intf.create_entry(record_key, record_data):
-				updates_performed += 1
-
-		if dml_intf.write_pending() < 0:
-			logger.warning("The searchable copy of new templates was not written; they stay pending for the next run.")
-			skipped_dml_error += 1
-
-		# Log summary stats
-		if skipped_invalid > 0 or skipped_dml_error > 0 or conflicts_marked > 0:
-			logger.info("Processing summary: added={}, existing={}, invalid={}, errors={}, conflicts={}".format(
-				updates_performed, skipped_existing, skipped_invalid, skipped_dml_error, conflicts_marked))
-
-		return updates_performed
+		return read
 	except Exception as e:
 		logger.error("Unexpected error in tenx dml to kv handler - {}.".format(e), exc_info=1)
+		if state_intf is not None:
+			try:
+				write_state(state_intf, read_state(state_intf), status=STATUS_FAILED, detail=str(e)[:500])
+			except Exception:
+				logger.warning("The checkpoint record could not be marked failed.", exc_info=1)
 		return -1
 
 
@@ -404,13 +622,13 @@ if __name__ == "__main__":
 	if len(sys.argv) > 1 and sys.argv[1] == "--execute":
 		startTime = tenx_util.current_time_ms()
 		payload = json.loads(sys.stdin.read())
-		num_updates = update_kv_store(payload)
+		num_read = update_kv_store(payload)
 
-		if num_updates < 0:
+		if num_read < 0:
 			logger.warning("Failed updating KV store")
 			sys.exit(2)
-		
-		logger.info("Updated KV store with {} records".format(num_updates))
+
+		logger.info("Read {} template records".format(num_read))
 		logger.info("Total runtime - {}ms".format(tenx_util.current_time_ms() - startTime))
 	else:
 		logger.error("Unsupported execution mode (expected --execute flag)")

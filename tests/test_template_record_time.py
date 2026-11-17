@@ -4,8 +4,8 @@ Template records take their index time.
 A record sent to HEC's event endpoint carries the sender's time, which for Fluent Bit is the
 time of the event that made the template, and DATETIME_CONFIG = CURRENT does not apply to
 that endpoint. So [tenx_dml_raw_json] runs tenx-dml-time, which sets _time to the clock
-while the record is parsed, and Consume KV (savedsearches.conf) stores the records indexed in
-the last seven minutes, by index time, so a record that reaches the index late is stored too.
+while the record is parsed, and Consume KV (savedsearches.conf) stores the records by index
+time, from a checkpoint, so a record that reaches the index late is stored too.
 """
 import configparser
 import os
@@ -41,22 +41,33 @@ class TestTemplateRecordTime:
 	def test_index_time_without_a_sender_time_is_unchanged(self):
 		assert conf('props.conf').get('tenx_dml_raw_json', 'DATETIME_CONFIG') == 'CURRENT'
 
-	def test_consume_kv_reads_the_last_seven_minutes_of_index_time(self):
-		# A record held on a heavy forwarder reaches the index after the time it was parsed;
-		# selecting by index time stores it in the first run after it is indexed.
+	def test_consume_kv_starts_the_action_on_every_run(self):
+		# The action reads the records itself, from its checkpoint of index time, so a record
+		# that reaches the index late is stored in the first run after it is indexed, and no
+		# result cap or window of the search limits what is stored.
 		saved = conf('savedsearches.conf')
-		search = saved.get('Consume KV', 'search')
-		assert search == 'index=tenx_dml sourcetype=tenx_dml_raw_json _index_earliest=-7m _index_latest=now'
+		assert saved.get('Consume KV', 'search') == '| makeresults'
 		assert saved.get('Consume KV', 'cron_schedule') == '*/5 * * * *'
-		# the event-time window only bounds the buckets read, and is wider than the index-time one
-		assert saved.get('Consume KV', 'dispatch.earliest_time') == '-24h'
-		assert saved.get('Consume KV', 'dispatch.latest_time') == 'now'
+		assert saved.get('Consume KV', 'action.tenx_dml_to_kv') == '1'
+		actions = conf('alert_actions.conf')
+		assert actions.get('tenx_dml_to_kv', 'param.source') == 'index=tenx_dml sourcetype=tenx_dml_raw_json'
+		assert actions.get('tenx_dml_to_kv', 'param.from') == ''
 
-	def test_backfill_kv_is_unchanged(self):
+	def test_backfill_kv_loads_from_the_start(self):
 		saved = conf('savedsearches.conf')
-		assert saved.get('Backfill KV', 'search') == 'index=tenx_dml sourcetype=tenx_dml_raw_json'
-		assert saved.get('Backfill KV', 'dispatch.earliest_time') == '-30d'
+		assert saved.get('Backfill KV', 'search') == '| makeresults'
+		assert saved.get('Backfill KV', 'action.tenx_dml_to_kv.param.from') == '0'
 		assert saved.get('Backfill KV', 'enableSched') == '0'
+
+	def test_diagnostics_shows_the_template_store_gap_search(self):
+		gap = conf('savedsearches.conf').get('Template Store Gap', 'search')
+		view = open(os.path.join(APP, 'default', 'data', 'ui', 'views', 'tenx_diagnostics.xml')).read()
+		assert '<query>%s</query>' % gap in view
+		assert 'missing=indexed-stored' in gap
+
+	def test_the_checkpoint_collection_is_not_replicated(self):
+		collections = conf('collections.conf')
+		assert collections.get('tenx_kv_state', 'replicate') == 'false'
 
 	def test_compact_events_keep_their_own_time_transform(self):
 		assert transforms_of('tenx_encoded') == {'TRANSFORMS-tenx_time': 'tenx-event-time'}

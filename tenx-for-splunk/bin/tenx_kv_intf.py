@@ -28,6 +28,12 @@ GET /servicesNS/{owner}/{app}/storage/collections/data/{collection}/{key}
 POST /servicesNS/{owner}/{app}/storage/collections/data/{collection}/
     Create a new record
 
+POST /servicesNS/{owner}/{app}/storage/collections/data/{collection}/batch_find
+    Read the records under many keys ({"_key": {"$in": [...]}})
+
+POST /servicesNS/{owner}/{app}/storage/collections/data/{collection}/batch_save
+    Write many whole records
+
 Usage
 -----
     from tenx_util import ServerConnection
@@ -63,6 +69,13 @@ logger = logging.getLogger(__name__)
 import json
 import urllib.parse
 import urllib.error
+
+# Splunk's defaults for limits.conf [kvstore] max_documents_per_batch_save and max_size_per_batch_save_mb.
+DEFAULT_BATCH_DOCUMENTS = 1000
+DEFAULT_BATCH_SIZE_MB = 50
+# Keys asked for in one batch_find query. One query returns at most max_rows_per_query rows (50,000)
+# and max_size_per_batch_result_mb (100 MB); 500 templates stay far below both.
+FIND_KEYS = 500
 
 
 class TenxKVInterface:
@@ -188,3 +201,56 @@ class TenxKVInterface:
 			logger.error("Failed saving {} records in a batch - {}".format(len(records), e), exc_info=1)
 
 		return False
+
+	def batch_limits(self):
+		"""
+		The KV store's limits on one batch_save call (limits.conf [kvstore]): documents and
+		megabytes. Splunk's defaults when the settings cannot be read.
+		"""
+		docs, size_mb = DEFAULT_BATCH_DOCUMENTS, DEFAULT_BATCH_SIZE_MB
+		try:
+			content = self.server_connection.get('/services/configs/conf-limits/kvstore')['entry'][0]['content']
+			docs = int(content.get('max_documents_per_batch_save') or docs)
+			size_mb = float(content.get('max_size_per_batch_save_mb') or size_mb)
+		except Exception as e:
+			logger.info("Could not read the KV store batch limits, using {} documents and {} MB - {}".format(docs, size_mb, e))
+		return max(1, docs), max(1.0, size_mb)
+
+	def save_many(self, records, limits=None):
+		"""
+		Writes whole records, each carrying its _key, in as few batch_save calls as the KV
+		store's limits allow. Returns True when every call succeeded.
+		"""
+		docs, size_mb = limits or self.batch_limits()
+		# Half the size limit: the limit counts the stored form, which can be larger than the JSON.
+		budget = int(size_mb * 1024 * 1024 / 2)
+		batch, size = [], 0
+		for record in records:
+			length = len(json.dumps(record)) + 2
+			if batch and (len(batch) >= docs or size + length > budget):
+				if not self.save_batch(batch):
+					return False
+				batch, size = [], 0
+			batch.append(record)
+			size += length
+		return self.save_batch(batch) if batch else True
+
+	def find_many(self, record_keys):
+		"""
+		The stored records under the given KV keys, as {key: record}, read with batch_find in
+		groups of FIND_KEYS keys. A key with no record is left out. Raises when the store
+		cannot be read, so a caller never takes an unread key for a missing one.
+		"""
+		found = {}
+		keys = list(dict.fromkeys(record_keys))
+		url = self.build_record_url("batch_find")
+		for start in range(0, len(keys), FIND_KEYS):
+			group = keys[start:start + FIND_KEYS]
+			answer = self.server_connection.post(url, json.dumps([{"query": {self.KV_KEY: {"$in": group}}}]))
+			rows = answer[0] if isinstance(answer, list) and answer and isinstance(answer[0], list) else answer
+			if not isinstance(rows, list):
+				raise RuntimeError("unexpected batch_find answer: {}".format(str(answer)[:200]))
+			for row in rows:
+				if isinstance(row, dict) and row.get(self.KV_KEY) is not None:
+					found[row[self.KV_KEY]] = row
+		return found

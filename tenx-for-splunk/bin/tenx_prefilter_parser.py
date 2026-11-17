@@ -76,6 +76,7 @@ so it may select more than the search keeps, never fewer.
 """
 import fnmatch
 import re
+import time
 
 MACRO = "`tx`"
 # The macros whose subsearch runs tenxprefilter: `tx`, `txf` and `txf(<sourcetype>)`.
@@ -1171,3 +1172,34 @@ def wild_plan(text):
 	for start, end, mark in sorted(edits, reverse=True):
 		search = search[:start] + mark + search[end:]
 	return ", ".join(steps), search.strip()
+
+
+# The record the Consume KV alert action keeps of how far it has stored template records
+# (collections.conf [tenx_kv_state], tenx_dml_to_kv.py). It runs every five minutes.
+STORE_STATE_PATH = "/servicesNS/nobody/tenx-for-splunk/storage/collections/data/tenx_kv_state/consume_kv?output_mode=json"
+STORE_STALE_SECONDS = 900
+
+
+def store_warning(state, now):
+	"""
+	The warning `tx` and `txf` show when the template store can lack templates their events
+	need, from the Consume KV record, or None. Events whose template is not stored stay compact.
+	"""
+	if not isinstance(state, dict) or not state:
+		return None
+	try:
+		updated = float(state.get("updated"))
+		through = float(state.get("loaded_through") or 0)
+	except (TypeError, ValueError):
+		return None
+	after = (" indexed after %s" % time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(through))) if through > 0 else ""
+	status = state.get("status")
+	if status == "failed":
+		return ("tx: Consume KV stopped with an error (%s), so templates%s may not be stored; events that use them stay "
+				"compact. See the Diagnostics dashboard." % (str(state.get("detail") or "see tenx_dml_to_kv.log")[:200], after))
+	if now - updated > STORE_STALE_SECONDS:
+		return ("tx: Consume KV has not run since %s, so templates indexed since then are not stored; events that use "
+				"them stay compact." % time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(updated)))
+	if status == "loading":
+		return ("tx: Consume KV is still storing templates%s; events that use them stay compact until it has." % after)
+	return None
