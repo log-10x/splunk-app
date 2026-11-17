@@ -11,6 +11,7 @@ Compact events and their template records come from the Receiver, the Log10x eng
 - [Installation](#installation)
 - [Configuration](#configuration)
 - [Usage](#usage)
+- [Fluent Bit Beside the Receiver](#fluent-bit-beside-the-receiver)
 - [Fields of the Original Sourcetype: txf](#fields-of-the-original-sourcetype-txf)
 - [Data Models and Detections: the Field Map](#data-models-and-detections-the-field-map)
 - [Which Searches Change When a Source Moves](#which-searches-change-when-a-source-moves)
@@ -537,6 +538,97 @@ index=myindex sourcetype=tenx_encoded
 
 ---
 
+## Fluent Bit Beside the Receiver
+
+Fluent Bit runs as two processes beside the Receiver, each in its own container with its own buffer
+folder: the first reads the logs and hands each record to the Receiver, and the second takes the
+Receiver's events back and sends them to Splunk's HTTP Event Collector (HEC). The Receiver and the
+second process share the first one's network:
+
+```sh
+docker run -d --name tenx-fluentbit-in --network <network> \
+  -v <fluent-bit-in.conf>:/fluent-bit/etc/fluent-bit.conf:ro -v <log folder>:/logs fluent/fluent-bit:5.1.5
+docker run -d --name tenx-receiver --network container:tenx-fluentbit-in log10x/edge-10x:1.1.181 \
+  @run/input/forwarder/fluentbit @apps/receiver receiverOptimize true varMaxRecurIndexes 0 \
+  timestampZone UTC timestampMaxPerObject 1 groupJoinLines false
+docker run -d --name tenx-fluentbit-back --network container:tenx-fluentbit-in --env-file <env file> \
+  -v <fluent-bit-back.conf>:/fluent-bit/etc/fluent-bit.conf:ro -v <log folder>:/logs fluent/fluent-bit:5.1.5
+```
+
+`<network>` is a Docker network from which the HEC is reachable. The env file sets
+`HEC_TOKEN=<HEC token>`, for a token that may write to `tenx_dml` and the compact index. The Receiver
+and the second process run in the first one's network, so restart them after each restart of the
+first. With `Retry_Limit False`, Fluent Bit keeps the records it reads in the meantime and sends them
+when the Receiver is back.
+
+The first process, `fluent-bit-in.conf`, with one `tail` input per log file:
+
+```
+[SERVICE]
+    storage.path      /logs/flb-storage
+
+[INPUT]
+    Name              tail
+    Path              /logs/<log file>
+    DB                /logs/<log file>.db
+    Tag               src.app
+    Read_from_Head    true
+    storage.type      filesystem
+
+[OUTPUT]
+    Name              forward
+    Match             src.*
+    Host              127.0.0.1
+    Port              24224
+    Retry_Limit       False
+```
+
+The second process, `fluent-bit-back.conf`: the template records go to `tenx_dml`, and each source's
+compact events to the compact index.
+
+```
+[SERVICE]
+    storage.path      /logs/flb-storage-back
+    HTTP_Port         2021
+
+[INPUT]
+    Name              forward
+    Listen            0.0.0.0
+    Port              24225
+    Tag_Prefix        tenx.
+    storage.type      filesystem
+
+[OUTPUT]
+    Name              splunk
+    Match             tenx.tenx-template
+    Host              <HEC host>
+    Port              8088
+    Splunk_Token      ${HEC_TOKEN}
+    TLS               On
+    event_index       tenx_dml
+    event_source      fluent-bit-tenx
+    event_sourcetype  tenx_dml_raw_json
+    Retry_Limit       False
+
+[OUTPUT]
+    Name              splunk
+    Match             tenx.src.app
+    Host              <HEC host>
+    Port              8088
+    Splunk_Token      ${HEC_TOKEN}
+    TLS               On
+    event_index       <compact index>
+    event_sourcetype  tenx_encoded
+    event_key         $log
+    Retry_Limit       False
+```
+
+A multi-line source takes a multiline parser with `flush_timeout 30000` on its `tail` input, as the
+Windows sources below do. Every `rewrite_tag` filter takes `Emitter_Storage.type filesystem` and
+`Emitter_Mem_Buf_Limit 0`. Leave these unset: `storage.pause_on_chunks_overlimit`, `rate_gate`, and
+memory storage with `Mem_Buf_Limit`, on a `tail` input; `Mem_Buf_Limit` and any pause option on the
+second process's `forward` input; `storage.total_limit_size` on any output.
+
 ## Fields of the Original Sourcetype: `txf`
 
 `tx` gives an expanded event the fields Splunk extracts from its text. The `txf` macro also
@@ -557,9 +649,10 @@ To set it up:
 1. Give every compact event the indexed field `tenx_sourcetype` with its original sourcetype: in
    the HEC event's `fields`, for example `"fields": {"tenx_sourcetype": "XmlWinEventLog"}`, or with
    `_meta = tenx_sourcetype::XmlWinEventLog` in the `inputs.conf` stanza that reads a compact file.
-   With Fluent Bit as in the setup guide, the events the Receiver sends back arrive on Fluent Bit's
-   `forward` input with `Tag_Prefix tenx.`; for each source, a `modify` filter adds the field and
-   the `splunk` output sends it as an indexed field:
+   With Fluent Bit as in [Fluent Bit Beside the Receiver](#fluent-bit-beside-the-receiver), the
+   events the Receiver sends back arrive on the second process's `forward` input with
+   `Tag_Prefix tenx.`; for each source, a `modify` filter there adds the field and the `splunk`
+   output sends it as an indexed field:
 
    ```
    [FILTER]
@@ -579,6 +672,7 @@ To set it up:
        event_source      XmlWinEventLog:Security
        event_key         $log
        event_field       tenx_sourcetype $tenx_sourcetype
+       Retry_Limit       False
    ```
 
    The compact events must carry the source the add-on expects, as the raw events would: the
@@ -595,13 +689,15 @@ To set it up:
    Fluent Bit's `tail` input with a multiline parser that starts a record at `<Event` gives that
    form, the parser in a parsers file named by `Parsers_File` in `[SERVICE]`. Events read from the
    Windows event log itself, by a Universal Forwarder's `WinEventLog` input or Fluent Bit's
-   `winevtlog` input, are outside these steps:
+   `winevtlog` input, are outside these steps. Set `storage.path` in `[SERVICE]` as well and
+   `storage.type filesystem` on the input, so a record the parser completes while the input is paused
+   waits on disk:
 
    ```
    [MULTILINE_PARSER]
        name          win_xml
        type          regex
-       flush_timeout 2000
+       flush_timeout 30000
        rule          "start_state"  "/^<Event/"       "cont"
        rule          "cont"         "/^(?!<Event)/"   "cont"
 
@@ -614,6 +710,7 @@ To set it up:
        Buffer_Chunk_Size 64k
        Buffer_Max_Size   2M
        multiline.parser  win_xml
+       storage.type      filesystem
    ```
 
    The `DB` file keeps Fluent Bit's place in each file it reads, so after a restart it reads on
@@ -732,17 +829,21 @@ has its own cap file and its own scheduled `check`.
    docker rm tenx-config
    ```
 
-   Fluent Bit and the Receiver then run as two containers that share Fluent Bit's network:
+   Fluent Bit and the Receiver then run as in
+   [Fluent Bit Beside the Receiver](#fluent-bit-beside-the-receiver), with the Receiver's arguments
+   above:
 
    ```sh
-   docker run -d --name tenx-fluentbit --network <network> --env-file <env file> \
-     -v <fluent-bit.conf>:/fluent-bit/etc/fluent-bit.conf:ro \
+   docker run -d --name tenx-fluentbit-in --network <network> \
+     -v <fluent-bit-in.conf>:/fluent-bit/etc/fluent-bit.conf:ro \
      -v <parsers file>:/fluent-bit/etc/win-parsers.conf:ro -v <log folder>:/logs fluent/fluent-bit:5.1.5
-   docker run -d --name tenx-receiver --network container:tenx-fluentbit \
+   docker run -d --name tenx-receiver --network container:tenx-fluentbit-in \
      -v <edited compact config.yaml>:/etc/tenx/config/pipelines/run/receive/compact/config.yaml:ro \
      -v <host folder of the cap file>:/etc/tenx/win log10x/edge-10x:1.1.181 \
      @run/input/forwarder/fluentbit @apps/receiver varMaxRecurIndexes 0 timestampZone UTC \
      timestampMaxPerObject 1 groupJoinLines false compactReceiverLookupFile /etc/tenx/win/compact-cap.csv
+   docker run -d --name tenx-fluentbit-back --network container:tenx-fluentbit-in --env-file <env file> \
+     -v <fluent-bit-back.conf>:/fluent-bit/etc/fluent-bit.conf:ro -v <log folder>:/logs fluent/fluent-bit:5.1.5
    ```
 
    `<network>` is a Docker network from which the HTTP Event Collector is reachable. The env file
@@ -751,16 +852,14 @@ has its own cap file and its own scheduled `check`.
    path on the host, and the Receiver the path inside the container. The host folder need not be
    `/etc/tenx` (creating a folder there needs root).
 
-   The Receiver runs in Fluent Bit's network, so restart the Receiver after each restart of Fluent
-   Bit. With `Retry_Limit False`, Fluent Bit keeps the records it reads in the meantime and sends them
-   when the Receiver is back.
+   The first process's configuration holds:
 
-   The Fluent Bit configuration of the mapped source holds:
-
-   - `Parsers_File /fluent-bit/etc/win-parsers.conf` in `[SERVICE]`, and in that file the `win_xml`
-     parser of [Fields of the Original Sourcetype](#fields-of-the-original-sourcetype-txf), step 1;
-   - the source's `tail` input with `multiline.parser win_xml`, as in that step;
-   - the hand-off to the Receiver and the input its events come back on:
+   - `Parsers_File /fluent-bit/etc/win-parsers.conf` and `storage.path /logs/flb-storage` in
+     `[SERVICE]`, and in that file the `win_xml` parser of
+     [Fields of the Original Sourcetype](#fields-of-the-original-sourcetype-txf), step 1;
+   - the source's `tail` input with `multiline.parser win_xml` and `storage.type filesystem`, as in
+     that step;
+   - the hand-off to the Receiver:
 
      ```
      [OUTPUT]
@@ -769,17 +868,26 @@ has its own cap file and its own scheduled `check`.
          Host        127.0.0.1
          Port        24224
          Retry_Limit False
-
-     [INPUT]
-         Name        forward
-         Listen      0.0.0.0
-         Port        24225
-         Tag_Prefix  tenx.
      ```
 
-   - the template output of the [Splunk setup page](https://doc.log10x.com/apps/receiver/compact/splunk/),
-     step 3, with `Match tenx.tenx-template`, which sends the template records to `tenx_dml`;
-   - the `modify` filter and the `splunk` output of the source, as in that step 1, with
+   The second process's configuration holds:
+
+   - `storage.path /logs/flb-storage-back` and `HTTP_Port 2021` in `[SERVICE]`, and the input the
+     Receiver's events come back on:
+
+     ```
+     [INPUT]
+         Name         forward
+         Listen       0.0.0.0
+         Port         24225
+         Tag_Prefix   tenx.
+         storage.type filesystem
+     ```
+
+   - the template output of [Fluent Bit Beside the Receiver](#fluent-bit-beside-the-receiver), with
+     `Match tenx.tenx-template`, which sends the template records to `tenx_dml`;
+   - the `modify` filter and the `splunk` output of the source, as in
+     [Fields of the Original Sourcetype](#fields-of-the-original-sourcetype-txf), step 1, with
      `event_sourcetype tenx_win` and `event_source XmlWinEventLog:Security` (step 5 below).
 
    Every event arrives whole, with all its fields, until its template is listed. From the first
@@ -981,16 +1089,15 @@ search of a mapped event then lacks it, and `_time` is set as before.
 
 **Windows Security as classic text** (sourcetype `WinEventLog:Security`: a date line, then
 `name=value` lines and the `Message=` block, not rendered XML) has its own map, Receiver and cap file,
-`/etc/tenx/wincl/compact-cap.csv`. Fluent Bit starts a record at the event's date line, and ends it
-only after 10 seconds without a new line (with 2 seconds, a host under load cut 1 event of 100,000
-in two). Give the `tail` input a `Mem_Buf_Limit` it does not reach (`512M` here): a paused input
-joined parts of 2 events of 100,000 at `64M`:
+`/etc/tenx/wincl/compact-cap.csv`. Fluent Bit starts a record at the event's date line and ends it
+at the next one, or after 30 seconds without a new line; the `tail` input takes
+`storage.type filesystem`, as in [Fluent Bit Beside the Receiver](#fluent-bit-beside-the-receiver):
 
 ```
 [MULTILINE_PARSER]
     name          win_classic
     type          regex
-    flush_timeout 10000
+    flush_timeout 30000
     rule          "start_state"  "/^\d{2}\/\d{2}\/\d{4} \d{2}:\d{2}:\d{2} [AP]M$/"       "cont"
     rule          "cont"         "/^(?!\d{2}\/\d{2}\/\d{4} \d{2}:\d{2}:\d{2} [AP]M$)/"  "cont"
 ```

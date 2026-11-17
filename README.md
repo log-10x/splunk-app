@@ -56,6 +56,8 @@ The first argument names the input module for the forwarder in use, here Fluent 
 The Receiver runs in Fluent Bit's network, so restart the Receiver after each restart of Fluent Bit.
 With `Retry_Limit False`, Fluent Bit keeps the records it reads in the meantime and sends them when the
 Receiver is back.
+Fluent Bit's side, two processes with their buffers on disk, is in the app's README:
+[Fluent Bit Beside the Receiver](tenx-for-splunk/README.md#fluent-bit-beside-the-receiver).
 
 The three options live in two files of the Receiver's config folder (`$TENX_CONFIG`, mounted at
 `/etc/tenx/config` in the container image):
