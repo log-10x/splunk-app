@@ -1,8 +1,8 @@
 """
 The csv reader (a DELIMS extraction with FIELDS: positional values, as the Splunk Add-on for Palo Alto Networks reads
-PAN-OS syslog), its layouts from an add-on, the [source::] stanzas that leave an add-on's text rules out for compact
-events, and a TIME_PREFIX match that spans values. What Splunk does was measured on Splunk Enterprise 10.4.3 (see the
-docstrings of CsvReader, csv_layouts and "Rules that read a compact event's text"); these tests pin what gen writes.
+PAN-OS syslog), its layouts from an add-on, tenx_blank and the search-time rules that null what an add-on's positional
+rule reads from a compact line, and a TIME_PREFIX match that spans values. What Splunk does was measured on Splunk Enterprise 10.4.3 (see the
+docstrings of CsvReader, csv_layouts and "A positional rule on a compact line"); these tests pin what gen writes.
 The add-on here is synthetic.
 """
 import json
@@ -75,22 +75,16 @@ class TestLayoutsFromAddon:
 			('^[^,]+,[^,]+,SYSTEM,', ['head', 'when', 'type', 'module', 'description'], ',')]
 		assert 'no REPORT- transform' in report[LOG]
 
-	def test_classes_that_read_the_text(self, tmp_path):
-		props, transforms = fm.read_addon(addon(tmp_path))
-		assert fm.text_reading_classes(props, transforms, TRAFFIC) == [('REPORT-search', ['extract_misc'])]
-		assert fm.text_reading_classes(props, transforms, SYSTEM) == [('REPORT-search', [])]
-		assert fm.text_reading_classes(props, transforms, LOG) == []
-
 
 class TestGen:
 	def target(self, tmp_path):
 		p = tmp_path / 'target.json'
 		p.write_text(json.dumps({'reader': 'csv', 'sourcetype': 'tenx_fw', 'rename': [TRAFFIC, SYSTEM, LOG],
-			'compact_source': True, 'time_prefix': '^(?:[^,]*,){1}', 'time_format': ['%Y/%m/%d %H:%M:%S,%N',
+			'time_prefix': '^(?:[^,]*,){1}', 'time_format': ['%Y/%m/%d %H:%M:%S,%N',
 			'%Y/%m/%d %H:%M:%S']}), encoding='utf-8')
 		return str(p)
 
-	def test_map_with_compact_source(self, tmp_path):
+	def test_map_of_several_layouts(self, tmp_path):
 		items = [('t1', '$(MMM dd HH:mm:ss) $,$//$//$ $:$:$,TRAFFIC,$.$.$.$,$,site//a'),
 			('s1', '$(MMM dd HH:mm:ss) $,$//$//$ $:$:$,SYSTEM,auth,user $ failed')]
 		assert fm.main(['gen', '--rules', 'lookup', '--records', records(tmp_path, items), '--target', self.target(tmp_path),
@@ -100,13 +94,10 @@ class TestGen:
 		assert names['t1'][:5] == ['head', 'when', 'type', 'src', 'dst'] and 'misc' in names['t1']
 		assert ['head', 'when', 'type', 'module', 'description'] == names['s1'][:5]
 		props = (tmp_path / 'fm' / 'default' / 'props.conf').read_text(encoding='utf-8')
-		transforms = (tmp_path / 'fm' / 'default' / 'transforms.conf').read_text(encoding='utf-8')
-		assert '[source::tenx:fw:traffic:...]\nREPORT-search = extract_misc\n' in props
-		assert '[source::tenx:fw:system:...]\nREPORT-search = \n' in props
-		assert '[source::tenx:fw:log:' not in props
-		assert re.search(r'TRANSFORMS-tenx_fw = .*tenx_fw_rename, tenx_fw_source\n', props)
-		assert ('INGEST_EVAL = source:=if(substr(_raw,1,1)=="~" AND sourcetype!="tenx_fw", "tenx:" . sourcetype . ":" . '
-			'source, source)') in transforms
+		# source is left as it is: no [source::] stanza and no index-time rule writes it
+		assert '[source::' not in props and 'source:=' not in (tmp_path / 'fm' / 'default' / 'transforms.conf').read_text(
+			encoding='utf-8')
+		assert re.search(r'TRANSFORMS-tenx_fw = .*tenx_fw_rename\n', props)
 		report = json.loads((tmp_path / 'fm_report.json').read_text(encoding='utf-8'))
 		# The prefix spans the header's values (the timestamp and one more) and still ends at template text.
 		assert report['event_time']['templates_with_rule'] == 2
@@ -125,7 +116,7 @@ class TestGen:
 
 	def test_palo_alto_target(self):
 		t = fm.load_target('palo-alto', {})
-		assert t['reader'] == 'csv' and t['compact_source'] and fm.several(t)
+		assert t['reader'] == 'csv' and fm.several(t)
 		assert fm.renames(t)[0] == 'pan:traffic' and fm.renames(t)[-1] == 'pan:log'
 		assert t['time_format'] == ['%Y/%m/%d %H:%M:%S,%N', '%Y/%m/%d %H:%M:%S']
 
@@ -140,3 +131,36 @@ class TestTimePrefixOverValues:
 		rx = re.compile(r'^\S+ ')
 		text = '\x000\x00 rest'
 		assert not fm.prefix_match_is_stable(rx, text, rx.search(text).end())
+
+
+class TestBlankColumns:
+	def test_blank_columns_and_evals(self, tmp_path):
+		p = tmp_path / 'target.json'
+		p.write_text(json.dumps({'reader': 'csv', 'sourcetype': 'tenx_fw', 'rename': [TRAFFIC, SYSTEM, LOG]}),
+			encoding='utf-8')
+		# Values: the timestamp, 6 of the date and time, 4 of the address: 11, so the compact line fills 12 columns.
+		items = [('t1', '$(MMM dd HH:mm:ss) $,$//$//$ $:$:$,TRAFFIC,$.$.$.$,,site//a')]
+		assert fm.main(['gen', '--rules', 'lookup', '--records', records(tmp_path, items), '--target', str(p),
+			'--addon', addon(tmp_path), '--out', str(tmp_path / 'fm')]) == 0
+		row = fm.read_lookup_file(str(tmp_path / 'fm' / 'lookups' / 'tenx_fw_fields.csv.gz'))['t1']['f']
+		fields = dict(fm.parse_meta(row))
+		assert fields[fm.BLANK_FIELD] == 'dst'
+		props = (tmp_path / 'fm' / 'default' / 'props.conf').read_text(encoding='utf-8')
+		assert 'EVAL-dst = if(match(tenx_blank, "(^| )(dst)( |$)"), null(), \'dst\')' in props
+		assert '[source::' not in props
+		transforms = (tmp_path / 'fm' / 'default' / 'transforms.conf').read_text(encoding='utf-8')
+		assert 'source:=' not in transforms
+
+	def test_add_on_rules_that_read_a_column_are_guarded(self, tmp_path):
+		a = addon(tmp_path)
+		with open(os.path.join(a, 'default', 'props.conf'), 'a', encoding='utf-8') as f:
+			f.write('\n[%s]\nFIELDALIAS-url = misc AS url\nFIELDALIAS-type = when AS dst\nEVAL-who = coalesce(dst, "dst unknown")\n' % TRAFFIC)
+		props, transforms = fm.read_addon(a)
+		out = dict(fm.blank_overrides(props, transforms, TRAFFIC, ['head', 'when', 'type', 'src', 'dst', 'misc']))
+		# the add-on's own calculated field, its column reference guarded, the literal kept
+		# dst is overwritten by an alias from when, so its column no longer decides it
+		assert out['EVAL-who'] == 'coalesce(if(match(tenx_blank, "(^| )(when)( |$)"), null(), \'dst\'), "dst unknown")'
+		# fields an alias or a REPORT derives from a column are nulled with it
+		assert out['EVAL-url'] == 'if(match(tenx_blank, "(^| )(misc)( |$)"), null(), \'url\')'
+		assert out['EVAL-misc_host'] == 'if(match(tenx_blank, "(^| )(misc)( |$)"), null(), \'misc_host\')'
+		assert out['EVAL-src'] == 'if(match(tenx_blank, "(^| )(src)( |$)"), null(), \'src\')'
