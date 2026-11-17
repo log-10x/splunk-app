@@ -4,7 +4,7 @@ tenxprefilter: the prefilter of the `tx` macro, built once per search.
 `tx` expands to `tenx-events` [| tenxprefilter] | `tenx-inflate` | ... | search *, and the words
 written after `tx` become the arguments of that last search. This command runs in the
 subsearch: it reads the running job's own search text through the REST API, parses the words
-after `tx` (tenx_prefilter_parser), asks the template dictionary which templates carry each
+after `tx` (tenx_prefilter_parser), asks the KV store of templates which templates carry each
 word, and returns one row whose `search` field is the prefilter.
 
 A field comparison (field=value, field IN (...)) narrows only when tenx_config.conf [config] has
@@ -53,6 +53,20 @@ EVERY_EVENT = "(*)"
 NARROWING_STANZA = "tenx:narrowing"
 
 SUBSEARCH_SID = re.compile(r"^subsearch_(.+)_\d+\.\d+$")
+
+
+def dictionary_failed(result):
+	"""
+	The first message of a oneshot answer that means its rows cannot be trusted as complete: an
+	error (the KV store unavailable, the lookup missing) or a warning that rows were cut. None
+	when there is none. A template the answer misses would select none of its events, so the
+	prefilter then selects every compact event instead.
+	"""
+	for message in result.get("messages", []) or []:
+		kind, text = str(message.get("type", "")).upper(), str(message.get("text", ""))
+		if kind in ("ERROR", "FATAL") or (kind == "WARN" and any(w in text.lower() for w in ("truncat", "limit", "exceed"))):
+			return "%s: %s" % (kind, text[:200])
+	return None
 
 
 @Configuration()
@@ -193,7 +207,9 @@ class TenxPrefilterCommand(GeneratingCommand):
 					"/servicesNS/%s/%s/search/jobs" % (urllib.parse.quote(self._metadata.searchinfo.username), APP_NAME),
 					{"search": parser.dictionary_search(pieces), "exec_mode": "oneshot", "output_mode": "json",
 					 "count": "0", "earliest_time": "0", "latest_time": "now"})
-				dictionary = parser.dictionary_from_rows(result.get("results", []))
+				if dictionary_failed(result):
+					raise RuntimeError("the template lookup reported: %s" % dictionary_failed(result))
+				dictionary = parser.dictionary_from_rows(result.get("results", []), pieces)
 			except Exception as e:
 				self.logger.warning("tx: the template lookup failed: %s", e)
 				self.write_warning("tx: the template lookup did not complete; every compact event in range is expanded.")
