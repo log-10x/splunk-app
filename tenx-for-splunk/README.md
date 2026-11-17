@@ -639,6 +639,14 @@ process the events coming back from the Receiver wait behind the backlog of the 
 Fluent Bit's Splunk output has no indexer acknowledgement, so when the HEC answers 503, a chunk
 Fluent Bit sends again can be indexed twice, as on any Fluent Bit path to HEC, raw events included.
 
+While Fluent Bit takes the Receiver's events slower than they come, the Receiver logs the WARN line
+`forward output buffer full (the destination takes events slower than they come): events wait until
+it takes them`: the events wait, the Receiver reads more slowly, and Fluent Bit keeps the records it
+has read. An ERROR line `forward output: an event was not written`, `forward output closed with
+events not written` or `forward output closed with events not delivered` names events the Receiver
+did not hand back to Fluent Bit, which are lost. The HEC token is read by the second Fluent Bit
+process only, and does not reach the Receiver or its log.
+
 ## Fields of the Original Sourcetype: `txf`
 
 `tx` gives an expanded event the fields Splunk extracts from its text. The `txf` macro also
