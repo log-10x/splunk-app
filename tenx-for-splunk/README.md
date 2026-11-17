@@ -179,6 +179,7 @@ The `tenx_dml` collection stores parsed template data with fields:
 | Rebuild Field Replay | every hour | Runs `tenxreplay`, which writes the replay macros `txf` runs |
 | Rebuild Field Replay When New | every 5 minutes | Runs `tenxreplay` for original sourcetypes not yet covered |
 | Field Map Events Without Fields | not scheduled | Counts compact events indexed without their fields (`tenx_unmapped`) by index, sourcetype and reason, with index-time rule errors from `splunkd.log`; schedule it where a field map is installed |
+| Field Map Dropped Events | every 5 minutes, a tracked alert | Counts the compact events Splunk dropped at parsing because a field map's index-time lookup failed, by node and sourcetype, from splunkd.log. Finds nothing where no field map is installed. |
 
 #### Python Scripts
 
@@ -263,7 +264,8 @@ tenx-for-splunk/
 │   ├── props.conf               # Sourcetype definitions
 │   ├── restmap.conf, web.conf   # The /tenx-search and /tenx-alert endpoints
 │   ├── savedsearches.conf       # Consume KV, Backfill KV, Recompile Compiled Alerts, Rebuild Field Replay,
-│   │                            # Rebuild Field Replay When New, Field Map Events Without Fields
+│   │                            # Rebuild Field Replay When New, Field Map Events Without Fields,
+│   │                            # Field Map Dropped Events
 │   ├── searchbnf.conf, server.conf  # Command help; tenx_config and tenx_replay replicated in a search head cluster
 │   ├── tenx_config.conf         # App configuration
 │   ├── transforms.conf          # Field extractions and lookups

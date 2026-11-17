@@ -133,10 +133,11 @@ An event whose template is found but whose expansion gives no text also stays co
 A compact event's `_time` is the time in its original log line wherever the Receiver wrote
 one, and the time Splunk indexed it otherwise. The Receiver writes a template's timestamp as
 an epoch in the event's first variable, 13 digits for milliseconds or 19 for nanoseconds.
-The `tenx-event-time` transform sets `_time` from a first variable of that shape while the
-event is parsed, when it falls inside Splunk's own timestamp window: 2,000 days back and 2
-days ahead, the defaults for `MAX_DAYS_AGO` and `MAX_DAYS_HENCE`. Any other first variable
-keeps the index time. Searches and alerts over a time range select late and replayed logs by
+The `tenx-event-time` transform sets `_time` from the event's first variable of that shape
+while the event is parsed, when that time falls between 2,000 days before indexing and 2 days
+after. The window is fixed in the transform; `MAX_DAYS_AGO` and `MAX_DAYS_HENCE` do not change
+it. An event outside it, such as a replay of logs more than 2,000 days old, takes the time
+Splunk indexed it. Searches and alerts over a time range select late and replayed logs by
 the time in the line.
 
 Measured on Splunk 9.4.15, 10.4.3 and 10.6.0.5, the same on each, with the OpenTelemetry demo
