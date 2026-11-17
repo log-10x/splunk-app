@@ -41,6 +41,14 @@ own search text, and this module
    tx-inflate prints it again, so no digit of such a form is a term of the compact event: the
    936 of "20:11:45.936" is three digits, which the first test alone kept, and the search found
    none of the events that hold it.
+   A run of digits (4625, 54849625) is the one exception the stored templates can settle: a token
+   that starts with a digit is always a value of the compact event (FORMAT_SPEC S3.2), so the
+   timestamp is the only text that prints digits the compact event does not hold. tenxprefilter
+   reads the timestamp formats of the stored templates (FORMAT_KEY_STEPS, in the same read of the
+   KV store as the template dictionary), and a run of digits that
+   none of them can print (timestamp_prints()) is used like any other piece; one that some format
+   can print (a year, the two digits of a minute, a fraction of the same length) is not. When the
+   formats cannot be read, no run of digits is used.
 
    Field narrowing is off unless tenx_config.conf [config] says field_narrowing = true, and
    then only once tenxreplay has written the list it needs; off, field comparisons place no
@@ -76,6 +84,7 @@ so it may select more than the search keeps, never fewer.
 """
 import fnmatch
 import re
+import time
 
 MACRO = "`tx`"
 # The macros whose subsearch runs tenxprefilter: `tx`, `txf` and `txf(<sourcetype>)`.
@@ -188,6 +197,8 @@ class Tokens(list):
 	def __init__(self):
 		list.__init__(self)
 		self.glued = set()
+		# (start, end) of each token in the text it was read from
+		self.spans = []
 
 
 def macro_call(search):
@@ -341,10 +352,12 @@ def tokenize(text):
 				buf.append(text[j])
 				j += 1
 			tokens.append(("phrase", "".join(buf)))
+			tokens.spans.append((i, j))
 			i = j
 			continue
 		if c in "()":
 			tokens.append((c, c))
+			tokens.spans.append((i, i + 1))
 			i += 1
 			continue
 		if c == "[":
@@ -363,6 +376,7 @@ def tokenize(text):
 						break
 				j += 1
 			tokens.append(("subsearch", ""))
+			tokens.spans.append((i, j))
 			i = j
 			continue
 		j, buf = i, []
@@ -383,6 +397,7 @@ def tokenize(text):
 			buf.append(text[j])
 			j += 1
 		tokens.append(("word", "".join(buf)))
+		tokens.spans.append((i, j))
 		i = j
 	return tokens
 
@@ -394,6 +409,10 @@ class Parser(object):
 		self.tokens, self.i = tokens, 0
 		self.time_modifier = False
 		self.unquoted_comma = False
+		# id() of each ("text", ...) node made from one word or phrase token -> that token's index
+		self.text_at = {}
+		# id() of each TERM() or CASE() node -> (TERM or CASE, its one word or None, first token, last token)
+		self.call_at = {}
 
 	def _peek(self, k=0):
 		return self.tokens[self.i + k] if self.i + k < len(self.tokens) else (None, None)
@@ -498,27 +517,34 @@ class Parser(object):
 				# with certainty, so it places no restriction.
 				self._take()
 				return ("unknown", value)
-			return ("text", value)
+			node = ("text", value)
+			self.text_at[id(node)] = self.i - 1
+			return node
 		if kind != "word":
 			raise Unparsed("unexpected %s" % kind)
 		if value in ("AND", "OR", "IN"):
 			raise Unparsed("%s where a search term should be" % value)
 		following = self._peek()
 		if value in ("TERM", "CASE") and following[0] == "(":
+			first = self.i - 1
 			self._take()
-			inner = []
+			inner, kinds = [], []
 			while self._peek()[0] not in (")", None):
 				kind_, item = self._take()
 				if kind_ not in ("word", "phrase"):
 					raise Unparsed("%s() holding %s" % (value, kind_))
 				inner.append(item)
+				kinds.append(kind_)
 			if self._take()[0] != ")":
 				raise Unparsed("%s( without its closing parenthesis" % value)
 			# `tx` applies the user's words after a pipe, where Splunk tests TERM() and CASE() against
 			# the event's text, which for some arguments differs from the same search on an index
 			# (TERM(pattern=*.log): 0 events on the index, 1,025 after a pipe, Splunk Enterprise 10.4.3).
-			# Which words every such event holds is not certain, so they place no restriction.
-			return ("unknown", "%s(%s)" % (value, " ".join(inner)))
+			# Which words every such event holds is not certain, so they place no restriction on the
+			# prefilter. wild_plan() matches some of them as the index does before the final search.
+			node = ("unknown", "%s(%s)" % (value, " ".join(inner)))
+			self.call_at[id(node)] = (value, inner[0] if kinds == ["word"] else None, first, self.i - 1)
+			return node
 		if following == ("word", "IN"):
 			self._take()
 			if self._peek()[0] != "(":
@@ -579,7 +605,9 @@ class Parser(object):
 			return ("unknown", value)
 		if "," in value:
 			self.unquoted_comma = True
-		return ("text", value)
+		node = ("text", value)
+		self.text_at[id(node)] = self.i - 1
+		return node
 
 
 def unquote(value):
@@ -845,6 +873,189 @@ def usable(piece):
 			and not TIMESTAMP_PIECE.match(piece) and not timestamp_could_print(piece))
 
 
+# A run of digits the search holds: a piece that usable() refuses only because a rendered timestamp
+# prints runs of digits. Every other run of digits of an event is a value of its compact event: a
+# token that starts with a digit is never template text (FORMAT_SPEC.md S3.2, rule 2), except "-1"
+# (S2.2), which the template dictionary finds in the template's text. So such a piece narrows once no
+# timestamp format of the stored templates can print it (digit_pieces_cleared()).
+DIGIT_PIECE = re.compile(r"[0-9]+")
+# The directives a stored timestamp_format holds (tenx_dml_builder.to_splunk_time_format), as
+# tenx-inflate prints them: (fewest digits, most digits, lowest value, highest value, zero-padded).
+# The year is printed from the first 10 digits of the epoch (tenx-inflate tenx_ts_sec), so it is
+# between 1969 and 2286; 1900 to 2299 is used. A seconds field is the epoch's second of the minute.
+TS_NUMBER = {
+	"Y": (4, 4, 1900, 2299, True), "y": (2, 2, 0, 99, True),
+	"m": (2, 2, 1, 12, True), "-m": (1, 2, 1, 12, False),
+	"d": (2, 2, 1, 31, True), "-d": (1, 2, 1, 31, False),
+	"j": (3, 3, 1, 366, True), "-j": (1, 3, 1, 366, False), "V": (2, 2, 1, 53, True),
+	"H": (2, 2, 0, 23, True), "-H": (1, 2, 0, 23, False),
+	"I": (2, 2, 1, 12, True), "-I": (1, 2, 1, 12, False),
+	"M": (2, 2, 0, 59, True), "-M": (1, 2, 0, 59, False),
+	"S": (2, 2, 0, 59, True), "-S": (1, 2, 0, 59, False),
+}
+# Directives that print letters only (AM/PM, month and day names, UTC), and the zone offsets, which
+# tenx-inflate prints as these literal characters.
+TS_LETTERS = frozenset(("p", "b", "B", "a", "A", "Z"))
+TS_ZONES = {"z": "+0000", ":z": "+00:00", ":::z": "+00"}
+TS_DIRECTIVE = re.compile(r"%(-?)(:*)([0-9]*)([A-Za-z%])")
+EPOCH_PASSTHROUGH = "__TENX_EPOCH__"
+# Per stored record: its timestamp_format and whether a digit can stand right before (lg) or right
+# after (rg) the rendered timestamp, so that Splunk reads them as one run with it. A digit of the
+# template text, or a value (the placeholder at the start or the end of a part): counted as one. The
+# placeholder is the literal tenx-inflate replaces. dictionary_search(formats=True) returns the
+# distinct "<lg><rg>|<timestamp_format>" of every record that has a timestamp, in tenx_formats. mvfilter() takes
+# one field (Splunk 10.4.3 refuses mvfilter(match(mvappend(...), ...)) as invalid arguments), hence two evals.
+FORMAT_KEY_STEPS = (
+	' | eval tenx_tp=mvappend(part_0, pattern_parts, pattern_terminator)'
+	' | eval tenx_tp=mvfilter(match(tenx_tp, "__TENX_TS__"))'
+	' | eval tenx_fk=if(isnull(tenx_tp), null(), if(isnotnull(mvfind(tenx_tp, "(^|[0-9])__TENX_TS__")), "1", "0")'
+	' . if(isnotnull(mvfind(tenx_tp, "__TENX_TS__([0-9]|$)")), "1", "0") . "|" . coalesce(timestamp_format, ""))'
+)
+
+
+def timestamp_elements(fmt):
+	"""
+	What a stored timestamp_format prints, in order: ("lit", character), ("num", *TS_NUMBER entry),
+	("any", fewest, most or None) for digits of any value, ("letters",). A directive this does not
+	know prints any digits, which can only make a piece unusable.
+	"""
+	out, i = [], 0
+	qs = len(re.findall(r"%[0-9]+Q", fmt))
+	while i < len(fmt):
+		if fmt[i] != "%":
+			out.append(("lit", fmt[i]))
+			i += 1
+			continue
+		m = TS_DIRECTIVE.match(fmt, i)
+		if not m:
+			out.append(("any", 1, None))
+			i += 1
+			continue
+		dash, colons, width, letter = m.groups()
+		i = m.end()
+		key = dash + colons + letter
+		if letter == "%" and not (dash or colons or width):
+			out.append(("lit", "%"))
+		elif letter == "Q" and width and not (dash or colons):
+			# tenx-inflate prints every %<n>Q with the digit count of the last one; one is exact
+			n = int(width)
+			out.append(("any", n, n) if qs == 1 and 1 <= n <= 9 else ("any", 1, None))
+		elif width:
+			out.append(("any", 1, None))
+		elif key in TS_NUMBER:
+			out.append(("num",) + TS_NUMBER[key])
+		elif key in TS_ZONES:
+			out.extend(("lit", c) for c in TS_ZONES[key])
+		elif key in TS_LETTERS:
+			out.append(("letters",))
+		else:
+			out.append(("any", 1, None))
+	return out
+
+
+def timestamp_prints(piece, fmt, glued_left=True, glued_right=True):
+	"""
+	Whether a timestamp rendered with the stored timestamp_format `fmt` can print a run between
+	Splunk's breakers equal to `piece`, a run of digits. Every character that is not a letter or a
+	digit is taken as a breaker (more runs than Splunk sees, so more pieces refused, never fewer).
+	`glued_left`/`glued_right`: digits may stand right before or after the timestamp (FORMAT_KEY_STEPS),
+	so the first or last run may carry any digits before or after what the format prints. A format
+	that writes the epoch back as it is (EPOCH_PASSTHROUGH) prints the compact event's own value, so
+	it can print a piece the compact event does not hold only when glued to digits.
+	"""
+	if not DIGIT_PIECE.fullmatch(piece):
+		return True
+	if fmt == EPOCH_PASSTHROUGH:
+		return glued_left or glued_right
+	elements = timestamp_elements(fmt)
+	n = len(piece)
+	runs, start = [], 0
+	for k, e in enumerate(elements + [("lit", " ")]):
+		if e[0] == "lit" and not e[1].isalnum():
+			if k > start:
+				runs.append((start, k))
+			start = k + 1
+
+	def prints(run, left, right):
+		memo = {}
+
+		def go(i, k):
+			if (i, k) in memo:
+				return memo[(i, k)]
+			if k == len(run):
+				ok = i == n or right
+			else:
+				e = run[k]
+				ok = False
+				if e[0] == "lit":
+					ok = i < n and piece[i] == e[1] and go(i + 1, k + 1)
+				elif e[0] == "any":
+					most = n - i if e[2] is None else min(e[2], n - i)
+					ok = any(go(i + w, k + 1) for w in range(e[1], most + 1))
+				elif e[0] == "num":
+					_, fewest, most, low, high, padded = e
+					for w in range(fewest, min(most, n - i) + 1):
+						s = piece[i:i + w]
+						if low <= int(s) <= high and (padded or s == str(int(s))) and go(i + w, k + 1):
+							ok = True
+							break
+			memo[(i, k)] = ok
+			return ok
+		return any(go(i, 0) for i in (range(n) if left else (0,)))
+
+	for a, b in runs:
+		run = elements[a:b]
+		if any(e[0] == "letters" or (e[0] == "lit" and not e[1].isdigit()) for e in run):
+			continue
+		if prints(run, glued_left and a == 0, glued_right and b == len(elements)):
+			return True
+	return False
+
+
+def formats_from_rows(rows):
+	"""
+	The (timestamp_format, glued_left, glued_right) of every stored template with a timestamp, from the
+	tenx_formats of dictionary_search(formats=True). None when the answer carries no tenx_formats.
+	"""
+	found = None
+	for row in rows:
+		keys = row.get("tenx_formats")
+		if keys is None:
+			continue
+		found = found or []
+		for key in ([keys] if isinstance(keys, str) else keys):
+			key = str(key)
+			if len(key) >= 3 and key[2] == "|":
+				found.append((key[3:], key[0] != "0", key[1] != "0"))
+	return found
+
+
+def digit_candidates(node, text_field=None):
+	"""The runs of digits the prefilter would use if no rendered timestamp could print them."""
+	found = set()
+	node = as_text(node, text_field) or node
+	if node[0] == "text":
+		in_address = {p for a in addresses_of(node[1]) for p in pieces_of(a)} | set(prefix_parts(node[1]))
+		found.update(p for p in (pieces_outside_times(node[1]) if text_field is None else pieces_kept(node[1]))
+					 if DIGIT_PIECE.fullmatch(p) and not usable(p) and p not in in_address)
+	elif node[0] in ("and", "or"):
+		for child in node[1]:
+			found |= digit_candidates(child, text_field)
+	return found
+
+
+def digit_pieces_cleared(candidates, formats):
+	"""
+	The candidates (digit_candidates()) no stored timestamp format can print (timestamp_prints()):
+	those narrow like any other piece. `formats` is formats_from_rows() of every template that has a
+	timestamp. No formats is taken as not known (the read failed or found no template), and then no
+	run of digits narrows.
+	"""
+	if not formats:
+		return frozenset()
+	return frozenset(p for p in candidates if not any(timestamp_prints(p, f, lg, rg) for f, lg, rg in formats))
+
+
 def addresses_of(text):
 	"""The IPv4 addresses written in a word or phrase, in order, without repeats."""
 	found = []
@@ -874,26 +1085,30 @@ def prefix_parts(text):
 	return found
 
 
-def lookup_pieces(node, found=None, text_field=None):
+def lookup_pieces(node, found=None, text_field=None, digits=frozenset()):
 	"""Every usable piece the prefilter would look up in the template dictionary. The parts of an
-	address are not looked up: a part is digits only, so never template text (FORMAT_SPEC S3.2)."""
+	address are not looked up: a part is digits only, so never template text (FORMAT_SPEC S3.2).
+	`digits`: runs of digits no stored timestamp format prints (digit_pieces_cleared()); they are
+	looked up, because "-1" is template text (S2.2)."""
 	found = set() if found is None else found
 	node = as_text(node, text_field) or node
 	if node[0] == "text":
 		in_address = {p for a in addresses_of(node[1]) for p in pieces_of(a)} | set(prefix_parts(node[1]))
 		found.update(p for p in (pieces_outside_times(node[1]) if text_field is None else pieces_kept(node[1]))
-					 if usable(p) and p not in in_address)
+					 if (usable(p) or p in digits) and p not in in_address)
 	elif node[0] in ("and", "or"):
 		for child in node[1]:
-			lookup_pieces(child, found, text_field)
+			lookup_pieces(child, found, text_field, digits)
 	return found
 
 
-def prefilter(node, dictionary, text_field=None):
+def prefilter(node, dictionary, text_field=None, digits=frozenset()):
 	"""
 	The prefilter for a parsed search, or None for no restriction. `dictionary` maps a piece to
 	(number of templates carrying it, [TERM(...) clauses for those templates]). `text_field`
 	(see text_field_predicate) decides which field comparisons may restrict; None: none do.
+	`digits`: runs of digits that narrow because no stored timestamp format prints them
+	(digit_pieces_cleared()); empty, no run of digits narrows.
 	"""
 	node = as_text(node, text_field) or node
 	kind = node[0]
@@ -903,7 +1118,7 @@ def prefilter(node, dictionary, text_field=None):
 		prefixed = [p for p in prefix_parts(node[1]) if p not in {q for a in addresses for q in address_parts(a)}]
 		in_address = {p for a in addresses for p in pieces_of(a)} | set(prefixed)
 		for piece in (pieces_outside_times(node[1]) if text_field is None else pieces_kept(node[1])):
-			if not usable(piece) or piece in in_address:
+			if not (usable(piece) or piece in digits) or piece in in_address:
 				continue
 			count, terms = dictionary.get(piece, (0, []))
 			if count > MAX_TEMPLATES:
@@ -914,10 +1129,10 @@ def prefilter(node, dictionary, text_field=None):
 		clauses.extend("TERM(%s)" % part for part in prefixed)
 		return "(" + " AND ".join(clauses) + ")" if clauses else None
 	if kind == "and":
-		clauses = [c for c in (prefilter(child, dictionary, text_field) for child in node[1]) if c is not None]
+		clauses = [c for c in (prefilter(child, dictionary, text_field, digits) for child in node[1]) if c is not None]
 		return "(" + " AND ".join(clauses) + ")" if clauses else None
 	if kind == "or":
-		clauses = [prefilter(child, dictionary, text_field) for child in node[1]]
+		clauses = [prefilter(child, dictionary, text_field, digits) for child in node[1]]
 		return None if any(c is None for c in clauses) else "(" + " OR ".join(clauses) + ")"
 	return None
 
@@ -949,32 +1164,282 @@ def hash_term(dml_hash):
 	return runs[0][0]
 
 
-def dictionary_search(pieces):
+# The word boundary of the template dictionary's matching: a letter or a digit may not touch a piece.
+NOT_WORD = "[^\\p{L}\\p{N}]"
+
+
+def piece_regex(piece):
+	"""The SPL regex that finds `piece` (a usable piece: a-z, 0-9, '*' at its ends) in lowered template text."""
+	return "(^|%s)%s(%s|$)" % (NOT_WORD, piece.replace("*", "[\\p{L}\\p{N}]*"), NOT_WORD)
+
+
+def dictionary_search(pieces, formats=False):
 	"""
-	The search that answers, for each piece, which templates carry it, as the TERM() clause of
-	each template's hash_term, computed in SPL: the runs with '*' on both sides are blanked, the
-	text is split at the major breakers, and the longest run of at least two characters with a
-	letter or a digit is taken, else the first run.
+	The search that answers, for each piece, which templates carry it in their text, as the
+	TERM() clause of each template's hash_term.
+
+	It reads the templates from the KV store (tenx-dml-lookup), the store tenx-inflate expands
+	from, so every template that can expand an event is asked about. The searchable copy in the
+	template index (`tenx-templates`) is written later, by the Consume KV alert action, and a
+	template whose copy is not written yet expands its events but is not in that index: read from
+	there, a word in its text selected none of its events (Splunk Enterprise 10.4.3, 175,480
+	templates in the KV store with their copies pending: `tx` jsmith 0 events, raw 905; copies
+	written: 905). The text is the record's pattern_search, the same text the copy holds (or its
+	pattern with the value separators removed, for a record stored before that field).
+
+	The term is computed in SPL from the hash as the engine wrote it (pattern_hash; the record
+	key is trimmed): the runs with '*' on both sides are blanked, the text is split at the major
+	breakers, and the longest run of at least two characters with a letter or a digit is taken,
+	else the first run. One row comes back, n<i> and hs<i> for the i-th piece of sorted(pieces);
+	no command in it caps the rows it passes on (no mvexpand, head or subsearch).
+
+	formats: also return, in tenx_formats, the timestamp format of every stored template with its
+	glue (FORMAT_KEY_STEPS), for the runs of digits (digit_pieces_cleared()). Every record then reaches
+	the stats; the term is computed only on records that hold some piece.
 	"""
 	plist = sorted(pieces)
+	marks = ", ".join('m%d=if(match(tenx_t, "%s"), 1, null())' % (i, piece_regex(piece)) for i, piece in enumerate(plist))
+	counts = ", ".join('values(eval(if(m%d=1, h, null()))) as hs%d, count(m%d) as n%d' % (i, i, i, i)
+					   for i in range(len(plist)))
+	prune = 'match(tenx_t, "(^|' + NOT_WORD + ')(' + "|".join(p.replace("*", "[\\p{L}\\p{N}]*") for p in plist) + ')(' + NOT_WORD + '|$)")'
+	if formats:
+		head = (' | eval tenx_any=if(' + prune + ', 1, null())' + FORMAT_KEY_STEPS +
+				' | eval dml_hash=if(isnotnull(tenx_any), coalesce(pattern_hash, _key), null())')
+	else:
+		head = ' | where ' + prune + ' | eval dml_hash=coalesce(pattern_hash, _key)'
 	return (
-		'search `tenx-templates` earliest=0 latest=now ("%s") | fields dml_hash, _raw'
-		' | eval piece=split("%s", " ") | mvexpand piece'
-		' | where match(lower(_raw), "(^|[^\\p{L}\\p{N}])" . replace(piece, "\\*", "[\\p{L}\\p{N}]*") . "([^\\p{L}\\p{N}]|$)")'
-		' | stats count by piece, dml_hash'
-		' | eval segs=split(replace(replace(replace("~" . dml_hash, "--|%%[0-9A-Fa-f]{2}", " "),'
+		'| inputlookup tenx-dml-lookup | fields _key, pattern_hash, pattern_search, pattern'
+		+ (', timestamp_format, part_0, pattern_parts, pattern_terminator' if formats else '') +
+		' | eval tenx_t=lower(coalesce(pattern_search, replace(pattern, "[$]", "")))'
+		+ head +
+		' | eval ' + marks +
+		' | eval segs=split(replace(replace(replace("~" . dml_hash, "--|%[0-9A-Fa-f]{2}", " "),'
 		' "(?<=\\*)[^ !;<>{}|&?+\\[\\]*,()\'\\"]+(?=\\*)", " "), "[ !;<>{}|&?+\\[\\]*,()\'\\"]", " "), " ")'
 		' | eval cand=mvfilter(len(segs) >= 2 AND match(segs, "[\\p{L}\\p{N}]"))'
-		' | eval best=substr(mvindex(mvsort(mvmap(cand, printf("%%03d", len(cand)) . cand)), -1), 4)'
+		' | eval best=substr(mvindex(mvsort(mvmap(cand, printf("%03d", len(cand)) . cand)), -1), 4)'
 		' | eval h="TERM(" . coalesce(best, mvindex(segs, 0)) . ")"'
-		' | stats values(h) as hs count as n by piece'
-	) % ('" OR "'.join(plist), " ".join(plist))
+		' | stats ' + counts + (', values(tenx_fk) as tenx_formats' if formats else '')
+	)
 
 
-def dictionary_from_rows(rows):
+def dictionary_from_rows(rows, pieces=None):
+	"""
+	The dictionary of dictionary_search()'s answer: piece -> (templates carrying it, [TERM() of
+	each]). `pieces` are the pieces the search was built for; rows in the earlier form (one row a
+	piece, with piece, n and hs) are read as well.
+	"""
 	dictionary = {}
 	for row in rows:
-		terms = row.get("hs") or []
-		terms = [terms] if isinstance(terms, str) else list(terms)
-		dictionary[row["piece"]] = (int(row.get("n") or 0), terms)
+		if "piece" in row:
+			terms = row.get("hs") or []
+			dictionary[row["piece"]] = (int(row.get("n") or 0), [terms] if isinstance(terms, str) else list(terms))
+			continue
+		for i, piece in enumerate(sorted(pieces or ())):
+			terms = row.get("hs%d" % i) or []
+			dictionary[piece] = (int(row.get("n%d" % i) or 0), [terms] if isinstance(terms, str) else list(terms))
 	return dictionary
+
+
+# A wildcard inside a word, TERM() and CASE() after `tx` (Splunk Enterprise 10.4.3). `tx` applies the
+# words after it in a `search` after a pipe that Splunk cannot fold into the base search, and there
+# some of them match other events than the same search on the index:
+# - a word with a `*` after its first character (Se*Privilege, le*FO, S*P*e) is matched as its prefix
+#   alone: any term starting with "se" (Windows 662 sample: 662 events, the base search on the raw
+#   events 3; Se*Zzz also 662). On the index the whole word is matched against the event's terms,
+#   case-insensitively, `*` standing for any characters: a major segment (the text between two major
+#   breakers) or a minor piece (between any two breakers). A word starting with `*`, or ending with its
+#   only `*`, or holding a breaker of its own (10.0*14, foo.*.com), matched after the pipe as on the
+#   index on every case measured, so it is left alone.
+# - TERM(x) on the index is a term of the event that is x (`*` as above): a major segment, or, when x
+#   holds no minor breaker, a minor piece. After the pipe x is found inside a longer term too
+#   (TERM(10.2.236.94) in client_ip=10.2.236.94: 0 on the index, 1 after the pipe). TERM() of a plain
+#   word matched alike both ways and is left alone. When x holds a major breaker, the index matched no
+#   event on default segmentation (TERM(+0000): 0) but did match on Windows events indexed under the
+#   Windows add-on (TERM(Name='SubjectLogonId'>0x331dbb</Data><Data): 18), so where such a TERM()
+#   selects events it is left to the final search; under NOT it is taken as matching nothing, which
+#   can only keep more events than the final search would.
+# - CASE(x) matched alike both ways except when x has a wildcard inside it: after the pipe, a term
+#   starting with x's prefix in its letter case; on the index, an event that holds x as the word above
+#   (any letter case) and also matches CASE(x) as after the pipe (CASE(Se*Privilege) matches
+#   "sexprivilege Seattle" and "SeQPRIVILEGE", not "SEXPRIVILEGE").
+# The breakers of segmenters.conf [indexing] (btool on 10.4.3), the default for every sourcetype here.
+MAJOR_CHARS = "[]<>(){}|!;,'\"*\n\r \t&?+"
+MAJOR_SEQUENCES = ("%2526", "%2520", "%21", "%26", "%3B", "%7C", "%20", "%2B", "%3D", "--", "%5D", "%5B", "%3A",
+				   "%0A", "%2C", "%28", "%29")
+MINOR_CHARS = "/:=@.-$#%\\_"
+# The fields wild_plan() sets on each event: tenx_w0, tenx_w1, ...
+WILD_FIELD = "tenx_w"
+
+
+def mid_wildcard(word):
+	"""Whether `word` is a word Splunk matches differently after a pipe than on the index (see above)."""
+	if not word or word[0] == "*" or "*" not in word.rstrip("*"):
+		return False
+	return not any(c in MAJOR_CHARS.replace("*", "") or c in MINOR_CHARS or c.isspace() for c in word)
+
+
+def _major_breaker(text):
+	return any(c in MAJOR_CHARS.replace("*", "") or c.isspace() for c in text) or any(s in text for s in MAJOR_SEQUENCES)
+
+
+def _class(chars):
+	return "[" + "".join("\\" + c if c in "]\\^-[" else c for c in chars).replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t") + "]"
+
+
+def term_regex(word, case=False, major_only=False):
+	"""
+	A regular expression (PCRE, as Splunk's match() reads it, and Python's re alike) that finds `word`
+	in an event's text as a base search on the index finds it: some major segment or minor piece of
+	the text is the word, case-insensitively, each `*` standing for any characters of that term (as
+	the index places the parts, see pattern()).
+	`case`: the letter case kept. `major_only`: a major segment only (TERM() of a word with a minor
+	breaker in it, which no minor piece can be).
+	"""
+	major = _class(MAJOR_CHARS.replace("*", "") + "*")
+	seq = "|".join(re.escape(s) for s in MAJOR_SEQUENCES)
+	brk = "(?:%s|%s)" % (major, seq)
+	in_major = "(?:(?!%s)[^%s])" % (seq, _class(MAJOR_CHARS.replace("*", "") + "*")[1:-1])
+	minor = _class(MINOR_CHARS)
+	in_minor = "[^%s%s]" % (_class(MAJOR_CHARS.replace("*", "") + "*")[1:-1], minor[1:-1])
+	parts = word.split("*")
+	tail = parts[-1] != ""
+
+	def pattern(start, inner, end):
+		# The index takes each part after a `*` at its first place in the rest of the term, and the last
+		# part, when the word does not end with `*`, again only after the end of each place it found
+		# that does not end the term: 19*44 matches 19.2.3.4.44 and 198/544 but not 19.2.3.444 or
+		# 198/55444 (the second 44 overlaps the first), x*ab matches xabab (Splunk Enterprise 10.4.3).
+		text = re.escape(parts[0])
+		for k, p in enumerate(parts[1:], 1):
+			if not p:
+				text += inner + "*?"
+				continue
+			first = "(?:(?!%s)%s)*%s" % (re.escape(p), inner, re.escape(p))
+			text += "(?:%s)+" % first if tail and k == len(parts) - 1 else first
+		return start + text + (end if tail else "")
+	whole = pattern("(?:^|%s)" % brk, in_major, "(?=%s|$)" % brk)
+	piece = pattern("(?:^|%s|%s)" % (brk, minor), in_minor, "(?=%s|%s|$)" % (brk, minor))
+	return ("" if case else "(?i)") + "(?:%s)" % (whole if major_only else whole + "|" + piece)
+
+
+def _eval_string(text):
+	return '"' + text.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def _atom_test(name, word, positive=True):
+	"""
+	The eval condition that matches the atom as a base search on the index (see above), or None
+	when it matches alike after the pipe or is not read with certainty: name is None for a word or
+	a quoted word, TERM or CASE; positive is False where the atom stands under NOT.
+	"""
+	if not word:
+		return None
+	if name is None:
+		return ("match(_raw, %s)" % _eval_string(term_regex(word))) if mid_wildcard(word) else None
+	if name == "CASE":
+		return ("match(_raw, %s)" % _eval_string(term_regex(word))) if mid_wildcard(word) else None
+	if "\\" in word:
+		# Splunk applies the escape first (TERM(\resource) matched what TERM(resource) matches, 1,161 events)
+		return None
+	if _major_breaker(word):
+		return None if positive else "false()"
+	minor = any(c in MINOR_CHARS for c in word)
+	if not minor and not mid_wildcard(word):
+		return None
+	return "match(_raw, %s)" % _eval_string(term_regex(word, major_only=minor))
+
+
+def wild_plan(text):
+	"""
+	The words after `tx` (`text`) with every word that matches other events after a pipe than on
+	the index (see above) put as a field the step before computes: (eval, search), where `eval` sets
+	tenx_w0, tenx_w1, ... to 1 on the events whose text holds that word as the index does, and
+	`search` is `text` with each such word replaced by tenx_wN=1 (CASE(x) by (tenx_wN=1 CASE(x)), see
+	above). `| eval <eval> | search <search>` then keeps the events the base search on the index would
+	keep for those words, under AND, OR and NOT alike (on the index, NOT CASE() ignores the letter
+	case, so it is not the opposite of CASE(); this gives the opposite), and every other word as
+	`search` after a pipe keeps them. None when no word needs it, or when the text is not read with
+	certainty (a subsearch, a macro, parentheses that do not close).
+
+	A word written right against another word or phrase (no space) is left as it is.
+	"""
+	tokens = tokenize(text)
+	if any(kind == "subsearch" for kind, _ in tokens):
+		return None
+	reader = Parser(tokens)
+	try:
+		tree = reader.parse()
+	except Unparsed:
+		return None
+	marks, steps, edits = {}, [], []
+
+	def glued_to_text(first, last):
+		before = first in tokens.glued and tokens[first - 1][0] in ("word", "phrase")
+		after = (last + 1) in tokens.glued and tokens[last + 1][0] in ("word", "phrase")
+		return before or after
+
+	def visit(node, positive=True):
+		kind = node[0]
+		if kind in ("and", "or"):
+			for child in node[1]:
+				visit(child, positive)
+			return
+		if kind == "not":
+			visit(node[1], not positive)
+			return
+		if kind == "text" and id(node) in reader.text_at:
+			index = reader.text_at[id(node)]
+			name, word, first, last = None, node[1], index, index
+			if tokens[index][0] == "phrase" and (not word or any(c.isspace() for c in word)):
+				return
+		elif kind == "unknown" and id(node) in reader.call_at:
+			name, word, first, last = reader.call_at[id(node)]
+		else:
+			return
+		test = _atom_test(name, word, positive)
+		if test is None or glued_to_text(first, last):
+			return
+		if test not in marks:
+			marks[test] = "%s%d" % (WILD_FIELD, len(marks))
+			steps.append("%s=%s" % (marks[test], "0" if test == "false()" else "if(%s, 1, 0)" % test))
+		start, end = tokens.spans[first][0], tokens.spans[last][1]
+		edits.append((start, end, "(%s=1 %s)" % (marks[test], text[start:end]) if name == "CASE" else marks[test] + "=1"))
+
+	visit(tree)
+	if not edits:
+		return None
+	search = text
+	for start, end, mark in sorted(edits, reverse=True):
+		search = search[:start] + mark + search[end:]
+	return ", ".join(steps), search.strip()
+
+
+# The record the Consume KV alert action keeps of how far it has stored template records
+# (collections.conf [tenx_kv_state], tenx_dml_to_kv.py). It runs every five minutes.
+STORE_STATE_PATH = "/servicesNS/nobody/tenx-for-splunk/storage/collections/data/tenx_kv_state/consume_kv?output_mode=json"
+STORE_STALE_SECONDS = 900
+
+
+def store_warning(state, now):
+	"""
+	The warning `tx` and `txf` show when the template store can lack templates their events
+	need, from the Consume KV record, or None. Events whose template is not stored stay compact.
+	"""
+	if not isinstance(state, dict) or not state:
+		return None
+	try:
+		updated = float(state.get("updated"))
+		through = float(state.get("loaded_through") or 0)
+	except (TypeError, ValueError):
+		return None
+	after = (" indexed after %s" % time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(through))) if through > 0 else ""
+	status = state.get("status")
+	if status == "failed":
+		return ("tx: Consume KV stopped with an error (%s), so templates%s may not be stored; events that use them stay "
+				"compact. See the Diagnostics dashboard." % (str(state.get("detail") or "see tenx_dml_to_kv.log")[:200], after))
+	if now - updated > STORE_STALE_SECONDS:
+		return ("tx: Consume KV has not run since %s, so templates indexed since then are not stored; events that use "
+				"them stay compact." % time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(updated)))
+	if status == "loading":
+		return ("tx: Consume KV is still storing templates%s; events that use them stay compact until it has." % after)
+	return None

@@ -126,8 +126,9 @@ class TestRecompileDecisions:
 		assert conn.posts_to(SAVED) == [] and conn.posts_to(CONF) == []
 
 	def test_unchanged_alert_is_a_no_op(self):
-		conn = MockConn(entries=[_stanza('a', 'search NATIVE x', original='sourcetype=tenx_encoded x', compiled='search NATIVE x')])
-		result = AlertCompileResult(AlertStrategy.NATIVE, 'search NATIVE x', 'sourcetype=tenx_encoded x')
+		# stored as the compiler writes it since 1.2.2 (no leading `search`, which the pass repairs)
+		conn = MockConn(entries=[_stanza('a', 'NATIVE x', original='sourcetype=tenx_encoded x', compiled='NATIVE x')])
+		result = AlertCompileResult(AlertStrategy.NATIVE, 'NATIVE x', 'sourcetype=tenx_encoded x')
 
 		summary = _handler().recompile_all(conn, 'admin', FakeCompiler(result))
 

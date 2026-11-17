@@ -82,6 +82,9 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 >   detections read them without `tx`.
 > - Both are checked on Windows Security, AWS CloudTrail and FortiGate events with their
 >   add-ons, against the same events indexed raw.
+> - The search report, `bin/tenx_search_report.py`, lists which saved searches, alerts and
+>   dashboard panels of a search head run unchanged after a source moves to compact events, with
+>   or without a field map, and which need `tx`, `txf` or a field map.
 >
 > **Speed**, on one laptop running Splunk 10.4.3: a `tx` search over 157,228 compact events
 > returns in about 1.5 to 4 seconds, where the same search over the raw lines takes under a
@@ -163,17 +166,17 @@ Repository name: `log-10x/splunk-app`. Repository URL: https://github.com/log-10
 
 | Field | Value |
 |---|---|
-| Version | 1.2.1, read from the package |
+| Version | 1.2.2, read from the package |
 | Splunk platform compatibility | Splunk Enterprise 9.4, 10.0, 10.2, 10.4, 10.6 |
 | CIM | None |
 
-Each line is tested: 9.4.15, 10.0.10, 10.2.7 and 10.4.3, each a fresh install of 1.1.2. 1.1.3
+Each line is tested: 9.4.15, 10.0.12, 10.2.9, 10.4.3 and 10.6.0.5 for 1.2.x, and 9.4.15, 10.0.10, 10.2.7 and 10.4.3, each a fresh install of 1.1.2. 1.1.3
 changed one `props.conf` key, checked on 10.4.3 and measured on 9.4. 1.1.4 changes how
 templates are stored; it is checked on 9.4.15, 10.4.3 and 10.6.0.5, on a fresh install and an
 upgrade over 1.1.3. 1.1.5 changes the compact sourcetype's event time and the expansion macro; it is
 checked on 9.4.15, 10.4.3 and 10.6.0.5, each a fresh install. 1.1.6 adds the `tx` macro and
 its command and replicates the template collection; it is checked on 10.4.3 as an upgrade over
-1.1.5, and on 9.4.15 and 10.6.0.5 as a fresh install. 1.1.7 changes how fields and dates come out of an expanded event; it is checked on 10.4.3 as an upgrade over 1.1.6, and on 9.4.15 and 10.6.0.5 as a fresh install. 1.2.1 adds the `txf` macro and the field map tool, and changes when template records are stored and how a template whose hash contains `*` is selected; it is checked on 10.4.3 as an upgrade over 1.1.7, and on 9.4.15, 10.4.3 and 10.6.0.5 as a fresh install. Splunk
+1.1.5, and on 9.4.15 and 10.6.0.5 as a fresh install. 1.1.7 changes how fields and dates come out of an expanded event; it is checked on 10.4.3 as an upgrade over 1.1.6, and on 9.4.15 and 10.6.0.5 as a fresh install. 1.2.1 adds the `txf` macro and the field map tool, and changes when template records are stored and how a template whose hash contains `*` is selected. Splunk
 ships on-premises releases every other minor, so 10.1 and 10.3 exist only on Splunk Cloud
 Platform, where compatibility is set by cloud vetting after upload rather than selected here.
 Splunkbase requires a release to run on every version it names.
@@ -181,6 +184,33 @@ Splunkbase requires a release to run on every version it names.
 **Release notes**
 
 Paste the block for the version being uploaded. Splunkbase keeps notes per release.
+
+1.2.2:
+
+> - The new search report, `bin/tenx_search_report.py`, reads a search head's saved searches, alerts and dashboards, over REST or from files, and says for each one whether it runs unchanged when a source moves to compact events, needs `tx` or `txf` (with the search edited to hold it), needs a field map, or meets a limit the README states.
+> - Alerts compiled in the Compile Alert view now fire when Splunk runs them. An alert compiled with an earlier version is rewritten by the app within 15 minutes of the upgrade, unless someone edited it since.
+> - The field map's `check` also counts compact events indexed without their fields since its previous run, and fails with the count and the reason. It empties the list when a row or the lookup file fails (`bad_row`, `no_table`), and keeps it for templates the list does not hold (`no_row`) and values a row does not take (`no_match`).
+> - The field map's `check` also counts the compact events Splunk dropped because it could not load the map's lookup file, from Splunk's own log, and empties the list and fails with that count. The new **Field Map Dropped Events** alert, scheduled every five minutes, reports them by node.
+> - `activate` and `check` take `--tls-ca-file`, and refuse a lookup file that is not gzip or has no `hash` column. `gen` says when a KV store export holds no template records, such as an export that failed with "Unauthorized".
+> - Outside `NOT`, a wildcard inside a word (`Se*Privilege`), `TERM()` of part of a longer term and `CASE()` of a word with a wildcard inside it match as on the original lines through `tx`, `txf`, `| tx`, `tenxsearch`, dashboards and compiled alerts. Under `NOT`, `| tx` and the other rewritten searches give the exact opposite of such a word.
+> - Through `tx`, `txf`, `| tx`, `tenxsearch`, dashboards and compiled alerts, an event the sender passed whole without `tenx_sourcetype` keeps the fields Splunk read it with, each value once.
+> - The field replay behind `txf` keeps the indexed fields found on the most recent event of each index, host, source and sourcetype, besides those of the 1,000 most recent compact events and those fields.conf declares with `INDEXED = true`.
+> - Compact events read from a file by a forwarder carry no indexed `timestamp=none`, on the compact sourcetype and on a field map's.
+> - Splunk reads each entry of the app's own logs as one event, and the app reads its settings without broken-pipe warnings in `splunkd.log`.
+> - Word searches through `tx`, dashboards and compiled alerts find the events of every stored template, including templates stored in the last few minutes.
+> - Consume KV stores every template record, a burst of new templates included; its first run after the upgrade stores templates earlier versions skipped.
+> - `tx` expands events whose template the indexers hold twice. An event `tx` cannot expand keeps its compact text and says why in `tenx_expand_refused`.
+> - `tx` and `txf` expand an event whose values begin or end with white space or a carriage return, such as a Windows event with CR LF line ends, to its full text.
+> - Compiled alerts select the events of templates whose hash holds a `$`; alerts compiled earlier are rewritten by the recompile pass.
+> - An epoch-seconds timestamp with a fraction, such as `msg=audit(1723042099.699:13369)`, expands as written and sets the event's time.
+> - A carriage return inside an event comes back in place through `tx` and `txf`.
+> - A run of digits narrows a `tx` search when no stored template's timestamp could print it.
+> - With a Palo Alto field map, the Network_Traffic and Change data models, `tstats` and ESCU detections give the same results on compact PAN-OS traffic and system events as on raw ones; threat events are passed whole.
+> - Two field maps of one target, each with its own sourcetype, install side by side.
+> - `activate` against a search head without the floor app says the floor app was not checked instead of stopping.
+> - `check` keeps the field map's template list when its probe arrives late, unless Splunk's log shows events of the map dropped.
+> - An event with the indexed field `tenx_time=sender` keeps its sender's time.
+> - The README's Fluent Bit recipe runs two processes beside the Receiver with their buffers on disk, so records survive a restart and a slow HEC.
 
 1.2.1:
 
@@ -250,6 +280,7 @@ Paste the block for the version being uploaded. Splunkbase keeps notes per relea
 
 | Check | Result |
 |---|---|
+| Search report on Splunk 10.4.3 with the Windows add-on 12.0.0, the AWS add-on 8.3.1, the FortiGate add-on 1.6.10 and CIM 8.8.0: 117 saved searches, 18 of them ESCU detection base searches, and two dashboards, one Simple XML and one Dashboard Studio, over 8,311 Windows Security, 5,000 CloudTrail and 10,923 FortiGate events (132 objects), each run on the events indexed raw and on the same events compact, without and with a field map (FortiGate without), as written or with the report's edit | Every object the report gives as unchanged, needing `tx` or needing `txf` returns the same number of events or rows as on raw (58 and 63 on Windows without and with a map, 16 and 21 on CloudTrail, 13 on FortiGate); all return the same rows except 4, which return the same events at the same times with their text compact: an alert that lists events, as its reason says, and two dashboard base searches whose panels return the same rows (Windows), and a CloudTrail alert that lists events. The objects that need a field map return nothing as written. Of the limits, punct, `tstats` on sourcetype, `NOT CASE()` (more events), event time on CloudTrail without a map and on FortiGate, and through a map `vendor_privilege`, the CloudTrail delete event type and `sessionToken` return other results than raw; a comma after the macro stops the search with its message; the rest return what raw returns on these events. Read over REST and from the files, the report gives the same verdicts and edits on all 238 object runs |
 | 1.2.1 unit tests | 1016 passed, among them the field replay behind `txf`, the field map and its fail-safe, field comparisons written with spaces, the index time of template records, the Consume KV window, and the term that selects a template whose hash contains `*` |
 | 1.2.1 AppInspect 4.4.0: default, cloud, future, private_victoria, private_classic | 0 errors, 0 failures, 0 future failures; warnings 6, 5, 0, 6, 6 in that order |
 | 1.2.1 as packaged on Splunk 10.4.3, upgraded in place over 1.1.7 with Splunk's app install; Windows Security, OpenTelemetry demo and synthetic key=value events with their templates | every stored template kept; 64 of 75 searches unchanged; 10 now equal raw; one, a wildcard inside a word (`Se*Privilege`), follows the limit stated in the README: 3 events on raw, 662 through `tx`; after the upgrade step, records sent with 2022 event times are stored and their events expand (200 of 200) |
@@ -300,7 +331,7 @@ From the repository root:
 rm -rf /tmp/sbpkg && mkdir -p /tmp/sbpkg
 rsync -a --exclude 'local/' --exclude '__pycache__/' --exclude '*.pyc' --exclude '*.pyo' --exclude '.*' \
   tenx-for-splunk/ /tmp/sbpkg/tenx-for-splunk/
-cd /tmp/sbpkg && COPYFILE_DISABLE=1 tar --format ustar -czf tenx-for-splunk-1.2.1.tar.gz tenx-for-splunk
+cd /tmp/sbpkg && COPYFILE_DISABLE=1 tar --format ustar -czf tenx-for-splunk-1.2.2.tar.gz tenx-for-splunk
 ```
 
 ## Submitting

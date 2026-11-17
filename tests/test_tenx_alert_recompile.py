@@ -155,3 +155,58 @@ def test_the_scheduled_pass_leaves_tx_saved_searches_alone():
 		compiler_for(TEMPLATES), migrate_legacy=False)
 
 	assert summary['examined'] == 0 and conn.stanzas[0]['search'] == search
+
+
+def test_the_scheduled_pass_repairs_an_alert_stored_with_its_first_search_command():
+	# Before 1.2.2 a native compile was stored as 'search <terms> | ...'; Splunk runs a saved search as
+	# 'search <text>', so the alert found nothing. The scheduled pass rewrites it without that command,
+	# also when its compile needs review (here no word restricts the compact events), and keeps the
+	# fingerprint in step so later passes see no hand edit.
+	now = compiled(TEMPLATES, SEARCH)
+	assert not now.startswith('search ')
+	before = 'search ' + now
+	review = 'sourcetype=tenx_encoded NOT cartstore'
+	before_review = 'search ' + compiled(TEMPLATES, review)
+	conn = Conn([{'name': 'Cart alerts', 'owner': 'alice', 'search': before, 'original': SEARCH},
+				 {'name': 'Not cart', 'owner': 'bob', 'search': before_review, 'original': review}])
+
+	summary = tenx_alert_recompile.recompile_all(conn, tenx_alert_recompile.ALL_OWNERS, compiler_for(TEMPLATES),
+		migrate_legacy=False)
+
+	assert summary['repaired'] == 2 and summary['updated'] == ['Cart alerts', 'Not cart']
+	assert conn.stanzas[0]['search'] == now and conn.stanzas[1]['search'] == before_review[len('search '):]
+	meta = [d for url, d in conn.posts if '/configs/conf-savedsearches/' in url]
+	assert [d[tenx_alert_persist.COMPILED_SEARCH_KEY] for d in meta] == [now, before_review[len('search '):]]
+	assert all('/servicesNS/%s/' % o in url for (url, _), o in zip(conn.posts, ['alice', 'alice', 'bob', 'bob']))
+
+
+def test_a_repaired_alert_is_left_alone_on_the_next_pass():
+	before = 'search ' + compiled(TEMPLATES, SEARCH)
+	conn = Conn([{'name': 'Cart alerts', 'owner': 'alice', 'search': before, 'original': SEARCH}])
+	tenx_alert_recompile.recompile_all(conn, tenx_alert_recompile.ALL_OWNERS, compiler_for(TEMPLATES))
+	conn.stanzas[0]['compiled'] = conn.stanzas[0]['search']
+	conn.posts = []
+
+	summary = tenx_alert_recompile.recompile_all(conn, tenx_alert_recompile.ALL_OWNERS, compiler_for(TEMPLATES))
+
+	assert summary['repaired'] == 0 and summary['unchanged'] == 1 and conn.posts == []
+
+
+def test_a_hand_edited_old_alert_is_not_repaired():
+	before = 'search ' + compiled(TEMPLATES, SEARCH)
+	conn = Conn([{'name': 'Cart alerts', 'owner': 'alice', 'search': before + ' | head 5', 'original': SEARCH,
+				  'compiled': before}])
+
+	summary = tenx_alert_recompile.recompile_all(conn, tenx_alert_recompile.ALL_OWNERS, compiler_for(TEMPLATES))
+
+	assert summary['drifted'] == 1 and summary['repaired'] == 0 and conn.posts == []
+
+
+def test_only_a_leading_search_command_with_terms_is_repaired():
+	r = tenx_alert_persist.repaired_search
+	k = tenx_alert_persist.COMPILED_SEARCH_KEY
+	assert r({'search': 'search index=a x | stats count', k: 'search index=a x | stats count'}) == 'index=a x | stats count'
+	assert r({'search': 'SEARCH (a OR b)', k: 'SEARCH (a OR b)'}) == '(a OR b)'
+	for text in ('| tx index=a x', 'searchtxn x', 'search | stats count', 'search', 'index=a x'):
+		assert r({'search': text, k: text}) is None, text
+	assert r({'search': 'search index=a x'}) is None

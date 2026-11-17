@@ -370,11 +370,11 @@ class TestFieldMap:
 		assert fm.main(['gen', '--rules', 'lookup', '--records', str(records), '--reader', 'json', '--sourcetype', 'tenx_ct',
 			'--rename', 'aws:cloudtrail', '--reserved-names', 'restore', '--out', str(out)]) == 0
 		props = (out / 'default' / 'props.conf').read_text()
-		assert props.endswith('[aws:cloudtrail]\nREPORT-tenx_fm_hash_vars = tenx_fm_hash_vars\n'
+		assert props.endswith('[aws:cloudtrail]\nREPORT-tenx_ct_hash_vars = tenx_ct_hash_vars\n'
 			'# Search-time: each name Splunk does not keep for an indexed field, given back from extracted_<name>.\n'
-			'REPORT-tenx_fm_restore = tenx_fm_restore_eventType\n')
+			'REPORT-tenx_ct_restore = tenx_ct_restore_eventType\n')
 		transforms = (out / 'default' / 'transforms.conf').read_text()
-		assert ('[tenx_fm_restore_eventType]\nSOURCE_KEY = extracted_eventType\nREGEX = ^([\\s\\S]*)$\n'
+		assert ('[tenx_ct_restore_eventType]\nSOURCE_KEY = extracted_eventType\nREGEX = ^([\\s\\S]*)$\n'
 			'FORMAT = eventType::$1\n') in transforms
 		rows = fm.read_lookup_file(str(out / 'lookups' / 'tenx_ct_fields.csv.gz'))
 		assert 'extracted_eventType::' in rows['k1']['f'] and ' eventType::' not in rows['k1']['f']
@@ -388,7 +388,7 @@ class TestFieldMap:
 		target = {'sourcetype': 'tenx_p', 'rename': 'p:st', 'transforms_class': 'p', 'transform_prefix': 'p', 'description': 'd'}
 		props = fm.props_text(target, f, [], search_hash=False)
 		assert props.endswith('[p:st]\n# Search-time: each name Splunk does not keep for an indexed field, given back from '
-			'x_<name>.\nREPORT-tenx_fm_restore = tenx_fm_restore_eventType\n')
+			'x_<name>.\nREPORT-p_restore = p_restore_eventType\n')
 		assert 'SOURCE_KEY = x_eventType' in fm.transforms_text(f, search_hash=False, target=target, sourcetype_field=None)
 
 	def test_no_restore_stanza_when_nothing_collides(self):
@@ -422,7 +422,7 @@ class TestApp:
 		copied, not_copied = fm.parsing_settings(fm.default_app_props())
 		assert copied == [('DATETIME_CONFIG', 'CURRENT'), ('LINE_BREAKER', '([\\r\\n]+)'),
 			('SHOULD_LINEMERGE', 'false'), ('NO_BINARY_CHECK', 'true'), ('TRUNCATE', '262144'),
-			('TRANSFORMS-tenx_time', 'tenx-event-time')]
+			('ADD_EXTRA_TIME_FIELDS', 'subseconds'), ('TRANSFORMS-tenx_time', 'tenx-event-time')]
 		assert sorted(not_copied) == ['REPORT-tenx', 'category', 'disabled', 'pulldown_type']
 
 	def test_gen_says_where_the_floor_app_goes(self, tmp_path, capsys):
@@ -445,13 +445,30 @@ class TestApp:
 		assert '[tenx_fw]\n' in props and \
 			'TRANSFORMS-tenx_fw = tenx_fw_sourcetype, tenx_fw_00000_k1, tenx_fw_ingest_eval\n' in props
 		assert 'rename = fw:traffic\n' in props
-		assert props.endswith('[fw:traffic]\nREPORT-tenx_fm_hash_vars = tenx_fm_hash_vars\n')
+		assert props.endswith('[fw:traffic]\nREPORT-tenx_fw_hash_vars = tenx_fw_hash_vars\n')
 		assert '[tenx_fw_00000_k1]\nREGEX = ^~ *k1 *,([^,]*),([^,]*),([^,]*)$\n' \
 			'FORMAT = user::"$2" src::"$3" tenx_fmf_time::"1" tenx_fmv_time_1::"$1" tenx_mapped::"1"\nWRITE_META = true\n' \
 			in (out / 'default' / 'transforms.conf').read_text()
 		assert '[user]\nINDEXED_VALUE = false\n' in (out / 'default' / 'fields.conf').read_text()
 		report = json.loads((tmp_path / 'app_report.json').read_text())
 		assert report['hashes_with_outer_spaces'] == 1 and report['templates'] == 1
+
+	def test_gen_says_a_kv_export_that_failed_holds_no_templates(self, tmp_path, capsys):
+		# curl -u admin in a script: no password, and Splunk's answer is written as the export.
+		records = tmp_path / 'kv_0.json'
+		records.write_text('{"messages":[{"type":"ERROR","text":"Unauthorized"}]}')
+		assert fm.main(['gen', '--rules', 'lookup', '--records', str(records), '--target', 'windows-security',
+			'--out', str(tmp_path / 'app')]) == 2
+		err = capsys.readouterr().err
+		assert 'holds no template records: Splunk answered "Unauthorized"' in err and 'KeyError' not in err
+		assert not os.path.exists(str(tmp_path / 'app'))
+
+	def test_gen_names_a_line_that_is_not_a_template_record(self, tmp_path, capsys):
+		records = tmp_path / 'templates.json'
+		records.write_text(json.dumps({'templateHash': 'k1', 'template': 'a=$'}) + '\n' + json.dumps({'x': 1}) + '\n')
+		assert fm.main(['gen', '--rules', 'lookup', '--records', str(records), '--reader', 'kv', '--sourcetype', 'tenx_fw',
+			'--rename', 'fw:traffic', '--out', str(tmp_path / 'app')]) == 2
+		assert 'line 2 is not a template record' in capsys.readouterr().err
 
 	def test_gen_says_so_when_no_template_gets_a_rule(self, tmp_path, capsys):
 		# Records the Windows reader finds no field in: gen still writes the app and exits 0, and says so.
@@ -610,12 +627,23 @@ FIRST_FILES = ['--mark', 'none', '--search-hash', 'off', '--sourcetype-field', '
 TAUTH = ('data', 't3', 'win_security_auth_change', 'splunk')
 
 
+def as_first_files(text):
+	# ADD_EXTRA_TIME_FIELDS is copied from [tenx_encoded], which set it after the first files were made.
+	return ''.join(l for l in text.splitlines(True) if not l.startswith('ADD_EXTRA_TIME_FIELDS ='))
+
+
+def first_names(text, sourcetype):
+	# The first files named every stanza and class after the target (tenx_win); a generated app now names them after its
+	# compact sourcetype, so two maps of one target coexist on one instance (test_field_map_two_maps.py).
+	return text.replace('TRANSFORMS-%s =' % sourcetype, 'TRANSFORMS-tenx_win =').replace(sourcetype + '_', 'tenx_win_')
+
+
 @needs_samples
 class TestGoldenWindows:
 	def test_662_event_sample_equals_the_first_files(self, tmp_path):
 		out = generate(tmp_path, 'b2', ['--records', sample('data', 'b2_kv_rows.json'), '--target', 'windows-security',
 			'--stanza-names', 'hash', '--hash-match', 'exact', '--trim-values', 'off'] + FIRST_FILES)
-		assert read(str(out / 'default' / 'props.conf')) == read(sample('conf', 'b2', 'props.conf'))
+		assert as_first_files(read(str(out / 'default' / 'props.conf'))) == read(sample('conf', 'b2', 'props.conf'))
 		assert read(str(out / 'default' / 'transforms.conf')).split('\n', 1)[1] == \
 			read(sample('conf', 'b2', 'transforms.conf')).split('\n', 1)[1]
 		golden = json.load(open(sample('conf', 'b2', 'gen_report.json')))
@@ -626,8 +654,9 @@ class TestGoldenWindows:
 		out = generate(tmp_path, 'b2_4663', ['--records', sample('data', 'b2_kv_rows_all.json'),
 			'--only-hashes-in', sample(*T4663 + ('templates.json',)), '--target', 'windows-security',
 			'--sourcetype', 'tenx_win4663'] + FIRST_FILES)
-		assert read(str(out / 'default' / 'props.conf')) == read(sample('conf', 'b2_4663', 'props.conf'))
-		assert read(str(out / 'default' / 'transforms.conf')).split('\n', 1)[1] == \
+		assert first_names(as_first_files(read(str(out / 'default' / 'props.conf'))), 'tenx_win4663') == \
+			read(sample('conf', 'b2_4663', 'props.conf'))
+		assert first_names(read(str(out / 'default' / 'transforms.conf')).split('\n', 1)[1], 'tenx_win4663') == \
 			read(sample('conf', 'b2_4663', 'transforms.conf')).split('\n', 1)[1]
 
 		def stanzas(path):
@@ -765,8 +794,8 @@ class TestWhatTxNeeds:
 		props, transforms = self.gen(tmp_path)
 		# a renamed event runs only the target's search-time rules: REPORT-tenx under [tenx_win]
 		# gave tenx_hash on 0 of 662 renamed events on Splunk 10.4.3, this on 662 of 662
-		assert props.split('[XmlWinEventLog]\n', 1)[1] == 'REPORT-tenx_fm_hash_vars = tenx_fm_hash_vars\n'
-		assert '\n[tenx_fm_hash_vars]\nREGEX = ^~(?<tenx_hash>[^,]+)' in transforms
+		assert props.split('[XmlWinEventLog]\n', 1)[1] == 'REPORT-tenx_fw_hash_vars = tenx_fw_hash_vars\n'
+		assert '\n[tenx_fw_hash_vars]\nREGEX = ^~(?<tenx_hash>[^,]+)' in transforms
 
 	def test_the_search_time_regex_is_the_apps_with_the_tilde_required(self):
 		import configparser
@@ -813,7 +842,7 @@ class TestWhatTxNeeds:
 	def test_the_mark_and_the_extraction_can_be_left_out(self, tmp_path):
 		props, transforms = self.gen(tmp_path, '--mark', 'none', '--search-hash', 'off')
 		assert 'tenx_mapped' not in transforms and '[XmlWinEventLog]' not in props
-		assert 'tenx_fm_hash_vars' not in transforms
+		assert 'tenx_fw_hash_vars' not in transforms
 
 	def test_the_mark_is_not_a_field_of_the_event(self):
 		t = fm.Transform('h1', 's', r'^~ *h1 *,([^,]*),([^,]*)$', 'EventID::"$1" Computer::"$2" tenx_mapped::"1"', 2, 2)
@@ -867,7 +896,7 @@ class TestLookupRules:
 		assert text.startswith('$pd:tenx_fm_row$=if(substr(_raw, 1, 1)=="~", lookup("tenx_fw_fields", ')
 		# every intermediate value is a pd: key; only _meta is written
 		assert [e.split('=', 1)[0] for e in re.split(r', (?=\$pd:tenx_fm_\w+\$=|_meta=)', text)] == \
-			['$pd:tenx_fm_%s$' % k for k in ('row', 'f', 't', 'n', 'ok', 'e', 'x', 'm')] + ['_meta'] + \
+			['$pd:tenx_fm_%s$' % k for k in ('row', 'f', 't', 'n', 'ok', 'e', 'x', 'm', 'm')] + ['_meta'] + \
 			['$pd:tenx_fm_why$'] * 2 + ['_meta']
 
 	def test_the_rule_builds_a_regex_only_from_a_row_it_can_use(self):
@@ -1031,12 +1060,12 @@ class TestLookupRules:
 
 	def test_the_rule_trims_field_ends_only_for_a_reader_that_trims(self, tmp_path):
 		xml = fm.lookup_eval_text('t', None, True)
-		assert 'replace(replace($pd:tenx_fm_m$, "::" . urldecode("%22") . "[[:space:]]+", "::" . urldecode("%22")), ' \
-			'"[[:space:]]+" . urldecode("%22"), urldecode("%22"))' in xml
+		assert 'replace(replace($pd:tenx_fm_m$, "::" . urldecode("%22") . "[[:cntrl:]]+", "::" . urldecode("%22")), ' \
+			'"[[:cntrl:]]+" . urldecode("%22"), urldecode("%22"))' in xml
 		assert '_meta=if(isnull($pd:tenx_fm_m$) OR $pd:tenx_fm_m$==$pd:tenx_fm_x$, _meta, coalesce(_meta, "") . " " . ' \
 			'$pd:tenx_fm_mt$)' in xml
 		plain = fm.lookup_eval_text('t')
-		assert '$pd:tenx_fm_mt$' not in plain and '[[:space:]]' not in plain
+		assert '$pd:tenx_fm_mt$' not in plain and '[[:cntrl:]]' not in plain
 		# value 0, the timestamp, is read whatever line ends the text holds
 		assert 'replace(_raw, "(?s)^~[^,]*,([^,|]*).*$", "\\1")' in plain
 
@@ -1076,10 +1105,13 @@ class FakeSplunkd(object):
 		import urllib.parse as up
 		self.on_disk, self.app_name, self.cap_file = on_disk, app_name, cap_file
 		self.calls, self.events, self.rows = [], [], set()
-		# drop: probe events are not indexed (a lookup that throws); floor: the instance holds the floor app
-		self.drop, self.floor = False, True
+		# drop: probe events are not indexed (a lookup that throws); floor: the instance holds the floor app;
+		# absent_404: an app the instance does not hold answers 404, as Splunk Enterprise 10.4.3 does for its namespace
+		self.drop, self.floor, self.absent_404 = False, True, False
 		# hec_unmapped: events sent through HEC are parsed where the app is not installed (no fields)
 		self.hec_unmapped = False
+		# splunkd.log lines of events Splunk dropped: (node, sourcetype, index time); internal: whether _internal is readable
+		self.dropped, self.internal = [], True
 		self.now, self.schedule, self.limits = time.time, [], None
 		self.loaded = on_disk if loaded else None
 		if loaded:
@@ -1120,6 +1152,32 @@ class FakeSplunkd(object):
 						h = line[1:].split(',', 1)[0].strip()
 						outer.events.append(dict(q, raw=line, hash=h, mapped=h in outer.rows, t=outer.now()))
 					self._send({})
+				elif path == '/services/search/jobs' and 'index=_internal' in dict(up.parse_qsl(data))['search']:
+					m = dict(up.parse_qsl(data))
+					if m['search'].startswith('| tstats'):
+						self._send({'results': [{'count': '42'}] if outer.internal else []})
+					else:
+						st = re.search(r'where tenx_fm_st="([^"]*)"', m['search']).group(1)
+						lo = int(re.search(r'_index_earliest=(-?\d+)', m['search']).group(1))
+						hi = int(re.search(r'_index_latest=(-?\d+)', m['search']).group(1))
+						by = {}
+						for node, dst, t in outer.dropped:
+							if dst == st and lo <= t < hi:
+								c, a, b = by.get(node, (0, t, t))
+								by[node] = (c + 1, min(a, t), max(b, t))
+						self._send({'results': [{'host': n, 'count': str(c), 'first': str(a), 'last': str(b)}
+							for n, (c, a, b) in sorted(by.items())]})
+				elif path == '/services/search/jobs' and dict(up.parse_qsl(data))['search'].startswith('| tstats'):
+					# check's count of the map's compact events indexed without their fields (not probes)
+					m = dict(up.parse_qsl(data))
+					st = re.search(r'sourcetype="([^"]*)"', m['search']).group(1)
+					lo = int(re.search(r'_index_earliest=(-?\d+)', m['search']).group(1))
+					hi = int(re.search(r'_index_latest=(-?\d+)', m['search']).group(1))
+					counts = {}
+					for e in outer.events:
+						if e.get('host') != fm.PROBE_HOST and e.get('sourcetype') == st and not e['mapped'] and lo <= e['t'] < hi:
+							counts[e.get('why', fm.WHY_NO_ROW)] = counts.get(e.get('why', fm.WHY_NO_ROW), 0) + 1
+					self._send({'results': [{fm.UNMAPPED_FIELD: k, 'count': str(v)} for k, v in sorted(counts.items())]})
 				elif path == '/services/search/jobs':
 					m = dict(up.parse_qsl(data))
 					assert m['exec_mode'] == 'oneshot' and 'host="%s"' % fm.PROBE_HOST in m['search']
@@ -1148,14 +1206,19 @@ class FakeSplunkd(object):
 				if path == '/services/configs/conf-limits/lookup':
 					if outer.limits is not None:
 						entries = [{'name': 'lookup', 'content': outer.limits}]
-				elif '/conf-' in path and outer.loaded:
+				elif '/conf-' in path:
 					conf = path.rsplit('/conf-', 1)[1]
 					app = up.unquote(path.split('/servicesNS/nobody/', 1)[1].split('/', 1)[0])
-					folder = outer.loaded if app == outer.app_name else (fm.floor_dir(outer.loaded)
-						if app == outer.app_name + fm.FLOOR_SUFFIX and outer.floor else None)
+					folder = None if not outer.loaded else outer.loaded if app == outer.app_name else (
+						fm.floor_dir(outer.loaded) if app == outer.app_name + fm.FLOOR_SUFFIX and outer.floor else None)
 					if folder:
 						entries = [{'name': n, 'content': dict((k, '1' if v == 'true' else v) for k, v in c.items()),
 							'acl': {'app': app}} for n, c in fm.read_conf(os.path.join(folder, 'default', conf + '.conf')).items()]
+					elif outer.absent_404:
+						self.send_response(404)
+						self.send_header('Content-Length', '0')
+						self.end_headers()
+						return
 				self._send({'entry': entries})
 
 		self.server = http.server.HTTPServer(('127.0.0.1', 0), Handler)
@@ -1334,7 +1397,30 @@ class TestCapFile:
 		finally:
 			fake.close()
 		assert rc == 1 and 'does not hold app fm_fw' in out and fake.events == []
+		assert 'install the app folders as gen wrote them, whole, and run activate again' in out
 		assert read(str(cap)) == 'pattern_hash,value\n' and os.path.exists(str(cap) + '.pending')
+
+	@pytest.mark.parametrize('broken', ['not gzip', 'no hash column'])
+	def test_activate_refuses_a_lookup_file_splunk_cannot_read(self, tmp_path, broken):
+		# Splunk drops every compact event of the map, floor app or not, while the file it reads is like this
+		import gzip
+		cap = tmp_path / 'compact-cap.csv'
+		assert self.gen(tmp_path, ['k1'], cap) == 0
+		table = tmp_path / 'fm_fw' / 'lookups' / 'tenx_fw_fields.csv.gz'
+		text = gzip.open(str(table), 'rt', encoding='utf-8').read()
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		if broken == 'not gzip':
+			table.write_text(text, encoding='utf-8')
+		else:
+			with gzip.open(str(table), 'wt', encoding='utf-8') as f:
+				f.write(text.replace('hash,', 'key,', 1))
+		try:
+			rc, out = self.activate(tmp_path, cap, fake)
+		finally:
+			fake.close()
+		assert rc == 1 and fake.events == [] and read(str(cap)) == 'pattern_hash,value\n'
+		assert ('activate: the lookup file %s %s' % (table, 'cannot be read as gzip CSV' if broken == 'not gzip'
+			else 'has no hash column')) in out and 'Splunk drops the compact events of tenx_fw' in out
 
 	def test_activate_needs_a_probe_index_to_add(self, tmp_path):
 		cap = tmp_path / 'compact-cap.csv'
@@ -1384,6 +1470,63 @@ class TestCapFile:
 		assert rc == 1 and 'floor app fm_fw_floor' in out and fake.events == []
 		assert read(str(cap)) == 'pattern_hash,value\n'
 
+	def test_activate_stops_cleanly_on_an_instance_without_the_floor_app_at_all(self, tmp_path):
+		# Splunk answers 404 for an app namespace it does not hold; the probes are parsed on this instance.
+		cap = tmp_path / 'compact-cap.csv'
+		assert self.gen(tmp_path, ['k1'], cap) == 0
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		fake.floor, fake.absent_404 = False, True
+		try:
+			rc, out = self.activate(tmp_path, cap, fake)
+		finally:
+			fake.close()
+		assert rc == 1 and 'does not hold the floor app fm_fw_floor' in out and fake.events == []
+		assert read(str(cap)) == 'pattern_hash,value\n'
+
+	def test_activate_says_when_the_app_is_not_on_the_instance(self, tmp_path):
+		cap = tmp_path / 'compact-cap.csv'
+		assert self.gen(tmp_path, ['k1'], cap) == 0
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap), loaded=False)
+		fake.absent_404 = True
+		try:
+			rc, out = self.activate(tmp_path, cap, fake)
+		finally:
+			fake.close()
+		assert rc == 1 and "does not hold app fm_fw as generated (1 stanzas, first app fm_fw is not on the instance)" in out
+		assert fake.events == [] and read(str(cap)) == 'pattern_hash,value\n'
+
+	def test_a_search_head_apart_from_the_parsing_instances_needs_no_floor_app(self, tmp_path):
+		# --splunkd names a search head; the probes go to another host's HTTP Event Collector, where the compact events
+		# are parsed. The floor app acts only there, so its absence on the search head does not stop activate.
+		cap = tmp_path / 'compact-cap.csv'
+		assert self.gen(tmp_path, ['k1'], cap) == 0
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		fake.floor, fake.absent_404 = False, True
+		hec = fake.url.replace('127.0.0.1', 'localhost')
+		out = io.StringIO()
+		try:
+			rc = fm.activate(str(tmp_path / 'fm_fw'), str(cap), fm.Splunkd(fake.url, hec_url=hec, hec_token='t'), out=out,
+				probe_index='probes', sleep=lambda s: None)
+		finally:
+			fake.close()
+		out = out.getvalue()
+		assert rc == 0, out
+		assert ('activate: fm_fw_floor was not checked: the compact events are parsed at %s, not at %s, the one instance '
+			'this tool reads apps from; install the floor app on each instance that parses them\n' % (hec.split('//')[1],
+			fake.url.split('//')[1])) in out
+		assert read(str(cap)) == 'pattern_hash,value\n"k1",true\n'
+
+	@pytest.mark.parametrize('splunkd,hec,parsed', [
+		('https://sh:8089', None, True),
+		('https://splunk:8089', 'https://splunk:8088', True),
+		('https://SH.example:8089', 'https://sh.example:8088', True),
+		('https://sh:8089', 'https://idx1:8088', False),
+		('https://sh:8089', ['https://idx1:8088', 'https://idx2:8088'], False),
+		('https://idx1:8089', ['https://idx1:8088', 'https://idx2:8088'], True),
+	])
+	def test_where_the_probes_are_parsed(self, splunkd, hec, parsed):
+		assert fm.probes_parsed_on(fm.Splunkd(splunkd, hec_url=hec, hec_token='t')) is parsed
+
 	def listed(self, tmp_path, hashes, kept=''):
 		cap = tmp_path / 'compact-cap.csv'
 		assert self.gen(tmp_path, hashes, cap) == 0
@@ -1411,6 +1554,78 @@ class TestCapFile:
 		assert sorted(e['hash'] for e in fake.events) == ['k1', 'k2'] and 'all indexed with their fields' in out
 		assert set(c[1] for c in fake.posts()) == {'/services/receivers/simple', '/services/search/jobs'}
 
+	def counted_from_zero(self, cap):
+		# The first check counts from the cap file's own time; these tests run check on a clock that starts at 0.
+		(cap.parent / (cap.name + fm.CAP_CHECKED_SUFFIX)).write_text('0\n', encoding='utf-8')
+
+	def compact(self, fake, h, t, why=None, sourcetype='tenx_fw'):
+		e = dict(index='main', host='app1', source='a.log', sourcetype=sourcetype, raw='~%s,x' % h, hash=h, mapped=False, t=t)
+		if why:
+			e['why'] = why
+		fake.events.append(e)
+
+	def test_check_fails_when_unlisted_templates_arrive_compact(self, tmp_path):
+		# receiverOptimize true kept in the Receiver's arguments: templates the cap file does not list arrive compact,
+		# with no row in the lookup. The probes of the listed ones pass; check counts those events and fails, and
+		# leaves the list, since taking listed templates off it would not stop them.
+		cap = self.listed(tmp_path, ['k1', 'k2'])
+		before = read(str(cap))
+		self.counted_from_zero(cap)
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		for i in range(3):
+			self.compact(fake, 'unlisted%d' % i, 1)
+		self.compact(fake, 'other', 1, sourcetype='tenx_other')
+		try:
+			rc, out = self.check(tmp_path, cap, fake, sample=2)
+		finally:
+			fake.close()
+		assert rc == 1 and read(str(cap)) == before and not os.path.exists(str(cap) + '.pending')
+		assert 'check: 3 compact events of tenx_fw were indexed without their fields since 1970-01-01T00:00:00Z (no_row 3)' in out
+		assert 'receiverOptimize true' in out and 'the cap file is left as it was' in out
+
+	def test_check_empties_the_list_when_rows_of_listed_templates_fail(self, tmp_path):
+		cap = self.listed(tmp_path, ['k1', 'k2'])
+		self.counted_from_zero(cap)
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		self.compact(fake, 'k1', 1, why='bad_row')
+		self.compact(fake, 'x', 1)
+		try:
+			rc, out = self.check(tmp_path, cap, fake, sample=2)
+		finally:
+			fake.close()
+		assert rc == 1 and fm.read_cap(str(cap))[0] == set() and fm.read_cap(str(cap) + '.pending')[0] == {'k1', 'k2'}
+		assert '2 compact events of tenx_fw were indexed without their fields since' in out and '(bad_row 1, no_row 1)' in out
+
+	def test_check_keeps_the_list_when_values_of_some_events_do_not_match(self, tmp_path):
+		# a value holding a line feed: no_match on that event, while the probe of the same template has its fields
+		cap = self.listed(tmp_path, ['k1', 'k2'])
+		before = read(str(cap))
+		self.counted_from_zero(cap)
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		self.compact(fake, 'k1', 1, why='no_match')
+		self.compact(fake, 'x', 1)
+		try:
+			rc, out = self.check(tmp_path, cap, fake, sample=2)
+		finally:
+			fake.close()
+		assert rc == 1 and read(str(cap)) == before and not os.path.exists(str(cap) + '.pending')
+		assert '(no_match 1, no_row 1): templates the lookup file has no row for arrived compact' in out
+		assert 'events of listed templates hold values their row does not take (a value holding a control character ' \
+			'other than a carriage return, such as a line feed or a NUL byte); the cap file is left as it was' in out
+
+	def test_the_next_check_counts_only_what_was_indexed_since(self, tmp_path):
+		cap = self.listed(tmp_path, ['k1'])
+		self.counted_from_zero(cap)
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		self.compact(fake, 'u1', 1)
+		try:
+			first, _ = self.check(tmp_path, cap, fake)
+			assert read(str(cap) + fm.CAP_CHECKED_SUFFIX).strip().isdigit()
+			second, out = self.check(tmp_path, cap, fake)
+		finally:
+			fake.close()
+		assert first == 1 and second == 0 and 'all indexed with their fields' in out
+
 	def test_check_empties_the_list_when_a_probe_comes_back_without_fields(self, tmp_path):
 		cap = self.listed(tmp_path, ['k1', 'k2'], '"keep",false\n')
 		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
@@ -1424,22 +1639,51 @@ class TestCapFile:
 		assert read(str(cap) + '.pending') == 'pattern_hash,value\n"k1",true\n"k2",true\n"keep",false\n'
 		assert 'without its fields (tenx_unmapped=no_row)' in out
 
-	def test_check_empties_the_list_when_a_probe_is_not_indexed(self, tmp_path):
+	def test_a_probe_not_indexed_in_time_leaves_the_list_when_splunk_logged_no_drop(self, tmp_path):
+		# a probe behind an indexing backlog, or right after a restart, is not a failed proof
+		cap = self.listed(tmp_path, ['k1', 'k2'], '"keep",false\n')
+		before = read(str(cap))
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		fake.drop = True
+		try:
+			rc, out = self.check(tmp_path, cap, fake, timeout=20, poll=5, sample=2)
+		finally:
+			fake.close()
+		assert rc == 2 and read(str(cap)) == before and not os.path.exists(str(cap) + '.pending')
+		assert '2 of 2 probes not indexed within 20 s' in out and "not checked: 'k1', 'k2'" in out
+		assert 'cap file left as it was' in out
+
+	def test_check_empties_the_list_when_a_probe_is_not_indexed_and_splunk_logged_dropping_it(self, tmp_path):
 		cap = self.listed(tmp_path, ['k1'])
 		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
 		fake.drop = True
+		try:
+			# Splunk drops the probe at index time and logs it (DROP_SEARCH), as a lookup file it cannot load does
+			# (check's clock here runs 0, 5, 10, ...: the probe is sent at about 10 and waited for to about 40)
+			fake.dropped.append(('idx1', fm.lookup_app(str(tmp_path / 'fm_fw')).sourcetype, 15))
+			rc, out = self.check(tmp_path, cap, fake, timeout=20, poll=5)
+		finally:
+			fake.close()
+		assert rc == 1 and read(str(cap)) == 'pattern_hash,value\n'
+		assert read(str(cap) + '.pending') == 'pattern_hash,value\n"k1",true\n'
+
+	def test_check_empties_the_list_when_a_probe_is_not_indexed_and_internal_cannot_be_read(self, tmp_path):
+		cap = self.listed(tmp_path, ['k1'])
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		fake.drop, fake.internal = True, False
 		try:
 			rc, out = self.check(tmp_path, cap, fake, timeout=20, poll=5)
 		finally:
 			fake.close()
 		assert rc == 1 and read(str(cap)) == 'pattern_hash,value\n' and '1 of 1 probes not indexed within 20 s' in out
-		assert read(str(cap) + '.pending') == 'pattern_hash,value\n"k1",true\n'
 
 	def test_after_check_activate_lists_the_templates_again_once_they_have_fields(self, tmp_path):
 		cap = self.listed(tmp_path, ['k1', 'k2'])
 		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
 		try:
 			fake.drop = True
+			# the probe is dropped at index time and Splunk logs it, so check empties the list
+			fake.dropped.append(('idx1', fm.lookup_app(str(tmp_path / 'fm_fw')).sourcetype, 15))
 			assert self.check(tmp_path, cap, fake, timeout=20, poll=5)[0] == 1
 			assert self.activate(tmp_path, cap, fake, timeout=0)[0] == 1 and read(str(cap)) == 'pattern_hash,value\n'
 			fake.drop = False
@@ -1458,7 +1702,18 @@ class TestCapFile:
 			rc, out = self.check(tmp_path, cap, fake)
 		finally:
 			fake.close()
-		assert rc == 1 and fake.posts() == [] and 'is missing' in out and read(str(cap)) == 'pattern_hash,value\n'
+		assert rc == 1 and not [c for c in fake.posts() if c[1] != '/services/search/jobs'] and 'is missing' in out and read(str(cap)) == 'pattern_hash,value\n'
+
+	def test_check_withdraws_at_once_when_the_lookup_file_is_not_gzip(self, tmp_path):
+		cap = self.listed(tmp_path, ['k1'])
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		(tmp_path / 'fm_fw' / 'lookups' / 'tenx_fw_fields.csv.gz').write_text('hash,n\n', encoding='utf-8')
+		try:
+			rc, out = self.check(tmp_path, cap, fake)
+		finally:
+			fake.close()
+		assert rc == 1 and not [c for c in fake.posts() if c[1] != '/services/search/jobs'] and 'cannot be read as gzip CSV' in out
+		assert read(str(cap)) == 'pattern_hash,value\n' and fm.read_cap(str(cap) + '.pending')[0] == {'k1'}
 
 	def test_the_list_activate_restores_is_a_newer_file_than_the_one_check_emptied(self, tmp_path):
 		# the Receiver rereads its cap file when the file's time changes
@@ -1466,6 +1721,8 @@ class TestCapFile:
 		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
 		try:
 			fake.drop = True
+			# the probe is dropped at index time and Splunk logs it, so check empties the list
+			fake.dropped.append(('idx1', fm.lookup_app(str(tmp_path / 'fm_fw')).sourcetype, 15))
 			assert self.check(tmp_path, cap, fake, timeout=20, poll=5)[0] == 1
 			os.utime(str(cap), (1000000000, 1000000000))
 			os.utime(str(cap) + '.pending', (1000000000, 1000000000))
@@ -1492,15 +1749,35 @@ class TestCapFile:
 		assert fake.events and all(e.get('via') == 'hec' for e in fake.events)
 		assert '/services/receivers/simple' not in set(c[1] for c in fake.posts())
 
-	def test_check_with_nothing_listed_sends_nothing(self, tmp_path):
+	def test_check_with_nothing_listed_sends_no_probe(self, tmp_path):
 		cap = tmp_path / 'compact-cap.csv'
 		assert self.gen(tmp_path, ['k1'], cap) == 0
+		self.counted_from_zero(cap)
 		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
 		try:
 			rc, out = self.check(tmp_path, cap, fake)
 		finally:
 			fake.close()
-		assert rc == 0 and fake.posts() == [] and 'nothing listed' in out
+		assert rc == 0 and fake.events == [] and 'nothing listed' in out
+		assert set(c[1] for c in fake.posts()) == {'/services/search/jobs'}
+
+	def test_check_with_nothing_listed_fails_when_templates_arrive_compact(self, tmp_path):
+		# The Receiver keeps receiverOptimize true: with nothing listed it still compacts every template, and the
+		# ones the lookup has no row for arrive without their fields.
+		cap = tmp_path / 'compact-cap.csv'
+		assert self.gen(tmp_path, ['k1'], cap) == 0
+		# no probe moves the clock, so the previous check is put before the events
+		(tmp_path / ('compact-cap.csv' + fm.CAP_CHECKED_SUFFIX)).write_text('-10\n', encoding='utf-8')
+		fake = FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+		self.compact(fake, 'u1', -5)
+		self.compact(fake, 'u2', -5)
+		try:
+			rc, out = self.check(tmp_path, cap, fake)
+		finally:
+			fake.close()
+		assert rc == 1 and fake.events[2:] == [] and read(str(cap)) == 'pattern_hash,value\n'
+		assert 'check: nothing listed' in out and '2 compact events of tenx_fw were indexed without their fields' in out
+		assert '(no_row 2)' in out and 'receiverOptimize true' in out
 
 	class Clock(object):
 		"""Time that moves only when activate or check sleeps."""
@@ -1575,6 +1852,22 @@ class TestCapFile:
 			else:
 				assert read(str(cap)) == 'pattern_hash,value\n"k1",true\n' and "'k2' (tenx_unmapped=no_row)" in out
 
+	def test_activate_goes_on_when_check_counts_events_but_leaves_the_list(self, tmp_path):
+		# FortiGate lines holding NUL bytes are indexed compact without fields (no_match) while the map is in use. The
+		# check activate runs each round counts them and fails, but leaves the list: activate goes on and adds the new
+		# template once the instance reads its row (before, it stopped at the first round, adding nothing).
+		cap, fake, clock = self.waiting(tmp_path, ['k1'], ['k2'])
+		self.counted_from_zero(cap)
+		self.compact(fake, 'k1', 999, why=fm.WHY_NO_MATCH)
+		fake.schedule = [(1020, lambda: (setattr(fake, 'on_disk', str(tmp_path / 'fm_fw')), fake.refresh()))]
+		try:
+			rc, out = self.activate(tmp_path, cap, fake, timeout=300, poll=10, clock=clock, sleep=clock.sleep)
+		finally:
+			fake.close()
+		assert '1 compact events of tenx_fw were indexed without their fields' in out and '(no_match 1)' in out
+		assert 'withdrawn by check' not in out
+		assert rc == 0 and read(str(cap)) == 'pattern_hash,value\n"k1",true\n"k2",true\n', out
+
 	def test_activate_probes_a_listed_template_on_every_round(self, tmp_path):
 		cap, fake, clock = self.waiting(tmp_path, ['k1', 'k3'], ['k2'])
 		try:
@@ -1647,7 +1940,7 @@ class TestCapFile:
 				rc, out = self.check(case, cap, fake, sample=sample)
 			finally:
 				fake.close()
-			assert rc == 1 and fake.posts() == [] and read(str(cap)) == 'pattern_hash,value\n', out
+			assert rc == 1 and not [c for c in fake.posts() if c[1] != '/services/search/jobs'] and read(str(cap)) == 'pattern_hash,value\n', out
 			assert '%d listed templates have no row' % (2 - len(rows)) in out
 			assert read(str(cap) + '.pending') == 'pattern_hash,value\n"k1",true\n"k2",true\n'
 
@@ -1848,3 +2141,60 @@ class TestEveryParsingNode:
 		assert seen['nodes'] == ['https://idx1:8088', 'https://idx2:8088']
 		assert fm.Splunkd('https://sh:8089', hec_url='https://lb:8088').nodes == [None]
 		assert fm.Splunkd('https://sh:8089', hec_url=['https://lb:8088']).nodes == [None]
+
+
+
+class TestCheckCountsDroppedEvents:
+	"""check reads Splunk's own log for compact events dropped by the map's failing index-time lookup()."""
+
+	def setup(self, tmp_path, hashes=('k1', 'k2')):
+		t = TestCapFile()
+		cap = t.listed(tmp_path, list(hashes)) if hashes else tmp_path / 'compact-cap.csv'
+		if not hashes:
+			assert t.gen(tmp_path, ['k1'], cap) == 0
+		(tmp_path / ('compact-cap.csv' + fm.CAP_CHECKED_SUFFIX)).write_text('-100\n', encoding='utf-8')
+		return t, cap, FakeSplunkd(str(tmp_path / 'fm_fw'), 'fm_fw', str(cap))
+
+	def test_check_empties_the_list_and_names_the_count_the_nodes_and_the_times(self, tmp_path):
+		t, cap, fake = self.setup(tmp_path)
+		fake.dropped = [('idx1', 'tenx_fw', -50), ('idx1', 'tenx_fw', -40), ('idx2', 'tenx_fw', -45), ('idx1', 'other', -45)]
+		try:
+			rc, out = t.check(tmp_path, cap, fake, sample=2)
+		finally:
+			fake.close()
+		assert rc == 1 and fm.read_cap(str(cap))[0] == set() and fm.read_cap(str(cap) + '.pending')[0] == {'k1', 'k2'}
+		assert '3 compact events of tenx_fw were dropped by Splunk since 1969-12-31T23:58:20Z' in out
+		assert 'idx1 2, first 1969-12-31T23:59:10Z, last 1969-12-31T23:59:20Z; idx2 1' in out
+		# no probe was sent: the drops decide
+		assert fake.events == [] and '/services/receivers/simple' not in set(c[1] for c in fake.posts())
+		assert read(str(cap) + fm.CAP_CHECKED_SUFFIX).strip() == '0'
+
+	def test_the_next_check_counts_only_what_was_dropped_since(self, tmp_path):
+		t, cap, fake = self.setup(tmp_path)
+		fake.dropped = [('idx1', 'tenx_fw', -50)]
+		try:
+			first, _ = t.check(tmp_path, cap, fake, sample=2)
+			cap.write_text(fm.cap_text({'k1', 'k2'}), encoding='utf-8')
+			second, out = t.check(tmp_path, cap, fake, sample=2)
+		finally:
+			fake.close()
+		assert first == 1 and second == 0 and 'dropped' not in out
+
+	def test_with_nothing_listed_check_still_fails_on_dropped_events(self, tmp_path):
+		t, cap, fake = self.setup(tmp_path, hashes=())
+		fake.dropped = [('hf1', 'tenx_fw', -10)]
+		try:
+			rc, out = t.check(tmp_path, cap, fake)
+		finally:
+			fake.close()
+		assert rc == 1 and '1 compact events of tenx_fw were dropped by Splunk' in out and 'the cap file lists no template' in out
+
+	def test_a_role_that_cannot_read_internal_is_told(self, tmp_path):
+		t, cap, fake = self.setup(tmp_path)
+		fake.internal = False
+		fake.dropped = [('idx1', 'tenx_fw', -50)]
+		try:
+			rc, out = t.check(tmp_path, cap, fake, sample=2)
+		finally:
+			fake.close()
+		assert 'cannot read _internal' in out and rc == 0 and fm.read_cap(str(cap))[0] == {'k1', 'k2'}

@@ -103,13 +103,15 @@ class TestNativeCompile:
 		assert '`tenx-inflate`' in result.compiled_search
 		assert result.compiled_search.endswith('| search payment failed')
 
-	def test_native_output_is_idiomatic_no_leading_pipe(self):
+	def test_native_output_starts_with_the_terms(self):
 		result = make_compiler().compile('sourcetype=tenx_encoded payment')
 
 		assert result.strategy == AlertStrategy.NATIVE
-		# stored form starts with the bare 'search' command, not '| search'
-		assert result.compiled_search.startswith('search ')
-		assert not result.compiled_search.startswith('| ')
+		# Splunk puts `search ` in front of a saved search's text when it dispatches it: the stored
+		# form starts with the terms, neither '| search' nor 'search' ('search search ...' made the
+		# word "search" a term and the alert found nothing)
+		assert not result.compiled_search.startswith('|')
+		assert not result.compiled_search.lower().startswith('search')
 
 	def test_original_is_preserved_for_recompile(self):
 		original = 'sourcetype=tenx_encoded payment failed'
@@ -368,12 +370,18 @@ class TestRejected:
 # ---------------------------------------------------------------------------
 
 class TestNormalizeNative:
-	def test_strips_leading_search_pipe(self):
-		assert _normalize_native(' | search foo | `tenx-inflate`') == 'search foo | `tenx-inflate`'
+	def test_strips_leading_search_pipe_and_command(self):
+		assert _normalize_native(' | search foo | `tenx-inflate`') == 'foo | `tenx-inflate`'
+		assert _normalize_native('| search (index=a OR index=b) x | `tenx-inflate`') == '(index=a OR index=b) x | `tenx-inflate`'
+		assert _normalize_native('| SEARCH foo') == 'foo'
+
+	def test_a_search_without_terms_keeps_its_pipe(self):
+		assert _normalize_native('| search | `tenx-inflate`') == '| search | `tenx-inflate`'
+		assert _normalize_native('| search') == '| search'
 
 	def test_leaves_inner_search_pipes(self):
 		out = _normalize_native('| search a | `tenx-inflate` | extract | search a')
-		assert out == 'search a | `tenx-inflate` | extract | search a'
+		assert out == 'a | `tenx-inflate` | extract | search a'
 		assert out.count('| search') == 1  # only the trailing re-narrow remains piped
 
 	def test_does_not_unwrap_generating_command(self):

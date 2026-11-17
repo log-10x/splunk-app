@@ -141,6 +141,18 @@ def _unique(names):
 	return result
 
 
+def props_conf_of(service):
+	"""
+	props.conf's stanzas, read through configs/conf-props. service.confs['props'] first GETs properties/props, the
+	list of every props stanza of every app, to see that the file exists, and closes the connection without
+	reading the answer: splunkd then logged "Socket error ... while accessing .../properties/props: Broken pipe"
+	(Splunk Enterprise 9.4.15, 10.4.3 and 10.6.0.5, 3 to 6 lines an instance). props.conf always exists.
+	"""
+	if isinstance(service, getattr(client, 'Service', ())) and hasattr(client, 'ConfigurationFile'):
+		return client.ConfigurationFile(service, client.PATH_CONF % 'props', state={'title': 'props'})
+	return service.confs['props']
+
+
 def get_tenx_config(service=None, server_uri=None, token=None):
 	"""
 	Builds the config needed by 10x to work, from the tenx_config.conf and props.conf files.
@@ -172,7 +184,7 @@ def get_tenx_config(service=None, server_uri=None, token=None):
 			# bound, and went on naming sourcetypes whose props stanza had since been deleted.
 			result[key] = list(value) if isinstance(value, list) else value
 
-		props_conf = service.confs['props']
+		props_conf = props_conf_of(service)
 		sources, source_types = [], []
 
 		for stanza in props_conf:

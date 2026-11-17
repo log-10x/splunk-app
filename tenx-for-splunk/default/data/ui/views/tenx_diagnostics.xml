@@ -92,31 +92,28 @@
   <!-- Row 3: KV Store Status -->
   <row>
     <panel>
-      <title>6. KV Store Template Count</title>
-      <single>
+      <title>6. Templates Indexed, Stored and Missing</title>
+      <table>
         <search>
-          <query>| inputlookup tenx-dml-lookup | stats count</query>
-          <earliest>1</earliest>
+          <query>index=tenx_dml sourcetype=tenx_dml_raw_json _index_latest=-10m | eval tenx_key=trim(templateHash) | stats count by tenx_key | lookup tenx-dml-lookup _key AS tenx_key OUTPUT pattern_hash AS tenx_stored | stats count as indexed, count(tenx_stored) as stored | eval missing=indexed-stored</query>
+          <earliest>0</earliest>
           <latest></latest>
         </search>
         <option name="drilldown">none</option>
-        <option name="unit">templates in KV store</option>
-      </single>
+      </table>
     </panel>
     <panel>
-      <title>7. Consume KV Last Run</title>
-      <single>
+      <title>7. Consume KV Loaded Through</title>
+      <table>
         <search>
-          <query>index=_internal sourcetype=scheduler savedsearch_name="Consume KV" status=success
-| head 1
-| eval last_run=strftime(_time, "%Y-%m-%d %H:%M:%S")
-| table last_run</query>
-          <earliest>1</earliest>
+          <query>| inputlookup tenx-kv-state-lookup
+| eval loaded_through=strftime(loaded_through, "%Y-%m-%d %H:%M:%S"), last_run=strftime(updated, "%Y-%m-%d %H:%M:%S")
+| table loaded_through, last_run, status, detail, last_cut</query>
+          <earliest>0</earliest>
           <latest></latest>
         </search>
         <option name="drilldown">none</option>
-        <option name="field">last_run</option>
-      </single>
+      </table>
     </panel>
     <panel>
       <title>8. Recent Consume KV Runs</title>

@@ -20,7 +20,7 @@ import sys
 import tempfile
 
 import tenx_replay_builder as b
-from test_replay_units import CHILD, ROOT, compiled, baseline_builder
+from test_replay_units import CHILD, ROOT, compiled, baseline_builder, without_guard
 
 APP = os.path.join(ROOT, 'tenx-for-splunk')
 
@@ -216,7 +216,8 @@ class TestThreeCases:
 		assert b.rewrite_replay(self.COVERED, ['sec_compact']) is None
 		assert b.rewrite_replay(self.COVERED, ['sec_compact', 'main']) is None
 		search = 'index=sec_compact sourcetype=tenx_encoded status=500 payment'
-		assert compiled(search, self.COVERED) == compiled(search, False, baseline_builder)
+		state, text = compiled(search, self.COVERED)
+		assert (state, without_guard(text)) == compiled(search, False, baseline_builder)
 
 	def test_unknown_is_the_full_replay(self):
 		assert b.rewrite_replay(self.COVERED, ['newidx']) == b.FULL

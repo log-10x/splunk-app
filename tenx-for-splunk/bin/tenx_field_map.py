@@ -54,6 +54,28 @@ while the event is indexed:
   at search time, so `index=X host=Y sourcetype::tenx_win` returns no event (Splunk Enterprise
   10.4.3: 0 of 662 renamed events; without host=Y, 662).
 
+Several original sourcetypes
+----------------------------
+Some add-ons keep the rules of one source under several sourcetypes and pick one per event from the event's text
+at index time: the Fortinet FortiGate Add-on 1.6.10 sets fortigate_traffic, fortigate_utm, fortigate_event or
+fortigate_anomaly from type= ([fgt_log] TRANSFORMS force_sourcetype_fortigate, DEST_KEY = MetaData:Sourcetype). A
+compact event's text holds no type=, so the sender picks: it sets tenx_sourcetype by the line's type=, as it does
+for txf. A map with several --rename sourcetypes (--target fortigate) has one compact sourcetype, one lookup file,
+one cap file and one Receiver for all of them, writes no rename line, and ends its TRANSFORMS- list with
+
+    SOURCE_KEY = field:tenx_sourcetype
+    REGEX = ^(fortigate_traffic|fortigate_utm|fortigate_event|fortigate_anomaly)$
+    DEST_KEY = MetaData:Sourcetype
+    FORMAT = sourcetype::$1
+
+(SOURCE_KEY = field:<name> reads an indexed field, transforms.conf.spec), so every event of the compact sourcetype,
+compact or whole, is stored under the sourcetype its sender named, and the add-on's search-time rules run on it as
+on the raw event; `tstats ... by sourcetype` counts it there as well. The search-time extraction for `tx`, the
+restored reserved names and the copies of text rules sit under each of those sourcetypes; `tx` finds the events by
+tenx_compact_st, which a map with several sourcetypes therefore always writes. An event whose tenx_sourcetype names
+none of them keeps the compact sourcetype. Splunk Enterprise 10.4.3, FortiGate add-on 1.6.10: 1,000,000 of 1,000,000
+BOTS v1 traffic events and 239 of 239 events of four log types stored under the sourcetype the sender named.
+
 Which fields a template yields is decided by a "first link" reader, applied to the template's
 text with a marker in place of every value, and applied unchanged to raw text by `verify`:
 
@@ -67,6 +89,10 @@ text with a marker in place of every value, and applied unchanged to raw text by
   own detections for aws:cloudtrail, not from a running Splunk.
 * kv: `name=value` and `name="value"` pairs delimited by whitespace. A conservative subset of
   Splunk's automatic key-value extraction, whose exact rules were not available to read.
+* delims: a DELIMS extraction with pair delimiters space and comma and the key-value delimiter "=", as
+  the FortiGate add-on's [field_extract], read from what Splunk extracted on raw FortiGate events.
+* windows-classic: classic Windows event log text, as Splunk's wel-message, wel-eq-kv and wel-col-kv
+  read it (the header's name=value lines, and the message's "name:" lines).
 
 Rules this keeps from the first generator of these files (b2_gen.py), each counted in the report:
 
@@ -112,7 +138,8 @@ prove what Splunk does with the generated files.
 Usage
 -----
     tenx_field_map.py gen --records <kv_rows.json | templates.json> [--records ...]
-        --target windows-security | <target.json> [--sourcetype ...] [--rename ...] [--addon <add-on dir>] --out <app dir>
+        --target windows-security | windows-security-classic | fortigate | <target.json> [--sourcetype ...] [--rename ...]
+        [--addon <add-on dir>] --out <app dir>
     tenx_field_map.py verify --records ... --target ... --encoded <encoded.log> --raw <raw.log>
     tenx_field_map.py gen --rules lookup ... --cap-file <compact cap file> [--splunkd <management URL> --probe-index <index>]
     tenx_field_map.py activate --app <app dir> --cap-file <compact cap file> --splunkd <management URL> --probe-index <index>
@@ -132,6 +159,7 @@ import argparse
 import base64
 import collections
 import configparser
+import glob
 import csv
 import datetime
 import hashlib
@@ -204,10 +232,23 @@ RESERVED_PREFIXES = ('_', 'tag::', 'date_')
 # Put in a reader's output where text cannot be decoded without the value that follows it (a
 # JSON backslash in template text, the escaped character in the value). FORMAT refuses it.
 UNDECODABLE = "\x01"
+# The lookup rule writes such a field: the backslash is a token delimiter of the Receiver, so "abc\/def="
+# in a JSON string is template text "abc", the backslash, and a value "/def=" (CloudTrail sessionToken). The
+# row's recipe holds SPLIT_ESCAPE where the backslash was; after the replace() the rule decodes it with the
+# value's first character: "/" reads as itself, "n", "t" and "r" as a space (as a line break or tab in any
+# indexed value), and a field holding any other escape is left out. A private-use character no template
+# text holds (gen refuses a template that does).
+SPLIT_ESCAPE = "\ue000"
+SPLIT_ESCAPE_KEEP = "/"
+SPLIT_ESCAPE_SPACE = "ntr"
+# The \u escapes JSON encoders write to keep text HTML-safe (Gson, used for AWS CloudTrail, writes "=" as \u003d at the
+# end of a sessionToken), decoded by the rule; any other \u escape leaves the field out.
+SPLIT_ESCAPE_UNICODE = (('003c', '<'), ('003e', '>'), ('0026', '&'), ('003d', '='), ('0027', "'"))
 
 REFUSED_UNSAFE = "the app does not expand this template (expand_unsafe: %s)"
 REFUSED_CONFLICT = "two different templates under one hash"
 REFUSED_COUNT = "number of values unknown (no timestamp, no text before the first value, no pattern)"
+REFUSED_SENTINEL = "the template text holds U+E000, which the lookup rule uses to mark a split escape"
 REFUSED_NO_FIELDS = "the reader found no field"
 
 # Why a template's row has no event time recipe (see "Event time").
@@ -223,7 +264,7 @@ TIME_DEFAULT_DAYS_HENCE = 2
 # Settings of the app's [tenx_encoded] stanza that are copied, in this order, then every key
 # with one of the prefixes in the stanza's own order. Every other key of the stanza is listed
 # in the report as not copied, so a parsing setting added to the app later is seen, not lost.
-COPIED_KEYS = ('DATETIME_CONFIG', 'LINE_BREAKER', 'SHOULD_LINEMERGE', 'NO_BINARY_CHECK', 'TRUNCATE')
+COPIED_KEYS = ('DATETIME_CONFIG', 'LINE_BREAKER', 'SHOULD_LINEMERGE', 'NO_BINARY_CHECK', 'TRUNCATE', 'ADD_EXTRA_TIME_FIELDS')
 COPIED_PREFIXES = ('TRANSFORMS-', 'SEDCMD-')
 SOURCE_STANZA = 'tenx_encoded'
 # The indexed field every FORMAT writes, unless --mark none.
@@ -231,14 +272,18 @@ MARK_FIELD = 'tenx_mapped'
 # Indexed field every event of the compact sourcetype gets, for tenx-events (see the docstring).
 SOURCETYPE_FIELD = 'tenx_compact_st'
 # Search-time hash and values of a compact event under the rename target (see the docstring).
-HASH_TRANSFORM = 'tenx_fm_hash_vars'
+# Named after the map's transform prefix (hash_stanza), as is every name a generated app defines, so two maps of one
+# target coexist on one instance; where both put a class in the same original sourcetype's stanza, Splunk Enterprise
+# 10.4.3 keeps the value of the first class that extracts a field and adds none (three REPORT- classes writing one
+# field gave it one value).
+HASH_TRANSFORM = 'hash_vars'
 HASH_REGEX = '^~(?<tenx_hash>[^,]+)(?:,(?<tenx_var_0>[^,]+)(?:,(?<tenx_vars>.*))?)?'
 # --reserved-names restore: one search-time transform per reserved name, under the rename target's stanza,
 # that reads the indexed <reserved_prefix><name> and writes <name>. A search-time field may carry such a
 # name: KV_MODE = json gives eventType on uncompacted CloudTrail events. Extractions run before field
 # aliases, calculated fields and lookups (props.conf.spec), so the add-on's rules that read the name
 # (FIELDALIAS-... = eventType AS app, EVAL-user's eventType="AwsConsoleSignIn") find it.
-RESTORE_TRANSFORM = 'tenx_fm_restore_'
+RESTORE_TRANSFORM = 'restore_'
 RESTORE_REGEX = '^([\\s\\S]*)$'
 
 # re.escape's set of escaped characters on Python 3.7 and later, written out so the generated
@@ -263,10 +308,13 @@ LOOKUP_MAX_VALUES = 984
 LOOKUP_CR = '@'
 LOOKUP_VALUE_GROUP = ',([^,[:cntrl:]]*(?:@[^,[:cntrl:]]*)*)'
 LOOKUP_VALUE_GROUP_PY = ',([^,\\x00-\\x1f\\x7f]*(?:\\r[^,\\x00-\\x1f\\x7f]*)*)'
-# Whitespace at the two ends of a field value, which the rule drops for a reader whose add-on trims values
-# (TRIM_CHARS, the POSIX class [:space:]). Template text there is cut when the app is generated; this is
-# for a value's own carriage return at the end of a field (AccessList "%%1538\r" before "\n\t\t\t\t").
-LOOKUP_EDGE_SPACE_PY = (re.compile('::"[ \\t\\n\\x0b\\x0c\\r]+'), re.compile('[ \\t\\n\\x0b\\x0c\\r]+"'))
+# Control characters at the two ends of a field value, which the rule drops for a reader whose add-on trims values.
+# Template text there is cut when the app is generated, and a compact value holds no space at either end; this is
+# for a value's own carriage return at the end of a field (AccessList "%%1538\r" before "\n\t\t\t\t"). A space is
+# not dropped: the one between two fields follows the closing quote of a value that ends with "::" (an IPv6 address
+# such as transip=:: or ipaddr="2001:db8::"), and dropping it joined that field with the next (Splunk Enterprise
+# 10.4.3: transip read back as "::transport::0" with the POSIX class [:space:]; "::" with [:cntrl:]).
+LOOKUP_EDGE_SPACE_PY = (re.compile('::"[\\x00-\\x1f\\x7f]+'), re.compile('[\\x00-\\x1f\\x7f]+"'))
 # Appended to the compact line, after "|<timestamp text>|", so the replacement can write these
 # characters by reference instead of as text: replace() reads a backslash followed by digits as a
 # reference (greedily), so a literal backslash, and a digit right after a reference, would be read wrong.
@@ -274,8 +322,9 @@ LOOKUP_TAIL = '0123456789\\\t\n\r'
 LOOKUP_COLUMNS = ('hash', 'n', 'e', 't', 'f')
 # With an event time rule (see "Event time"), one more column: the recipe of the text after TIME_PREFIX.
 LOOKUP_TIME_COLUMN = 'w'
-# The file must stay under limits.conf [lookup] ingest_max_memtable_bytes (default 10485760): above it
-# lookup() fails at index time and Splunk drops the event (see "Lookup rules").
+# Kept under limits.conf [lookup] ingest_max_memtable_bytes (default 10485760). A missing file makes lookup()
+# fail at index time and Splunk drop the event (see "Lookup rules"); gzip files of 12.8 MB and 25.6 MB, over
+# that setting, still mapped 2 of 2 events each on Splunk 10.4.3, so the bound is kept as a margin only.
 LOOKUP_DEFAULT_MAX_BYTES = 10000000
 REFUSED_TOO_MANY = "more values than the lookup rule takes (%d)"
 # The indexed field a compact event gets when the lookup rule writes none of its fields, and its values:
@@ -292,6 +341,10 @@ FLOOR_HASH = 'tenx-fm-floor'
 WINDOWS_WILDCARD_FIELDS = ('object_file_path', 'object_path', 'object_file_name', 'ObjectName', 'ObjectType',
 	'process_path', 'process_name', 'ProcessName', 'file_path', 'file_name')
 
+# The indexed field a map with several original sourcetypes reads each event's sourcetype from: the field
+# the sender sets for txf (see "Several original sourcetypes").
+RENAME_FIELD = 'tenx_sourcetype'
+
 # Built-in target descriptions. Any key can be overridden on the command line or given in a
 # JSON file with the same keys.
 TARGETS = {
@@ -302,13 +355,64 @@ TARGETS = {
 		# The source the compact events carry (Fluent Bit: event_source): the add-on's
 		# [source::XmlWinEventLog:Security] rules apply to them only with it.
 		'source': 'XmlWinEventLog:Security',
-		'transform_prefix': 'tenx_win',
-		'transforms_class': 'tenx_win',
 		# Fields ESCU's EventCode 4663 detections match with wildcard values.
 		'indexed_value_false': list(WINDOWS_WILDCARD_FIELDS),
 		'description': 'Compact Windows Security events',
 	},
+	# Windows Security events as classic text (WinEventLog), the form a Universal Forwarder's WinEventLog input
+	# writes with renderXml = false: the add-on's rules are those of the sourcetype WinEventLog and of the sources
+	# WinEventLog:Security and WinEventLog... (Splunk's own wel-* extractions).
+	'windows-security-classic': {
+		'reader': 'windows-classic',
+		'sourcetype': 'tenx_wincl',
+		'rename': 'WinEventLog',
+		'source': 'WinEventLog:Security',
+		# EventType= in the header is a Splunk default field name (eventtype, any case).
+		'reserved_names': 'restore',
+		# Stored as WinEventLog while indexed, like the raw event after the add-on's own index-time fix-up, so tstats
+		# by sourcetype counts it there; the sender sets tenx_sourcetype WinEventLog as it does for txf.
+		'rename_field': RENAME_FIELD,
+		'description': 'Compact Windows Security events, classic text',
+	},
+	# One FortiGate stream, several sourcetypes: the add-on keeps each log type's rules under its own
+	# sourcetype and sets it from the line's type= (see "Several original sourcetypes"). The sender sets
+	# tenx_sourcetype by type= as it does for txf, and the map sets each event's sourcetype from it.
+	'fortigate': {
+		'reader': 'delims',
+		'sourcetype': 'tenx_fgt',
+		'rename': ['fortigate_traffic', 'fortigate_utm', 'fortigate_event', 'fortigate_anomaly'],
+		# The UTM lines' eventtype= is a Splunk default field name; Splunk gives the raw event's text value
+		# under eventtype, beside the event types.
+		'reserved_names': 'restore',
+		# The add-on's [fortigate_*] stanzas have TIME_PREFIX = ^ and no TIME_FORMAT: Splunk recognises
+		# date= and time= itself. The rule reads the same two fields.
+		'time_prefix': r'\bdate=',
+		'time_format': ['%Y-%m-%d time=%H:%M:%S'],
+		'description': 'Compact FortiGate events',
+	},
+	# Palo Alto Networks PAN-OS syslog (the Splunk Add-on for Palo Alto Networks): one map for the log types the
+	# add-on stores by the line's fourth value ([pan:log] TRANSFORMS-sourcetype). The csv reader takes each
+	# sourcetype's FIELDS from the add-on (--addon), and the compact events' source names their sourcetype (see
+	# "Rules that read a compact event's text").
+	'palo-alto': {
+		'reader': 'csv',
+		'sourcetype': 'tenx_pan',
+		# pan:log last: a line none of the add-on's rules routes stays under the sourcetype it came in with.
+		'rename': ['pan:traffic', 'pan:threat', 'pan:system', 'pan:config', 'pan:hipmatch', 'pan:correlation',
+			'pan:userid', 'pan:globalprotect', 'pan:decryption', 'pan:log'],
+		'reserved_names': 'restore',
+		# Splunk fixes _time before the add-on's rule renames the event, with the settings of the sourcetype it
+		# came in with: [pan:log] TIME_PREFIX = ^(?:[^,]*,){5}, [pan:firewall] ^(?:[^,]*,){6}, neither with a
+		# TIME_FORMAT, so Splunk recognises the value after the sixth comma (generated_time) itself, and reads the
+		# digits that open the next value as its fraction: 21:46:38,10.0.2.107 gave 21:46:38.10 (97,736 of 97,736
+		# BOTS v2 traffic lines, Splunk Enterprise 10.4.3). strptime() with %N reads the same digits (10.0.2.107
+		# .10, 192.168 .192, 7.1 .7) and gives null when none follow; the plain format then reads the time.
+		'time_prefix': r'^(?:[^,]*,){6}',
+		'time_format': ['%Y/%m/%d %H:%M:%S,%N', '%Y/%m/%d %H:%M:%S'],
+		'description': 'Compact Palo Alto Networks events',
+	},
 }
+
 
 
 # ---------------------------------------------------------------------------------------------
@@ -366,11 +470,31 @@ def load_templates(path):
 		text = f.read()
 
 	if text.lstrip().startswith('['):
-		return [_from_kv_row(r) for r in json.loads(text)]
+		rows = json.loads(text)
+		for i, r in enumerate(rows):
+			if not isinstance(r, dict) or '_key' not in r:
+				raise ValueError('%s: row %d is not a template record of the KV store (no _key)' % (path, i + 1))
+		return [_from_kv_row(r) for r in rows]
 
 	builder = tenx_dml_builder.TenxDMLBuilder(timestamp_placeholder=TIMESTAMP_PLACEHOLDER,
 		variable_separator=VARIABLE_SEPARATOR)
-	return [_from_template_line(json.loads(line), builder) for line in text.splitlines() if line.strip()]
+	records = []
+	for n, line in enumerate(text.splitlines(), 1):
+		if not line.strip():
+			continue
+		try:
+			obj = json.loads(line)
+		except ValueError:
+			raise ValueError('%s: line %d is not JSON' % (path, n))
+		if isinstance(obj, dict) and 'templateHash' not in obj and isinstance(obj.get('messages'), list):
+			# A KV store export that failed: Splunk's REST answer, such as {"messages":[{"type":"ERROR","text":"Unauthorized"}]}.
+			said = '; '.join(str(m.get('text', '')) for m in obj['messages'] if isinstance(m, dict)) or 'no text'
+			raise ValueError('%s holds no template records: Splunk answered "%s". Export the KV store again with a '
+				'user and password or token that can read it' % (path, said))
+		if not isinstance(obj, dict) or 'templateHash' not in obj or 'template' not in obj:
+			raise ValueError('%s: line %d is not a template record (no templateHash and template)' % (path, n))
+		records.append(_from_template_line(obj, builder))
+	return records
 
 
 def _same_template(a, b):
@@ -704,6 +828,10 @@ class DelimsReader(object):
 	  spaces go, gives no field: msg=" Fortigate scheduled update ..." gave "Fortigate scheduled update ..."
 	  (50 of 50 events), user="" gave no value (isnull(user) on 2,660 of 2,660 FortiGate UTM events), and on
 	  probe lines "  a b  " gave "a b", "x " gave "x", " " and "" gave no value.
+	* a double quote that opens a value and has no closing double quote after it runs to the end of the text, and
+	  no pair is read inside it: a line ending in msg="some text with key=value in it gave msg "some text with
+	  key=value in it" and no field key (Splunk Enterprise 10.4.3, 2 of 2 lines of that form in FortiGate sample
+	  files).
 	Not checked: msg="... a=b \"quoted\" c=" gave "... a=b "quoted" c" (the last "=" not kept; this reader
 	keeps it), how Splunk names a key that is empty once cleaned, an empty value without quotes, and tabs or
 	line breaks at the ends of a value.
@@ -714,7 +842,7 @@ class DelimsReader(object):
 	keeps_empty = False
 	field_name = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\Z')
 
-	PAIR = re.compile(r'(?:^|(?<=[ ,]))([^ ,="]+)=(?:"((?:[^"\\]|\\.)*)"(?=[ ,]|\Z)|([^ ,]*))', re.S)
+	PAIR = re.compile(r'(?:^|(?<=[ ,]))([^ ,="]+)=(?:"((?:[^"\\]|\\.)*)"(?=[ ,]|\Z)|"((?:[^"\\]|\\.)*)\Z|([^ ,]*))', re.S)
 	ESCAPE = re.compile(r'\\([\\"])')
 
 	@staticmethod
@@ -746,14 +874,256 @@ class DelimsReader(object):
 			if not key or key in seen:
 				continue
 			seen.add(key)
-			if m.group(2) is None and m.group(3) == '':
+			quoted = m.group(2) if m.group(2) is not None else m.group(3)
+			if quoted is None and m.group(4) == '':
 				# An empty value without quotes: left out, as before (not checked against Splunk).
 				continue
-			out.append((key, self.ESCAPE.sub(r'\1', m.group(2)) if m.group(2) is not None else m.group(3)))
+			out.append((key, self.ESCAPE.sub(r'\1', quoted) if quoted is not None else m.group(4)))
 		return out
 
 
-READERS = {r.name: r for r in (XmlWindowsReader, JsonReader, KeyValueReader, DelimsReader)}
+class CsvReader(object):
+	r"""
+	A transforms.conf DELIMS extraction with one set of delimiters and a FIELDS list: positional values, the
+	n-th value under the n-th name (Palo Alto Networks PAN-OS syslog: DELIMS = ",", FIELDS = "future_use1",
+	"receive_time", ...). Read from what Splunk Enterprise 10.4.3 extracted with the Splunk Add-on for Palo Alto
+	Networks 4.0.0 ([extract_traffic]) on probe lines, each a BOTS v2 traffic line with one value changed:
+	* a value runs to the next delimiter; values past the last name are dropped, and names past the last value
+	  get nothing;
+	* spaces at both ends of a value go ("  dns  " gave dns), and a value that is empty then gives no field
+	  (",," and "\"\"" alike);
+	* a value that opens with a double quote runs to the next double quote followed by a delimiter or the end of
+	  the text and loses those two quotes: "Client,Server" gave Client,Server and "a""b,c" gave a""b,c; inside
+	  it a backslash before a double quote or a backslash goes ("a\"b,c" gave a"b,c);
+	* outside quotes too, a backslash before a double quote or a backslash goes and the quote is text:
+	  \"used-by-malware,able-to-transfer-file\" gave "used-by-malware and able-to-transfer-file" (an elastic panw
+	  decryption fixture line);
+	* a double quote with no such closing quote, opening a value ("abc,...) or inside one (a"b,...), takes the
+	  rest of the text as that value, quotes kept, and no later value is read;
+	* a tab inside a value stays.
+	Not checked: a backslash before another character inside quotes (kept here), spaces between a closing
+	quote and the delimiter (allowed here), a quote inside an unquoted value that a later quote closes (the
+	value then runs to that quote here), tabs at the ends of a value (kept here), a name listed twice in FIELDS
+	(the first value kept here) and an empty name (no field here).
+
+	Which names a text takes (layouts): each layout is (route, names, delimiters). With several, the first
+	whose route (a regex) finds the text: the add-on's own index-time rule that sets the event's sourcetype
+	(Palo Alto: [pan_traffic] REGEX = ^[^,]+,[^,]+,[^,]+,TRAFFIC,), applied to the template's text, so a
+	template gets the names of the sourcetype its events are stored under. A template that no route finds gets
+	no field. A compact value holds no delimiter and no double quote.
+	"""
+	name = 'csv'
+	raw_split = r'\n'
+	trims_values = True
+	keeps_empty = False
+	field_name = re.compile(r'[A-Za-z_][A-Za-z0-9_.:\-]*\Z')
+
+	def __init__(self, layouts=()):
+		self.layouts = [(re.compile(_python_regex(r)) if r else None, list(names), delims) for r, names, delims in layouts]
+
+	def layout(self, text):
+		for route, names, delims in self.layouts:
+			if route is None or route.search(text):
+				return names, delims
+		return None, None
+
+	@staticmethod
+	def split(text, delims=','):
+		out, pos, n = [], 0, len(text)
+		while True:
+			start = j = pos
+			while j < n and text[j] == ' ':
+				j += 1
+			if j < n and text[j] == '"':
+				k, buf, closed = j + 1, [], None
+				while k < n:
+					c = text[k]
+					if c == '\\' and k + 1 < n and text[k + 1] in '"\\':
+						buf.append(text[k + 1])
+						k += 2
+						continue
+					if c == '"':
+						m = k + 1
+						while m < n and text[m] == ' ':
+							m += 1
+						if m == n or text[m] in delims:
+							closed = m
+							break
+					buf.append(c)
+					k += 1
+				if closed is None:
+					out.append(text[start:].strip(' '))
+					return out
+				out.append(''.join(buf).strip(' '))
+				if closed == n:
+					return out
+				pos = closed + 1
+				continue
+			k, buf = j, []
+			while k < n and text[k] not in delims and text[k] != '"':
+				if text[k] == '\\' and k + 1 < n and text[k + 1] in '"\\':
+					buf.append(text[k + 1])
+					k += 2
+					continue
+				buf.append(text[k])
+				k += 1
+			if k < n and text[k] == '"':
+				m = k + 1
+				while m < n:
+					if text[m] == '"':
+						e = m + 1
+						while e < n and text[e] == ' ':
+							e += 1
+						if e == n or text[e] in delims:
+							break
+					m += 1
+				if m >= n:
+					out.append(text[start:].strip(' '))
+					return out
+				out.append(text[start:m + 1].strip(' '))
+				e = m + 1
+				while e < n and text[e] == ' ':
+					e += 1
+				if e == n:
+					return out
+				pos = e + 1
+				continue
+			out.append((text[start:j] + ''.join(buf)).strip(' '))
+			if k == n:
+				return out
+			pos = k + 1
+
+	def pairs(self, text):
+		names, delims = self.layout(text)
+		if names is None:
+			return []
+		out, seen = [], set()
+		for name, value in zip(names, self.split(text, delims)):
+			if not name or value == '' or name in seen:
+				continue
+			seen.add(name)
+			out.append((name, value))
+		return out
+
+	def items(self, text):
+		return collections.Counter((name, 'column') for name, _ in self.pairs(text))
+
+
+# ---------------------------------------------------------------------------------------------
+# A positional rule on a compact line
+#
+# An add-on that reads positional values (DELIMS with FIELDS, as the Splunk Add-on for Palo Alto Networks reads
+# PAN-OS syslog) reads a compact event's text too, and the Receiver's line "~<hash>,<value>,<value>,..." is
+# comma-separated: its n-th value lands under the n-th name. Splunk Enterprise 10.4.3 keeps an indexed field over what
+# a search-time rule extracts under the same name (an HEC event with src_ip indexed kept that value alone), so the
+# columns the map writes are safe; every column the raw event leaves empty, or does not have, but the compact line
+# reaches would get a value raw has not (dest_user, dvc_name, and through the add-on's EVAL- user and dvc).
+#
+# So for the csv reader the map also writes tenx_blank, naming those columns for each template (BlankFieldReader), and
+# at search time nulls what the rule reads there (blank_overrides): EVAL-<column> = if(<column named>, null(),
+# <column>) for each column, and the add-on's own EVAL- that read such a field again under their names with each
+# reference guarded the same way, as calculated fields read the fields as extracted and aliased, before any of them.
+# A raw event has no tenx_blank and keeps every value. Measured on 100,000 BOTS v2 Palo Alto events against raw:
+# every field of a plain search equal but the event type err0r (a word of the raw text), Network_Traffic and Change
+# equal on every field and event. The cost is search time on compact events (about 2 times on a stats over six
+# fields, about 5 times on every field of every event; raw events about the same). Considered and measured: giving
+# compact events their own source, whose [source::] stanza leaves the add-on's text rule out (Splunk takes a
+# [source::] class over the sourcetype's), which costs no search time but leaves source different from raw on every
+# compact event; and nulling the columns alone, which leaves dvc and user wrong.
+
+BLANK_FIELD = 'tenx_blank'
+
+
+class BlankFieldReader(object):
+	"""
+	The reader's pairs and one more, tenx_blank: the columns a positional rule reading the compact line would fill (the
+	first 1 + values names of the template's layout: the hash, then one per value) that the map does not write.
+	"""
+
+	def __init__(self, reader, csv_reader):
+		self.reader, self.csv_reader = reader, csv_reader
+
+	def __getattr__(self, name):
+		return getattr(self.reader, name)
+
+	def pairs(self, text):
+		out = list(self.reader.pairs(text))
+		names, _ = self.csv_reader.layout(text)
+		if names is None:
+			return out
+		written = set(n for n, _ in out)
+		blank = []
+		for name in names[:len(set(MARK_RE.findall(text))) + 1]:
+			if name and name not in written and name not in blank:
+				blank.append(name)
+		# Always written, '-' when no column is blank: its presence marks a compact event of a csv map, which the
+		# rules for reserved names read (see blank_overrides).
+		out.append((BLANK_FIELD, ' '.join(blank) or '-'))
+		return out
+
+
+class WindowsClassicReader(object):
+	r"""
+	Classic Windows event log text (sourcetype WinEventLog), as Splunk's own search-time rules for sources
+	WinEventLog... read it (Splunk Enterprise 10.4.3 etc/system/default/transforms.conf, applied by the Windows
+	add-on's [source::(WMI:WinEventLog|WinEventLog)...] REPORT-0MESSAGE = wel-message, wel-eq-kv, wel-col-kv):
+	* [wel-message] REGEX = (?sm)^(?<_pre_msg>.+)\nMessage=(?<Message>.+)$: the text up to the last line that
+	  starts with Message= is _pre_msg, the rest is Message;
+	* [wel-eq-kv] SOURCE_KEY = _pre_msg, DELIMS = "\n","=", MV_ADD = true: each header line name=value;
+	* [wel-col-kv] SOURCE_KEY = Message, REGEX = \n([^:\n\r]+):[ \t]++([^\n]*), FORMAT = $1::$2, MV_ADD = true:
+	  each later line of the message "name:" followed by spaces or tabs and the value (the possessive [ \t]++ leaves
+	  no space or tab at the start of the value; greedy reads the same here, as the value may be empty).
+	Names are cleaned as Splunk cleans extracted keys (CLEAN_KEYS, transforms.conf.spec): every character that is
+	not a letter or digit becomes "_", then leading "_" and digits go ("\tAccount Name" gives Account_Name). A name
+	found again is written again (MV_ADD: the subject's and the new logon's Account_Name). A value that is empty
+	gives no field. Message itself is a field: its line breaks and tabs are written as spaces by an indexed field
+	(see "Lookup rules"). Not checked against Splunk here: a header value holding "=" (taken as everything after
+	the first "="), and a name that is a compact value.
+	"""
+	name = 'windows-classic'
+	raw_split = r'\n(?=\d{2}/\d{2}/\d{4} \d{2}:\d{2}:\d{2} [AaPp][Mm]\n)'
+	# Splunk drops whitespace at the ends of a search-time extraction's value (measured for the XML reader); the
+	# section rules of the add-on capture "\t\tNT AUTHORITY\SYSTEM" after "Security ID:" and give it without the tabs.
+	trims_values = True
+	keeps_empty = False
+	field_name = re.compile(r'[A-Za-z_][A-Za-z0-9_]*\Z')
+
+	MESSAGE = re.compile(r'(?s)^(.+)\nMessage=(.+)$')
+	COLON = re.compile(r'\n([^:\n\r]+):[ \t]+([^\n]*)')
+
+	@staticmethod
+	def clean(key):
+		parts = [p for p in MARK_SPLIT.split(key) if p]
+		out = []
+		for p in parts:
+			out.append(p if MARK_RE.fullmatch(p) else re.sub(r'[^A-Za-z0-9]', '_', p))
+		name = ''.join(out)
+		return re.sub(r'^[_0-9]+', '', name)
+
+	def pairs(self, text):
+		m = self.MESSAGE.match(text)
+		if m is None:
+			return []
+		# A forwarder's multi-line record can end with the line feed after the event's last line, which the raw
+		# event, broken before the next date line, does not hold.
+		pre, message = m.group(1), m.group(2).rstrip('\n')
+		out = []
+		for line in pre.split('\n'):
+			if '=' not in line:
+				continue
+			k, v = line.split('=', 1)
+			k = self.clean(k)
+			if k and v != '':
+				out.append((k, v))
+		out.append(('Message', message))
+		for c in self.COLON.finditer(message):
+			k = self.clean(c.group(1))
+			if k and c.group(2) != '':
+				out.append((k, c.group(2)))
+		return out
+
+
+READERS = {r.name: r for r in (XmlWindowsReader, JsonReader, KeyValueReader, DelimsReader, WindowsClassicReader, CsvReader)}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1019,6 +1389,27 @@ Transform = collections.namedtuple('Transform',
 # (datetime.xml), its use of the previous event's time outside the day window (MAX_DAYS_AGO), and TZ
 # (gen refuses a stanza that sets it). A text that no format reads leaves _time as it was.
 
+# Values a TIME_PREFIX match may span: a compact value holds no comma and no control character (see "Lookup
+# rules"), so these stand for any of them.
+TIME_PREFIX_PROBES = ('', 'x', '0', ' ', 'a b', 'Z9-x', ':', '=')
+
+
+def prefix_match_is_stable(prefix_re, text, end):
+	"""
+	Whether the first TIME_PREFIX match on a template's marked text ends at the same template text for whatever
+	values it spans: with each probe in place of every value (TIME_PREFIX_PROBES), the match must end where the
+	template text that follows the match on the marked text begins (Palo Alto's ^(?:[^,]*,){6} spans the syslog
+	header's values and still ends after the sixth comma, which is template text).
+	"""
+	head, rest = text[:end], text[end:]
+	for probe in TIME_PREFIX_PROBES:
+		h, r = MARK_RE.sub(lambda _: probe, head), MARK_RE.sub(lambda _: probe, rest)
+		m = prefix_re.search(h + r)
+		if m is None or m.end() != len(h):
+			return False
+	return True
+
+
 TimeRule = collections.namedtuple('TimeRule', 'prefix formats lookahead max_days_ago max_days_hence')
 
 
@@ -1263,6 +1654,16 @@ def lookup_ts_supported(fmt):
 	return True
 
 
+def split_escape_eval(m):
+	"""The SPL that decodes SPLIT_ESCAPE in the field text m: "/" as itself, a line break or tab escape as a space, the
+	\\u escapes of SPLIT_ESCAPE_UNICODE as their characters."""
+	text = 'replace(replace(%s, "%s([%s])", "\\1"), "%s[%s]", " ")' % (m, SPLIT_ESCAPE, SPLIT_ESCAPE_KEEP, SPLIT_ESCAPE,
+		SPLIT_ESCAPE_SPACE)
+	for code, char in SPLIT_ESCAPE_UNICODE:
+		text = 'replace(%s, "(?i)%su%s", "%s")' % (text, SPLIT_ESCAPE, code, char)
+	return text
+
+
 def lookup_eval_text(lookup_def, time_rule=None, trim=False):
 	"""The static INGEST_EVAL of --rules lookup (see "Lookup rules"). Every intermediate value sits in a
 	pd: key, which is not indexed. A compact event the rule writes no fields for gets UNMAPPED_FIELD with
@@ -1315,9 +1716,15 @@ def lookup_eval_text(lookup_def, time_rule=None, trim=False):
 		'%s=if(len(%s) > 0, replace(_raw, "(?s)^~[^,]*,([^,|]*).*$", "\\1"), "")' % (e, t),
 		'%s=if(%s == 1, _raw . "|" . %s . %s, null())' % (x, ok, ts, tail),
 		'%s=if(isnull(%s), null(), replace(%s, %s, %s))' % (m, x, x, regex, f),
+		# A JSON escape the Receiver split at its backslash (see SPLIT_ESCAPE): decoded with the value's first character,
+		# and a field that holds any other escape is left out.
+		'%s=if(isnull(%s) OR %s==%s, %s, replace(%s, %s, ""))' % (m, m, m, x, m, split_escape_eval(m),
+			'"[^ ]+::" . %s . "([^" . %s . urldecode("%%5C%%5C") . "]|" . urldecode("%%5C%%5C") . ".)*%s([^" . %s . '
+			'urldecode("%%5C%%5C") . "]|" . urldecode("%%5C%%5C") . ".)*" . %s . " ?"' % (quote, quote, SPLIT_ESCAPE, quote,
+				quote)),
 	] + ([
-		'%s=if(isnull(%s) OR %s==%s, %s, replace(replace(%s, "::" . %s . "[[:space:]]+", "::" . %s), '
-		'"[[:space:]]+" . %s, %s))' % (mt, m, m, x, m, m, quote, quote, quote, quote),
+		'%s=if(isnull(%s) OR %s==%s, %s, replace(replace(%s, "::" . %s . "[[:cntrl:]]+", "::" . %s), '
+		'"[[:cntrl:]]+" . %s, %s))' % (mt, m, m, x, m, m, quote, quote, quote, quote),
 	] if trim else []) + [
 		# _meta is null on an event no earlier rule gave an indexed field (an HEC event without "fields").
 		'_meta=if(isnull(%s) OR %s==%s, _meta, coalesce(_meta, "") . " " . %s)' % (m, m, x, mt if trim else m),
@@ -1376,6 +1783,26 @@ def lookup_file_bytes(rows, columns=LOOKUP_COLUMNS):
 	return gzip.compress(buf.getvalue().encode('utf-8'), mtime=0)
 
 
+def lookup_file_problem(path):
+	"""
+	Why the lookup file at `path` cannot be read as gen writes it, or None. While the file Splunk reads is missing,
+	cannot be read, is not gzip or has no hash column, lookup() fails in the static rule and Splunk drops every
+	compact event of the map's sourcetype, floor app or not (Splunk Enterprise 10.4.3). This reads the copy gen
+	wrote, the one installed from it.
+	"""
+	import gzip
+	if not os.path.exists(path):
+		return 'is missing'
+	try:
+		with gzip.open(path, 'rt', encoding='utf-8', newline='') as f:
+			header = next(csv.reader(f), None)
+	except (OSError, EOFError, UnicodeDecodeError, csv.Error) as e:
+		return 'cannot be read as gzip CSV (%s)' % e
+	if not header or 'hash' not in header:
+		return 'has no hash column'
+	return None
+
+
 def read_lookup_file(path):
 	"""hash -> row dict of a lookup file gen wrote."""
 	import gzip
@@ -1408,10 +1835,23 @@ def apply_lookup_row(transform, compact_line, trim=False):
 	groups = _lookup_groups(transform, compact_line)
 	if groups is None:
 		return None
-	text = splunk_replace_expand(transform.recipe, groups)
+	text = split_escape_decode(splunk_replace_expand(transform.recipe, groups))
 	if trim:
 		text = LOOKUP_EDGE_SPACE_PY[1].sub('"', LOOKUP_EDGE_SPACE_PY[0].sub('::"', text))
 	return [(n, v) for n, v in parse_meta(text) if n != MARK_FIELD]
+
+
+_SPLIT_KEEP = re.compile(SPLIT_ESCAPE + '([' + re.escape(SPLIT_ESCAPE_KEEP) + '])')
+_SPLIT_SPACE = re.compile(SPLIT_ESCAPE + '[' + SPLIT_ESCAPE_SPACE + ']')
+_SPLIT_LEFT = re.compile(r'[^ ]+::"([^"\\]|\\.)*' + SPLIT_ESCAPE + r'([^"\\]|\\.)*" ?')
+
+
+def split_escape_decode(text):
+	"""The lookup rule's decoding of SPLIT_ESCAPE in index-time field text, as Python reads it."""
+	text = _SPLIT_SPACE.sub(' ', _SPLIT_KEEP.sub(r'\1', text))
+	for code, char in SPLIT_ESCAPE_UNICODE:
+		text = re.sub('(?i)' + SPLIT_ESCAPE + 'u' + code, lambda _m, c=char: c, text)
+	return _SPLIT_LEFT.sub('', text)
 
 
 def apply_lookup_time(transform, compact_line, rule):
@@ -1469,6 +1909,8 @@ class FieldMap(object):
 		self.reserved_names = reserved_names
 		self.reserved_prefix = reserved_prefix
 		self.reserved = collections.Counter()
+		# Fields written with a JSON escape split by a value (see SPLIT_ESCAPE), per field name.
+		self.split_escapes = collections.Counter()
 		# Spaces and tabs at the ends of a value come only from template text (a compact value never
 		# holds one), so trimming the marked text trims the value Splunk would see. A compact value can
 		# end with the carriage return of a CR LF line end; the lookup rule trims that at index time.
@@ -1512,6 +1954,9 @@ class FieldMap(object):
 				text, n = marked_text(t)
 			except ValueError as e:
 				self.refused[key] = str(e)
+				continue
+			if SPLIT_ESCAPE in text:
+				self.refused[key] = REFUSED_SENTINEL
 				continue
 
 			stanza = stanza_name(prefix, position, key, stanza_names)
@@ -1625,8 +2070,13 @@ class FieldMap(object):
 			if self.trim_values:
 				value_expr = value_expr.strip(self.trim_chars)
 			if UNDECODABLE in value_expr:
-				self._skip(key, stanza, 'value: ' + WHY_SPLIT_ESCAPE, name_expr)
-				continue
+				# The escaped character is the first one of the value right after it: the rule decodes it (see SPLIT_ESCAPE).
+				if all(MARK_RE.match(value_expr, i + 1) for i, c in enumerate(value_expr) if c == UNDECODABLE):
+					value_expr = value_expr.replace(UNDECODABLE, SPLIT_ESCAPE)
+					self.split_escapes[_shown(name_expr)] += 1
+				else:
+					self._skip(key, stanza, 'value: ' + WHY_SPLIT_ESCAPE, name_expr)
+					continue
 			if value_expr == '' and not self.keeps_empty:
 				continue
 			carries_ts = bool(fmt) and (MARK % 0) in value_expr
@@ -1692,7 +2142,7 @@ class FieldMap(object):
 		m = self._time_re.search(text)
 		if m is None:
 			return None, WHY_TIME_NO_PREFIX
-		if '\x00' in m.group(0):
+		if '\x00' in m.group(0) and not prefix_match_is_stable(self._time_re, text, m.end()):
 			return None, WHY_TIME_PREFIX_VALUE
 		as_text = bool(fmt) and fmt != tenx_dml_builder.EPOCH_PASSTHROUGH
 		limit = self.time_rule.lookahead
@@ -1777,6 +2227,7 @@ class FieldMap(object):
 				('templates_per_field', dict(self.eval_fields)),
 				('forms_per_field', dict(collections.Counter(name for name, _, _ in self.forms))),
 				('working_fields_per_event_max', max([sum(1 + len(g) for _, _, g in t.evals) for t in self.transforms] or [0]))])),
+			('fields_with_a_split_escape', dict(self.split_escapes)),
 			('reserved_field_names', collections.OrderedDict([
 				('action', 'left out' if self.reserved_names == 'skip' else (
 					'written as %s<name>' % self.reserved_prefix if self.reserved_names == 'prefix' else
@@ -1885,6 +2336,206 @@ def read_addon(addon_dir):
 	if not merged[0]:
 		raise AddonError('no props.conf under %s (default/ or local/)' % addon_dir)
 	return merged[0], merged[1]
+
+
+def quoted_list(value):
+	"""A transforms.conf <quoted string list> ("a","b" or ",", "="): the strings, with the escapes tab, line feed,
+	carriage return, backslash and double quote read."""
+	out = []
+	for m in re.finditer(r'"((?:[^"\\]|\\.)*)"', value or ''):
+		out.append(re.sub(r'\\(.)', lambda e: {'t': '\t', 'n': '\n', 'r': '\r'}.get(e.group(1), e.group(1)), m.group(1)))
+	return out
+
+
+def csv_layouts(addon_dir, sourcetypes, by_sourcetype=False):
+	"""
+	(layouts, report) for the csv reader from an add-on: for each sourcetype, the names (FIELDS) and delimiters
+	(DELIMS, one set) of the first REPORT- transform of its stanza that reads the event's text that way, and,
+	with several sourcetypes, the REGEX of the add-on's index-time transform that stores an event under it
+	(DEST_KEY = MetaData:Sourcetype, FORMAT = sourcetype::<it>), which picks a template's layout.
+	"""
+	props, transforms = read_addon(addon_dir)
+	routes = collections.OrderedDict()
+	for settings in props.values():
+		for key, value in settings.items():
+			if not key.startswith('TRANSFORMS-'):
+				continue
+			for name in [x.strip() for x in value.split(',') if x.strip()]:
+				t = transforms.get(name, {})
+				m = re.match(r'\s*sourcetype::(\S+)\s*$', str(t.get('FORMAT', '')))
+				if str(t.get('DEST_KEY', '')).strip() == 'MetaData:Sourcetype' and m and t.get('REGEX'):
+					routes.setdefault(m.group(1), str(t['REGEX']).strip())
+	layouts, report, names_of = [], collections.OrderedDict(), collections.OrderedDict()
+	for st in sourcetypes:
+		found = None
+		for key, value in props.get(st, {}).items():
+			if not key.startswith('REPORT-'):
+				continue
+			for name in [x.strip() for x in value.split(',') if x.strip()]:
+				t = transforms.get(name, {})
+				delims = quoted_list(t.get('DELIMS'))
+				if _source_key(t) == '_raw' and len(delims) == 1 and t.get('FIELDS'):
+					found = (name, quoted_list(t['FIELDS']), delims[0])
+					break
+			if found:
+				break
+		if found is None:
+			report[st] = 'no REPORT- transform of [%s] reads the text with one DELIMS set and FIELDS' % st
+			continue
+		route = routes.get(st) if len(sourcetypes) > 1 else None
+		if len(sourcetypes) > 1 and route is None:
+			report[st] = 'no index-time rule of the add-on stores an event under %s, so no template is read as one' % st
+			continue
+		layouts.append((route, found[1], found[2]))
+		names_of[st] = found[1]
+		report[st] = '%s: %d names, delimiters %r%s' % (found[0], len(found[1]), found[2],
+			', templates whose text %s finds' % route if route else '')
+	return (layouts, report, names_of) if by_sourcetype else (layouts, report)
+
+
+def blank_overrides(props, transforms, stanza, columns, reserved_prefix=None):
+	"""
+	The search-time settings the map writes in [stanza] so that what the add-on's DELIMS rule reads
+	from a compact line where the map wrote no field (tenx_blank names those columns) is null, as on the raw event, with
+	source left as it is. A field is tainted by a column when it is the column, or an add-on rule that runs before the
+	calculated fields (REPORT or EXTRACT reading a field, FIELDALIAS) derives it from a tainted field. Then:
+	* each add-on EVAL- that reads a tainted field is written again under its own name with each such reference in
+	  if(<its column is blank>, null(), <field>); Splunk 10.4.3 takes the map's EVAL- over the add-on's for the same
+	  name and stanza (measured: an app named fg_* over Splunk_TA_paloalto_networks; search-time precedence puts the
+	  later name first), and a calculated field reads the fields as they were before any calculated field ran;
+	* every other tainted field gets EVAL-<field> = if(<its column is blank>, null(), <field>).
+	Returns [(key, value)] in order.
+	"""
+	settings = props.get(stanza, {})
+	taint = collections.OrderedDict((c, {c}) for c in columns if c)
+
+	def rule_reads():
+		out = []
+		for key, value in settings.items():
+			kind = key.split('-', 1)[0].upper()
+			if kind == 'REPORT':
+				for t in [x.strip() for x in value.split(',') if x.strip()]:
+					tr = transforms.get(t, {})
+					sk = _source_key(tr)
+					if sk != '_raw':
+						out.append(({sk}, set(written_names(tr))))
+			elif kind == 'EXTRACT':
+				m = re.search(r'\s+in\s+([A-Za-z_][A-Za-z0-9_]*)\s*$', value)
+				if m:
+					out.append(({m.group(1)}, set(re.findall(r'\(\?P?<([A-Za-z_]\w*)>', value))))
+			elif kind == 'FIELDALIAS':
+				for a, how, b in re.findall(r'("[^"]+"|\S+)\s+(AS(?:NEW)?)\s+("[^"]+"|\S+)', value, re.I):
+					out.append(({a.strip('"')}, {b.strip('"')}, how.upper() == 'AS'))
+		return [r if len(r) == 3 else r + (False,) for r in out]
+
+	reads = rule_reads()
+	# An alias with AS writes its field from the source alone (the raw event's object is log_subtype's value though the
+	# object column is empty), so the field's taint is the source's; any other rule adds to what the field had.
+	for ins, outs, replaces in reads:
+		if replaces:
+			for o in outs:
+				taint.pop(o, None)
+	changed = True
+	while changed:
+		changed = False
+		for ins, outs, replaces in reads:
+			src = set().union(*[taint[i] for i in ins if i in taint]) if any(i in taint for i in ins) else None
+			if not src:
+				continue
+			for o in outs:
+				if not taint.setdefault(o, set()) >= src:
+					taint[o] |= src
+					changed = True
+
+	def cond(name):
+		cols = sorted(taint[name])
+		return 'match(%s, "(^| )(%s)( |$)")' % (BLANK_FIELD, '|'.join(regex_escape(c) for c in cols))
+
+	def guarded(name):
+		if name in restored:
+			# Written as <prefix><name> and given back at search time after the add-on's rule, which reads the compact
+			# line under the name first: on a compact event the written value is the one.
+			return 'if(isnotnull(%s), \'%s%s\', \'%s\')' % (BLANK_FIELD, reserved_prefix, name, name)
+		return 'if(%s, null(), \'%s\')' % (cond(name), name)
+
+	# Columns the map writes under the reserved prefix that a search-time rule can still set: Splunk keeps its own
+	# host, source, sourcetype, index and splunk_server over an extraction (a userid line's source column left
+	# source as it was), and assigns eventtype and tag itself.
+	restored = set(c for c in taint if reserved_prefix and reserved_name(c) and not c.startswith(RESERVED_PREFIXES)
+		and c.lower() not in ('host', 'source', 'sourcetype', 'index', 'splunk_server', 'eventtype', 'tag'))
+
+	def guard_expr(value):
+		# mvfilter() takes an expression of one field, so tenx_blank inside it is not a valid expression and Splunk
+		# drops the calculated field, the add-on's own included, since the map's takes its name (measured: Invalid eval
+		# expression, The arguments to the 'mvfilter' function are invalid). Such a call is guarded whole instead:
+		# mvfilter() of a field that is not there is null, so the result is the same.
+		parts, pos, held = [], 0, []
+		for start, inner, end in call_spans(value, 'mvfilter'):
+			if start < pos:
+				continue
+			call = value[start:end]
+			names = sorted(expr_fields(value[inner:end - 1]) & set(taint))
+			if names and names[0] in restored:
+				call = 'if(isnotnull(%s), %s, %s)' % (BLANK_FIELD, rewrite_expr_fields(call,
+					lambda n: "'%s%s'" % (reserved_prefix, n) if n == names[0] else None), call)
+			elif names:
+				call = 'if(%s, null(), %s)' % (' OR '.join(cond(n) for n in names), call)
+			parts += [value[pos:start], '"\x00%d\x00"' % len(held)]
+			held.append(call)
+			pos = end
+		text = rewrite_expr_fields(''.join(parts) + value[pos:], lambda n: guarded(n) if n in taint else None)
+		for i, call in enumerate(held):
+			text = text.replace('"\x00%d\x00"' % i, call)
+		return text
+
+	out, own = [], set()
+	for key, value in settings.items():
+		if not key.startswith('EVAL-'):
+			continue
+		own.add(key[len('EVAL-'):])
+		if not (expr_fields(value) & set(taint)):
+			continue
+		out.append((key, guard_expr(value)))
+	for name in taint:
+		if name not in own:
+			out.append(('EVAL-%s' % name, guarded(name)))
+	return out
+
+
+def call_spans(expr, function):
+	"""(start, start of the arguments, end) of each call to an eval function in an expression, outside string literals
+	and quoted names, in order; a call inside another comes after it."""
+	masked = re.sub(r'"(?:[^"\\]|\\.)*"|\'[^\']*\'', lambda m: m.group(0)[0] + 'x' * (len(m.group(0)) - 2) + m.group(0)[0],
+		expr)
+	out = []
+	for m in re.finditer(r'(?<![A-Za-z0-9_.:{}])%s\s*\(' % re.escape(function), masked, re.I):
+		depth = 0
+		for j in range(m.end() - 1, len(masked)):
+			depth += {'(': 1, ')': -1}.get(masked[j], 0)
+			if depth == 0:
+				out.append((m.start(), m.end(), j + 1))
+				break
+	return out
+
+
+def rewrite_expr_fields(expr, replace):
+	"""An eval expression with each field reference (a word outside string literals that is not a function or keyword,
+	or a name in single quotes) given by replace(name), or kept when replace returns None."""
+	out, pos = [], 0
+	token = re.compile(r'"(?:[^"\\]|\\.)*"|\'([^\']+)\'|' + _EXPR_WORD.pattern)
+	for m in token.finditer(expr):
+		out.append(expr[pos:m.start()])
+		text = m.group(0)
+		if text.startswith('"'):
+			out.append(text)
+		else:
+			name = m.group(1) if text.startswith("'") else text
+			is_call = expr[m.end():].lstrip().startswith('(') and not text.startswith("'")
+			new = None if is_call or name.upper() in _EXPR_KEYWORDS else replace(name)
+			out.append(new if new is not None else text)
+		pos = m.end()
+	out.append(expr[pos:])
+	return ''.join(out)
 
 
 def source_pattern_matches(pattern, source):
@@ -2150,7 +2801,7 @@ def _source_key(transform):
 	return str(transform.get('SOURCE_KEY', '_raw') or '_raw').strip()
 
 
-def text_rule_copies(props, transforms, rename, source=None, prefix='tenx_fm', seen=None):
+def text_rule_copies(props, transforms, rename, source=None, prefix='tenx_fm', seen=None, xml=True, word_values=False):
 	"""
 	The field-reading copies of an add-on's rules that read the event's text (see "Add-on rules that read
 	the event's text"), for the xml-windows reader. A copy is not written for a name the System block of
@@ -2163,7 +2814,7 @@ def text_rule_copies(props, transforms, rename, source=None, prefix='tenx_fm', s
 	done with it.
 	"""
 	seen = seen or {}
-	stanzas = [rename] if rename in props else []
+	stanzas = [r for r in (rename if isinstance(rename, list) else [rename]) if r in props]
 	if source:
 		stanzas += [s for s in props if s.startswith('source::') and source_pattern_matches(s[len('source::'):], source)]
 	classes = []
@@ -2200,6 +2851,9 @@ def text_rule_copies(props, transforms, rename, source=None, prefix='tenx_fm', s
 			entry = collections.OrderedDict([('class', cls), ('stanza', st), ('transform', tname), ('source_key', sk),
 				('writes', written_names(t))])
 			reason, items, candidates = _copy_plan(regex, fmt, sk, blocks)
+			if not xml:
+				# A reader of text, not of XML items: no rule is copied to read one item, each is applied per template.
+				reason, items, candidates = 'the %s reader writes no XML items' % WindowsClassicReader.name, (), ()
 			if _block_of(t):
 				reason, candidates = 'writes the whole text of element %s as %s; the map writes the items the reader reads, ' \
 					'not whole elements' % _block_of(t), ()
@@ -2225,14 +2879,16 @@ def text_rule_copies(props, transforms, rename, source=None, prefix='tenx_fm', s
 				# and the copy reads the indexed field that carries the result.
 				outputs = ([(out, int(k)) for out, _, k in re.findall(r'([^\s:"]+)::("?)\$(\d+)\2', fmt)] if fmt else
 					[(g, g) for g in re.findall(r'\(\?P?<([A-Za-z_]\w*)>', regex)])
+				words = frozenset(WORD_GROUP.findall(regex)) if word_values else frozenset()
 				rule = DerivedRule(tname, _python_regex(regex), block_regex.get(sk),
 					[(out, g, '%s%s%s_%s' % (prefix, TEXT_RULE_DERIVED, sanitize(tname), sanitize(out))) for out, g in outputs],
-					tuple(covered))
+					tuple(covered), words)
 				derived.append(rule)
-				for out, _, field in rule.outputs:
+				for out, g, field in rule.outputs:
 					name = '%s%s%s_%s' % (prefix, TEXT_RULE_INFIX, sanitize(tname), sanitize(out))
-					copies.append(TextRule(st, copy_cls, name, field, '\\A([\\s\\S]*)\\z', '%s::$1' % out, tname, field,
-						'template'))
+					# A word group's field carries the whole value; the copy keeps its first word, as the rule does on raw text.
+					copies.append(TextRule(st, copy_cls, name, field, '\\A(\\S+)' if g in words else '\\A([\\s\\S]*)\\z',
+						'%s::$1' % out, tname, field, 'template'))
 					report['copied'].append(collections.OrderedDict([('class', cls), ('stanza', st), ('transform', tname),
 						('reads', 'the rule on each template\'s text, indexed as %s' % field), ('copy', name),
 						('writes', [out]), ('why_per_template', why)]))
@@ -2288,7 +2944,9 @@ TEXT_RULE_HARD = ('writes the block', 'writes the whole text', 'no REGEX', 'take
 TEXT_RULE_DERIVED = '_fr_'
 # covered: the fields the rule's own copies read; a template whose text the rule captures from one of them needs no
 # field of its own.
-DerivedRule = collections.namedtuple('DerivedRule', 'rule regex block outputs covered', defaults=((),))
+DerivedRule = collections.namedtuple('DerivedRule', 'rule regex block outputs covered words', defaults=((), frozenset()))
+# A named group that reads one word, (?<name>\S+): on the raw event it stops at the first space or tab of the value.
+WORD_GROUP = re.compile(r'\(\?P?<([A-Za-z_]\w*)>\\S\+\)')
 
 
 def _block_of(transform):
@@ -2420,9 +3078,14 @@ def text_rule_props(copies):
 
 DERIVE_PROBES = ('x', '0', '4', '5156', '5157', '4798', '10.0.1.14', '::1', '127.0.0.1', 'a b', '-', '%%14592',
 	'C:\\Windows\\System32\\svchost.exe', 'A user account was changed.', 'Changed Attributes:\n x')
+# The probes for the windows-classic reader leave out the one with a line feed: the lookup rule writes no field for an
+# event whose compact value holds a line feed (LOOKUP_VALUE_GROUP), so a rule's result on such a value never reaches an
+# index. In classic text every rule that reads a section ("Subject:", then "\tAccount Name:\t\t<value>" on the next
+# lines) stops its value at the line's end, which only that probe moved.
+DERIVE_PROBES_NO_LINE_FEED = tuple(v for v in DERIVE_PROBES if '\n' not in v)
 
 
-def derive_pairs(rule, text):
+def derive_pairs(rule, text, probes=DERIVE_PROBES):
 	"""The (indexed field, marked text) pairs a DerivedRule gives for a template's marked text, and whether a match
 	was dropped because its result depends on the values."""
 	src = text
@@ -2435,7 +3098,7 @@ def derive_pairs(rule, text):
 	if m is None:
 		return [], False
 	got = [(field, m.group(g)) for _, g, field in rule.outputs if m.group(g) is not None]
-	for v in DERIVE_PROBES:
+	for v in probes:
 		for each in (False, True):
 			def put(mm, v=v, each=each):
 				return v + mm.group(1) if each else v
@@ -2443,17 +3106,242 @@ def derive_pairs(rule, text):
 			if mv is None:
 				return [], True
 			for (_, g, field), (_, marked) in zip([o for o in rule.outputs if m.group(o[1]) is not None], got):
-				if mv.group(g) != MARK_RE.sub(put, marked):
-					return [], True
+				want = MARK_RE.sub(put, marked)
+				if mv.group(g) == want:
+					continue
+				# A word group whose text is exactly one value: the field carries the whole value and the copy cuts it
+				# at its first space or tab (see WORD_GROUP), so a probe with a space reads the same as raw text.
+				if g in rule.words and MARK_RE.fullmatch(marked) and want.split() and mv.group(g) == want.split()[0]:
+					continue
+				return [], True
 	return got, False
+
+
+# ---------------------------------------------------------------------------------------------
+# The fields the data models need (--fields cim)
+#
+# Every indexed field takes index space (the classic Windows Message field made a mapped index 10 times its raw
+# index). With --fields cim the map writes only the fields that the CIM data models, and the add-on's event types,
+# read on the event, directly or through the add-on's own search-time rules: starting from every field name the CIM
+# models use (their fields, calculations and constraints) and every field the add-on's event types search, the
+# inputs of each rule that writes a needed field are needed too (FIELDALIAS, EVAL, LOOKUP, a REPORT or EXTRACT that
+# reads a field), until nothing is added. A field whose name the map takes from a value is kept. Every other field is
+# left out: a search that reads it directly finds it through txf, not on the indexed event.
+
+_SEARCH_FIELD = re.compile(r'(?<![A-Za-z0-9_.:{}])([A-Za-z_][A-Za-z0-9_.:{}-]*)\s*(?:!=|<=|>=|=|<|>|\s+IN\s*\()', re.I)
+_EXPR_WORD = re.compile(r'[A-Za-z_][A-Za-z0-9_.:{}]*')
+_EXPR_KEYWORDS = frozenset(('AND', 'OR', 'NOT', 'IN', 'LIKE', 'TRUE', 'FALSE', 'NULL', 'AS', 'BY', 'XOR'))
+
+
+def expr_fields(expr):
+	"""Field names an eval expression reads: words outside string literals that are not functions or keywords, and
+	names in single quotes."""
+	text = re.sub(r'"(?:[^"\\]|\\.)*"', ' ', expr)
+	names = set(re.findall(r"'([^']+)'", text))
+	text = re.sub(r"'[^']*'", ' ', text)
+	for m in _EXPR_WORD.finditer(text):
+		if text[m.end():].lstrip().startswith('(') or m.group(0).upper() in _EXPR_KEYWORDS:
+			continue
+		names.add(m.group(0))
+	return names
+
+
+def search_fields(search):
+	"""Field names a search string compares (name=value, name!=value, name IN (...))."""
+	return set(m.group(1) for m in _SEARCH_FIELD.finditer(search or ''))
+
+
+_SEARCH_TAG = re.compile(r'(?<![A-Za-z0-9_])tag\s*=\s*"?([A-Za-z0-9_:-]+)"?')
+_SEARCH_TOKEN = re.compile(r'\(|\)|"(?:[^"\\]|\\.)*"|`[^`]*`|[^\s()]+')
+
+
+def tags_can_match(search, tags):
+	"""Whether an event carrying every tag in tags can match the search part of a dataset's constraint: tag=x is
+	true when x is among tags, index=_x (one of Splunk's own indexes) is false, any other term is true, NOT is true,
+	terms side by side (or AND) must all be true and OR needs one side. Endpoint.Processes (tag=process tag=report) can match the Windows add-on's tags;
+	Application_State's (tag=listening tag=port) OR (tag=process tag=report) can match tags holding either pair."""
+	tokens = _SEARCH_TOKEN.findall(search or '')
+	pos = [0]
+
+	def peek():
+		return tokens[pos[0]] if pos[0] < len(tokens) else None
+
+	def take():
+		pos[0] += 1
+		return tokens[pos[0] - 1]
+
+	def unary():
+		t = take()
+		if t.upper() == 'NOT':
+			if peek() is not None:
+				unary()
+			return True
+		if t == '(':
+			v = disjunction()
+			if peek() == ')':
+				take()
+			return v
+		m = _SEARCH_TAG.fullmatch(t)
+		if m:
+			return m.group(1) in tags
+		# Splunk's own indexes (Splunk_Audit's index=_internal) hold no event of an add-on.
+		return re.fullmatch(r'index\s*=\s*"?_\S*', t) is None
+
+	def conjunction():
+		v = True
+		while peek() is not None and peek() != ')' and peek().upper() != 'OR':
+			if peek().upper() == 'AND':
+				take()
+				continue
+			v = unary() and v
+		return v
+
+	def disjunction():
+		v = conjunction()
+		while peek() is not None and peek().upper() == 'OR':
+			take()
+			v = conjunction() or v
+		return v
+
+	return disjunction()
+
+
+def _dataset_search(obj):
+	"""A dataset's search: its constraints, and for a BaseSearch dataset (Endpoint's) its base search up to the first pipe."""
+	parts = ['(%s)' % c['search'] for c in obj.get('constraints', []) if c.get('search')]
+	if obj.get('baseSearch'):
+		parts.append('(%s)' % obj['baseSearch'].split('|')[0])
+	return ' '.join(parts)
+
+
+def cim_fields(cim_dir, tags=None):
+	"""Every field name the CIM data models of cim_dir use: dataset fields, calculation outputs and inputs, and the
+	fields their constraints and base searches read. With tags, only the models with a root dataset an event carrying
+	those tags can match (tags_can_match), so a model the add-on's events never reach adds no name."""
+	names = set()
+	for path in sorted(glob.glob(os.path.join(cim_dir, 'default', 'data', 'models', '*.json'))):
+		with open(path, encoding='utf-8') as f:
+			model = json.load(f)
+		roots = [o for o in model.get('objects', []) if o.get('parentName') in ('BaseEvent', 'BaseSearch')]
+		if tags is not None:
+			searches = [_dataset_search(o) for o in roots]
+			if not any(_SEARCH_TAG.search(q) and tags_can_match(q, tags) for q in searches):
+				continue
+		for obj in model.get('objects', []):
+			for fld in obj.get('fields', []):
+				names.add(fld.get('fieldName'))
+			for calc in obj.get('calculations', []):
+				for fld in calc.get('outputFields', []):
+					names.add(fld.get('fieldName'))
+				names |= expr_fields(calc.get('expression') or '')
+				names |= set(calc.get('inputField') and [calc['inputField']] or [])
+			for c in obj.get('constraints', []):
+				names |= search_fields(c.get('search'))
+			if obj.get('baseSearch'):
+				parts = obj['baseSearch'].split('|')
+				names |= search_fields(parts[0])
+				for part in parts[1:]:
+					if re.match(r'\s*eval\s', part):
+						names |= expr_fields(re.sub(r'^\s*eval\s', '', part))
+	names.discard(None)
+	return names
+
+
+def addon_rules(props, transforms, stanzas):
+	"""[(written names, read names)] of the add-on's search-time rules in the given props stanzas."""
+	rules = []
+	for st in stanzas:
+		for key, value in props.get(st, {}).items():
+			kind = key.split('-', 1)[0].upper()
+			if kind == 'FIELDALIAS':
+				for a, b in re.findall(r'("[^"]+"|\S+)\s+AS(?:NEW)?\s+("[^"]+"|\S+)', value, re.I):
+					rules.append(({b.strip('"')}, {a.strip('"')}))
+			elif kind == 'EVAL':
+				rules.append(({key.split('-', 1)[1]}, expr_fields(value)))
+			elif kind == 'LOOKUP':
+				m = re.match(r'\s*\S+\s+(.*?)(?:\s+OUTPUT(?:NEW)?\s+(.*))?$', value, re.I | re.S)
+				if not m:
+					continue
+				ins = set(x.strip().split()[-1].strip('"') for x in m.group(1).split(',') if x.strip())
+				outs = set(x.strip().split()[-1].strip('"') for x in (m.group(2) or '').split(',') if x.strip())
+				rules.append((outs or {'*'}, ins))
+			elif kind in ('REPORT', 'EXTRACT'):
+				names = [x.strip() for x in value.split(',')] if kind == 'REPORT' else []
+				for t in names:
+					tr = transforms.get(t, {})
+					sk = str(tr.get('SOURCE_KEY', '_raw')).strip()
+					if sk == '_raw':
+						continue
+					fmt, regex = str(tr.get('FORMAT', '')), str(tr.get('REGEX', ''))
+					outs = set(re.findall(r'([A-Za-z_][A-Za-z0-9_]*)::', fmt)) | set(re.findall(r'\(\?P?<([A-Za-z_]\w*)>', regex))
+					rules.append((outs or {'*'}, {sk}))
+				if kind == 'EXTRACT':
+					m = re.search(r'\s+in\s+([A-Za-z_][A-Za-z0-9_]*)\s*$', value)
+					if m:
+						rules.append((set(re.findall(r'\(\?P?<([A-Za-z_]\w*)>', value)), {m.group(1)}))
+	return rules
+
+
+def needed_fields(addon_dir, cim_dir, stanzas, copies=()):
+	"""The fields the CIM models and the add-on's event types read, closed over the add-on's rules (see above).
+	copies: the TextRule copies gen writes of the add-on's rules that read the event's text; such a copy reads an
+	indexed field (Data CommandLine for Process_Command_Line), which is then needed when the rule's field is."""
+	props, transforms = read_addon(addon_dir)
+	eventtypes = collections.OrderedDict()
+	for sub in ('default', 'local'):
+		eventtypes.update(read_splunk_conf(os.path.join(addon_dir, sub, 'eventtypes.conf')))
+	tags = set()
+	for sub in ('default', 'local'):
+		for settings in read_splunk_conf(os.path.join(addon_dir, sub, 'tags.conf')).values():
+			tags |= set(k for k, v in settings.items() if str(v).strip().lower() == 'enabled')
+	needed = cim_fields(cim_dir, tags)
+	for settings in eventtypes.values():
+		needed |= search_fields(settings.get('search'))
+	rules = addon_rules(props, transforms, stanzas)
+	rules += [(set(written_names(transforms.get(c.rule, {}))), {c.field}) for c in copies]
+	while True:
+		before = len(needed)
+		for outs, ins in rules:
+			if '*' in outs or outs & needed:
+				needed |= ins
+		if len(needed) == before:
+			return needed
+
+
+class NeededFieldsReader(object):
+	"""A reader that keeps only the fields of needed_fields; a name that holds a compact value is kept."""
+
+	def __init__(self, reader, needed):
+		self.reader, self.needed = reader, frozenset(needed)
+
+	def __getattr__(self, name):
+		return getattr(self.reader, name)
+
+	def pairs(self, text):
+		return [(n, v) for n, v in self.reader.pairs(text) if n in self.needed or MARK_RE.search(n)]
+
+
+class LeaveOutReader(object):
+	"""A reader without the fields --leave-out names: the map does not write them (each indexed field costs index space,
+	and a field such as classic Windows Message, which an indexed field cannot hold with its line breaks, may not be
+	worth it)."""
+
+	def __init__(self, reader, names):
+		self.reader, self.names = reader, frozenset(names)
+
+	def __getattr__(self, name):
+		return getattr(self.reader, name)
+
+	def pairs(self, text):
+		return [(n, v) for n, v in self.reader.pairs(text) if n not in self.names]
 
 
 class TextRuleReader(object):
 	"""A reader with the pairs of derive_pairs added after its own, for the rules of "Rules the copies cannot read
 	from one field". Counts, per rule, the texts it wrote fields for and the texts it left out."""
 
-	def __init__(self, reader, rules):
-		self.reader, self.rules = reader, list(rules)
+	def __init__(self, reader, rules, probes=DERIVE_PROBES):
+		self.reader, self.rules, self.probes = reader, list(rules), probes
 		self.written, self.dependent = collections.Counter(), collections.Counter()
 
 	def __getattr__(self, name):
@@ -2463,7 +3351,7 @@ class TextRuleReader(object):
 		out = list(self.reader.pairs(text))
 		have = set(name for name, _ in out)
 		for rule in self.rules:
-			got, dependent = derive_pairs(rule, text)
+			got, dependent = derive_pairs(rule, text, self.probes)
 			# A field the map writes from the same text already (UserData's SubjectUserName as Caller_User_Name), or
 			# text one of the rule's own copies reads from its field.
 			outs = dict((field, out_name) for out_name, _, field in rule.outputs)
@@ -2500,8 +3388,9 @@ def addon_text_rules(addon_dir, target, templates):
 	props, transforms = read_addon(addon_dir)
 	reader = READERS[target['reader']]()
 	copies, report, derived = text_rule_copies(props, transforms, target['rename'], target.get('source'),
-		target['transform_prefix'], template_items(templates, reader))
-	if target['reader'] != XmlWindowsReader.name:
+		target['transform_prefix'], template_items(templates, reader), xml=target['reader'] == XmlWindowsReader.name,
+		word_values=target['reader'] == WindowsClassicReader.name)
+	if target['reader'] not in (XmlWindowsReader.name, WindowsClassicReader.name):
 		for c in report['copied']:
 			report['not_copied'].append(dict(c, why='the %s reader has no copies of rules that read the text'
 				% target['reader']))
@@ -2542,13 +3431,49 @@ def load_target(name_or_path, overrides):
 			raise ValueError('the target needs "%s"' % required)
 	if target['reader'] not in READERS:
 		raise ValueError('unknown reader %s (one of %s)' % (target['reader'], ', '.join(sorted(READERS))))
+	# One original sourcetype (a string) or several (a list, or names separated by commas on the command line).
+	names = target['rename'] if isinstance(target['rename'], list) else str(target['rename']).split(',')
+	names = [n.strip() for n in names if n.strip()]
+	if not names or len(set(names)) != len(names):
+		raise ValueError('"rename" needs one or more different sourcetype names')
+	for n in names:
+		if not RENAME_NAME.match(n):
+			raise ValueError('"rename": %r is not a sourcetype name the map writes (letters, digits, _ - : . only)' % n)
+	target['rename'] = names[0] if len(names) == 1 else names
+	if len(names) > 1:
+		target.setdefault('rename_field', RENAME_FIELD)
+	if target.get('rename_field') is not None and not EVAL_NAME.match(target['rename_field']):
+		raise ValueError('"rename_field": %r is not a field name' % target['rename_field'])
+	if target.get('reserved_names') not in (None, 'skip', 'prefix', 'restore'):
+		raise ValueError('"reserved_names": skip, prefix or restore')
+	if isinstance(target.get('time_format'), str):
+		target['time_format'] = [target['time_format']]
 
 	target.setdefault('transform_prefix', sanitize(target['sourcetype']))
 	target.setdefault('transforms_class', target['transform_prefix'])
 	target.setdefault('indexed_value_false', [])
-	target.setdefault('description', 'Compact events renamed to %s' % target['rename'])
+	target.setdefault('description', 'Compact events renamed to %s' % ', '.join(names))
 	target.setdefault('app_name', 'tenx_fieldmap_' + sanitize(target['sourcetype']))
 	return target
+
+
+# A sourcetype name the rename rule writes: no character its regex or FORMAT would read as syntax.
+RENAME_NAME = re.compile(r'[A-Za-z0-9_][A-Za-z0-9_:.\-]*\Z')
+
+
+def renames(target):
+	"""The original sourcetypes of the target, as a list."""
+	return target['rename'] if isinstance(target['rename'], list) else [target['rename']]
+
+
+def several(target):
+	"""True when each event is stored under the original sourcetype its rename_field names, by an index-time rule,
+	instead of a rename line: always for several original sourcetypes, and for one when the target names the field."""
+	return len(renames(target)) > 1 or bool(target.get('rename_field'))
+
+
+def rename_stanza(target):
+	return '%s_rename' % target['transform_prefix']
 
 
 def default_app_props():
@@ -2586,8 +3511,16 @@ def restored_names(field_map):
 	return sorted(field_map.reserved)
 
 
-def restore_stanza(name):
-	return RESTORE_TRANSFORM + sanitize(name)
+def map_prefix(target):
+	return target['transform_prefix'] if target else 'tenx_fm'
+
+
+def restore_stanza(target, name):
+	return '%s_%s%s' % (map_prefix(target), RESTORE_TRANSFORM, sanitize(name))
+
+
+def hash_stanza(target):
+	return '%s_%s' % (map_prefix(target), HASH_TRANSFORM)
 
 
 def props_text(target, field_map, settings, search_hash=True, sourcetype_field=SOURCETYPE_FIELD, text_rules=()):
@@ -2608,40 +3541,59 @@ def props_text(target, field_map, settings, search_hash=True, sourcetype_field=S
 		names = first + ([sourcetype_stanza(target)] if sourcetype_field else []) + [lookup_eval_stanza(target)]
 	else:
 		names = ([sourcetype_stanza(target)] if sourcetype_field else []) + [t.stanza for t in field_map.transforms]
+	if several(target):
+		lines[1] = lines[1].replace('Search-time: renamed to the add-on\'s sourcetype.',
+			'Then each event\'s sourcetype is set to the add-on\'s.')
 	if field_map.forms:
 		names.append(eval_stanza(target))
+	if several(target):
+		names.append(rename_stanza(target))
 	if first:
 		lines.append('# %s first, then the fields and the event time from the template\'s row.' % ', '.join(first))
+	if several(target):
+		lines.append('# Last: the event\'s sourcetype from its %s (see transforms.conf [%s]).' % (target['rename_field'],
+			rename_stanza(target)))
 	lines.append('TRANSFORMS-%s = %s' % (target['transforms_class'], ', '.join(names)))
-	lines.append('rename = %s' % target['rename'])
-	if search_hash:
-		lines += ['',
-			'# Search-time, for `tx`: the hash and values of these events once renamed. A renamed event runs only',
-			'# the search-time rules of the target, so this sits in the target\'s stanza; text that does not start',
-			'# with "~" (every uncompacted %s event) gets nothing from it.' % target['rename'],
-			'[%s]' % target['rename'],
-			'REPORT-%s = %s' % (HASH_TRANSFORM, HASH_TRANSFORM)]
+	if not several(target):
+		lines.append('rename = %s' % target['rename'])
 	restored = restored_names(field_map)
-	in_rename = search_hash
-	if restored:
-		if not in_rename:
-			lines += ['', '[%s]' % target['rename']]
-			in_rename = True
-		lines += ['# Search-time: each name Splunk does not keep for an indexed field, given back from %s<name>.'
-			% field_map.reserved_prefix,
-			'REPORT-tenx_fm_restore = %s' % ', '.join(restore_stanza(n) for n in restored)]
 	by_stanza = text_rule_props(text_rules)
 	note = ('# Search-time: the add-on\'s rules that read the event\'s text, as copies that read the field the map\n'
 		'# indexes for that text, each in a class that sorts right after the rule\'s own class (see "Add-on rules\n'
 		'# that read the event\'s text" in tenx_field_map.py). On an uncompacted event the rule has already\n'
 		'# written the field when its copy runs, and the copy adds nothing.')
-	if target['rename'] in by_stanza:
-		if not in_rename:
-			lines += ['', '[%s]' % target['rename']]
-		lines += [note] + by_stanza.pop(target['rename'])
-		note = '# Search-time: as above, for the rules of this stanza of the add-on.'
+	for i, rename in enumerate(renames(target)):
+		in_rename = False
+		if search_hash:
+			if i == 0:
+				lines += ['',
+					'# Search-time, for `tx`: the hash and values of these events once renamed. A renamed event runs only',
+					'# the search-time rules of the target, so this sits in the target\'s stanza; text that does not start',
+					'# with "~" (every uncompacted %s event) gets nothing from it.' % rename]
+			else:
+				lines += ['', '# As above, for %s.' % rename]
+			lines += ['[%s]' % rename, 'REPORT-%s = %s' % (hash_stanza(target), hash_stanza(target))]
+			in_rename = True
+		if restored:
+			if not in_rename:
+				lines += ['', '[%s]' % rename]
+				in_rename = True
+			lines += ['# Search-time: each name Splunk does not keep for an indexed field, given back from %s<name>.'
+				% field_map.reserved_prefix,
+				'REPORT-%s_restore = %s' % (map_prefix(target), ', '.join(restore_stanza(target, n) for n in restored))]
+		if rename in by_stanza:
+			if not in_rename:
+				lines += ['', '[%s]' % rename]
+			lines += [note] + by_stanza.pop(rename)
+			note = '# Search-time: as above, for the rules of this stanza of the add-on.'
 	for stanza, entries in by_stanza.items():
 		lines += ['', '[%s]' % stanza, note] + entries
+	for stanza, settings in (target.get('blank_evals') or {}).items():
+		lines += ['', '# Search-time: what the add-on\'s DELIMS rule reads from a compact line where the map wrote no field (the',
+			'# columns %s names) is null, as on the raw event: the add-on\'s calculated fields that read such a field, again' % BLANK_FIELD,
+			'# with each reference guarded, and every other such field nulled. On any other event %s is null and' % BLANK_FIELD,
+			'# nothing changes.', '[%s]' % stanza]
+		lines += ['%s = %s' % kv for kv in settings]
 	return '\n'.join(lines) + '\n'
 
 
@@ -2661,21 +3613,33 @@ def transforms_text(field_map, search_hash=True, target=None, sourcetype_field=S
 	if field_map.forms and target:
 		stanzas.append('# Values FORMAT cannot write (a line break, a double quote, $<digit>) and timestamps as written,\n'
 			'# built from the tenx_fmf_* and tenx_fmv_* fields the transforms above write, which it then removes.\n'
-			'# Last in the TRANSFORMS- list.\n[%s]\nINGEST_EVAL = %s\n' % (eval_stanza(target), ingest_eval_text(field_map)))
+			'# Last in the TRANSFORMS- list%s.\n[%s]\nINGEST_EVAL = %s\n' % (
+				' but the sourcetype rule' if several(target) else '', eval_stanza(target), ingest_eval_text(field_map)))
+	if target and several(target):
+		stanzas.append(rename_transform_text(target))
 	header = ('# Generated by tenx_field_map.py from the app\'s template records: one index-time transform per '
 		'template.\n\n') if field_map.rules != RULES_LOOKUP else (
 		'# Generated by tenx_field_map.py: one index-time rule for every template of the sourcetype.\n\n')
 	text = header + '\n'.join(stanzas)
 	if search_hash:
 		text += ('\n# Search-time: tenx-hash-vars-extraction (tenx-for-splunk) with the leading "~" required.\n'
-			'[%s]\nREGEX = %s\n' % (HASH_TRANSFORM, HASH_REGEX))
+			'[%s]\nREGEX = %s\n' % (hash_stanza(target), HASH_REGEX))
 	for name in restored_names(field_map):
 		text += ('\n# Search-time: %s, written at index time as %s%s.\n[%s]\nSOURCE_KEY = %s%s\nREGEX = %s\n'
-			'FORMAT = %s::$1\n' % (name, field_map.reserved_prefix, name, restore_stanza(name), field_map.reserved_prefix,
+			'FORMAT = %s::$1\n' % (name, field_map.reserved_prefix, name, restore_stanza(target, name), field_map.reserved_prefix,
 				name, RESTORE_REGEX, name))
 	if text_rules:
 		text += '\n' + text_rule_transforms(text_rules)
 	return text
+
+
+def rename_transform_text(target):
+	"""The index-time rule of a map with several original sourcetypes (see "Several original sourcetypes")."""
+	return ('# Every event of %s whose %s names one of the add-on\'s sourcetypes is stored under that sourcetype,\n'
+		'# so the add-on\'s search-time rules run on it. Last in the TRANSFORMS- list. Any other event keeps %s.\n'
+		'[%s]\nSOURCE_KEY = field:%s\nREGEX = ^(%s)$\nDEST_KEY = MetaData:Sourcetype\nFORMAT = sourcetype::$1\n' % (
+			target['sourcetype'], target['rename_field'], target['sourcetype'], rename_stanza(target),
+			target['rename_field'], '|'.join(regex_escape(n) for n in renames(target))))
 
 
 def fields_text(target):
@@ -2995,9 +3959,10 @@ def verify(templates, field_map, encoded_path, raw_path, raw_split=None, out=sys
 # * check proves the converse for templates already listed: it fails at once when a listed template
 #   has no row in the app's lookup file, else it sends probe events of a few listed templates on the
 #   same probe stream, and when one of them is indexed without its fields, or is not indexed within its
-#   --timeout (an index-time error drops an event), it empties the list at once (rows that do not start
-#   with `true` are kept) and leaves every listed template pending, so the Receiver sends them whole
-#   until activate has proven them again. The loop runs it on every turn, and activate runs it on every
+#   --timeout while Splunk logs dropping the map's events (an index-time error drops an event), it empties
+#   the list at once (rows that do not start with `true` are kept) and leaves every listed template
+#   pending, so the Receiver sends them whole until activate has proven them again. A probe not indexed in
+#   time with no such log (a backlog, a restart) leaves the list as it is and check returns 2. The loop runs it on every turn, and activate runs it on every
 #   probe round (--check-timeout), so activating new templates never holds up the check of the listed
 #   ones: a lookup that stops giving rows while activate waits is found within one round.
 #
@@ -3011,6 +3976,9 @@ def verify(templates, field_map, encoded_path, raw_path, raw_split=None, out=sys
 
 CAP_HEADER = 'pattern_hash,value\n'
 CAP_PENDING_SUFFIX = '.pending'
+# check writes the index time up to which it has counted the map's compact events indexed without their
+# fields to <cap file>.checked; the next check counts from there (from the cap file's own time the first time).
+CAP_CHECKED_SUFFIX = '.checked'
 # Per-template transforms (--rules transforms) are not activated: on Splunk Enterprise 10.4.3 a
 # transform stanza added to the app takes effect after POST conf-transforms/_reload and
 # conf-props/_reload only for an input stream (host, source and sourcetype) that starts afterwards; a
@@ -3119,8 +4087,9 @@ class TlsVerifyError(Exception):
 	"""The certificate of a Splunk endpoint did not verify; str() is one line for the person running the tool."""
 
 	def __init__(self, url, detail):
-		Exception.__init__(self, 'the certificate of %s did not verify (%s); for an instance with Splunk\'s default '
-			'self-signed certificate, add --tls-verify off' % (url, detail))
+		Exception.__init__(self, 'the certificate of %s did not verify (%s); add --tls-ca-file with the PEM file of the '
+			'authority that signed it, or, for an instance with Splunk\'s default self-signed certificate, --tls-verify off'
+			% (url, detail))
 
 
 def _certificate_failure(e):
@@ -3148,7 +4117,7 @@ def urlopen_checked(req, context, timeout):
 class Splunkd(object):
 	"""The management port of the instance that parses the data (REST, JSON)."""
 
-	def __init__(self, url, auth=None, token=None, tls_verify=True, hec_url=None, hec_token=None):
+	def __init__(self, url, auth=None, token=None, tls_verify=True, hec_url=None, hec_token=None, ca_file=None):
 		self.url = url.rstrip('/')
 		# hec_url: one HTTP Event Collector URL, or a list with one per parsing node (each indexer's or heavy
 		# forwarder's own endpoint, not a load balancer), which activate and check then prove one by one.
@@ -3161,10 +4130,14 @@ class Splunkd(object):
 		elif auth:
 			self.headers['Authorization'] = 'Basic ' + base64.b64encode(auth.encode('utf-8')).decode('ascii')
 		self.ctx = None
-		if self.url.startswith('https') and not tls_verify:
+		if not tls_verify:
 			self.ctx = ssl.create_default_context()
 			self.ctx.check_hostname = False
 			self.ctx.verify_mode = ssl.CERT_NONE
+		elif ca_file:
+			# Certificates are checked against these authorities only, host name included (the management port and
+			# every HTTP Event Collector given).
+			self.ctx = ssl.create_default_context(cafile=ca_file)
 
 	def call(self, method, path, params=None):
 		params = dict(params or {}, output_mode='json')
@@ -3252,10 +4225,16 @@ def _same_setting(key, written, held):
 
 
 def not_installed(splunkd, app_dir, app_name):
-	"""The stanzas of the app's transforms.conf and props.conf the instance does not hold as written."""
+	"""The stanzas of the app's transforms.conf and props.conf the instance does not hold as written. An instance
+	without the app at all answers 404 for its namespace: one entry says so."""
 	differ = []
 	for conf in ('transforms', 'props'):
-		have = splunkd.stanzas(app_name, conf)
+		try:
+			have = splunkd.stanzas(app_name, conf)
+		except urllib.error.HTTPError as e:
+			if e.code != 404:
+				raise
+			return ['app %s is not on the instance' % app_name]
 		for name, settings in read_conf(os.path.join(app_dir, 'default', conf + '.conf')).items():
 			got = have.get(name)
 			if got is None:
@@ -3265,21 +4244,33 @@ def not_installed(splunkd, app_dir, app_name):
 	return differ
 
 
+LookupApp = collections.namedtuple('LookupApp', 'sourcetype table field')
+
+# The indexed field the sourcetype rule of gen writes: [<prefix>_sourcetype] FORMAT = <field>::"<sourcetype>".
+SOURCETYPE_FORMAT = re.compile(r'^([A-Za-z_][A-Za-z0-9_]*)::"([^"]*)"$')
+
+
 def lookup_app(app_dir):
-	"""(compact sourcetype, lookup file path) of an app gen wrote with --rules lookup, or None."""
+	"""(compact sourcetype, lookup file path, the indexed field every event of the sourcetype gets or None) of an app
+	gen wrote with --rules lookup, or None. The compact sourcetype is the stanza whose TRANSFORMS- list holds the lookup
+	rule; it has a rename line, or, with several original sourcetypes, a sourcetype rule instead."""
 	props = read_conf(os.path.join(app_dir, 'default', 'props.conf'))
 	transforms = read_conf(os.path.join(app_dir, 'default', 'transforms.conf'))
 	for name, settings in props.items():
-		if 'rename' not in settings:
-			continue
 		for k, v in settings.items():
 			if not k.startswith('TRANSFORMS-'):
 				continue
-			for stanza in (x.strip() for x in v.split(',')):
+			listed = [x.strip() for x in v.split(',')]
+			for stanza in listed:
 				if stanza.endswith('_fields_eval') and 'INGEST_EVAL' in transforms.get(stanza, {}):
 					table = transforms.get(stanza[:-len('_eval')], {}).get('filename')
 					if table:
-						return name, os.path.join(app_dir, 'lookups', table)
+						field = None
+						for other in listed:
+							m = SOURCETYPE_FORMAT.match(str(transforms.get(other, {}).get('FORMAT', '')).strip())
+							if other.endswith('_sourcetype') and m and m.group(2) == name:
+								field = m.group(1)
+						return LookupApp(name, os.path.join(app_dir, 'lookups', table), field)
 	return None
 
 
@@ -3347,6 +4338,25 @@ def lookup_refresh_secs(splunkd):
 	return float(LOOKUP_REFRESH_DEFAULT), False
 
 
+def _netloc(url):
+	return urllib.parse.urlsplit(url).netloc
+
+
+def parsing_endpoints(splunkd):
+	"""The URLs the probes go to: each HTTP Event Collector given, or the management port named by --splunkd
+	(receivers/simple) when none is."""
+	if not splunkd.hec_url:
+		return [splunkd.url]
+	return [splunkd.hec_url] if splunkd.nodes == [None] else list(splunkd.nodes)
+
+
+def probes_parsed_on(splunkd):
+	"""True when the instance --splunkd names parses the probes: no HTTP Event Collector given, or one on the same
+	host. False when they go to other hosts, such as a search head's indexers or heavy forwarders."""
+	host = (urllib.parse.urlsplit(splunkd.url).hostname or '').lower()
+	return any((urllib.parse.urlsplit(u).hostname or '').lower() == host for u in parsing_endpoints(splunkd))
+
+
 def activate(app_dir, cap_file, splunkd, app_name=None, probe_index=None, timeout=None, poll=10, out=sys.stdout,
 		clock=time.time, sleep=time.sleep, check_timeout=60, rng=None):
 	"""
@@ -3377,24 +4387,39 @@ def activate(app_dir, cap_file, splunkd, app_name=None, probe_index=None, timeou
 		out.write('activate: app %s has per-template transforms, which reach a running stream only after a restart; '
 			'generate it with --rules lookup; cap file left as it was\n' % app_name)
 		return 1
-	sourcetype, table = layout
+	sourcetype, table = layout.sourcetype, layout.table
 	before, kept = read_cap(cap_file)
 	after, _ = read_cap(pending)
 	added = sorted(after - before)
 	differ = not_installed(splunkd, app_dir, app_name)
 	if differ:
-		out.write('activate: the instance does not hold app %s as generated (%d stanzas, first %s); '
-			'cap file left as it was\n' % (app_name, len(differ), differ[0]))
+		out.write('activate: the instance does not hold app %s as generated (%d stanzas, first %s); install the app '
+			'folders as gen wrote them, whole, and run activate again; cap file left as it was\n' % (app_name, len(differ),
+			differ[0]))
 		return 1
 	floor = floor_dir(app_dir)
-	if added and os.path.isdir(floor) and not_installed(splunkd, floor, app_name + FLOOR_SUFFIX):
-		out.write('activate: the instance does not hold the floor app %s, without which a missing lookup file drops compact '
-			'events; cap file left as it was\n' % (app_name + FLOOR_SUFFIX))
-		return 1
+	if added and os.path.isdir(floor):
+		if probes_parsed_on(splunkd):
+			if not_installed(splunkd, floor, app_name + FLOOR_SUFFIX):
+				out.write('activate: the instance does not hold the floor app %s, without which a missing lookup file drops '
+					'compact events; cap file left as it was\n' % (app_name + FLOOR_SUFFIX))
+				return 1
+		else:
+			# The floor app acts only where the compact events are parsed. A search head named by --splunkd, apart from
+			# the HTTP Event Collector that takes the probes, does not need it, and this tool cannot read the parsing
+			# instances' apps from here.
+			out.write('activate: %s was not checked: the compact events are parsed at %s, not at %s, the one instance this '
+				'tool reads apps from; install the floor app on each instance that parses them\n' % (app_name + FLOOR_SUFFIX,
+				', '.join(_netloc(n) for n in parsing_endpoints(splunkd)), _netloc(splunkd.url)))
 	confirmed, failed = set(), {}
 	if added:
 		if not probe_index:
 			out.write('activate: --probe-index is needed to prove new templates; cap file left as it was\n')
+			return 1
+		problem = lookup_file_problem(table)
+		if problem:
+			out.write('activate: the lookup file %s %s; Splunk drops the compact events of %s while the file it reads is '
+				'like that; cap file left as it was\n' % (table, problem, sourcetype))
 			return 1
 		rows = read_lookup_file(table)
 		refresh, read_from_instance = lookup_refresh_secs(splunkd)
@@ -3423,9 +4448,12 @@ def activate(app_dir, cap_file, splunkd, app_name=None, probe_index=None, timeou
 				checks += 1
 				if check(app_dir, cap_file, splunkd, app_name, probe_index, 1, check_timeout, poll, held, clock, sleep, rng) == 1:
 					out.write(held.getvalue())
-					out.write('activate: stopped after %.0f s, the list withdrawn by check; %d of %d new templates '
-						'had their fields; all stay pending\n' % (clock() - start, len(confirmed), len(added)))
-					return 1
+					# check also fails, leaving the list, when it counts compact events indexed without their fields for
+					# a reason the list does not cause (no_row, no_match): the probing goes on. Only a withdrawn list stops it.
+					if not read_cap(cap_file)[0]:
+						out.write('activate: stopped after %.0f s, the list withdrawn by check; %d of %d new templates '
+							'had their fields; all stay pending\n' % (clock() - start, len(confirmed), len(added)))
+						return 1
 			else:
 				sleep(poll)
 			seen = node_states(splunkd, probe_index, sourcetype, start - 1)
@@ -3473,11 +4501,15 @@ def activate(app_dir, cap_file, splunkd, app_name=None, probe_index=None, timeou
 def check(app_dir, cap_file, splunkd, app_name=None, probe_index=None, sample=1, timeout=60, poll=10, out=sys.stdout,
 		clock=time.time, sleep=time.sleep, rng=None):
 	"""
-	Probes `sample` listed templates, chosen at random. When every probe is indexed with its fields, returns 0 and
-	changes nothing. When one is indexed without them or is not indexed within `timeout` seconds, the cap
-	file keeps only its rows that do not start with true, every listed template is left pending
-	(<cap file>.pending, merged with a pending list already there), and returns 1: the Receiver sends
-	those templates whole until activate proves them again.
+	Probes `sample` listed templates, chosen at random. When every probe is indexed with its fields, or nothing
+	is listed, counts the compact events of the map's sourcetype indexed without their fields since the previous
+	check and returns 0 when there are none, else 1 (check_unmapped says when the list is emptied). When one is
+	indexed without them, the cap file keeps only its rows that do not start with true, every listed template
+	is left pending (<cap file>.pending, merged with a pending list already there), and returns 1: the Receiver
+	sends those templates whole until activate proves them again. When one is not indexed within `timeout`
+	seconds, the same happens only if Splunk logged dropping events of the map's sourcetype in that time, or
+	_internal cannot be read; otherwise the list is left as it was, the templates not checked are named, and it
+	returns 2.
 
 	With one HEC endpoint per parsing node (splunkd.nodes), the probes go to every node, and the answer of
 	each node that took them counts; a node that cannot be reached is left out. When no node takes them,
@@ -3485,18 +4517,23 @@ def check(app_dir, cap_file, splunkd, app_name=None, probe_index=None, sample=1,
 	"""
 	import random
 	listed, kept = read_cap(cap_file)
-	if not listed:
-		out.write('check: nothing listed (%s)\n' % cap_file)
-		return 0
-	app_name = app_name or os.path.basename(os.path.abspath(app_dir))
 	layout = lookup_app(app_dir)
+	if layout and check_dropped(cap_file, splunkd, layout[0], clock, out):
+		return 1
+	if not listed:
+		# Nothing to probe; a Receiver that compacts every template (receiverOptimize true) still sends
+		# compact events that have no row, so those are counted.
+		out.write('check: nothing listed (%s)\n' % cap_file)
+		return check_unmapped(cap_file, splunkd, layout.sourcetype, clock, out, layout.field) if layout else 0
+	app_name = app_name or os.path.basename(os.path.abspath(app_dir))
 	if layout is None or not probe_index:
 		out.write('check: needs an app generated with --rules lookup and --probe-index; cap file left as it was\n')
 		return 2
-	sourcetype, table = layout
-	if not os.path.exists(table):
+	sourcetype, table = layout.sourcetype, layout.table
+	problem = lookup_file_problem(table)
+	if problem:
 		# Splunk keeps the rows it read until its next refresh, then fails on every compact event: withdraw now.
-		withdraw(cap_file, 'the lookup file %s is missing' % table, out)
+		withdraw(cap_file, 'the lookup file %s %s' % (table, problem), out)
 		return 1
 	rows = read_lookup_file(table)
 	without = sorted(h for h in listed if h.strip() not in rows)
@@ -3526,13 +4563,139 @@ def check(app_dir, cap_file, splunkd, app_name=None, probe_index=None, sample=1,
 			if all(got):
 				out.write('check: %d of %d listed templates probed%s, all indexed with their fields (%.0f s)%s\n' % (
 					len(probed), len(listed), '' if up == [None] else ' on %d nodes' % len(up), clock() - start, away))
-				return 0
+				return check_unmapped(cap_file, splunkd, sourcetype, clock, out, layout.field)
 			if clock() - start > timeout:
-				late = [n for (h, n), g in zip(pairs, got) if g is None]
+				late = [(h, n) for (h, n), g in zip(pairs, got) if g is None]
 				why = '%d of %d probes not indexed within %.0f s%s' % (len(late), len(pairs), timeout,
-					'' if up == [None] else ' (%s)' % ', '.join(sorted(set(late))))
-				break
+					'' if up == [None] else ' (%s)' % ', '.join(sorted(set(n for _, n in late))))
+				# A probe that has not come back is not a failed proof: behind an indexing backlog, or right after a
+				# restart, it is indexed later (measured: a check right after an indexer restart, and one behind a HEC
+				# backlog, emptied lists whose rows worked). It is one when Splunk dropped it, which its own log says
+				# (DROP_SEARCH); without that log (no _internal for the role) it is taken as one, as before. A drop
+				# logged after this window is counted by the next check (check_dropped), whose window starts here.
+				drops = dropped_since(splunkd, sourcetype, start - 1, clock() + 1)
+				if drops is None or drops:
+					break
+				out.write('check: %s and Splunk logged no dropped event of %s; not checked: %s; cap file left as it '
+					'was, run check again\n' % (why, sourcetype, ', '.join(sorted(set(repr(h) for h, _ in late)))))
+				return 2
 	withdraw(cap_file, why, out)
+	return 1
+
+
+# A compact event Splunk drops because the map's index-time lookup() failed (a lookup file Splunk finds but cannot load:
+# unreadable, not gzip, no hash column) leaves one splunkd.log line per event on the node that parsed it, the event's
+# sourcetype at the end of its confkey (Splunk Enterprise 10.4.3):
+#   ERROR pipeline [... typing] - Runtime exception in  pipeline=typing processor=regexreplacement error='Invalid function
+#   argument' confkey='source::<source>|host::<host>|tenx_win|'
+DROP_SEARCH = ('search index=_internal sourcetype=splunkd "Runtime exception" "processor=regexreplacement" "%s" '
+	'_index_earliest=%d _index_latest=%d | rex "confkey=\'[^\']*\\|(?<tenx_fm_st>[^|\']+)\\|\'" '
+	'| where tenx_fm_st="%s" | stats count, min(_time) as first, max(_time) as last by host')
+
+
+def dropped_since(splunkd, sourcetype, since, until):
+	"""
+	[(node, count, first, last)] of the compact events of `sourcetype` Splunk dropped from `since` to `until` (epoch
+	seconds, index time of its own log lines) because an index-time rule failed on them, read from _internal; None when
+	the caller cannot read _internal (its role does not search it), so a count of 0 would mean nothing.
+	"""
+	if not splunkd.search('| tstats count where index=_internal earliest=-1h | where count>0'):
+		return None
+	rows = splunkd.search(DROP_SEARCH % (sourcetype, int(since), int(until), sourcetype))
+	got = []
+	for r in rows:
+		n = int(float(r.get('count') or 0))
+		if n:
+			got.append((r.get('host') or '?', n, float(r.get('first') or 0), float(r.get('last') or 0)))
+	return sorted(got)
+
+
+def check_window(cap_file, clock):
+	"""(since, until): from the previous check (from the cap file's own time the first time) to now."""
+	try:
+		with open(cap_file + CAP_CHECKED_SUFFIX, encoding='utf-8') as f:
+			since = float(f.read().strip())
+	except (IOError, OSError, ValueError):
+		since = os.path.getmtime(cap_file) if os.path.exists(cap_file) else 0
+	return since, clock()
+
+
+def check_dropped(cap_file, splunkd, sourcetype, clock, out):
+	"""
+	Counts the compact events of `sourcetype` Splunk dropped since the previous check (see DROP_SEARCH). When there
+	are any, the list is emptied (the Receiver then sends the map's events whole, and lookup() is not called on a whole
+	event), the window moves on, and it returns True. A caller that cannot read _internal is told so, and False.
+	"""
+	since, until = check_window(cap_file, clock)
+	got = dropped_since(splunkd, sourcetype, since, until)
+	if got is None:
+		out.write('check: cannot read _internal, so events Splunk dropped are not counted; give the role index _internal\n')
+		return False
+	if not got:
+		return False
+	write_if_changed(cap_file + CAP_CHECKED_SUFFIX, '%d\n' % int(until))
+	t = lambda e: time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(e))
+	what = '%d compact events of %s were dropped by Splunk since %s, its index-time lookup failing on the map\'s lookup ' \
+		'file (%s)' % (sum(n for _, n, _, _ in got), sourcetype, t(since),
+		'; '.join('%s %d, first %s, last %s' % (h, n, t(a), t(b)) for h, n, a, b in got))
+	if read_cap(cap_file)[0]:
+		withdraw(cap_file, what, out)
+	else:
+		out.write('check: %s; the cap file lists no template\n' % what)
+	return True
+
+
+def unmapped_since(splunkd, sourcetype, since, until, field=None):
+	"""
+	{reason: count} of the compact events of `sourcetype` indexed without their fields (tenx_unmapped) from
+	`since` to `until` (epoch seconds, index time), probe events left out: the search of the saved search
+	Field Map Events Without Fields, held to one compact sourcetype. With `field`, the indexed field every event
+	of the sourcetype gets (SOURCETYPE_FIELD), events stored under another sourcetype by a map with several
+	original sourcetypes are counted as well.
+	"""
+	which = 'sourcetype="%s"' % sourcetype if not field else '(sourcetype="%s" OR %s="%s")' % (sourcetype, field, sourcetype)
+	rows = splunkd.search('| tstats count where index=* %s %s=* NOT host="%s" _index_earliest=%d '
+		'_index_latest=%d by %s' % (which, UNMAPPED_FIELD, PROBE_HOST, int(since), int(until), UNMAPPED_FIELD))
+	got = {}
+	for r in rows:
+		n = int(float(r.get('count') or 0))
+		if n:
+			got[r.get(UNMAPPED_FIELD) or '?'] = n
+	return got
+
+
+def check_unmapped(cap_file, splunkd, sourcetype, clock, out, field=None):
+	"""
+	Counts the compact events of `sourcetype` indexed without their fields since the previous check (from the cap
+	file's own time the first time) and returns 0 when there are none, else 1:
+	* no_row: templates the lookup has no row for arrived compact, so the Receiver compacts templates the cap file
+	  does not list (receiverOptimize true in its arguments, or another map's cap file). Taking the listed
+	  templates off the list would not stop that.
+	* no_match: an event of a listed template has values its row does not take (a value holding a line feed), while
+	  the probe of the same run had its fields: a matter of those events, not of the list.
+	  For these two the list is left as it is.
+	* bad_row, no_table: the row or the whole lookup file fails, for every event of the templates concerned, so the
+	  list is emptied, as when a probe comes back without its fields.
+	"""
+	state = cap_file + CAP_CHECKED_SUFFIX
+	since, until = check_window(cap_file, clock)
+	got = unmapped_since(splunkd, sourcetype, since, until, field)
+	write_if_changed(state, '%d\n' % int(until))
+	if not got:
+		return 0
+	what = '%d compact events of %s were indexed without their fields since %s (%s)' % (sum(got.values()), sourcetype,
+		time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(since)), ', '.join('%s %d' % kv for kv in sorted(got.items())))
+	if set(got) - {WHY_NO_ROW, WHY_NO_MATCH} and read_cap(cap_file)[0]:
+		withdraw(cap_file, what, out)
+		return 1
+	causes = []
+	if WHY_NO_ROW in got:
+		causes.append('templates the lookup file has no row for arrived compact: the Receiver compacts templates the '
+			'cap file does not list (receiverOptimize true in its arguments, or another map\'s cap file), or the lookup '
+			'file Splunk holds lacks their rows')
+	if WHY_NO_MATCH in got:
+		causes.append('events of listed templates hold values their row does not take (a value holding a control character other than a carriage return, such as a line feed or a NUL byte)')
+	out.write('check: %s: %s; the cap file is left as it was\n' % (what, '; '.join(causes) or 'the cap file lists no template'))
 	return 1
 
 
@@ -3552,11 +4715,13 @@ def withdraw(cap_file, why, out=sys.stdout):
 
 def _build(args):
 	overrides = {
-		'reader': args.reader, 'sourcetype': args.sourcetype, 'rename': args.rename,
+		'reader': args.reader, 'sourcetype': args.sourcetype, 'rename': args.rename, 'rename_field': args.rename_field,
 		'transform_prefix': args.transform_prefix, 'transforms_class': args.transforms_class,
 		'app_name': args.app_name, 'source': getattr(args, 'source', None),
 		'indexed_value_false': None if args.indexed_value_false is None
 			else [f for f in args.indexed_value_false.split(',') if f],
+		'reserved_names': args.reserved_names, 'time_prefix': args.time_prefix, 'time_format': args.time_format,
+		'leave_out': None if args.leave_out is None else [f for f in args.leave_out.split(',') if f],
 	}
 	target = load_target(args.target, overrides)
 	templates, refused = merge_templates([load_templates(p) for p in args.records])
@@ -3566,22 +4731,74 @@ def _build(args):
 		for p in args.only_hashes_in:
 			keep |= hash_keys_in(p)
 	time_rule = None
-	if args.time_props or args.time_format or args.time_prefix is not None:
-		settings = read_time_settings(args.time_props, target['rename']) if args.time_props else {}
-		time_rule = make_time_rule(settings, args.time_prefix, args.time_format or (), args.time_lookahead)
+	time_prefix, time_formats = target.get('time_prefix'), target.get('time_format') or ()
+	if args.time_props or time_formats or time_prefix is not None:
+		settings = {}
+		if args.time_props:
+			# Several original sourcetypes: one rule for all, so their timestamp settings must agree.
+			each = [read_time_settings(args.time_props, r) for r in renames(target)]
+			if any(e != each[0] for e in each[1:]):
+				raise ValueError('--time-props: the timestamp settings of %s differ; one rule reads them all'
+					% ', '.join(renames(target)))
+			settings = each[0]
+		time_rule = make_time_rule(settings, time_prefix, time_formats, args.time_lookahead)
 	reader, text_rules = READERS[target['reader']](), None
+	if target['reader'] == CsvReader.name:
+		columns = getattr(args, 'columns', None) or target.get('columns')
+		if columns:
+			header = [c.strip() for c in (columns.split(',') if isinstance(columns, str) else columns)]
+			layouts, layout_report = [(None, header, getattr(args, 'delimiter', None) or target.get('delimiter') or ',')], {}
+		elif getattr(args, 'addon', None):
+			try:
+				layouts, layout_report = csv_layouts(args.addon, renames(target))
+			except OSError as e:
+				raise AddonError(str(e))
+		else:
+			raise ValueError('the csv reader needs the column names: --columns a,b,c, or --addon with the add-on whose '
+				'REPORT- transforms list them (DELIMS and FIELDS)')
+		if not layouts:
+			raise ValueError('the csv reader found no column names: %s' % '; '.join('%s: %s' % kv for kv in layout_report.items()))
+		reader = CsvReader(layouts)
+		target['layouts'] = layout_report
+	if isinstance(reader, CsvReader):
+		# See "A positional rule on a compact line": tenx_blank and the search-time rules that null what such a rule
+		# reads from a compact line where the map wrote no field.
+		csv_reader = reader
+		if getattr(args, 'addon', None):
+			props, transforms = read_addon(args.addon)
+			_, _, by_sourcetype = csv_layouts(args.addon, renames(target), by_sourcetype=True)
+		else:
+			props, transforms, by_sourcetype = {}, {}, collections.OrderedDict((st, header) for st in renames(target))
+		prefix = args.reserved_prefix if target.get('reserved_names') == 'restore' else None
+		target['blank_evals'] = collections.OrderedDict(
+			(st, blank_overrides(props, transforms, st, columns, prefix)) for st, columns in by_sourcetype.items())
+	leave_out = target.get('leave_out') or []
+	if leave_out:
+		reader = LeaveOutReader(reader, leave_out)
+	if getattr(args, 'fields', 'all') == 'cim' and not (getattr(args, 'addon', None) and getattr(args, 'cim', None)):
+		raise ValueError('--fields cim needs --addon and --cim (the folders of the add-on and of Splunk_SA_CIM)')
 	if getattr(args, 'addon', None):
 		try:
 			copies, report, derived = addon_text_rules(args.addon, target, templates)
 		except OSError as e:
 			raise AddonError(str(e))
+		if getattr(args, 'fields', 'all') == 'cim':
+			stanzas = renames(target)
+			if target.get('source'):
+				props, _ = read_addon(args.addon)
+				stanzas = stanzas + [st for st in props if st.startswith('source::') and source_pattern_matches(
+					st[len('source::'):], target['source'])]
+			reader = NeededFieldsReader(reader, needed_fields(args.addon, args.cim, stanzas, copies))
 		if derived:
-			reader = TextRuleReader(reader, derived)
+			reader = TextRuleReader(reader, derived, DERIVE_PROBES_NO_LINE_FEED if target['reader'] == WindowsClassicReader.name
+				else DERIVE_PROBES)
 		text_rules = (copies, report, reader)
+	if target.get('blank_evals'):
+		reader = BlankFieldReader(reader, csv_reader)
 	field_map = FieldMap(templates, reader, target['transform_prefix'],
 		stanza_names=args.stanza_names, hash_match=args.hash_match, timestamp_values=args.timestamp_values,
 		keep=keep, refused=refused, mixed_names=args.mixed_names,
-		reserved_names=args.reserved_names, reserved_prefix=args.reserved_prefix,
+		reserved_names=target.get('reserved_names') or 'skip', reserved_prefix=args.reserved_prefix,
 		trim_values={'auto': None, 'on': True, 'off': False}[args.trim_values],
 		mark=None if args.mark == 'none' else args.mark, eval_values=args.eval_values == 'on', rules=args.rules,
 		time_rule=time_rule)
@@ -3603,13 +4820,26 @@ def build_parser():
 		p.add_argument('--target', help='built-in target (%s) or a JSON file' % ', '.join(sorted(TARGETS)))
 		p.add_argument('--reader', choices=sorted(READERS))
 		p.add_argument('--sourcetype', help='the compact sourcetype the generated props.conf defines')
-		p.add_argument('--rename', help='the original sourcetype, whose search-time rules should run')
+		p.add_argument('--rename', help='the original sourcetype, whose search-time rules should run; several, '
+			'separated by commas: each event is stored under the one its --rename-field names (see "Several original '
+			'sourcetypes")')
+		p.add_argument('--rename-field', help='with several --rename sourcetypes, the indexed field the sender sets to '
+			'the event\'s original sourcetype (default %s)' % RENAME_FIELD)
 		p.add_argument('--source', help='the source the compact events carry (windows-security: XmlWinEventLog:Security); '
 			'with --addon, the add-on\'s source:: stanzas that match it are read as well')
 		p.add_argument('--transform-prefix')
 		p.add_argument('--transforms-class')
 		p.add_argument('--app-name')
 		p.add_argument('--indexed-value-false', help='comma-separated field names for fields.conf')
+		p.add_argument('--leave-out', help='comma-separated field names the map does not write')
+		p.add_argument('--columns', help='csv reader: the column names, in order, separated by commas (a header list); '
+			'without it the names come from the add-on (--addon)')
+		p.add_argument('--delimiter', help='csv reader with --columns: the delimiter (default a comma)')
+		p.add_argument('--fields', choices=('all', 'cim'), default='all',
+			help='all: every field the reader finds (default); cim: only the fields the CIM data models and the add-on\'s '
+				'event types read, through the add-on\'s rules (needs --addon and --cim; see "The fields the data models '
+				'need")')
+		p.add_argument('--cim', help='with --fields cim, the folder of Splunk_SA_CIM (its default/data/models/*.json)')
 		p.add_argument('--stanza-names', choices=('indexed', 'hash', 'stable'), default='indexed',
 			help='indexed: <prefix>_<position>_<hash> (default); hash: <prefix>_<hash>, refused on a clash; '
 				'stable: <prefix>_<hash>_<sha1 prefix>, unchanged when templates are added')
@@ -3623,17 +4853,18 @@ def build_parser():
 		p.add_argument('--trim-values', choices=('auto', 'on', 'off'), default='auto',
 			help='drop spaces and tabs at the ends of a value; auto: as the reader\'s Splunk extraction does '
 				'(xml-windows on, json and kv off)')
-		p.add_argument('--reserved-names', choices=('skip', 'prefix', 'restore'), default='skip',
+		p.add_argument('--reserved-names', choices=('skip', 'prefix', 'restore'),
 			help='a field named like a Splunk default field (eventtype, host, source, ...; any case): '
-				'skip it (default), write it under --reserved-prefix (prefix), or write it under the prefix and give it '
-				'back under its own name at search time, under the rename target (restore); all are reported')
+				'skip it, write it under --reserved-prefix (prefix), or write it under the prefix and give it '
+				'back under its own name at search time, under the rename target (restore); all are reported (default: '
+				'the target\'s, else skip)')
 		p.add_argument('--reserved-prefix', default='extracted_',
 			help='prefix for --reserved-names prefix and restore (default extracted_, the name Splunk 10.4.3 itself gave)')
 		p.add_argument('--mark', default=MARK_FIELD,
 			help='indexed field every FORMAT writes as <mark>::"1" (default %s; none: no mark). `tx` keeps the '
 				'indexed fields of an event that has it from being extracted a second time' % MARK_FIELD)
 		p.add_argument('--mixed-names', action='store_true',
-			help='write names that join text and values (checked on Splunk 10.4.3 with the CloudTrail map; off by default)')
+			help='write names that join text and values (checked on Splunk 9.4.15, 10.4.3 and 10.6.0.5 with the CloudTrail map; off by default)')
 		p.add_argument('--rules', choices=(RULES_TRANSFORMS, RULES_LOOKUP), default=RULES_TRANSFORMS,
 			help='transforms: one index-time transform per template (default); lookup: one static rule per sourcetype '
 				'and one row per template in lookups/<prefix>_fields.csv.gz, so adding a template changes only that '
@@ -3660,9 +4891,8 @@ def build_parser():
 				help='indexed field every event of the compact sourcetype gets as <field>::"<sourcetype>", which '
 					'tenx-events names so that `tx` finds these events (default %s; none: not written)' % SOURCETYPE_FIELD)
 			p.add_argument('--lookup-max-bytes', type=int, default=LOOKUP_DEFAULT_MAX_BYTES,
-				help='with --rules lookup, refuse to write a lookup file larger than this (default %d; Splunk drops '
-					'compact events when the file passes limits.conf ingest_max_memtable_bytes, default 10485760)'
-					% LOOKUP_DEFAULT_MAX_BYTES)
+				help='with --rules lookup, refuse to write a lookup file larger than this (default %d, below '
+					'limits.conf ingest_max_memtable_bytes, 10485760)' % LOOKUP_DEFAULT_MAX_BYTES)
 			p.add_argument('--floor', choices=('on', 'off'), default='on',
 				help='with --rules lookup, also write the floor app <out>_floor (default on): the lookup definition and a '
 					'file of the same name holding one row, which Splunk reads when the app\'s own file is missing, so the rule '
@@ -3721,12 +4951,15 @@ def _splunkd_args(p, required, timeout=None, timeout_help='seconds activate keep
 		help='environment variable holding the HEC token for --probe-hec (default TENX_PROBE_HEC_TOKEN)')
 	p.add_argument('--tls-verify', choices=('on', 'off'), default='on',
 		help='off: accept the instance\'s certificate without checking it (a self-signed management port)')
+	p.add_argument('--tls-ca-file',
+		help='PEM file of the certificate authorities that signed the certificates of --splunkd and --probe-hec; they '
+			'are checked against these instead of the system\'s, host name included')
 
 
 def _splunkd(args):
 	return Splunkd(args.splunkd, auth=os.environ.get(args.splunkd_auth_env),
 		token=os.environ.get(args.splunkd_token_env), tls_verify=args.tls_verify == 'on', hec_url=args.probe_hec,
-		hec_token=os.environ.get(args.probe_hec_token_env))
+		hec_token=os.environ.get(args.probe_hec_token_env), ca_file=args.tls_ca_file)
 
 
 def main(argv=None):
@@ -3761,6 +4994,10 @@ def _main(args):
 
 	settings, not_copied = parsing_settings(args.app_props)
 	sourcetype_field = None if args.sourcetype_field == 'none' else args.sourcetype_field
+	if several(target) and not sourcetype_field:
+		sys.stderr.write('gen: with several --rename sourcetypes, events are stored under the original sourcetype, so '
+			'tenx-events finds them only by --sourcetype-field; it cannot be none\n')
+		return 2
 	if args.cap_file and args.rules != RULES_LOOKUP:
 		sys.stderr.write('gen: --cap-file needs --rules lookup (per-template transforms reach a running stream only '
 			'after a restart)\n')
@@ -3829,6 +5066,10 @@ def _main(args):
 	if sourcetype_field:
 		sys.stdout.write('for tx: add %s::%s to the tenx-events macro, for example\n'
 			'    index=* (sourcetype::tenx_encoded OR %s::%s)\n' % (sourcetype_field, target['sourcetype'], sourcetype_field,
+			target['sourcetype']))
+	if several(target):
+		sys.stdout.write('sender: set %s on every event of %s to its original sourcetype, one of %s; an event without '
+			'one of them keeps %s\n' % (target['rename_field'], target['sourcetype'], ', '.join(renames(target)),
 			target['sourcetype']))
 	if args.rules == RULES_LOOKUP and args.floor == 'on':
 		sys.stdout.write('floor app: %s; install it on every instance that parses the compact events\n'

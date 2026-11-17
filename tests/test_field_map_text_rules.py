@@ -426,7 +426,7 @@ class TestGenerated:
 		props = open(str(out / 'default' / 'props.conf'), encoding='utf-8').read()
 		transforms = open(str(out / 'default' / 'transforms.conf'), encoding='utf-8').read()
 		head, sec = props.split('\n[source::XmlWinEventLog:Security]\n', 1)
-		assert 'REPORT-tenx_fm_hash_vars = tenx_fm_hash_vars\n' in head.split('[XmlWinEventLog]\n', 1)[1]
+		assert 'REPORT-tenx_win_hash_vars = tenx_win_hash_vars\n' in head.split('[XmlWinEventLog]\n', 1)[1]
 		assert 'REPORT-EventCode_from_xml-tenx_win = tenx_win_text_EventID_any_as_EventCode\n' in head
 		assert 'REPORT-dest_for_security-tenx_win = tenx_win_text_Computer_text_as_dest\n' in sec
 		assert 'REPORT-1ip_from_xml-tenx_win = tenx_win_text_ip_text_as_src_ip\n' in sec
@@ -490,7 +490,8 @@ class TestCertificateFailure:
 			assert rc == 1
 			assert err.count('\n') == 1 and 'Traceback' not in err
 			assert err.startswith('%s: the certificate of https://splunk.example:8089 did not verify (' % mode)
-			assert err.rstrip().endswith('add --tls-verify off')
+			assert '; add --tls-ca-file with the PEM file of the authority that signed it, or, for an instance' in err
+			assert err.rstrip().endswith('--tls-verify off')
 
 	def test_other_failures_are_not_changed(self, monkeypatch):
 		def down(req, context=None, timeout=None):
@@ -498,3 +499,80 @@ class TestCertificateFailure:
 		monkeypatch.setattr(urllib.request, 'urlopen', down)
 		with pytest.raises(urllib.error.URLError):
 			fm.Splunkd('https://splunk.example:8089').call('GET', '/services/server/info')
+
+
+def _openssl(*args, cwd=None):
+	import subprocess
+	subprocess.run(['openssl'] + list(args), cwd=cwd, check=True, capture_output=True)
+
+
+@pytest.fixture
+def tls_server(tmp_path):
+	"""An HTTPS server on 127.0.0.1 with a certificate for 127.0.0.1 signed by a CA made here: (url, CA file,
+	another CA file)."""
+	import shutil
+	import subprocess
+	import threading
+	from http.server import BaseHTTPRequestHandler, HTTPServer
+	if shutil.which('openssl') is None:
+		pytest.skip('no openssl')
+	d = str(tmp_path)
+	for name in ('ca', 'other'):
+		_openssl('req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', name + '.key', '-out', name + '.pem',
+			'-days', '2', '-subj', '/CN=test %s' % name, '-addext', 'basicConstraints=critical,CA:TRUE',
+			'-addext', 'keyUsage=critical,keyCertSign,cRLSign', cwd=d)
+	(tmp_path / 'ext.cnf').write_text('subjectAltName = IP:127.0.0.1\nbasicConstraints = CA:FALSE\n'
+		'keyUsage = critical,digitalSignature,keyEncipherment\nextendedKeyUsage = serverAuth\n'
+		'authorityKeyIdentifier = keyid,issuer\nsubjectKeyIdentifier = hash\n', encoding='utf-8')
+	_openssl('req', '-newkey', 'rsa:2048', '-nodes', '-keyout', 'srv.key', '-out', 'srv.csr', '-subj', '/CN=127.0.0.1',
+		cwd=d)
+	_openssl('x509', '-req', '-in', 'srv.csr', '-CA', 'ca.pem', '-CAkey', 'ca.key', '-CAcreateserial', '-out', 'srv.pem',
+		'-days', '2', '-extfile', 'ext.cnf', cwd=d)
+
+	class Handler(BaseHTTPRequestHandler):
+		def do_GET(self):
+			body = json.dumps({'entry': [{'name': 'server-info'}]}).encode('utf-8')
+			self.send_response(200)
+			self.send_header('Content-Type', 'application/json')
+			self.send_header('Content-Length', str(len(body)))
+			self.end_headers()
+			self.wfile.write(body)
+
+		def log_message(self, *a):
+			pass
+
+	server = HTTPServer(('127.0.0.1', 0), Handler)
+	ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+	ctx.load_cert_chain(os.path.join(d, 'srv.pem'), os.path.join(d, 'srv.key'))
+	server.socket = ctx.wrap_socket(server.socket, server_side=True)
+	t = threading.Thread(target=server.serve_forever, daemon=True)
+	t.start()
+	try:
+		yield 'https://127.0.0.1:%d' % server.server_address[1], os.path.join(d, 'ca.pem'), os.path.join(d, 'other.pem')
+	finally:
+		server.shutdown()
+		server.server_close()
+
+
+class TestCaFile:
+	def test_a_certificate_signed_by_the_given_authority_verifies(self, tls_server):
+		url, ca, _ = tls_server
+		got = fm.Splunkd(url, ca_file=ca).call('GET', '/services/server/info')
+		assert got['entry'][0]['name'] == 'server-info'
+
+	def test_without_it_the_same_certificate_does_not_verify(self, tls_server):
+		url, _, _ = tls_server
+		with pytest.raises(fm.TlsVerifyError):
+			fm.Splunkd(url).call('GET', '/services/server/info')
+
+	def test_another_authority_does_not_verify_it(self, tls_server):
+		url, _, other = tls_server
+		with pytest.raises(fm.TlsVerifyError):
+			fm.Splunkd(url, ca_file=other).call('GET', '/services/server/info')
+
+	def test_the_option_reaches_the_connection(self, tmp_path):
+		args = fm.build_parser().parse_args(['check', '--app', 'a', '--cap-file', 'c', '--splunkd', 'https://h:8089',
+			'--tls-ca-file', str(tmp_path / 'missing.pem')])
+		assert args.tls_ca_file == str(tmp_path / 'missing.pem')
+		with pytest.raises((FileNotFoundError, ssl.SSLError, OSError)):
+			fm._splunkd(args)

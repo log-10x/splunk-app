@@ -15,12 +15,12 @@ Key Operations
 1. **Create Search Job**: POST to /services/search/jobs with search parameters
 2. **Poll Job Status**: GET job details and check dispatchState
 3. **Get Results**: Retrieve events from completed jobs
-4. **DML Search**: Search tenx_dml_pure to find template hashes matching query
+4. **DML Search**: Read the KV store of templates to find the template hashes holding a piece
 
 DML Search Workflow
 -------------------
 When a user searches for "error":
-1. Create search: "search sourcetype=tenx_dml_pure error"
+1. Create search: "| inputlookup tenx-dml-lookup | ... | where match(<template text>, <error as a word>)"
 2. Poll until job completes
 3. Extract unique dml_hash values from results
 4. Return list of template hashes that contain "error"
@@ -94,6 +94,58 @@ class JobState(Enum):
 # probe collapses the dictionary rows to distinct hashes first (a template re-sent to the
 # dictionary index is two rows and one hash), so the cap counts templates, not rows.
 DML_FETCH_LIMIT = 25000
+
+# The KV store lookup of the templates (transforms.conf [tenx-dml-lookup]), the store tenx-inflate expands from.
+DML_LOOKUP = 'tenx-dml-lookup'
+
+# The word boundary of the template lookup, as the `tx` prefilter's dictionary uses it
+# (tenx_prefilter_parser.NOT_WORD): a letter or a digit may not touch a piece.
+NOT_WORD = '[^\\p{L}\\p{N}]'
+
+
+def term_piece(dml_search):
+	"""The piece of a lookup term as the builder writes it (tenx_search_builder.quoted_term), lowered."""
+	text = dml_search.strip()
+	if len(text) >= 2 and text.startswith('"') and text.endswith('"'):
+		text = text[1:-1].replace('\\"', '"').replace('\\\\', '\\')
+	return text.lower()
+
+
+def piece_regex(piece):
+	"""
+	The SPL regex that finds a piece in lowered template text as a word. Letters and digits of
+	ASCII stand for themselves, '*' for any text, and any other character for itself by its code
+	point, or, outside ASCII, for one to four of any character, so a regex engine reading bytes
+	or characters finds it either way. Every choice here can only find more templates than the
+	index did, never fewer: a template too many widens the search, which the search after
+	expansion corrects.
+	"""
+	out = []
+	for ch in piece:
+		if ch == '*':
+			out.append('.*')
+		elif ch.isascii() and ch.isalnum():
+			out.append(ch)
+		elif ch.isascii():
+			out.append('\\x{%02x}' % ord(ch))
+		else:
+			out.append('.{1,4}')
+	return '(^|%s)%s(%s|$)' % (NOT_WORD, ''.join(out), NOT_WORD)
+
+
+def lookup_cut(job_details):
+	"""
+	The first message of a finished lookup job that means its rows cannot be trusted as complete:
+	an error, or a warning that rows were cut (as tenx_prefilter.dictionary_failed reads a oneshot
+	answer). None when there is none.
+	"""
+	for message in (job_details or {}).get('messages', []) or []:
+		if not isinstance(message, dict):
+			continue
+		kind, text = str(message.get('type', '')).upper(), str(message.get('text', ''))
+		if kind in ('ERROR', 'FATAL') or (kind == 'WARN' and any(w in text.lower() for w in ('truncat', 'limit', 'exceed'))):
+			return '%s: %s' % (kind, text[:200])
+	return None
 
 
 class TenxSearchManager:
@@ -271,28 +323,33 @@ class TenxSearchManager:
 
 	def create_dml_search(self, dml_search):
 		"""
-		Creates a search job specifically for runs on the 10x DML sourcetype, from the given dml_search string.
+		Creates the job that answers which templates hold a piece, from the lookup term the
+		builder writes for it (tenx_search_builder.quoted_term).
 
-		Jobs are always set to run from earliest_time of 0 until latest_time of now, as we need all the matches.
-		Additionally sets to fetch the 'dml_hash' field from the events for easier usage later on.
+		It reads the templates from the KV store (tenx-dml-lookup), the store tenx-inflate expands
+		from, as the `tx` prefilter's dictionary does (tenx_prefilter_parser.dictionary_search). The
+		searchable copy in the template index is written later, by the Consume KV alert action, and a
+		template whose copy was not written yet expands its events but was not in that index: read
+		from there, a word in its text selected none of its events (Splunk Enterprise 10.4.3, 175,480
+		templates in the KV store with their copies pending: `tx` jsmith 0 events, raw 905). The text
+		is the record's pattern_search, the same text the copy holds (or its pattern with the value
+		separators removed, for a record stored before that field); the hash is pattern_hash as the
+		engine wrote it (the record key is trimmed).
 
-		Returns the search job SID, or None in case of errors.
+		The job runs over all time, as the lookup ignores the time range anyway, and fetches the
+		dml_hash field for get_dml_results. Returns the search job SID, or None in case of errors.
 		"""
-		# The index is named, not just the sourcetype. Splunk searches only a user's default
-		# indexes when none is given, which is 'main' out of the box, so a deployment keeping
-		# its templates anywhere else resolved every search term to zero hashes. The search
-		# then ran with the user's terms still in front of the inflate macro, matched nothing
-		# and returned no results with no error, because the text being searched for is in the
-		# original line and not in the compact event.
+		separator = self.tenx_config.get('variable_separator') or '$'
 		search_data = {
 			'earliest_time': '0',
 			'latest_time': 'now',
 			'rf': self.dml_key,
-			# The searchable copy exists in two forms on an upgraded install: sourcetype
-			# tenx_dml_pure, and sourcetype stash with that name as its source.
-			'search': 'search index=%s (sourcetype=%s OR source=%s) %s | stats count by %s' % (
-				self.tenx_config['dest_dml_index'], self.tenx_config['dml_source_type'],
-				self.tenx_config['dml_source_type'], dml_search, self.dml_key)
+			'search': ('| inputlookup %s | fields _key, pattern_hash, pattern_search, pattern'
+				' | eval tenx_t=lower(coalesce(pattern_search, replace(pattern, "[%s]", "")))'
+				' | where match(tenx_t, "%s")'
+				' | eval %s=coalesce(pattern_hash, _key) | stats count by %s') % (
+				DML_LOOKUP, ''.join('\\x{%02x}' % ord(c) for c in separator), piece_regex(term_piece(dml_search)),
+				self.dml_key, self.dml_key)
 		}
 
 		return self.create_search_job(search_data)
@@ -346,6 +403,14 @@ class TenxSearchManager:
 			# Couldn't confirm the true total - fall back to the one signal we do have:
 			# fetching exactly the cap is itself a sign there may be more.
 			truncated = len(raw_rows) >= DML_FETCH_LIMIT
+
+		cut = lookup_cut(job_details)
+
+		if cut:
+			# The lookup said it failed or cut its rows: the hashes may miss a template, so the
+			# piece is left unrestricted, which selects every compact event it could be in.
+			logger.warning("Template lookup {} reported - {}; the piece places no restriction.".format(sid, cut))
+			truncated = True
 
 		return hashes, truncated
 

@@ -123,7 +123,7 @@ class TestToSplunkTimeFormat:
 
 	def test_epoch_formats_pass_the_value_through(self):
 		# Format spec S4.4: the source text was already an epoch and the value is that text.
-		for fmt in ('epoch', 'epochNano', '+%s', '+%s.%N'):
+		for fmt in ('epoch', 'epochNano', '+%s', '+%s.%N', '+%s.%f'):
 			assert to_splunk_time_format(fmt) == EPOCH_PASSTHROUGH
 
 	def test_bsd_syslog_day_keeps_its_space_padding(self):
@@ -212,6 +212,10 @@ class TestTenxDMLBuilder:
 	def test_build_pure_dml_line_no_variables(self, builder):
 		result = builder.build_pure_dml_line('xyz', 'Static message')
 		assert result == 'xyz\tStatic message'
+
+	def test_a_lone_carriage_return_separates_words_too(self, builder):
+		# engine 1.1.181 keeps a lone CR inside a multi-line event's template
+		assert builder.build_pure_dml_line('key', 'a\rb\r\tc') == 'key\ta b \tc'
 
 	def test_build_pure_dml_line_newlines_removed(self, builder):
 		result = builder.build_pure_dml_line('key', 'Line1\nLine2\r\nLine3')

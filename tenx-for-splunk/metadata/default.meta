@@ -50,6 +50,10 @@ export = system
 access = read : [ * ], write : [ admin, sc_admin, power ]
 export = system
 
+[macros/tenx-wild]
+access = read : [ * ], write : [ admin, sc_admin, power ]
+export = system
+
 [macros/tenx-replay]
 access = read : [ * ], write : [ admin, sc_admin, power ]
 export = system
@@ -109,5 +113,13 @@ access = read : [ * ], write : [ admin, sc_admin, power ]
 export = system
 
 [macros/tenx-mapped-restore]
+access = read : [ * ], write : [ admin, sc_admin, power ]
+export = system
+
+[macros/tenx-whole-hide]
+access = read : [ * ], write : [ admin, sc_admin, power ]
+export = system
+
+[macros/tenx-whole-restore]
 access = read : [ * ], write : [ admin, sc_admin, power ]
 export = system

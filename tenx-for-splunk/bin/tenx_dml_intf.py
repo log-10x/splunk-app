@@ -21,14 +21,14 @@ props.conf's [source::tenx_dml_pure] stanza keeps one template per event and ext
 How it is written
 -----------------
 The Consume KV alert stores each new template in the KV store with `search_copy` set to
-"pending". One search then copies every pending record:
+"pending". Searches then copy the pending records, COPY_BATCH at a time:
 
-    | inputlookup tenx-dml-lookup where search_copy="pending"
+    | inputlookup tenx-dml-lookup where search_copy="pending" | head <COPY_BATCH>
     | eval _raw=pattern_hash."\t".pattern_search
     | collect index=<index> sourcetype=stash source=<source> addtime=false
 
-and the records it copied are marked "written". A record whose copy failed stays pending and
-is copied by the next run.
+and the records each one copied are marked "written" before the next runs. A record whose copy
+failed, or whose run stopped before marking it, stays pending and is copied by the next run.
 
 See Also
 --------
@@ -39,6 +39,7 @@ See Also
 
 import json
 import logging
+import time
 import urllib.parse
 
 import tenx_dml_builder
@@ -49,15 +50,12 @@ SEARCH_COPY = "search_copy"
 SEARCH_COPY_PENDING = "pending"
 SEARCH_COPY_WRITTEN = "written"
 
-# The KV store's default limit on documents per batch_save call is 1,000.
-BATCH_SIZE = 500
+# Records marked written are saved with TenxKVInterface.save_many, within the KV store's batch limits.
 
-# One read of a collection returns no more than limits.conf [kvstore] max_rows_per_query rows (50,000)
-# and max_size_per_result_mb (50 MB) of them, whatever limit asks for (Splunk Enterprise 10.4.3: one
-# read of 18,809 template records returned 16,990). The pending records are read in pages sorted by key,
-# each starting after the rows already read, until a page brings no new record, so a page the size limit
-# cuts short is followed by the next one.
-PAGE_SIZE = 1000
+# Templates one copy search writes. A oneshot search returns at most limits.conf [restapi]
+# maxresultrows keys (50,000), so each search copies fewer, and its records are marked written
+# before the next search runs.
+COPY_BATCH = 20000
 
 
 class TenxDmlInterface:
@@ -72,12 +70,13 @@ class TenxDmlInterface:
 		self.index_name = index_name
 		self.source = source
 
-	def build_copy_search(self):
-		return ('| inputlookup {lookup} where {flag}="{pending}"'
+	def build_copy_search(self, limit=None):
+		return ('| inputlookup {lookup} where {flag}="{pending}" | head {limit}'
 			' | eval _raw={hash_field}."\t".{text_field}'
 			' | collect index={index} sourcetype=stash source={source} addtime=false'
 			' | fields _key').format(
 				lookup=self.lookup_name, flag=SEARCH_COPY, pending=SEARCH_COPY_PENDING,
+				limit=int(limit or COPY_BATCH),
 				hash_field=tenx_dml_builder.RECORD_PATTERN_HASH,
 				text_field=tenx_dml_builder.RECORD_PATTERN_SEARCH,
 				index=self.index_name, source=self.source)
@@ -97,55 +96,79 @@ class TenxDmlInterface:
 
 		return [r.get('_key') for r in (response or {}).get('results', []) if r.get('_key')]
 
-	def pending_records(self):
+	def any_pending(self):
+		"""Whether any record waits for its searchable copy (one read of one key, on an indexed field)."""
 		query = json.dumps({SEARCH_COPY: SEARCH_COPY_PENDING})
-		records, keys = [], set()
+		page = self.server_connection.get(self.kv_intf.build_collection_url(), {'query': query, 'limit': 1, 'fields': '_key'})
+		return bool(page)
 
-		while True:
-			page = self.server_connection.get(self.kv_intf.build_collection_url(),
-				{'query': query, 'sort': '_key', 'limit': PAGE_SIZE, 'skip': len(records)})
-			new = [r for r in (page or []) if r.get('_key') not in keys]
-
-			if not new:
-				return records
-
-			records.extend(new)
-			keys.update(r.get('_key') for r in new)
-
-	def write_pending(self):
+	def write_pending(self, known=None, deadline=None):
 		"""
-		Writes the searchable copy of every pending template and marks those records written.
+		Writes the searchable copy of the pending templates, COPY_BATCH at a time, and marks each
+		batch written before the next copy search runs. A run that stops leaves written, and
+		marked, every batch it finished; the records of a batch it did not mark stay pending and
+		the next copy search copies them again (a template with two copies is matched once: the
+		prefilter's template search counts by template hash).
 
-		Returns the number of templates copied, or -1 when the copy could not be written; the
-		records then stay pending for the next run.
+		known: pending records the caller just wrote, whole, marked from memory; any other record
+		a copy search copied (pending from an earlier run) is read by its key. deadline: no copy
+		search starts after this time.
+
+		Returns the number of templates copied and marked, or -1 when a copy search or a marking
+		failed; the records not marked stay pending for the next run.
 		"""
+		known = {r.get('_key'): r for r in (known or [])}
+
 		try:
-			pending = self.pending_records()
+			if not known and not self.any_pending():
+				return 0
 		except Exception as e:
 			logger.error("Could not read pending templates - {}".format(e), exc_info=1)
 			return -1
 
-		if not pending:
-			return 0
+		total, marked = 0, set()
 
-		copied_keys = self.run_copy_search()
+		while deadline is None or time.time() < deadline:
+			began = time.time()
+			keys = self.run_copy_search()
+			searched = time.time() - began
 
-		if copied_keys is None:
-			return -1
+			if keys is None:
+				return -1
 
-		copied = set(copied_keys)
-		done = []
+			fresh = [k for k in dict.fromkeys(keys) if k not in marked]
 
-		for record in pending:
-			if record.get('_key') in copied:
+			if not fresh:
+				if keys:
+					logger.warning("The copy search copied {} templates already marked written; their marks did not hold.".format(len(keys)))
+					return -1
+				return total
+
+			records = [known[k] for k in fresh if k in known]
+			others = [k for k in fresh if k not in known]
+
+			if others:
+				try:
+					records.extend(self.kv_intf.find_many(others).values())
+				except Exception as e:
+					logger.warning("Could not read {} templates copied from an earlier run; they are copied again later - {}".format(len(others), e))
+					return -1
+
+			done = []
+			for record in records:
 				record = {k: v for k, v in record.items() if k == '_key' or not k.startswith('_')}
 				record[SEARCH_COPY] = SEARCH_COPY_WRITTEN
 				done.append(record)
 
-		for start in range(0, len(done), BATCH_SIZE):
-			if not self.kv_intf.save_batch(done[start:start + BATCH_SIZE]):
+			if not self.kv_intf.save_many(done):
 				return -1
 
-		logger.info("Wrote the searchable copy of {} templates.".format(len(done)))
+			marked.update(fresh)
+			total += len(done)
+			logger.info("Wrote the searchable copy of {} templates ({:.1f} s searching, {:.1f} s marking).".format(len(done), searched, time.time() - began - searched))
 
-		return len(done)
+			if len(keys) < COPY_BATCH:
+				return total
+
+		logger.info("Stopped writing searchable copies at the run's time limit; the next run continues.")
+		return total

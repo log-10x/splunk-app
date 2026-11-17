@@ -149,3 +149,31 @@ class TestGetTenxConfigDoesNotAccumulate:
 		result = tenx_util.get_tenx_config(service=service)
 
 		assert result['tenx_source_types'] == ['tenx_encoded', 'other_encoded']
+
+
+class TestPropsReadInFull:
+	"""service.confs['props'] first GETs properties/props, the list of every props stanza, and closes the connection
+	without reading it: splunkd logged "Broken pipe" for it. props.conf is read through configs/conf-props only."""
+
+	def test_a_service_reads_props_through_configs_without_the_existence_probe(self, monkeypatch):
+		import types
+		made = []
+
+		class Service(object):
+			class confs(object):
+				def __getitem__(self, name):
+					raise AssertionError('service.confs[%r] probes properties/%s' % (name, name))
+			confs = confs()
+
+		def ConfigurationFile(service, path, state=None):
+			made.append((path, state))
+			return []
+
+		fake = types.SimpleNamespace(Service=Service, ConfigurationFile=ConfigurationFile, PATH_CONF='configs/conf-%s/')
+		monkeypatch.setattr(tenx_util, 'client', fake)
+		assert tenx_util.props_conf_of(Service()) == []
+		assert made == [('configs/conf-props/', {'title': 'props'})]
+
+	def test_a_stand_in_keeps_its_confs(self):
+		service = _service_with('tenx_encoded')
+		assert [s.name for s in tenx_util.props_conf_of(service)] == ['tenx_encoded']

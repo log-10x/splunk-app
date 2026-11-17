@@ -4,7 +4,7 @@ an event rather than what its text looks like.
 
 It runs a list of events (dicts) through a pipeline string. It knows only what the replay macro,
 the `tx` macro and the search rewrite use: eval (if, case, coalesce, isnull, isnotnull, null,
-true, mvindex, match, len, lower, substr, mvappend, mvdedup, mvsort; ==, !=, AND, OR, NOT), fields -, foreach,
+true, mvindex, match, len, lower, substr, mvappend, mvjoin, mvdedup, mvsort; ==, !=, AND, OR, NOT), fields -, foreach,
 rename (one literal name to another, on every event that has it), and stand-ins for extract, spath,
 lookup, typer and tags supplied by the test.
 
@@ -226,6 +226,9 @@ def evaluate(node, event):
 				if v is not None:
 					out.extend(v if isinstance(v, list) else [v])
 			return out or None
+		if name == 'mvjoin':
+			v = vals[0]
+			return None if v is None else str(vals[1]).join(str(x) for x in (v if isinstance(v, list) else [v]))
 		if name == 'mvdedup':
 			v = vals[0]
 			return None if v is None else list(dict.fromkeys(v if isinstance(v, list) else [v]))
@@ -234,6 +237,10 @@ def evaluate(node, event):
 			return None if v is None else sorted(v if isinstance(v, list) else [v])
 		raise Unsupported('function %s' % name)
 	raise Unsupported(kind)
+
+
+# What `tenx-wild` stands for in a pipeline the model runs (see Model.step).
+WILD_STEP = 'tenx_wild_step'
 
 
 class Model(object):
@@ -257,13 +264,18 @@ class Model(object):
 
 	def expand(self, text):
 		for _ in range(5):
-			new = re.sub(r'`([^`]+)`', lambda m: self.macros[m.group(1)], text)
+			new = re.sub(r'`([^`]+)`', lambda m: WILD_STEP if m.group(1) == 'tenx-wild' else self.macros[m.group(1)], text)
 			if new == text:
 				return text
 			text = new
 		raise Unsupported('macro recursion')
 
 	def step(self, step, events):
+		if step == WILD_STEP:
+			# The step before the final search of the tx macros (macros.conf [tenx-wild]): with no word
+			# with a wildcard inside it, TERM() or CASE() that needs it, the prefilter stores nothing, and
+			# the step marks nothing and searches `*`.
+			return
 		word = step.split(None, 1)[0]
 		rest = step[len(word):].strip()
 		if word == 'eval':

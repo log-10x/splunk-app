@@ -122,8 +122,14 @@ class ResolvedState(Enum):
 # ('--' and the %XX escapes) are covered by their single characters.
 # After expansion: drop the _kv mark so extract runs the event's own extraction (key=value and
 # JSON), and let spath read only text that starts with "<" (XML path fields). The same steps with
-# and without a field replay.
-XML_AND_KV_STEPS = (' | fields - _kv | extract | eval tenx_xml=if(match(_raw, "^\\s*<"), _raw, null())'
+# and without a field replay. An event the sender passed whole (WHOLE_MARK) is hidden from that
+# extract, as the `tx` macro hides it (macros.conf tenx-whole-hide): Splunk extracted its fields
+# when it read it, and extract would give each JSON field a second value.
+WHOLE_MARK = 'tenx_passed=if(match(_raw, "^~"), null(), 1)'
+# With a field replay, only the whole events without tenx_sourcetype: the replay reads the others.
+WHOLE_MARK_REPLAY = 'tenx_passed=if(match(_raw, "^~") OR isnotnull(tenx_sourcetype), null(), 1)'
+XML_AND_KV_STEPS = (' | `tenx-whole-hide` | fields - _kv | extract | `tenx-whole-restore`'
+					' | eval tenx_xml=if(match(_raw, "^\\s*<"), _raw, null())'
 					' | spath input=tenx_xml | fields - tenx_xml, tenx_hash, tenx_var_0, tenx_vars')
 # The events kept from those steps when the search replays: the replayed ones (tenx_rst), and the
 # ones that arrived whole and that Splunk read under the sourcetype whose rules they need, which
@@ -411,7 +417,7 @@ def quoted_term(text):
 	return '"' + tenx_util.escape_spl_string_literal(text) + '"'
 
 
-def hash_predicate(dml_hash):
+def hash_predicate(dml_hash, saved=False):
 	"""
 	The SPL that selects the compact events of one template.
 
@@ -427,18 +433,25 @@ def hash_predicate(dml_hash):
 	none of the events of 6 of 74 such templates on 17,011 events (Splunk 10.4.3).
 	"""
 	if '*' not in dml_hash:
-		return quoted_term('~' + dml_hash)
+		predicate = quoted_term('~' + dml_hash)
+	else:
+		predicate = 'TERM(' + tenx_prefilter_parser.hash_term(dml_hash) + ')'
 
-	return 'TERM(' + tenx_prefilter_parser.hash_term(dml_hash) + ')'
+	# A saved search's text goes through Splunk's token substitution when it is dispatched,
+	# which reads `$$` as one `$` and `$name$` as a token: TERM(JVSWh$$) saved ran as
+	# TERM(JVSWh$) and selected none of its template's events (Splunk Enterprise 10.4.3; 21,439 of
+	# 175,480 hashes measured hold a `$`). Written for a saved search, each `$` is doubled.
+	return predicate.replace('$', '$$') if saved else predicate
 
 
-def hash_clause(hashes):
+def hash_clause(hashes, saved=False):
 	"""
 	One parenthesised OR over the predicates for a set of hashes, sorted and de-duplicated so
 	the same template set always compiles to the same text (the compiled search is persisted
-	in savedsearches.conf, and a recompile pass rewrites only when the text changed).
+	in savedsearches.conf, and a recompile pass rewrites only when the text changed). `saved`:
+	the text is for a saved search (hash_predicate).
 	"""
-	return '(' + ' OR '.join(sorted(set(hash_predicate(dml_hash) for dml_hash in hashes))) + ')'
+	return '(' + ' OR '.join(sorted(set(hash_predicate(dml_hash, saved) for dml_hash in hashes))) + ')'
 
 
 def conjoin(parts):
@@ -623,6 +636,8 @@ class TenxSearchCommand(TenxSplCommand):
 
 		self.search_manager = search_manager
 		self.server_connection = server_connection
+		# True when the rewritten text is stored as a saved search (TenxAlertCompiler): hash_predicate.
+		self.saved_search = False
 		self.too_complex = False
 		self.needs_tenx = False
 		self.force_tenx = force_tenx
@@ -795,7 +810,7 @@ class TenxSearchCommand(TenxSplCommand):
 			self._template_hits += 1
 
 			if len(hashes) <= PER_PIECE_HASH_LIMIT:
-				conjuncts.append('(' + quoted_term(piece) + ' OR ' + hash_clause(hashes) + ')')
+				conjuncts.append('(' + quoted_term(piece) + ' OR ' + hash_clause(hashes, self.saved_search) + ')')
 				continue
 
 			shared_pieces.append(piece)
@@ -805,7 +820,7 @@ class TenxSearchCommand(TenxSplCommand):
 			shared = ' OR '.join(quoted_term(piece) for piece in shared_pieces)
 
 			if shared_hashes:
-				shared = '(' + shared + ') OR ' + hash_clause(shared_hashes)
+				shared = '(' + shared + ') OR ' + hash_clause(shared_hashes, self.saved_search)
 
 			conjuncts.append('(' + shared + ')')
 
@@ -1159,9 +1174,9 @@ class TenxSearchCommand(TenxSplCommand):
 		"""
 		if replay is None:
 			# Nothing to replay: the suffix without any replay step.
-			return (" | " + tenx_util.splunk_inflate_macro(self.debug) + XML_AND_KV_STEPS)
+			return (" | eval " + WHOLE_MARK + " | " + tenx_util.splunk_inflate_macro(self.debug) + XML_AND_KV_STEPS)
 		held = REPLAY_HELD
-		return (" | eval tenx_compact_raw=_raw | " + tenx_util.splunk_inflate_macro(self.debug)
+		return (" | eval tenx_compact_raw=_raw, " + WHOLE_MARK_REPLAY + " | " + tenx_util.splunk_inflate_macro(self.debug)
 				+ " | eval tenx_hide_others=1 | " + replay + " | fields - tenx_hide_others"
 				+ " | eval tenx_h_raw=if(%s, _raw, null()), tenx_h_st=if(%s, sourcetype, null()),"
 				  " tenx_h_src=if(%s, source, null()), tenx_h_host=if(%s, host, null())" % ((held,) * 4)
@@ -1218,8 +1233,19 @@ class TenxSearchCommand(TenxSplCommand):
 
 		This can happen for complex queries as we interlace data from variables (encoded events) and
 		templates (coming from the decoding against tenx_dml)
+
+		That search comes after a pipe Splunk cannot fold into the base search, where a word with a
+		wildcard inside it (Se*Privilege) is matched as its prefix alone, and TERM() or CASE() of some
+		words other than on the index. Such a word is replaced by a field the eval before it sets where
+		the event holds the word as the index does (tenx_prefilter_parser.wild_plan), so under AND, OR
+		and NOT alike the search keeps what the base search on the index keeps.
 		"""
-		return " | search " + " ".join([item.text for item in self.user_search_terms])
+		import tenx_prefilter_parser
+		terms = " ".join([item.text for item in self.user_search_terms])
+		plan = tenx_prefilter_parser.wild_plan(terms)
+		if plan:
+			return " | eval %s | search %s | fields - %s*" % (plan[0], plan[1], tenx_prefilter_parser.WILD_FIELD)
+		return " | search " + terms
 
 	def resolved(self):
 		"""
@@ -1349,6 +1375,8 @@ class TenxSearchBuilder:
 
 		self.force_tenx = force_tenx
 		self.debug = debug
+		# True when what it builds is stored as a saved search (set by TenxAlertCompiler).
+		self.saved_search = False
 
 	def get_search_commands(self, search):
 		"""
@@ -1421,6 +1449,7 @@ class TenxSearchBuilder:
 				# Any other chained searches are now working on decoded data and can be left as is.
 				#
 				tenx_command = TenxSearchCommand(raw_command, self.server_connection, self.tenx_config, self.search_manager, self.force_tenx, self.debug)
+				tenx_command.saved_search = self.saved_search
 				leading_search = tenx_command
 			else:
 				tenx_command = TenxSplCommand(raw_command, self.tenx_config, self.debug)

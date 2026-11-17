@@ -53,6 +53,12 @@ docker run -d --name tenx-receiver --network container:<Fluent Bit container> lo
 The first argument names the input module for the forwarder in use, here Fluent Bit; the
 [forwarder inputs](https://doc.log10x.com/run/input/forwarder/) page lists the others.
 
+The Receiver runs in Fluent Bit's network, so restart the Receiver after each restart of Fluent Bit.
+With `Retry_Limit False`, Fluent Bit keeps the records it reads in the meantime and sends them when the
+Receiver is back.
+Fluent Bit's side, two processes with their buffers on disk, is in the app's README:
+[Fluent Bit Beside the Receiver](tenx-for-splunk/README.md#fluent-bit-beside-the-receiver).
+
 The three options live in two files of the Receiver's config folder (`$TENX_CONFIG`, mounted at
 `/etc/tenx/config` in the container image):
 
@@ -97,7 +103,7 @@ Pinning the Receiver to UTC makes that choice fixed and knowable, and this app's
 inflate macro renders in UTC to match. Without it, expansion returns a time
 shifted by the difference between the Receiver's host clock and UTC.
 
-Timestamps that carry their own zone, anything ending in `Z` or an offset, are unaffected.
+A timestamp written in UTC, ending in `Z`, `+0000` or `+00:00`, is unaffected.
 
 ### One timestamp per event
 
@@ -117,6 +123,10 @@ original line. The Diagnostics dashboard lists every refused template. To clear 
 after deciding which template is right, delete that key from the `tenx_dml` collection and run the
 backfill search in Step 5. A Receiver's clock zone leaves no trace in the data, so
 `timestampZone: UTC` is required rather than checked.
+
+An event whose template is found but whose expansion gives no text also stays compact, with
+`tenx_expand_refused` set to `empty-expansion`; an event whose template is not found, with
+`no-template`.
 
 ### Event time on compact events
 
@@ -161,13 +171,14 @@ Asia/Kolkata, Etc/GMT-4): every line is the UTC text. A zone in the timestamp fo
 
 ### Step 1: Install Splunk App
 
-Install from Splunkbase, or clone the repository into your Splunk apps directory:
+Download the package from Splunkbase, install it with Splunk's app install, and restart:
 
 ```bash
-git clone https://github.com/log-10x/splunk-app.git
-cp -r splunk-app/tenx-for-splunk $SPLUNK_HOME/etc/apps/
+$SPLUNK_HOME/bin/splunk install app tenx-for-splunk-<version>.tar.gz
 $SPLUNK_HOME/bin/splunk restart
 ```
+
+In a shell without a Splunk login, add `-auth <user>:<password>` to the install.
 
 In a distributed deployment, install the app on the search heads and on the indexers or heavy
 forwarders that parse compact events. The compact sourcetype's parsing settings, `TRUNCATE` and
@@ -232,7 +243,7 @@ index=your_logs_index `tx` | head 10
 
 ## Security Sources
 
-The `txf` macro gives expanded events the fields, event types and tags of their original sourcetype, and the field map tool makes compact events readable by data models and detections. Setup: [Fields of the Original Sourcetype](tenx-for-splunk/README.md#fields-of-the-original-sourcetype-txf), [the Field Map](tenx-for-splunk/README.md#data-models-and-detections-the-field-map), [What to Install on Each Tier](tenx-for-splunk/README.md#what-to-install-on-each-tier).
+The `txf` macro gives expanded events the fields, event types and tags of their original sourcetype, and the field map tool makes compact events readable by data models and detections. Setup: [Fields of the Original Sourcetype](tenx-for-splunk/README.md#fields-of-the-original-sourcetype-txf), [the Field Map](tenx-for-splunk/README.md#data-models-and-detections-the-field-map), [What to Install on Each Tier](tenx-for-splunk/README.md#what-to-install-on-each-tier). Before a source moves, [the search report](tenx-for-splunk/README.md#which-searches-change-when-a-source-moves) lists which of a search head's saved searches, alerts and dashboard panels need an edit.
 
 ## Analytics Dashboard
 
@@ -258,6 +269,7 @@ The Analytics dashboard finds compact events through the `tenx-events` macro.
 | **txf Macro** | `tx` with the search-time fields of the original sourcetype; see [Fields of the Original Sourcetype](tenx-for-splunk/README.md#fields-of-the-original-sourcetype-txf) |
 | **tenxreplay Command** | Writes the replay macros `txf` runs, from the search head's props; run by the Rebuild Field Replay saved searches |
 | **Field Map Tool** | `bin/tenx_field_map.py`: generates the app that writes compact events' original fields at index time; see [the Field Map](tenx-for-splunk/README.md#data-models-and-detections-the-field-map) |
+| **Search Report** | `bin/tenx_search_report.py`: says which saved searches, alerts and dashboard panels run unchanged, need `tx` or `txf`, or need a field map when a source moves to compact events; see [Which Searches Change](tenx-for-splunk/README.md#which-searches-change-when-a-source-moves) |
 | **tenxprefilter Command** | Run once per search by the `tx` macro; reads the search, looks up the templates that carry its words, and selects the compact events to expand |
 | **tx and tenxsearch Commands** | `\| tx <search>` and `\| tenxsearch searchstring="..."`: generating commands that write every event out through Python, kept so saved searches written with them keep working |
 | **tenxrecompile Command** | Recompiles every compiled alert so it picks up new templates |

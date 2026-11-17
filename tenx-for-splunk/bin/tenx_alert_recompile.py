@@ -110,8 +110,13 @@ def recompile_all(server_connection, owner, compiler, migrate_legacy=True):
 	migrate_legacy=False leaves `| tenxsearch` saved searches alone: the scheduled pass only
 	refreshes alerts already compiled through the app, and converting a saved search is left
 	to a person pressing "Recompile all managed alerts".
+
+	First, an alert compiled before 1.2.2 whose stored search still begins with the `search`
+	command that kept it from finding anything is rewritten without it (counted as `repaired`,
+	see tenx_alert_persist.repaired_search), whether or not its compile needs review: the scheduled
+	pass, every 15 minutes, repairs those alerts after an upgrade with nobody pressing a button.
 	"""
-	summary = {'examined': 0, 'recompiled': 0, 'migrated': 0, 'unchanged': 0,
+	summary = {'examined': 0, 'repaired': 0, 'recompiled': 0, 'migrated': 0, 'unchanged': 0,
 		'needs_review': 0, 'skipped': 0, 'drifted': 0, 'errors': 0, 'updated': []}
 
 	for stanza in list_managed_savedsearches(server_connection, owner):
@@ -133,6 +138,21 @@ def recompile_all(server_connection, owner, compiler, migrate_legacy=True):
 			summary['drifted'] += 1
 			continue
 
+		repaired = tenx_alert_persist.repaired_search(stanza)
+
+		if repaired is not None:
+			try:
+				write_tenx_metadata(server_connection, stanza_owner, name, source, repaired)
+				write_saved_search(server_connection, stanza_owner, name, {'search': repaired})
+			except Exception as e:
+				logger.warning("Repair failed for {} ({}) - {}".format(name, stanza_owner, e))
+				summary['errors'] += 1
+				continue
+			stanza = dict(stanza, search=repaired)
+			stanza[tenx_alert_persist.COMPILED_SEARCH_KEY] = repaired
+			summary['repaired'] += 1
+			summary['updated'].append(name)
+
 		try:
 			result = compiler.compile(source)
 			decision = tenx_alert_persist.decide(result, confirm=False)
@@ -152,7 +172,8 @@ def recompile_all(server_connection, owner, compiler, migrate_legacy=True):
 			write_saved_search(server_connection, stanza_owner, name, {'search': result.compiled_search})
 
 			summary['migrated' if is_legacy else 'recompiled'] += 1
-			summary['updated'].append(name)
+			if name not in summary['updated']:
+				summary['updated'].append(name)
 		except Exception as e:
 			logger.warning("Recompile failed for {} ({}) - {}".format(name, stanza_owner, e))
 			summary['errors'] += 1

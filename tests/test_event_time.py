@@ -2,8 +2,9 @@
 Event time and timestamp rendering for compact events.
 
 - tenx-event-time (transforms.conf) sets _time from the epoch a compact event carries in
-  its first variable, 13 digits for milliseconds or 19 for nanoseconds, and leaves every
-  other event at its index time. The patterns tested here are read from the conf file, so
+  its first variable, 13 digits for milliseconds or 19 for nanoseconds, or its seconds with a
+  fraction, and leaves every other event at the time it arrived with; an event with the indexed
+  field tenx_time=sender keeps its sender's time. The patterns tested here are read from the conf file, so
   the test runs the expression Splunk runs.
 - tenx-inflate renders every timestamp in UTC for every viewer, a DST transition
   included. strftime renders in the viewer's zone, so everything that depends on the hour
@@ -43,12 +44,25 @@ def capture_pattern():
 	return [s for s in spl_strings(ingest_eval()) if s.startswith('^~?') and '(\\d+)' in s][0]
 
 
-def event_seconds(raw):
-	"""What the INGEST_EVAL computes for _time, or None where it keeps the index time."""
-	if not re.search(match_pattern(), raw):
+def seconds_match():
+	return [s for s in spl_strings(ingest_eval()) if s.startswith('^~?') and ',\\d{10}\\.' in s][0]
+
+
+def seconds_capture():
+	return [s for s in spl_strings(ingest_eval()) if s.startswith('^~?') and '(\\d{10}\\.\\d{1,9})' in s][0]
+
+
+def event_seconds(raw, tenx_time=None):
+	"""What the INGEST_EVAL computes for _time, or None where it keeps the time the event arrived with (an HTTP
+	Event Collector sender's time, else the index time). tenx_time: the event's indexed field of that name."""
+	if tenx_time == 'sender':
 		return None
-	epoch = re.sub(capture_pattern(), r'\1', raw)
-	return int(epoch[:10]) + float('0.' + epoch[10:16])
+	if re.search(match_pattern(), raw):
+		epoch = re.sub(capture_pattern(), r'\1', raw)
+		return int(epoch[:10]) + float('0.' + epoch[10:16])
+	if re.search(seconds_match(), raw):
+		return float(re.sub(seconds_capture(), r'\1', raw))
+	return None
 
 
 class TestEventTime:
@@ -78,9 +92,41 @@ class TestEventTime:
 	def test_any_other_first_variable_keeps_the_index_time(self, raw):
 		assert event_seconds(raw) is None
 
+	@pytest.mark.parametrize('raw,seconds', [
+		# $(+%s.%f), engine 1.1.181: seconds, a dot, 1 to 9 fraction digits, as the line wrote them
+		('~Q<C9E6L.6o,1723042099.699,13369,c000003e,59', 1723042099.699),
+		('~IE{DdzvP[H,1705313472.123', 1705313472.123),
+		('~h,1723042099.6,x', 1723042099.6),
+		('~h,1705313472.022663733', 1705313472.022663733),
+	])
+	def test_seconds_with_a_fraction_are_the_event_time(self, raw, seconds):
+		assert event_seconds(raw) == pytest.approx(seconds, abs=1e-6)
+
+	@pytest.mark.parametrize('raw', ['~h,1723042099.,x', '~h,1723042099.1234567890', '~h,172304209.699', '~h,x1723042099.699'])
+	def test_other_dotted_first_variables_keep_the_index_time(self, raw):
+		assert event_seconds(raw) is None
+
 	def test_the_window_is_splunks_default_for_a_timestamp(self):
 		expr = ingest_eval()
-		assert 'time() - 2000*86400' in expr and 'time() + 2*86400' in expr
+		assert expr.count('time() - 2000*86400') == 2 and expr.count('time() + 2*86400') == 2
+
+	@pytest.mark.parametrize('raw', [
+		'~-3gTMRPTTYm,1759386934498,cart,7',
+		'~h,1759386934498123456,x',
+		'~Q<C9E6L.6o,1723042099.699,13369,c000003e,59',
+		'~h,probe',
+		'whole text 2024-01-01T00:00:00Z',
+	])
+	def test_an_event_its_sender_marks_keeps_the_senders_time(self, raw):
+		assert event_seconds(raw, 'sender') is None
+
+	@pytest.mark.parametrize('value', [None, '', 'Sender', 'index', '1'])
+	def test_any_other_value_leaves_the_first_variable_in_charge(self, value):
+		assert event_seconds('~h,1759386934498,x', value) == pytest.approx(1759386934.498, abs=1e-6)
+
+	def test_the_sender_mark_is_read_first_and_keeps_the_time_as_it_arrived(self):
+		assert ingest_eval().startswith('_time=if(tenx_time=="sender", _time, if(match(_raw, ')
+		assert ingest_eval().count('(') == ingest_eval().count(')')
 
 	def test_only_time_is_assigned(self):
 		# A working field assigned in INGEST_EVAL is licence-metered even when removed.

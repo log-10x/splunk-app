@@ -88,6 +88,8 @@ CONF = 'tenx_replay'
 # default/savedsearches.conf: rewrites every managed compiled alert whose compiled text changed.
 RECOMPILE_SEARCH = 'Recompile Compiled Alerts'
 SAMPLE_EVENTS = 1000
+# Senders (index, host, source, sourcetype) per search that reads the most recent event of each.
+SENDERS_PER_SEARCH = 200
 # Every event date: from the epoch, with no end (an end of 'now' leaves out events dated ahead).
 ALL_TIME = ('0', None)
 
@@ -193,8 +195,8 @@ class TenxReplayCommand(GeneratingCommand):
 		{original sourcetype: the indexed fields of its compact events}).
 
 		The first is what the prefilter must not narrow on (builder.fields_not_in_text): fields.conf
-		INDEXED = true, and the fields of a sample of compact events that tstats can count over all
-		compact events. The replay's clearing step keeps the second on every replayed event and the
+		INDEXED = true, and the fields of a sample of compact events (_sample_fields) that tstats can
+		count over all compact events. The replay's clearing step keeps the second on every replayed event and the
 		third per original sourcetype (builder.build keep_by_sourcetype), counted over the events the
 		replay works on: those carrying tenx_sourcetype and not indexed with a field map (tenx_mapped,
 		which tenx-mapped-hide keeps out of the replay). An indexed field one sender writes for one
@@ -207,8 +209,7 @@ class TenxReplayCommand(GeneratingCommand):
 				declared.add(entry['name'])
 		names = set(declared)
 		by_sourcetype = {}
-		rows = self._oneshot('search %s | head %d | fieldsummary | fields field' % (self._events(), SAMPLE_EVENTS), earliest, latest)
-		candidates = sorted(set(r.get('field') for r in rows if r.get('field')) - set(builder.DEFAULT_KEEP))
+		candidates = sorted(self._sample_fields(earliest, latest) - set(builder.DEFAULT_KEEP))
 		candidates = [c for c in candidates if not c.startswith(('_', 'tenx_', 'date_')) and '"' not in c]
 		if candidates:
 			funcs = ', '.join('dc("%s") as f%d' % (c, n) for n, c in enumerate(candidates))
@@ -227,6 +228,34 @@ class TenxReplayCommand(GeneratingCommand):
 			return sorted(n for n in found if n not in builder.DEFAULT_KEEP and '*' not in n and '::' not in n
 						  and not n.startswith(('_', 'tenx_', 'date_')))
 		return usable(names), usable(declared), dict((st, usable(found)) for st, found in by_sourcetype.items())
+
+	def _sample_fields(self, earliest, latest):
+		"""
+		The field names of a sample of the compact events: the SAMPLE_EVENTS most recent, and the most
+		recent event of each index, host, source and sourcetype, so a sender whose events are not among
+		the most recent still brings the indexed fields it writes (an event_field of one Fluent Bit, a
+		_meta of one forwarder). A field that only older events of a sender carry is not in it; fields.conf
+		INDEXED = true names such a field.
+		"""
+		found = set(r.get('field') for r in self._oneshot('search %s | head %d | fieldsummary | fields field' % (
+			self._events(), SAMPLE_EVENTS), earliest, latest))
+		clauses = []
+		for r in self._oneshot('| tstats max(_time) as t where %s by index host source sourcetype' % self._events(),
+							   earliest, latest):
+			values = [r.get(k) for k in ('index', 'host', 'source', 'sourcetype')]
+			try:
+				t = int(float(r.get('t')))
+			except (TypeError, ValueError):
+				continue
+			if all(v and builder.safe_text(v) for v in values):
+				clauses.append('(index=%s host=%s source=%s sourcetype=%s earliest=%d latest=%d)' % (
+					tuple(builder.spl_string(v) for v in values) + (t, t + 1)))
+		for n in range(0, len(clauses), SENDERS_PER_SEARCH):
+			found.update(r.get('field') for r in self._oneshot(
+				'search %s (%s) | dedup index host source sourcetype | fieldsummary | fields field' % (
+					self._events(), ' OR '.join(clauses[n:n + SENDERS_PER_SEARCH])), earliest, latest))
+		found.discard(None)
+		return found
 
 	def _indexed_value_false(self):
 		"""

@@ -4,7 +4,7 @@ tenxprefilter: the prefilter of the `tx` macro, built once per search.
 `tx` expands to `tenx-events` [| tenxprefilter] | `tenx-inflate` | ... | search *, and the words
 written after `tx` become the arguments of that last search. This command runs in the
 subsearch: it reads the running job's own search text through the REST API, parses the words
-after `tx` (tenx_prefilter_parser), asks the template dictionary which templates carry each
+after `tx` (tenx_prefilter_parser), asks the KV store of templates which templates carry each
 word, and returns one row whose `search` field is the prefilter.
 
 A field comparison (field=value, field IN (...)) narrows only when tenx_config.conf [config] has
@@ -17,12 +17,20 @@ words are applied to the expanded text: slower, never fewer results. It stops wi
 instead where the search would silently miss events: a time modifier after `tx`, an unquoted
 comma after `tx`, and a sourcetype= term naming an original sourcetype, which the compact events
 carry in tenx_sourcetype (they are indexed as the compact sourcetype).
+
+Some words match other events in that final search, after a pipe, than on the index: a wildcard
+inside a word (Se*Privilege is matched as its prefix alone), and TERM() or CASE() of some words
+(tenx_prefilter_parser.wild_plan). For those, this command also stores on the running job two
+custom fields, custom.tenx_wild_eval and custom.tenx_wild_search: an eval that marks the events
+holding each such word as the index does, and the words with each such word replaced by its mark.
+`tx` and `txf` read them back in the step before their final search (macros.conf [tenx-wild]).
 """
 import json
 import os
 import re
 import ssl
 import sys
+import time
 import urllib.parse
 import urllib.request
 
@@ -47,10 +55,24 @@ NARROWING_STANZA = "tenx:narrowing"
 SUBSEARCH_SID = re.compile(r"^subsearch_(.+)_\d+\.\d+$")
 
 
+def dictionary_failed(result):
+	"""
+	The first message of a oneshot answer that means its rows cannot be trusted as complete: an
+	error (the KV store unavailable, the lookup missing) or a warning that rows were cut. None
+	when there is none. A template the answer misses would select none of its events, so the
+	prefilter then selects every compact event instead.
+	"""
+	for message in result.get("messages", []) or []:
+		kind, text = str(message.get("type", "")).upper(), str(message.get("text", ""))
+		if kind in ("ERROR", "FATAL") or (kind == "WARN" and any(w in text.lower() for w in ("truncat", "limit", "exceed"))):
+			return "%s: %s" % (kind, text[:200])
+	return None
+
+
 @Configuration()
 class TenxPrefilterCommand(GeneratingCommand):
 
-	def _rest(self, path, data=None):
+	def _rest(self, path, data=None, answer=True):
 		info = self._metadata.searchinfo
 		context = ssl.create_default_context()
 		context.check_hostname = False
@@ -61,12 +83,14 @@ class TenxPrefilterCommand(GeneratingCommand):
 			method="POST" if data else "GET",
 			headers={"Authorization": "Splunk " + info.session_key})
 		with urllib.request.urlopen(request, context=context, timeout=60) as response:
-			return json.loads(response.read().decode())
+			body = response.read().decode()
+			return json.loads(body) if answer else None
 
 	def _search_text(self):
 		match = SUBSEARCH_SID.match(self._metadata.searchinfo.sid or "")
 		if not match:
 			return None
+		self.parent = match.group(1)
 		job = self._rest("/services/search/jobs/%s?output_mode=json" % urllib.parse.quote(match.group(1), safe=""))
 		search = job["entry"][0]["content"].get("search", "")
 		self.before = parser.macro_call(search)
@@ -114,7 +138,39 @@ class TenxPrefilterCommand(GeneratingCommand):
 		names = [n.strip() for n in str(entry.get("fields_not_in_text", "") or "").split(",") if n.strip()]
 		return parser.text_field_predicate(names)
 
+	def _store_wild_plan(self, text):
+		"""
+		Stores on the running job what the step before the final search of `tx` and `txf` applies
+		(macros.conf [tenx-wild]). Nothing when no word needs it: that step then marks nothing and
+		searches `*`. If it cannot be stored, such a word is matched as after any pipe.
+		"""
+		try:
+			plan = parser.wild_plan(text)
+			if plan is None:
+				return
+			self._rest("/services/search/jobs/%s?output_mode=json" % urllib.parse.quote(self.parent, safe=""),
+					   {"custom.tenx_wild_eval": plan[0], "custom.tenx_wild_search": plan[1]}, answer=False)
+		except Exception as e:
+			self.logger.warning("tx: storing the wildcard plan failed: %s", e)
+			self.write_warning("tx: a word with a wildcard inside it, TERM() or CASE() is matched in this search as after a "
+							   "pipe, which can differ from the same search on the index: the step that matches it as the "
+							   "index does could not be prepared.")
+
+	def _store_check(self):
+		"""
+		Warns when the template store can lack templates the events need: Consume KV failed, is
+		still loading, or has not run for fifteen minutes (tenx_prefilter_parser.store_warning).
+		One read of one KV record; nothing when it cannot be read.
+		"""
+		try:
+			note = parser.store_warning(self._rest(parser.STORE_STATE_PATH), time.time())
+		except Exception:
+			return
+		if note:
+			self.write_warning(note)
+
 	def generate(self):
+		self._store_check()
 		try:
 			text = self._search_text()
 		except Exception as e:
@@ -137,26 +193,34 @@ class TenxPrefilterCommand(GeneratingCommand):
 		if reader.unquoted_comma:
 			self.error_exit(RuntimeError("comma after tx"),
 				"tx: a comma after `tx` is matched literally, so this search would miss events. Remove it, or put the text in quotes.")
+		self._store_wild_plan(text)
 		rows, macro = self._original_sourcetype_rows(tree)
 		if rows:
 			self.error_exit(RuntimeError("original sourcetype"), parser.original_sourcetype_message(rows, macro))
 		# The setting is read only when it can change the prefilter (see narrowing_matters).
 		text_field = self._text_field() if parser.narrowing_matters(tree) else None
-		dictionary = {}
-		pieces = parser.lookup_pieces(tree, text_field=text_field)
+		# Runs of digits are looked up like words; the same read of the KV store returns the stored
+		# timestamp formats, which decide the runs that narrow (digit_pieces_cleared).
+		candidates = parser.digit_candidates(tree, text_field)
+		dictionary, digits = {}, frozenset()
+		pieces = parser.lookup_pieces(tree, text_field=text_field, digits=candidates)
 		if pieces:
 			try:
 				result = self._rest(
 					"/servicesNS/%s/%s/search/jobs" % (urllib.parse.quote(self._metadata.searchinfo.username), APP_NAME),
-					{"search": parser.dictionary_search(pieces), "exec_mode": "oneshot", "output_mode": "json",
+					{"search": parser.dictionary_search(pieces, formats=bool(candidates)), "exec_mode": "oneshot", "output_mode": "json",
 					 "count": "0", "earliest_time": "0", "latest_time": "now"})
-				dictionary = parser.dictionary_from_rows(result.get("results", []))
+				if dictionary_failed(result):
+					raise RuntimeError("the template lookup reported: %s" % dictionary_failed(result))
+				dictionary = parser.dictionary_from_rows(result.get("results", []), pieces)
+				if candidates:
+					digits = parser.digit_pieces_cleared(candidates, parser.formats_from_rows(result.get("results", [])))
 			except Exception as e:
 				self.logger.warning("tx: the template lookup failed: %s", e)
 				self.write_warning("tx: the template lookup did not complete; every compact event in range is expanded.")
 				yield {"search": EVERY_EVENT}
 				return
-		yield {"search": parser.prefilter(tree, dictionary, text_field) or EVERY_EVENT}
+		yield {"search": parser.prefilter(tree, dictionary, text_field, digits) or EVERY_EVENT}
 
 
 dispatch(TenxPrefilterCommand, sys.argv, sys.stdin, sys.stdout, __name__)
