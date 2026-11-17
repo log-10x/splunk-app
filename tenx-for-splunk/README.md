@@ -466,7 +466,7 @@ and `| tenxsearch searchstring="..."` run a rewritten search and write every eve
 through Python, which is several times slower than the macro. They are kept so saved
 searches written with them keep working. The search they run must name the compact sourcetype,
 `sourcetype=tenx_encoded`. Without it the command stops and says so. `| tx` and `| tenxsearch`
-return a CR LF line end as LF and drop a CR that ends the event; the `tx` and `txf` macros keep them.
+return a CR LF line end as LF; the `tx` and `txf` macros keep it.
 
 **Search behavior.**
 
