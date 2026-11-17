@@ -370,11 +370,11 @@ class TestFieldMap:
 		assert fm.main(['gen', '--rules', 'lookup', '--records', str(records), '--reader', 'json', '--sourcetype', 'tenx_ct',
 			'--rename', 'aws:cloudtrail', '--reserved-names', 'restore', '--out', str(out)]) == 0
 		props = (out / 'default' / 'props.conf').read_text()
-		assert props.endswith('[aws:cloudtrail]\nREPORT-tenx_fm_hash_vars = tenx_fm_hash_vars\n'
+		assert props.endswith('[aws:cloudtrail]\nREPORT-tenx_ct_hash_vars = tenx_ct_hash_vars\n'
 			'# Search-time: each name Splunk does not keep for an indexed field, given back from extracted_<name>.\n'
-			'REPORT-tenx_fm_restore = tenx_fm_restore_eventType\n')
+			'REPORT-tenx_ct_restore = tenx_ct_restore_eventType\n')
 		transforms = (out / 'default' / 'transforms.conf').read_text()
-		assert ('[tenx_fm_restore_eventType]\nSOURCE_KEY = extracted_eventType\nREGEX = ^([\\s\\S]*)$\n'
+		assert ('[tenx_ct_restore_eventType]\nSOURCE_KEY = extracted_eventType\nREGEX = ^([\\s\\S]*)$\n'
 			'FORMAT = eventType::$1\n') in transforms
 		rows = fm.read_lookup_file(str(out / 'lookups' / 'tenx_ct_fields.csv.gz'))
 		assert 'extracted_eventType::' in rows['k1']['f'] and ' eventType::' not in rows['k1']['f']
@@ -388,7 +388,7 @@ class TestFieldMap:
 		target = {'sourcetype': 'tenx_p', 'rename': 'p:st', 'transforms_class': 'p', 'transform_prefix': 'p', 'description': 'd'}
 		props = fm.props_text(target, f, [], search_hash=False)
 		assert props.endswith('[p:st]\n# Search-time: each name Splunk does not keep for an indexed field, given back from '
-			'x_<name>.\nREPORT-tenx_fm_restore = tenx_fm_restore_eventType\n')
+			'x_<name>.\nREPORT-p_restore = p_restore_eventType\n')
 		assert 'SOURCE_KEY = x_eventType' in fm.transforms_text(f, search_hash=False, target=target, sourcetype_field=None)
 
 	def test_no_restore_stanza_when_nothing_collides(self):
@@ -445,7 +445,7 @@ class TestApp:
 		assert '[tenx_fw]\n' in props and \
 			'TRANSFORMS-tenx_fw = tenx_fw_sourcetype, tenx_fw_00000_k1, tenx_fw_ingest_eval\n' in props
 		assert 'rename = fw:traffic\n' in props
-		assert props.endswith('[fw:traffic]\nREPORT-tenx_fm_hash_vars = tenx_fm_hash_vars\n')
+		assert props.endswith('[fw:traffic]\nREPORT-tenx_fw_hash_vars = tenx_fw_hash_vars\n')
 		assert '[tenx_fw_00000_k1]\nREGEX = ^~ *k1 *,([^,]*),([^,]*),([^,]*)$\n' \
 			'FORMAT = user::"$2" src::"$3" tenx_fmf_time::"1" tenx_fmv_time_1::"$1" tenx_mapped::"1"\nWRITE_META = true\n' \
 			in (out / 'default' / 'transforms.conf').read_text()
@@ -787,8 +787,8 @@ class TestWhatTxNeeds:
 		props, transforms = self.gen(tmp_path)
 		# a renamed event runs only the target's search-time rules: REPORT-tenx under [tenx_win]
 		# gave tenx_hash on 0 of 662 renamed events on Splunk 10.4.3, this on 662 of 662
-		assert props.split('[XmlWinEventLog]\n', 1)[1] == 'REPORT-tenx_fm_hash_vars = tenx_fm_hash_vars\n'
-		assert '\n[tenx_fm_hash_vars]\nREGEX = ^~(?<tenx_hash>[^,]+)' in transforms
+		assert props.split('[XmlWinEventLog]\n', 1)[1] == 'REPORT-tenx_fw_hash_vars = tenx_fw_hash_vars\n'
+		assert '\n[tenx_fw_hash_vars]\nREGEX = ^~(?<tenx_hash>[^,]+)' in transforms
 
 	def test_the_search_time_regex_is_the_apps_with_the_tilde_required(self):
 		import configparser
@@ -835,7 +835,7 @@ class TestWhatTxNeeds:
 	def test_the_mark_and_the_extraction_can_be_left_out(self, tmp_path):
 		props, transforms = self.gen(tmp_path, '--mark', 'none', '--search-hash', 'off')
 		assert 'tenx_mapped' not in transforms and '[XmlWinEventLog]' not in props
-		assert 'tenx_fm_hash_vars' not in transforms
+		assert 'tenx_fw_hash_vars' not in transforms
 
 	def test_the_mark_is_not_a_field_of_the_event(self):
 		t = fm.Transform('h1', 's', r'^~ *h1 *,([^,]*),([^,]*)$', 'EventID::"$1" Computer::"$2" tenx_mapped::"1"', 2, 2)
