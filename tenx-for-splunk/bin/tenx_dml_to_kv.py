@@ -238,7 +238,9 @@ RUN_BUDGET_SECONDS = 240
 # Records handed to the KV store together (one batch_find, then batch_save calls).
 CHUNK_RECORDS = 2000
 # New templates whose searchable copy is written together: one copy search returns at most
-# 50,000 keys (limits.conf [restapi] maxresultrows), so it is run before that many are pending.
+# 50,000 keys (limits.conf [restapi] maxresultrows), so it is run before that many are pending,
+# and at the end of a run. A record a run stored and did not copy stays pending in the
+# collection, and the next copy search copies it.
 COPY_EVERY = 40000
 
 
@@ -553,6 +555,7 @@ def load_since(server_connection, store, state_intf, dml_intf, source, start_fro
 
 	for index, (a, b, planned) in enumerate(slices):
 		if index and time.time() - began > budget:
+			store.copy_pending(dml_intf)
 			write_state(state_intf, state, status=STATUS_LOADING, detail="stopped after {} s with records indexed from {} left".format(int(time.time() - began), a))
 			logger.info("Stopped after {} s; the next run continues from index time {}.".format(int(time.time() - began), a))
 			return read
@@ -579,7 +582,8 @@ def load_since(server_connection, store, state_intf, dml_intf, source, start_fro
 						store.copy_pending(dml_intf)
 			store.store(chunk, refresh)
 			count += len(chunk)
-		store.copy_pending(dml_intf)
+		if index == len(slices) - 1:
+			store.copy_pending(dml_intf)
 		read += count
 		if planned:
 			logger.info("Index time {} to {}: {} records read and stored in {:.1f} s ({}).".format(int(a), int(b), count, time.time() - slice_began, store.summary()))
