@@ -632,6 +632,10 @@ Windows sources below do. Every `rewrite_tag` filter takes `Emitter_Storage.type
 `Emitter_Mem_Buf_Limit 0`. Leave these unset: `storage.pause_on_chunks_overlimit`, `rate_gate`, and
 memory storage with `Mem_Buf_Limit`, on a `tail` input; `Mem_Buf_Limit` and any pause option on the
 second process's `forward` input; `storage.total_limit_size` on any output.
+Each setting avoids a way Fluent Bit 5.1.5 loses or holds back records: a paused `tail` input drops
+a multi-line event it completes while paused, a size limit on an output drops its oldest chunks, a
+`rewrite_tag` filter whose emitter is full passes records on under their original tag, and in one
+process the events coming back from the Receiver wait behind the backlog of the logs being read.
 
 ## Fields of the Original Sourcetype: `txf`
 
