@@ -173,8 +173,8 @@ The `tenx_dml` collection stores parsed template data with fields:
 
 | Saved search | Schedule | What it does |
 |--------------|----------|--------------|
-| Consume KV | every 5 minutes | Stores the template records indexed in the last seven minutes in the KV store |
-| Backfill KV | not scheduled | The same load over 30 days, for templates indexed earlier |
+| Consume KV | every 5 minutes | Stores in the KV store every template record indexed since the last one it stored |
+| Backfill KV | not scheduled | The same load from the start of the index, after the KV store was emptied or restored |
 | Recompile Compiled Alerts | every 15 minutes | Runs `tenxrecompile` so compiled alerts pick up new templates |
 | Rebuild Field Replay | every hour | Runs `tenxreplay`, which writes the replay macros `txf` runs |
 | Rebuild Field Replay When New | every 5 minutes | Runs `tenxreplay` for original sourcetypes not yet covered |
@@ -317,29 +317,31 @@ Or modify `savedsearches.conf`:
 ```ini
 [Consume KV]
 cron_schedule = */5 * * * *
-search = index=tenx_dml sourcetype=tenx_dml_raw_json _index_earliest=-7m _index_latest=now
-dispatch.earliest_time = -24h
+search = | makeresults
+dispatch.earliest_time = -1m
 dispatch.latest_time = now
 ```
 
-Keep the index-time window (`_index_earliest`) wider than the interval, or a template that
-arrives between two runs is never stored.
+Each run stores every template record indexed since the last one it stored, so a longer interval delays
+new templates and skips none.
 
 ### Loading Templates Indexed Earlier
 
-Consume KV stores templates as they arrive. Templates indexed before the app was installed,
-or while Consume KV was disabled or failing, are loaded by running this search once, as an
-admin or power user, after installing and after any outage of Consume KV:
+Every five minutes the **Consume KV** saved search stores every template record indexed since the last
+one it stored, and a run that stops is continued by the next. Its first run after an install or an
+upgrade reads every template record in the index. To load them again after the KV collection was emptied
+or restored, run this as an admin or power user:
 
 ```spl
-index=tenx_dml sourcetype=tenx_dml_raw_json earliest=-30d | sendalert tenx_dml_to_kv
+| makeresults | sendalert tenx_dml_to_kv param.from=0
 ```
 
-Widen `earliest` to reach older templates. Running it again is safe: templates already
-stored are kept, and their records are brought up to date when this version of the app
-derives them differently. The **Backfill KV** saved search holds the same search; the **Run**
-button does not fire its alert action, so run the search above. To load every template
-record ever indexed, use `earliest=0`.
+The **Backfill KV** saved search holds the same search; the **Run** button does not fire its alert
+action, so run the search above. A run that stops before it ends leaves stored and copied what it
+finished, and the next run continues; Diagnostics shows the last run that did not finish.
+
+Diagnostics counts the template hashes indexed against those the KV store holds; `tx` and `txf` warn
+when Consume KV failed, is still loading, or has not run for fifteen minutes.
 
 ### Adding Custom Sourcetypes for Encoded Events
 
@@ -433,9 +435,8 @@ their SPL. To cover another app's dashboards, copy the file into that app's
 - `tx` inside another subsearch (`append`, `join`) or wrapped in another macro cannot read
   its own words. It then expands every compact event in range and applies the words after,
   with a warning: the same result, more slowly.
-- A compact event is the event the Receiver formed. Lines without a timestamp of their
-  own, such as the lines of a stack trace, join the line before them, so a stack trace is
-  one event, a count counts events, and words joined with AND can match on different lines
+- A compact event is one record the forwarder sent: a stack trace the forwarder joined into one
+  record is one event, a count counts events, and words joined with AND can match on different lines
   of one event.
 
 When `tx` or `txf` stops a search, the search fails with a message. The search bar, dashboard panels
@@ -458,7 +459,7 @@ by more than 5,000 templates select nothing on their own, and a `NOT`, a field c
 `OR` with any of these selects every event in range. A run of digits narrows unless a stored
 template's timestamp could print it (a year, two digits of a time, a fraction of that length).
 The search after `tx` then applies the full terms, so the selection may be wider than
-the result, never narrower.
+the result, never narrower. A `tx` word search reads the template store, which adds a few seconds per search where it holds hundreds of thousands of templates.
 
 **The `tx` and `tenxsearch` commands.** `| tx index=myindex sourcetype=tenx_encoded error`
 and `| tenxsearch searchstring="..."` run a rewritten search and write every event out
@@ -474,6 +475,8 @@ searches written with them keep working. The search they run must name the compa
 - A template appears in the dictionary when the Consume KV search stores it, every five
   minutes. Until then its events stay compact, and a search for a word of that template does
   not select them.
+- While the KV store is loaded again after it was emptied or restored, `tx` expands events but a
+  search for a word of a template not yet stored does not select them; Diagnostics shows the load.
 
 **Speed.** On one laptop running Splunk 10.4.3, a `tx` search over 157,228 compact events
 returned in about 1.5 to 4 seconds, where the same search over the raw lines took under a
@@ -659,7 +662,7 @@ index=wineventlog `txf` tag=authentication action=failure
 index=wineventlog `txf(XmlWinEventLog)` EventCode=4625 | stats count by user
 ```
 
-`txf(<sourcetype>)` applies the rules of that one sourcetype and starts faster. `txf` applies the
+`txf(<sourcetype>)` applies the rules of that one sourcetype and starts faster. It returns the other compact events in range as well, without those rules, so where an index holds other sourcetypes, name the sourcetype too: `tenx_sourcetype=<sourcetype>` before the macro, or `sourcetype=<sourcetype>` after it. `txf` applies the
 rules of every original sourcetype the app has recorded in the compact indexes.
 
 A field comparison after `txf` reads every compact event in range. When the value is written in the
@@ -786,7 +789,7 @@ FortiGate field map (below) gives every compact FortiGate event the raw event's 
 
 A timestamp without a year takes its year from the time the event is processed, so a replayed or
 backfilled file from an earlier year gets the wrong year. Splunk guesses the year for such lines
-too, and the two guesses can differ.
+too, and the two guesses can differ. A timestamp later than 12:00 UTC on 2029-12-31 that is written to the second or the millisecond, such as a certificate's expiry date used as an event's timestamp, does not decode to its original text: it comes back as a date in 1970.
 
 ## Data Models and Detections: the Field Map
 
@@ -794,9 +797,7 @@ Needs the Receiver at release 1.1.181 or later.
 
 Data models, their accelerations, `tstats` and saved searches that do not use `tx` read the
 fields Splunk stored with an event. The field map writes a compact event's original fields while
-it is indexed, so these searches read them. With a field map, the index is larger than raw on disk, by
-about 10% to 70% depending on the source, while license goes down; without one, the index is smaller
-than raw.
+it is indexed, so these searches read them. With a field map, the index is larger than raw on disk, from about 10% larger to about 3.5 times raw depending on the source and the fields left out, while license goes down; without one, the index is smaller than raw.
 
 Put field terms before the macro (`` index=wineventlog EventCode=4625 `txf(XmlWinEventLog)` ``) and run
 statistics, time charts and detections without it: Splunk answers from indexed fields. Use `tx` for
@@ -1007,6 +1008,8 @@ has its own cap file and its own scheduled `check`.
    templates and 136 to 2,576 bytes for the CloudTrail ones. When Splunk writes a probe's
    fields, that template moves from `compact-cap.csv.pending` into `compact-cap.csv`, and the
    Receiver, which rereads the file, then compacts its events. Nothing is restarted.
+   `--splunkd` may name a search head apart from the instances that parse the compact events; `activate`
+   then says it did not check the floor app, which belongs on each of those instances.
 
 7. Schedule `check` every minute with the arguments of `activate`, for example from cron:
 
@@ -1151,8 +1154,7 @@ python3 tenx-for-splunk/bin/tenx_field_map.py gen \
 rules that read a section of the text (`Subject_Account_Name`, `Target_Account_Name`,
 `process_id` and others) for every template where their result does not depend on a value.
 `--mixed-names` writes the field names the Receiver split into text and a value
-(`Token_Elevation_Type`). `--leave-out Message` leaves out the message text, which takes most of the map's index space; a
-plain search of a mapped event then lacks `Message` and `body`. Steps 6 and 7 take `--app fm_wincl --cap-file
+(`Token_Elevation_Type`). `--leave-out Message` leaves out the message text, which takes most of the map's index space; a plain search of a mapped event then lacks `Message` and `body`, and the fields the Windows add-on reads from the message: `vendor_privilege`, `privilege_id`, `privilege`, and the `audit` tag it gives by privilege. Steps 6 and 7 take `--app fm_wincl --cap-file
 /etc/tenx/wincl/compact-cap.csv`.
 
 **Palo Alto Networks** (the Splunk Add-on for Palo Alto Networks; PAN-OS syslog in as `pan:log`) has
@@ -1192,11 +1194,13 @@ python3 tenx-for-splunk/bin/tenx_field_map.py gen \
 for each log type taken from `--addon`, and sets `_time` as Splunk reads a `pan:log` line. Those rules
 also read a compact event's text, the Receiver's comma-separated line, so the map writes `tenx_blank`,
 the columns that line reaches where the raw event has no value, and nulls what the rules read there at
-search time, in the add-on's own calculated fields as well. Searches over compact Palo Alto events take
-longer for it: about twice as long for a `stats` over six fields of 100,000 events, about five times
-when every field of every event is read. Steps 6 and 7 take `--app fm_pan --cap-file
+search time, in the add-on's own calculated fields as well. `--leave-out generated_time,receive_time,future_use3,start_time` leaves out the four date and time columns of a Palo Alto line that no data model or event type reads; those four fields are then not on mapped events in a plain search. Steps 6 and 7 take `--app fm_pan --cap-file
 /etc/tenx/pan/compact-cap.csv`. Another source whose add-on reads positional values (`DELIMS` with
 `FIELDS`) takes `--reader csv`, with `--addon` or `--columns` for the names.
+
+With a Palo Alto field map, the Network_Traffic and Change data models, `tstats` and ESCU detections
+give the same results on compact PAN-OS traffic and system events as on raw ones; threat events are
+passed whole.
 
 `tstats` reads the indexed sourcetype, which stays the compact one with or without a field map, so
 `tstats` by or on the original sourcetype counts no compact event; `tenx_sourcetype` holds the
@@ -1228,13 +1232,13 @@ shows a mapped field longer than 1,000 characters, such as a PowerShell `ScriptB
 `tstats` on the field reads it whole. A template with more than 984 values
 gets no row, and its events arrive whole. An event whose compact value holds a line feed or another
 control character, such as a NUL byte in a FortiGate line, gets no fields and is marked
-`tenx_unmapped=no_match`. With `--reserved-names restore`, a mapped CloudTrail
+`tenx_unmapped=no_match`. In Linux audit records that add interpreted fields after a group separator (0x1D), the field map writes no fields; those events are kept, marked `tenx_unmapped=no_match`, and counted by `check`. With `--reserved-names restore`, a mapped CloudTrail
 event carries `extracted_eventType` beside `eventType`, and a mapped FortiGate UTM event
 `extracted_eventtype` beside `eventtype`, and a mapped Palo Alto decryption event `extracted_timestamp`
 beside `timestamp`. The Receiver keeps the log type `TRAFFIC`, `SYSTEM`, `CONFIG`,
 `USERID`, `DECRYPTION` or `CORRELATION` as template text, but makes `THREAT`, `GLOBALPROTECT` and
 `HIPMATCH` a value, so the map cannot tell which add-on rules read such a line: threat, GlobalProtect
-and HIP match events arrive whole, with the add-on's own fields as on raw events. Mapped events carry no `date_*` fields
+and HIP match events arrive whole, with the add-on's own fields as on raw events; their `_time` is the syslog header's, to the second. The map sets a Palo Alto event's `_time` as Splunk reads a `pan:log` line, within Splunk's 2,000-day window (`MAX_DAYS_AGO`); an older event keeps the time it arrived with. Mapped events carry no `date_*` fields
 (`date_hour`, `date_wday` and the others), which Splunk gives raw events it reads from a file, so a
 detection that reads them, such as a business-hours one, matches no mapped event. On classic
 Windows events, values such as `Access_Reasons` have spaces in place of line breaks and tabs, as do
@@ -1329,6 +1333,10 @@ forwarder's index-time rules apply before compaction. The steps are in the Log10
 [Receiver beside a heavy forwarder](https://doc.log10x.com/run/input/forwarder/splunkUF/#receiver-beside-a-heavy-forwarder).
 In that arrangement, a customer's `WRITE_META` fields must be named on the Fluent Bit output; route
 by sourcetype when an index override runs first.
+
+An event sent with the indexed field `tenx_time=sender` keeps the time its sender gave it, even when its
+template has a timestamp slot. On the return leg, add a `modify` filter with `Add tenx_time sender` on
+the Receiver's output tag, and `event_field tenx_time $tenx_time` on the `splunk` output.
 
 ## Getting Started
 

@@ -124,6 +124,9 @@ after deciding which template is right, delete that key from the `tenx_dml` coll
 backfill search in Step 5. A Receiver's clock zone leaves no trace in the data, so
 `timestampZone: UTC` is required rather than checked.
 
+An event whose template is found but whose expansion gives no text also stays compact, with
+`tenx_expand_refused` set to `empty-expansion`.
+
 ### Event time on compact events
 
 A compact event's `_time` is the time in its original log line wherever the Receiver wrote

@@ -197,7 +197,18 @@ Paste the block for the version being uploaded. Splunkbase keeps notes per relea
 > - The field replay behind `txf` keeps the indexed fields found on the most recent event of each index, host, source and sourcetype, besides those of the 1,000 most recent compact events and those fields.conf declares with `INDEXED = true`.
 > - Compact events read from a file by a forwarder carry no indexed `timestamp=none`, on the compact sourcetype and on a field map's.
 > - Splunk reads each entry of the app's own logs as one event, and the app reads its settings without broken-pipe warnings in `splunkd.log`.
-> - The README's Fluent Bit settings keep records across a restart: `Retry_Limit False` on the `forward` output, a `DB` file on the `tail` input, and the Receiver restarted after Fluent Bit.
+> - Word searches through `tx`, dashboards and compiled alerts find the events of every stored template, including templates stored in the last few minutes.
+> - Consume KV stores every template record, a burst of new templates included; its first run after the upgrade stores templates earlier versions skipped.
+> - `tx` expands events whose template the indexers hold twice. An expansion that gives no text keeps the compact event and marks it in `tenx_expand_refused`.
+> - Compiled alerts select the events of templates whose hash holds a `$`; alerts compiled earlier are rewritten by the recompile pass.
+> - An epoch-seconds timestamp with a fraction, such as `msg=audit(1723042099.699:13369)`, expands as written and sets the event's time.
+> - A carriage return inside an event comes back in place through `tx` and `txf`.
+> - A run of digits narrows a `tx` search when no stored template's timestamp could print it.
+> - With a Palo Alto field map, the Network_Traffic and Change data models, `tstats` and ESCU detections give the same results on compact PAN-OS traffic and system events as on raw ones; threat events are passed whole.
+> - Two field maps of one target, each with its own sourcetype, install side by side.
+> - `activate` against a search head without the floor app says the floor app was not checked instead of stopping.
+> - An event with the indexed field `tenx_time=sender` keeps its sender's time.
+> - The README's Fluent Bit recipe runs two processes beside the Receiver with their buffers on disk, so records survive a restart and a slow HEC.
 
 1.2.1:
 
