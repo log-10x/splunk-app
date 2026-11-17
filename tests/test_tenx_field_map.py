@@ -889,7 +889,7 @@ class TestLookupRules:
 		assert text.startswith('$pd:tenx_fm_row$=if(substr(_raw, 1, 1)=="~", lookup("tenx_fw_fields", ')
 		# every intermediate value is a pd: key; only _meta is written
 		assert [e.split('=', 1)[0] for e in re.split(r', (?=\$pd:tenx_fm_\w+\$=|_meta=)', text)] == \
-			['$pd:tenx_fm_%s$' % k for k in ('row', 'f', 't', 'n', 'ok', 'e', 'x', 'm')] + ['_meta'] + \
+			['$pd:tenx_fm_%s$' % k for k in ('row', 'f', 't', 'n', 'ok', 'e', 'x', 'm', 'm')] + ['_meta'] + \
 			['$pd:tenx_fm_why$'] * 2 + ['_meta']
 
 	def test_the_rule_builds_a_regex_only_from_a_row_it_can_use(self):
@@ -1053,12 +1053,12 @@ class TestLookupRules:
 
 	def test_the_rule_trims_field_ends_only_for_a_reader_that_trims(self, tmp_path):
 		xml = fm.lookup_eval_text('t', None, True)
-		assert 'replace(replace($pd:tenx_fm_m$, "::" . urldecode("%22") . "[[:space:]]+", "::" . urldecode("%22")), ' \
-			'"[[:space:]]+" . urldecode("%22"), urldecode("%22"))' in xml
+		assert 'replace(replace($pd:tenx_fm_m$, "::" . urldecode("%22") . "[[:cntrl:]]+", "::" . urldecode("%22")), ' \
+			'"[[:cntrl:]]+" . urldecode("%22"), urldecode("%22"))' in xml
 		assert '_meta=if(isnull($pd:tenx_fm_m$) OR $pd:tenx_fm_m$==$pd:tenx_fm_x$, _meta, coalesce(_meta, "") . " " . ' \
 			'$pd:tenx_fm_mt$)' in xml
 		plain = fm.lookup_eval_text('t')
-		assert '$pd:tenx_fm_mt$' not in plain and '[[:space:]]' not in plain
+		assert '$pd:tenx_fm_mt$' not in plain and '[[:cntrl:]]' not in plain
 		# value 0, the timestamp, is read whatever line ends the text holds
 		assert 'replace(_raw, "(?s)^~[^,]*,([^,|]*).*$", "\\1")' in plain
 
@@ -1540,8 +1540,8 @@ class TestCapFile:
 			fake.close()
 		assert rc == 1 and read(str(cap)) == before and not os.path.exists(str(cap) + '.pending')
 		assert '(no_match 1, no_row 1): templates the lookup file has no row for arrived compact' in out
-		assert 'events of listed templates hold values their row does not take (a value with a line feed); ' \
-			'the cap file is left as it was' in out
+		assert 'events of listed templates hold values their row does not take (a value holding a control character ' \
+			'other than a carriage return, such as a line feed or a NUL byte); the cap file is left as it was' in out
 
 	def test_the_next_check_counts_only_what_was_indexed_since(self, tmp_path):
 		cap = self.listed(tmp_path, ['k1'])
@@ -1750,6 +1750,22 @@ class TestCapFile:
 				assert 'lookup refresh 120 s)' in out and read(str(cap)) == 'pattern_hash,value\n"k1",true\n"k2",true\n'
 			else:
 				assert read(str(cap)) == 'pattern_hash,value\n"k1",true\n' and "'k2' (tenx_unmapped=no_row)" in out
+
+	def test_activate_goes_on_when_check_counts_events_but_leaves_the_list(self, tmp_path):
+		# FortiGate lines holding NUL bytes are indexed compact without fields (no_match) while the map is in use. The
+		# check activate runs each round counts them and fails, but leaves the list: activate goes on and adds the new
+		# template once the instance reads its row (before, it stopped at the first round, adding nothing).
+		cap, fake, clock = self.waiting(tmp_path, ['k1'], ['k2'])
+		self.counted_from_zero(cap)
+		self.compact(fake, 'k1', 999, why=fm.WHY_NO_MATCH)
+		fake.schedule = [(1020, lambda: (setattr(fake, 'on_disk', str(tmp_path / 'fm_fw')), fake.refresh()))]
+		try:
+			rc, out = self.activate(tmp_path, cap, fake, timeout=300, poll=10, clock=clock, sleep=clock.sleep)
+		finally:
+			fake.close()
+		assert '1 compact events of tenx_fw were indexed without their fields' in out and '(no_match 1)' in out
+		assert 'withdrawn by check' not in out
+		assert rc == 0 and read(str(cap)) == 'pattern_hash,value\n"k1",true\n"k2",true\n', out
 
 	def test_activate_probes_a_listed_template_on_every_round(self, tmp_path):
 		cap, fake, clock = self.waiting(tmp_path, ['k1', 'k3'], ['k2'])
