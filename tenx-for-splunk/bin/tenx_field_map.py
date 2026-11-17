@@ -3973,9 +3973,9 @@ def activate(app_dir, cap_file, splunkd, app_name=None, probe_index=None, timeou
 			# The floor app acts only where the compact events are parsed. A search head named by --splunkd, apart from
 			# the HTTP Event Collector that takes the probes, does not need it, and this tool cannot read the parsing
 			# instances' apps from here.
-			out.write('activate: the floor app %s was not checked: it is needed on each instance that parses the compact '
-				'events (%s), not on %s, and this tool reads apps only from %s\n' % (app_name + FLOOR_SUFFIX,
-				', '.join(_netloc(n) for n in parsing_endpoints(splunkd)), _netloc(splunkd.url), _netloc(splunkd.url)))
+			out.write('activate: %s was not checked: the compact events are parsed at %s, not at %s, the one instance this '
+				'tool reads apps from; install the floor app on each instance that parses them\n' % (app_name + FLOOR_SUFFIX,
+				', '.join(_netloc(n) for n in parsing_endpoints(splunkd)), _netloc(splunkd.url)))
 	confirmed, failed = set(), {}
 	if added:
 		if not probe_index:

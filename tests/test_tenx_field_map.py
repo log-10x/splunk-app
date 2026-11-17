@@ -1504,8 +1504,9 @@ class TestCapFile:
 			fake.close()
 		out = out.getvalue()
 		assert rc == 0, out
-		assert ('activate: the floor app fm_fw_floor was not checked: it is needed on each instance that parses the '
-			'compact events (%s), not on %s' % (hec.split('//')[1], fake.url.split('//')[1])) in out
+		assert ('activate: fm_fw_floor was not checked: the compact events are parsed at %s, not at %s, the one instance '
+			'this tool reads apps from; install the floor app on each instance that parses them\n' % (hec.split('//')[1],
+			fake.url.split('//')[1])) in out
 		assert read(str(cap)) == 'pattern_hash,value\n"k1",true\n'
 
 	@pytest.mark.parametrize('splunkd,hec,parsed', [
