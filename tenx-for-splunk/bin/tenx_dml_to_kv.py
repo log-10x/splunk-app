@@ -214,6 +214,10 @@ STATE_UPDATED = 'updated'
 STATE_STATUS = 'status'
 STATE_DETAIL = 'detail'
 STATE_RECORDS = 'records'
+# The app version that keeps the checkpoint, and the index time up to which the records read are
+# compared with what this version builds from them (see reconcile).
+STATE_VERSION = 'version'
+STATE_REFRESH_UNTIL = 'refresh_until'
 STATUS_CURRENT = 'current'
 STATUS_LOADING = 'loading'
 STATUS_FAILED = 'failed'
@@ -238,7 +242,7 @@ CHUNK_RECORDS = 2000
 COPY_EVERY = 40000
 
 
-def reconcile(dml_builder, existing, record_key, pattern):
+def reconcile(dml_builder, existing, record_key, pattern, refresh=True):
 	"""
 	Decides what an incoming template means for the record stored under its key, and returns
 	(outcome, record): one of the RECONCILE_* outcomes, and the whole record to write, or None
@@ -259,7 +263,8 @@ def reconcile(dml_builder, existing, record_key, pattern):
 
 	The same text sent again is rebuilt, and the record is rewritten when a field derived from
 	the text differs, as it does after an upgrade that changes how a field is derived (a
-	timestamp format, say). The searchable copy and a hash-conflict mark are kept.
+	timestamp format, say). The searchable copy and a hash-conflict mark are kept. With refresh
+	False (a record this version of the app has already compared) the same text changes nothing.
 	"""
 	if not isinstance(existing, dict):
 		record = dml_builder.build_kv_record_data(record_key, pattern)
@@ -271,6 +276,9 @@ def reconcile(dml_builder, existing, record_key, pattern):
 
 	same_hash = stored_hash is None or stored_hash == record_key
 	same_pattern = stored_pattern is None or stored_pattern == pattern
+
+	if same_hash and same_pattern and not refresh:
+		return RECONCILE_SAME, None
 
 	if same_hash and same_pattern:
 		rebuilt = dml_builder.build_kv_record_data(record_key, pattern)
@@ -335,15 +343,17 @@ class TemplateStore:
 		# Seconds spent reading the store, building records, writing them, and writing copies.
 		self.seconds = dict.fromkeys(('find', 'build', 'save', 'copy'), 0.0)
 
-	def store(self, records):
+	def store(self, records, refresh=True):
 		"""
-		records: (template hash, template) pairs in arrival order. Raises when the KV store
-		cannot be read or written, so a caller does not move its checkpoint past them.
+		records: (template hash, template) pairs in arrival order. refresh: compare a stored
+		record with the same text against what this version builds from it (see reconcile).
+		Raises when the KV store cannot be read or written, so a caller does not move its
+		checkpoint past them.
 		"""
 		for start in range(0, len(records), CHUNK_RECORDS):
-			self._store_chunk(records[start:start + CHUNK_RECORDS])
+			self._store_chunk(records[start:start + CHUNK_RECORDS], refresh)
 
-	def _store_chunk(self, records):
+	def _store_chunk(self, records, refresh=True):
 		valid = []
 		for record_key, pattern in records:
 			record_key, pattern = get_result_parts({'templateHash': record_key, 'template': pattern})
@@ -363,7 +373,7 @@ class TemplateStore:
 
 		for record_key, pattern in valid:
 			key = self.kv_intf.kv_key(record_key)
-			outcome, record = reconcile(self.dml_builder, current.get(key), record_key, pattern)
+			outcome, record = reconcile(self.dml_builder, current.get(key), record_key, pattern, refresh)
 			self.counts[outcome] += 1
 
 			if record is not None:
@@ -482,11 +492,22 @@ def read_state(state_intf):
 	return state if isinstance(state, dict) else {}
 
 
-def write_state(state_intf, previous, **fields):
-	"""Writes the checkpoint record; loaded_through never moves back."""
+def app_version():
+	"""This app's version, from default/app.conf; empty when it cannot be read."""
+	try:
+		import configparser
+		conf = configparser.RawConfigParser(strict=False)
+		conf.read(os.path.join(apphome, 'default', 'app.conf'))
+		return conf.get('launcher', 'version')
+	except Exception:
+		return ''
+
+
+def write_state(state_intf, previous, reset=False, **fields):
+	"""Writes the checkpoint record; loaded_through never moves back unless reset."""
 	state = {k: v for k, v in previous.items() if not k.startswith('_')}
 	state.update(fields)
-	if previous.get(STATE_LOADED_THROUGH) is not None and state.get(STATE_LOADED_THROUGH) is not None:
+	if not reset and previous.get(STATE_LOADED_THROUGH) is not None and state.get(STATE_LOADED_THROUGH) is not None:
 		state[STATE_LOADED_THROUGH] = max(float(previous[STATE_LOADED_THROUGH]), float(state[STATE_LOADED_THROUGH]))
 	state[STATE_UPDATED] = int(time.time())
 	state[state_intf.KV_KEY] = STATE_KEY
@@ -507,17 +528,23 @@ def load_since(server_connection, store, state_intf, dml_intf, source, start_fro
 	budget = RUN_BUDGET_SECONDS if budget is None else budget
 	began = time.time()
 	state = read_state(state_intf)
+	end = now - LAG_SECONDS
+	refresh_until = float(state.get(STATE_REFRESH_UNTIL) or 0)
 
 	if start_from is not None:
 		start = max(0, int(float(start_from)))
-	elif state.get(STATE_LOADED_THROUGH) is not None:
+		refresh_until = max(refresh_until, end)
+	elif state.get(STATE_LOADED_THROUGH) is not None and state.get(STATE_VERSION) == app_version():
 		start = max(0, int(float(state[STATE_LOADED_THROUGH])) - OVERLAP_SECONDS)
 	else:
-		# First run (a new install, or an upgrade from a version without the checkpoint): every
-		# template record in the index, so a template an earlier version skipped is stored too.
+		# First run of this version (a new install, or an upgrade): every template record in the
+		# index, so a template an earlier version skipped is stored, and every stored record takes
+		# what this version derives from its text.
 		start = 0
+		refresh_until = end
+		write_state(state_intf, state, **{STATE_VERSION: app_version(), STATE_REFRESH_UNTIL: end, STATE_LOADED_THROUGH: 0,
+			STATE_STATUS: STATUS_LOADING, STATE_DETAIL: 'reading every template record for version {}'.format(app_version())}, reset=True)
 
-	end = now - LAG_SECONDS
 	if end <= start:
 		return 0
 
@@ -536,6 +563,7 @@ def load_since(server_connection, store, state_intf, dml_intf, source, start_fro
 		if planned:
 			search = 'search {} _index_earliest={} _index_latest={} | fields templateHash, template, _indextime | fields - _raw'.format(source, int(a), int(b))
 			chunk = []
+			refresh = a < refresh_until
 			for result in export_results(server_connection, search):
 				chunk.append((result.get('templateHash'), result.get('template')))
 				try:
@@ -544,12 +572,12 @@ def load_since(server_connection, store, state_intf, dml_intf, source, start_fro
 				except (TypeError, ValueError):
 					pass
 				if len(chunk) >= CHUNK_RECORDS:
-					store.store(chunk)
+					store.store(chunk, refresh)
 					count += len(chunk)
 					chunk = []
 					if len(store.pending) >= COPY_EVERY:
 						store.copy_pending(dml_intf)
-			store.store(chunk)
+			store.store(chunk, refresh)
 			count += len(chunk)
 		store.copy_pending(dml_intf)
 		read += count
@@ -564,6 +592,9 @@ def load_since(server_connection, store, state_intf, dml_intf, source, start_fro
 			fields[STATE_LOADED_THROUGH] = through
 		elif state.get(STATE_LOADED_THROUGH) is None:
 			fields[STATE_LOADED_THROUGH] = start
+		if index == len(slices) - 1 or (through is not None and through >= refresh_until):
+			# The pass that compares stored records with this version's has gone past them.
+			fields[STATE_REFRESH_UNTIL] = 0
 		write_state(state_intf, state, **fields)
 
 	return read

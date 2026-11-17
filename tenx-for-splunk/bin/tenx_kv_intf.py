@@ -66,6 +66,7 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+import concurrent.futures
 import json
 import urllib.parse
 import urllib.error
@@ -74,8 +75,10 @@ import urllib.error
 DEFAULT_BATCH_DOCUMENTS = 1000
 DEFAULT_BATCH_SIZE_MB = 50
 # Keys asked for in one batch_find query. One query returns at most max_rows_per_query rows (50,000)
-# and max_size_per_batch_result_mb (100 MB); 500 templates stay far below both.
-FIND_KEYS = 500
+# and max_size_per_batch_result_mb (100 MB); 2,000 templates stay far below both.
+FIND_KEYS = 2000
+# batch_save calls made at once by save_many.
+SAVE_THREADS = 3
 
 
 class TenxKVInterface:
@@ -219,21 +222,26 @@ class TenxKVInterface:
 	def save_many(self, records, limits=None):
 		"""
 		Writes whole records, each carrying its _key, in as few batch_save calls as the KV
-		store's limits allow. Returns True when every call succeeded.
+		store's limits allow, SAVE_THREADS calls at a time. Each key must appear once. Returns
+		True when every call succeeded.
 		"""
 		docs, size_mb = limits or self.batch_limits()
 		# Half the size limit: the limit counts the stored form, which can be larger than the JSON.
 		budget = int(size_mb * 1024 * 1024 / 2)
-		batch, size = [], 0
+		batches, batch, size = [], [], 0
 		for record in records:
 			length = len(json.dumps(record)) + 2
 			if batch and (len(batch) >= docs or size + length > budget):
-				if not self.save_batch(batch):
-					return False
+				batches.append(batch)
 				batch, size = [], 0
 			batch.append(record)
 			size += length
-		return self.save_batch(batch) if batch else True
+		if batch:
+			batches.append(batch)
+		if len(batches) <= 1:
+			return all(self.save_batch(b) for b in batches)
+		with concurrent.futures.ThreadPoolExecutor(max_workers=SAVE_THREADS) as pool:
+			return all(list(pool.map(self.save_batch, batches)))
 
 	def find_many(self, record_keys):
 		"""

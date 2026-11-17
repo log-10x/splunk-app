@@ -491,3 +491,52 @@ def test_tx_warns_while_consume_kv_is_behind_or_failed():
 	stale = parser.store_warning({'updated': now - 3600, 'loaded_through': now - 3600, 'status': 'current'}, now)
 	assert 'has not run since' in stale
 	assert parser.store_warning({'updated': 'x'}, now) is None
+
+
+def test_a_record_this_version_compared_already_is_not_built_again(monkeypatch, tmp_path):
+	base = int(time.time()) - 3600
+	splunk, kv, state = FakeSplunk(flood(500, base)), StoreKV(), StoreKV()
+	consume(monkeypatch, tmp_path, splunk, kv, state)
+
+	import tenx_dml_builder
+	built = []
+	real = tenx_dml_builder.TenxDMLBuilder.build_kv_record_data
+	monkeypatch.setattr(tenx_dml_builder.TenxDMLBuilder, 'build_kv_record_data', lambda self, *a: built.append(a) or real(self, *a))
+	consume(monkeypatch, tmp_path, splunk, kv, state)
+
+	assert built == []
+
+
+def test_an_upgrade_reads_every_record_again_and_refreshes_what_it_derives(monkeypatch, tmp_path):
+	template = '$(MMM  d HH:mm:ss) web01 sshd[$]: Failed password for $'
+	old = [(1700000000, '-Sys1', template)]
+	splunk, kv, state = FakeSplunk(old + flood(10, int(time.time()) - 3600)), StoreKV(), StoreKV()
+	monkeypatch.setattr(tenx_dml_to_kv, 'app_version', lambda: '1.2.2')
+	consume(monkeypatch, tmp_path, splunk, kv, state)
+	kv.records['-Sys1']['timestamp_format'] = '%b  %d %H:%M:%S'  # what an older build derived
+
+	consume(monkeypatch, tmp_path, splunk, kv, state)
+	assert kv.records['-Sys1']['timestamp_format'] == '%b  %d %H:%M:%S'  # same version: not compared again
+
+	monkeypatch.setattr(tenx_dml_to_kv, 'app_version', lambda: '1.2.3')
+	consume(monkeypatch, tmp_path, splunk, kv, state)
+	assert kv.records['-Sys1']['timestamp_format'] == '%b  %-d %H:%M:%S'
+	assert state.records['consume_kv']['version'] == '1.2.3'
+	assert state.records['consume_kv']['status'] == 'current'
+
+
+def test_save_many_writes_every_batch_when_calls_run_at_once():
+	import tenx_kv_intf
+	import threading
+
+	seen, lock = [], threading.Lock()
+
+	class Conn:
+		def post(self, url, data, **kwargs):
+			with lock:
+				seen.extend(r['_key'] for r in json.loads(data))
+			return None
+
+	kv = tenx_kv_intf.TenxKVInterface('tenx_dml', Conn(), 'nobody', 'tenx-for-splunk')
+	assert kv.save_many([{'_key': 'k%d' % i} for i in range(10500)], limits=(1000, 50.0))
+	assert sorted(seen) == sorted('k%d' % i for i in range(10500))
