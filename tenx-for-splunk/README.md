@@ -1124,6 +1124,49 @@ rules that read a section of the text (`Subject_Account_Name`, `Target_Account_N
 plain search of a mapped event then lacks `Message` and `body`. Steps 6 and 7 take `--app fm_wincl --cap-file
 /etc/tenx/wincl/compact-cap.csv`.
 
+**Palo Alto Networks** (the Splunk Add-on for Palo Alto Networks; PAN-OS syslog in as `pan:log`) has
+one map for the add-on's log types, with its own Receiver and cap file, `/etc/tenx/pan/compact-cap.csv`,
+set up as in step 1. The add-on stores each line under `pan:traffic`, `pan:threat`, `pan:system` or
+one of six more by the line's fourth value, so the sender does the same and sets `tenx_sourcetype`;
+a line the add-on's rules do not route keeps `pan:log`:
+
+```
+[FILTER]
+    Name                   rewrite_tag
+    Match                  pan
+    Rule                   $log ^[^,]+,[^,]+,[^,]+,(TRAFFIC|THREAT|SYSTEM|CONFIG|HIPMATCH|CORRELATION|USERID|GLOBALPROTECT|DECRYPTION), pan.$1 false
+    Emitter_Name           pan_type
+    Emitter_Storage.type   filesystem
+    Emitter_Mem_Buf_Limit  0
+[FILTER]
+    Name    modify
+    Match   tenx.pan.TRAFFIC
+    Add     tenx_sourcetype pan:traffic
+```
+
+with one `modify` per type (`tenx.pan.THREAT` adds `pan:threat`, and so on) and one for `tenx.pan`
+that adds `pan:log`, and sends the compact events with `event_sourcetype tenx_pan`. The emitter
+buffers on disk with no memory limit (`storage.path` set under `[SERVICE]`): with memory only, while
+the HTTP Event Collector was slow to accept, it passed 122,726 of 1,902,151 lines on untouched, stored
+as `pan:log`. Step 4:
+
+```sh
+python3 tenx-for-splunk/bin/tenx_field_map.py gen \
+  --records kv_0.json --records kv_1.json --target palo-alto --rules lookup \
+  --addon Splunk_TA_paloalto_networks --app-name fm_pan \
+  --cap-file /etc/tenx/pan/compact-cap.csv --out fm_pan
+```
+
+`--target palo-alto` reads each line as the add-on's `DELIMS = ","` and `FIELDS` rules do, the names
+for each log type taken from `--addon`, and sets `_time` as Splunk reads a `pan:log` line. Those rules
+also read a compact event's text, the Receiver's comma-separated line, so the map writes `tenx_blank`,
+the columns that line reaches where the raw event has no value, and nulls what the rules read there at
+search time, in the add-on's own calculated fields as well. Searches over compact Palo Alto events take
+longer for it: about twice as long for a `stats` over six fields of 100,000 events, about five times
+when every field of every event is read. Steps 6 and 7 take `--app fm_pan --cap-file
+/etc/tenx/pan/compact-cap.csv`. Another source whose add-on reads positional values (`DELIMS` with
+`FIELDS`) takes `--reader csv`, with `--addon` or `--columns` for the names.
+
 `tstats` reads the indexed sourcetype, which stays the compact one with or without a field map, so
 `tstats` by or on the original sourcetype counts no compact event; `tenx_sourcetype` holds the
 original. Use `where (sourcetype=XmlWinEventLog OR tenx_sourcetype=XmlWinEventLog)`, or a data
@@ -1156,7 +1199,11 @@ gets no row, and its events arrive whole. An event whose compact value holds a l
 control character, such as a NUL byte in a FortiGate line, gets no fields and is marked
 `tenx_unmapped=no_match`. With `--reserved-names restore`, a mapped CloudTrail
 event carries `extracted_eventType` beside `eventType`, and a mapped FortiGate UTM event
-`extracted_eventtype` beside `eventtype`. Mapped events carry no `date_*` fields
+`extracted_eventtype` beside `eventtype`, and a mapped Palo Alto decryption event `extracted_timestamp`
+beside `timestamp`. The Receiver keeps the log type `TRAFFIC`, `SYSTEM`, `CONFIG`,
+`USERID`, `DECRYPTION` or `CORRELATION` as template text, but makes `THREAT`, `GLOBALPROTECT` and
+`HIPMATCH` a value, so the map cannot tell which add-on rules read such a line: threat, GlobalProtect
+and HIP match events arrive whole, with the add-on's own fields as on raw events. Mapped events carry no `date_*` fields
 (`date_hour`, `date_wday` and the others), which Splunk gives raw events it reads from a file, so a
 detection that reads them, such as a business-hours one, matches no mapped event. On classic
 Windows events, values such as `Access_Reasons` have spaces in place of line breaks and tabs, as do

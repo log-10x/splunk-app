@@ -1,13 +1,15 @@
 """
 Two maps of one target on one instance: every name a generated app defines (transforms stanzas, lookup definitions and
 files, the floor app's) comes from the map's compact sourcetype, so maps generated with different --sourcetype never
-define the same name, and a key both write in an original sourcetype's stanza has the same value in both.
+define the same name. In the original sourcetype's stanza, which both write search-time classes into, a key both
+write (EVAL-<column> of the csv reader, named after the field) has the same value in both.
 """
 import collections
 import json
 import os
 
 import tenx_field_map as fm
+from test_field_map_csv import addon as csv_addon
 
 TEMPLATES = {
 	'fortigate': 'date=$$$ time=$(HH:mm:ss) devname="$" type="utm" subtype="webfilter" eventtype="$" url="$"',
@@ -69,7 +71,15 @@ class TestTwoMapsOfOneTarget:
 			assert any(n.startswith('tenx_one_') for n in apps[0][0])
 			assert any(n.startswith('tenx_two_') for n in apps[1][0])
 
+	def test_the_csv_reader_with_an_add_on(self, tmp_path):
+		a = csv_addon(tmp_path)
+		p = tmp_path / 'target.json'
+		p.write_text(json.dumps({'reader': 'csv', 'sourcetype': 'tenx_fw', 'rename': ['fw:traffic', 'fw:system', 'fw:log']}),
+			encoding='utf-8')
+		assert_coexist(gen_two(tmp_path, str(p), '$(MMM dd HH:mm:ss) $,$//$//$ $:$:$,TRAFFIC,$.$.$.$,,site//a',
+			['--addon', a]))
+
 	def test_the_built_in_default_is_unchanged(self):
-		for target in ('fortigate', 'windows-security', 'windows-security-classic'):
+		for target in ('fortigate', 'windows-security', 'windows-security-classic', 'palo-alto'):
 			t = fm.load_target(target, {})
 			assert t['transform_prefix'] == t['sourcetype'] and t['transforms_class'] == t['sourcetype']

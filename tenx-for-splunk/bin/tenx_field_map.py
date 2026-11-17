@@ -390,6 +390,27 @@ TARGETS = {
 		'time_format': ['%Y-%m-%d time=%H:%M:%S'],
 		'description': 'Compact FortiGate events',
 	},
+	# Palo Alto Networks PAN-OS syslog (the Splunk Add-on for Palo Alto Networks): one map for the log types the
+	# add-on stores by the line's fourth value ([pan:log] TRANSFORMS-sourcetype). The csv reader takes each
+	# sourcetype's FIELDS from the add-on (--addon), and the compact events' source names their sourcetype (see
+	# "Rules that read a compact event's text").
+	'palo-alto': {
+		'reader': 'csv',
+		'sourcetype': 'tenx_pan',
+		# pan:log last: a line none of the add-on's rules routes stays under the sourcetype it came in with.
+		'rename': ['pan:traffic', 'pan:threat', 'pan:system', 'pan:config', 'pan:hipmatch', 'pan:correlation',
+			'pan:userid', 'pan:globalprotect', 'pan:decryption', 'pan:log'],
+		'reserved_names': 'restore',
+		# Splunk fixes _time before the add-on's rule renames the event, with the settings of the sourcetype it
+		# came in with: [pan:log] TIME_PREFIX = ^(?:[^,]*,){5}, [pan:firewall] ^(?:[^,]*,){6}, neither with a
+		# TIME_FORMAT, so Splunk recognises the value after the sixth comma (generated_time) itself, and reads the
+		# digits that open the next value as its fraction: 21:46:38,10.0.2.107 gave 21:46:38.10 (97,736 of 97,736
+		# BOTS v2 traffic lines, Splunk Enterprise 10.4.3). strptime() with %N reads the same digits (10.0.2.107
+		# .10, 192.168 .192, 7.1 .7) and gives null when none follow; the plain format then reads the time.
+		'time_prefix': r'^(?:[^,]*,){6}',
+		'time_format': ['%Y/%m/%d %H:%M:%S,%N', '%Y/%m/%d %H:%M:%S'],
+		'description': 'Compact Palo Alto Networks events',
+	},
 }
 
 
@@ -861,6 +882,186 @@ class DelimsReader(object):
 		return out
 
 
+class CsvReader(object):
+	r"""
+	A transforms.conf DELIMS extraction with one set of delimiters and a FIELDS list: positional values, the
+	n-th value under the n-th name (Palo Alto Networks PAN-OS syslog: DELIMS = ",", FIELDS = "future_use1",
+	"receive_time", ...). Read from what Splunk Enterprise 10.4.3 extracted with the Splunk Add-on for Palo Alto
+	Networks 4.0.0 ([extract_traffic]) on probe lines, each a BOTS v2 traffic line with one value changed:
+	* a value runs to the next delimiter; values past the last name are dropped, and names past the last value
+	  get nothing;
+	* spaces at both ends of a value go ("  dns  " gave dns), and a value that is empty then gives no field
+	  (",," and "\"\"" alike);
+	* a value that opens with a double quote runs to the next double quote followed by a delimiter or the end of
+	  the text and loses those two quotes: "Client,Server" gave Client,Server and "a""b,c" gave a""b,c; inside
+	  it a backslash before a double quote or a backslash goes ("a\"b,c" gave a"b,c);
+	* outside quotes too, a backslash before a double quote or a backslash goes and the quote is text:
+	  \"used-by-malware,able-to-transfer-file\" gave "used-by-malware and able-to-transfer-file" (an elastic panw
+	  decryption fixture line);
+	* a double quote with no such closing quote, opening a value ("abc,...) or inside one (a"b,...), takes the
+	  rest of the text as that value, quotes kept, and no later value is read;
+	* a tab inside a value stays.
+	Not checked: a backslash before another character inside quotes (kept here), spaces between a closing
+	quote and the delimiter (allowed here), a quote inside an unquoted value that a later quote closes (the
+	value then runs to that quote here), tabs at the ends of a value (kept here), a name listed twice in FIELDS
+	(the first value kept here) and an empty name (no field here).
+
+	Which names a text takes (layouts): each layout is (route, names, delimiters). With several, the first
+	whose route (a regex) finds the text: the add-on's own index-time rule that sets the event's sourcetype
+	(Palo Alto: [pan_traffic] REGEX = ^[^,]+,[^,]+,[^,]+,TRAFFIC,), applied to the template's text, so a
+	template gets the names of the sourcetype its events are stored under. A template that no route finds gets
+	no field. A compact value holds no delimiter and no double quote.
+	"""
+	name = 'csv'
+	raw_split = r'\n'
+	trims_values = True
+	keeps_empty = False
+	field_name = re.compile(r'[A-Za-z_][A-Za-z0-9_.:\-]*\Z')
+
+	def __init__(self, layouts=()):
+		self.layouts = [(re.compile(_python_regex(r)) if r else None, list(names), delims) for r, names, delims in layouts]
+
+	def layout(self, text):
+		for route, names, delims in self.layouts:
+			if route is None or route.search(text):
+				return names, delims
+		return None, None
+
+	@staticmethod
+	def split(text, delims=','):
+		out, pos, n = [], 0, len(text)
+		while True:
+			start = j = pos
+			while j < n and text[j] == ' ':
+				j += 1
+			if j < n and text[j] == '"':
+				k, buf, closed = j + 1, [], None
+				while k < n:
+					c = text[k]
+					if c == '\\' and k + 1 < n and text[k + 1] in '"\\':
+						buf.append(text[k + 1])
+						k += 2
+						continue
+					if c == '"':
+						m = k + 1
+						while m < n and text[m] == ' ':
+							m += 1
+						if m == n or text[m] in delims:
+							closed = m
+							break
+					buf.append(c)
+					k += 1
+				if closed is None:
+					out.append(text[start:].strip(' '))
+					return out
+				out.append(''.join(buf).strip(' '))
+				if closed == n:
+					return out
+				pos = closed + 1
+				continue
+			k, buf = j, []
+			while k < n and text[k] not in delims and text[k] != '"':
+				if text[k] == '\\' and k + 1 < n and text[k + 1] in '"\\':
+					buf.append(text[k + 1])
+					k += 2
+					continue
+				buf.append(text[k])
+				k += 1
+			if k < n and text[k] == '"':
+				m = k + 1
+				while m < n:
+					if text[m] == '"':
+						e = m + 1
+						while e < n and text[e] == ' ':
+							e += 1
+						if e == n or text[e] in delims:
+							break
+					m += 1
+				if m >= n:
+					out.append(text[start:].strip(' '))
+					return out
+				out.append(text[start:m + 1].strip(' '))
+				e = m + 1
+				while e < n and text[e] == ' ':
+					e += 1
+				if e == n:
+					return out
+				pos = e + 1
+				continue
+			out.append((text[start:j] + ''.join(buf)).strip(' '))
+			if k == n:
+				return out
+			pos = k + 1
+
+	def pairs(self, text):
+		names, delims = self.layout(text)
+		if names is None:
+			return []
+		out, seen = [], set()
+		for name, value in zip(names, self.split(text, delims)):
+			if not name or value == '' or name in seen:
+				continue
+			seen.add(name)
+			out.append((name, value))
+		return out
+
+	def items(self, text):
+		return collections.Counter((name, 'column') for name, _ in self.pairs(text))
+
+
+# ---------------------------------------------------------------------------------------------
+# A positional rule on a compact line
+#
+# An add-on that reads positional values (DELIMS with FIELDS, as the Splunk Add-on for Palo Alto Networks reads
+# PAN-OS syslog) reads a compact event's text too, and the Receiver's line "~<hash>,<value>,<value>,..." is
+# comma-separated: its n-th value lands under the n-th name. Splunk Enterprise 10.4.3 keeps an indexed field over what
+# a search-time rule extracts under the same name (an HEC event with src_ip indexed kept that value alone), so the
+# columns the map writes are safe; every column the raw event leaves empty, or does not have, but the compact line
+# reaches would get a value raw has not (dest_user, dvc_name, and through the add-on's EVAL- user and dvc).
+#
+# So for the csv reader the map also writes tenx_blank, naming those columns for each template (BlankFieldReader), and
+# at search time nulls what the rule reads there (blank_overrides): EVAL-<column> = if(<column named>, null(),
+# <column>) for each column, and the add-on's own EVAL- that read such a field again under their names with each
+# reference guarded the same way, as calculated fields read the fields as extracted and aliased, before any of them.
+# A raw event has no tenx_blank and keeps every value. Measured on 100,000 BOTS v2 Palo Alto events against raw:
+# every field of a plain search equal but the event type err0r (a word of the raw text), Network_Traffic and Change
+# equal on every field and event. The cost is search time on compact events (about 2 times on a stats over six
+# fields, about 5 times on every field of every event; raw events about the same). Considered and measured: giving
+# compact events their own source, whose [source::] stanza leaves the add-on's text rule out (Splunk takes a
+# [source::] class over the sourcetype's), which costs no search time but leaves source different from raw on every
+# compact event; and nulling the columns alone, which leaves dvc and user wrong.
+
+BLANK_FIELD = 'tenx_blank'
+
+
+class BlankFieldReader(object):
+	"""
+	The reader's pairs and one more, tenx_blank: the columns a positional rule reading the compact line would fill (the
+	first 1 + values names of the template's layout: the hash, then one per value) that the map does not write.
+	"""
+
+	def __init__(self, reader, csv_reader):
+		self.reader, self.csv_reader = reader, csv_reader
+
+	def __getattr__(self, name):
+		return getattr(self.reader, name)
+
+	def pairs(self, text):
+		out = list(self.reader.pairs(text))
+		names, _ = self.csv_reader.layout(text)
+		if names is None:
+			return out
+		written = set(n for n, _ in out)
+		blank = []
+		for name in names[:len(set(MARK_RE.findall(text))) + 1]:
+			if name and name not in written and name not in blank:
+				blank.append(name)
+		# Always written, '-' when no column is blank: its presence marks a compact event of a csv map, which the
+		# rules for reserved names read (see blank_overrides).
+		out.append((BLANK_FIELD, ' '.join(blank) or '-'))
+		return out
+
+
 class WindowsClassicReader(object):
 	r"""
 	Classic Windows event log text (sourcetype WinEventLog), as Splunk's own search-time rules for sources
@@ -922,7 +1123,7 @@ class WindowsClassicReader(object):
 		return out
 
 
-READERS = {r.name: r for r in (XmlWindowsReader, JsonReader, KeyValueReader, DelimsReader, WindowsClassicReader)}
+READERS = {r.name: r for r in (XmlWindowsReader, JsonReader, KeyValueReader, DelimsReader, WindowsClassicReader, CsvReader)}
 
 
 # ---------------------------------------------------------------------------------------------
@@ -1187,6 +1388,27 @@ Transform = collections.namedtuple('Transform',
 # Not reproduced: the timestamp processor's own recognition when a sourcetype has no TIME_FORMAT
 # (datetime.xml), its use of the previous event's time outside the day window (MAX_DAYS_AGO), and TZ
 # (gen refuses a stanza that sets it). A text that no format reads leaves _time as it was.
+
+# Values a TIME_PREFIX match may span: a compact value holds no comma and no control character (see "Lookup
+# rules"), so these stand for any of them.
+TIME_PREFIX_PROBES = ('', 'x', '0', ' ', 'a b', 'Z9-x', ':', '=')
+
+
+def prefix_match_is_stable(prefix_re, text, end):
+	"""
+	Whether the first TIME_PREFIX match on a template's marked text ends at the same template text for whatever
+	values it spans: with each probe in place of every value (TIME_PREFIX_PROBES), the match must end where the
+	template text that follows the match on the marked text begins (Palo Alto's ^(?:[^,]*,){6} spans the syslog
+	header's values and still ends after the sixth comma, which is template text).
+	"""
+	head, rest = text[:end], text[end:]
+	for probe in TIME_PREFIX_PROBES:
+		h, r = MARK_RE.sub(lambda _: probe, head), MARK_RE.sub(lambda _: probe, rest)
+		m = prefix_re.search(h + r)
+		if m is None or m.end() != len(h):
+			return False
+	return True
+
 
 TimeRule = collections.namedtuple('TimeRule', 'prefix formats lookahead max_days_ago max_days_hence')
 
@@ -1920,7 +2142,7 @@ class FieldMap(object):
 		m = self._time_re.search(text)
 		if m is None:
 			return None, WHY_TIME_NO_PREFIX
-		if '\x00' in m.group(0):
+		if '\x00' in m.group(0) and not prefix_match_is_stable(self._time_re, text, m.end()):
 			return None, WHY_TIME_PREFIX_VALUE
 		as_text = bool(fmt) and fmt != tenx_dml_builder.EPOCH_PASSTHROUGH
 		limit = self.time_rule.lookahead
@@ -2114,6 +2336,206 @@ def read_addon(addon_dir):
 	if not merged[0]:
 		raise AddonError('no props.conf under %s (default/ or local/)' % addon_dir)
 	return merged[0], merged[1]
+
+
+def quoted_list(value):
+	"""A transforms.conf <quoted string list> ("a","b" or ",", "="): the strings, with the escapes tab, line feed,
+	carriage return, backslash and double quote read."""
+	out = []
+	for m in re.finditer(r'"((?:[^"\\]|\\.)*)"', value or ''):
+		out.append(re.sub(r'\\(.)', lambda e: {'t': '\t', 'n': '\n', 'r': '\r'}.get(e.group(1), e.group(1)), m.group(1)))
+	return out
+
+
+def csv_layouts(addon_dir, sourcetypes, by_sourcetype=False):
+	"""
+	(layouts, report) for the csv reader from an add-on: for each sourcetype, the names (FIELDS) and delimiters
+	(DELIMS, one set) of the first REPORT- transform of its stanza that reads the event's text that way, and,
+	with several sourcetypes, the REGEX of the add-on's index-time transform that stores an event under it
+	(DEST_KEY = MetaData:Sourcetype, FORMAT = sourcetype::<it>), which picks a template's layout.
+	"""
+	props, transforms = read_addon(addon_dir)
+	routes = collections.OrderedDict()
+	for settings in props.values():
+		for key, value in settings.items():
+			if not key.startswith('TRANSFORMS-'):
+				continue
+			for name in [x.strip() for x in value.split(',') if x.strip()]:
+				t = transforms.get(name, {})
+				m = re.match(r'\s*sourcetype::(\S+)\s*$', str(t.get('FORMAT', '')))
+				if str(t.get('DEST_KEY', '')).strip() == 'MetaData:Sourcetype' and m and t.get('REGEX'):
+					routes.setdefault(m.group(1), str(t['REGEX']).strip())
+	layouts, report, names_of = [], collections.OrderedDict(), collections.OrderedDict()
+	for st in sourcetypes:
+		found = None
+		for key, value in props.get(st, {}).items():
+			if not key.startswith('REPORT-'):
+				continue
+			for name in [x.strip() for x in value.split(',') if x.strip()]:
+				t = transforms.get(name, {})
+				delims = quoted_list(t.get('DELIMS'))
+				if _source_key(t) == '_raw' and len(delims) == 1 and t.get('FIELDS'):
+					found = (name, quoted_list(t['FIELDS']), delims[0])
+					break
+			if found:
+				break
+		if found is None:
+			report[st] = 'no REPORT- transform of [%s] reads the text with one DELIMS set and FIELDS' % st
+			continue
+		route = routes.get(st) if len(sourcetypes) > 1 else None
+		if len(sourcetypes) > 1 and route is None:
+			report[st] = 'no index-time rule of the add-on stores an event under %s, so no template is read as one' % st
+			continue
+		layouts.append((route, found[1], found[2]))
+		names_of[st] = found[1]
+		report[st] = '%s: %d names, delimiters %r%s' % (found[0], len(found[1]), found[2],
+			', templates whose text %s finds' % route if route else '')
+	return (layouts, report, names_of) if by_sourcetype else (layouts, report)
+
+
+def blank_overrides(props, transforms, stanza, columns, reserved_prefix=None):
+	"""
+	The search-time settings the map writes in [stanza] so that what the add-on's DELIMS rule reads
+	from a compact line where the map wrote no field (tenx_blank names those columns) is null, as on the raw event, with
+	source left as it is. A field is tainted by a column when it is the column, or an add-on rule that runs before the
+	calculated fields (REPORT or EXTRACT reading a field, FIELDALIAS) derives it from a tainted field. Then:
+	* each add-on EVAL- that reads a tainted field is written again under its own name with each such reference in
+	  if(<its column is blank>, null(), <field>); Splunk 10.4.3 takes the map's EVAL- over the add-on's for the same
+	  name and stanza (measured: an app named fg_* over Splunk_TA_paloalto_networks; search-time precedence puts the
+	  later name first), and a calculated field reads the fields as they were before any calculated field ran;
+	* every other tainted field gets EVAL-<field> = if(<its column is blank>, null(), <field>).
+	Returns [(key, value)] in order.
+	"""
+	settings = props.get(stanza, {})
+	taint = collections.OrderedDict((c, {c}) for c in columns if c)
+
+	def rule_reads():
+		out = []
+		for key, value in settings.items():
+			kind = key.split('-', 1)[0].upper()
+			if kind == 'REPORT':
+				for t in [x.strip() for x in value.split(',') if x.strip()]:
+					tr = transforms.get(t, {})
+					sk = _source_key(tr)
+					if sk != '_raw':
+						out.append(({sk}, set(written_names(tr))))
+			elif kind == 'EXTRACT':
+				m = re.search(r'\s+in\s+([A-Za-z_][A-Za-z0-9_]*)\s*$', value)
+				if m:
+					out.append(({m.group(1)}, set(re.findall(r'\(\?P?<([A-Za-z_]\w*)>', value))))
+			elif kind == 'FIELDALIAS':
+				for a, how, b in re.findall(r'("[^"]+"|\S+)\s+(AS(?:NEW)?)\s+("[^"]+"|\S+)', value, re.I):
+					out.append(({a.strip('"')}, {b.strip('"')}, how.upper() == 'AS'))
+		return [r if len(r) == 3 else r + (False,) for r in out]
+
+	reads = rule_reads()
+	# An alias with AS writes its field from the source alone (the raw event's object is log_subtype's value though the
+	# object column is empty), so the field's taint is the source's; any other rule adds to what the field had.
+	for ins, outs, replaces in reads:
+		if replaces:
+			for o in outs:
+				taint.pop(o, None)
+	changed = True
+	while changed:
+		changed = False
+		for ins, outs, replaces in reads:
+			src = set().union(*[taint[i] for i in ins if i in taint]) if any(i in taint for i in ins) else None
+			if not src:
+				continue
+			for o in outs:
+				if not taint.setdefault(o, set()) >= src:
+					taint[o] |= src
+					changed = True
+
+	def cond(name):
+		cols = sorted(taint[name])
+		return 'match(%s, "(^| )(%s)( |$)")' % (BLANK_FIELD, '|'.join(regex_escape(c) for c in cols))
+
+	def guarded(name):
+		if name in restored:
+			# Written as <prefix><name> and given back at search time after the add-on's rule, which reads the compact
+			# line under the name first: on a compact event the written value is the one.
+			return 'if(isnotnull(%s), \'%s%s\', \'%s\')' % (BLANK_FIELD, reserved_prefix, name, name)
+		return 'if(%s, null(), \'%s\')' % (cond(name), name)
+
+	# Columns the map writes under the reserved prefix that a search-time rule can still set: Splunk keeps its own
+	# host, source, sourcetype, index and splunk_server over an extraction (a userid line's source column left
+	# source as it was), and assigns eventtype and tag itself.
+	restored = set(c for c in taint if reserved_prefix and reserved_name(c) and not c.startswith(RESERVED_PREFIXES)
+		and c.lower() not in ('host', 'source', 'sourcetype', 'index', 'splunk_server', 'eventtype', 'tag'))
+
+	def guard_expr(value):
+		# mvfilter() takes an expression of one field, so tenx_blank inside it is not a valid expression and Splunk
+		# drops the calculated field, the add-on's own included, since the map's takes its name (measured: Invalid eval
+		# expression, The arguments to the 'mvfilter' function are invalid). Such a call is guarded whole instead:
+		# mvfilter() of a field that is not there is null, so the result is the same.
+		parts, pos, held = [], 0, []
+		for start, inner, end in call_spans(value, 'mvfilter'):
+			if start < pos:
+				continue
+			call = value[start:end]
+			names = sorted(expr_fields(value[inner:end - 1]) & set(taint))
+			if names and names[0] in restored:
+				call = 'if(isnotnull(%s), %s, %s)' % (BLANK_FIELD, rewrite_expr_fields(call,
+					lambda n: "'%s%s'" % (reserved_prefix, n) if n == names[0] else None), call)
+			elif names:
+				call = 'if(%s, null(), %s)' % (' OR '.join(cond(n) for n in names), call)
+			parts += [value[pos:start], '"\x00%d\x00"' % len(held)]
+			held.append(call)
+			pos = end
+		text = rewrite_expr_fields(''.join(parts) + value[pos:], lambda n: guarded(n) if n in taint else None)
+		for i, call in enumerate(held):
+			text = text.replace('"\x00%d\x00"' % i, call)
+		return text
+
+	out, own = [], set()
+	for key, value in settings.items():
+		if not key.startswith('EVAL-'):
+			continue
+		own.add(key[len('EVAL-'):])
+		if not (expr_fields(value) & set(taint)):
+			continue
+		out.append((key, guard_expr(value)))
+	for name in taint:
+		if name not in own:
+			out.append(('EVAL-%s' % name, guarded(name)))
+	return out
+
+
+def call_spans(expr, function):
+	"""(start, start of the arguments, end) of each call to an eval function in an expression, outside string literals
+	and quoted names, in order; a call inside another comes after it."""
+	masked = re.sub(r'"(?:[^"\\]|\\.)*"|\'[^\']*\'', lambda m: m.group(0)[0] + 'x' * (len(m.group(0)) - 2) + m.group(0)[0],
+		expr)
+	out = []
+	for m in re.finditer(r'(?<![A-Za-z0-9_.:{}])%s\s*\(' % re.escape(function), masked, re.I):
+		depth = 0
+		for j in range(m.end() - 1, len(masked)):
+			depth += {'(': 1, ')': -1}.get(masked[j], 0)
+			if depth == 0:
+				out.append((m.start(), m.end(), j + 1))
+				break
+	return out
+
+
+def rewrite_expr_fields(expr, replace):
+	"""An eval expression with each field reference (a word outside string literals that is not a function or keyword,
+	or a name in single quotes) given by replace(name), or kept when replace returns None."""
+	out, pos = [], 0
+	token = re.compile(r'"(?:[^"\\]|\\.)*"|\'([^\']+)\'|' + _EXPR_WORD.pattern)
+	for m in token.finditer(expr):
+		out.append(expr[pos:m.start()])
+		text = m.group(0)
+		if text.startswith('"'):
+			out.append(text)
+		else:
+			name = m.group(1) if text.startswith("'") else text
+			is_call = expr[m.end():].lstrip().startswith('(') and not text.startswith("'")
+			new = None if is_call or name.upper() in _EXPR_KEYWORDS else replace(name)
+			out.append(new if new is not None else text)
+		pos = m.end()
+	out.append(expr[pos:])
+	return ''.join(out)
 
 
 def source_pattern_matches(pattern, source):
@@ -3166,6 +3588,12 @@ def props_text(target, field_map, settings, search_hash=True, sourcetype_field=S
 			note = '# Search-time: as above, for the rules of this stanza of the add-on.'
 	for stanza, entries in by_stanza.items():
 		lines += ['', '[%s]' % stanza, note] + entries
+	for stanza, settings in (target.get('blank_evals') or {}).items():
+		lines += ['', '# Search-time: what the add-on\'s DELIMS rule reads from a compact line where the map wrote no field (the',
+			'# columns %s names) is null, as on the raw event: the add-on\'s calculated fields that read such a field, again' % BLANK_FIELD,
+			'# with each reference guarded, and every other such field nulled. On any other event %s is null and' % BLANK_FIELD,
+			'# nothing changes.', '[%s]' % stanza]
+		lines += ['%s = %s' % kv for kv in settings]
 	return '\n'.join(lines) + '\n'
 
 
@@ -4302,6 +4730,35 @@ def _build(args):
 			settings = each[0]
 		time_rule = make_time_rule(settings, time_prefix, time_formats, args.time_lookahead)
 	reader, text_rules = READERS[target['reader']](), None
+	if target['reader'] == CsvReader.name:
+		columns = getattr(args, 'columns', None) or target.get('columns')
+		if columns:
+			header = [c.strip() for c in (columns.split(',') if isinstance(columns, str) else columns)]
+			layouts, layout_report = [(None, header, getattr(args, 'delimiter', None) or target.get('delimiter') or ',')], {}
+		elif getattr(args, 'addon', None):
+			try:
+				layouts, layout_report = csv_layouts(args.addon, renames(target))
+			except OSError as e:
+				raise AddonError(str(e))
+		else:
+			raise ValueError('the csv reader needs the column names: --columns a,b,c, or --addon with the add-on whose '
+				'REPORT- transforms list them (DELIMS and FIELDS)')
+		if not layouts:
+			raise ValueError('the csv reader found no column names: %s' % '; '.join('%s: %s' % kv for kv in layout_report.items()))
+		reader = CsvReader(layouts)
+		target['layouts'] = layout_report
+	if isinstance(reader, CsvReader):
+		# See "A positional rule on a compact line": tenx_blank and the search-time rules that null what such a rule
+		# reads from a compact line where the map wrote no field.
+		csv_reader = reader
+		if getattr(args, 'addon', None):
+			props, transforms = read_addon(args.addon)
+			_, _, by_sourcetype = csv_layouts(args.addon, renames(target), by_sourcetype=True)
+		else:
+			props, transforms, by_sourcetype = {}, {}, collections.OrderedDict((st, header) for st in renames(target))
+		prefix = args.reserved_prefix if target.get('reserved_names') == 'restore' else None
+		target['blank_evals'] = collections.OrderedDict(
+			(st, blank_overrides(props, transforms, st, columns, prefix)) for st, columns in by_sourcetype.items())
 	leave_out = target.get('leave_out') or []
 	if leave_out:
 		reader = LeaveOutReader(reader, leave_out)
@@ -4323,6 +4780,8 @@ def _build(args):
 			reader = TextRuleReader(reader, derived, DERIVE_PROBES_NO_LINE_FEED if target['reader'] == WindowsClassicReader.name
 				else DERIVE_PROBES)
 		text_rules = (copies, report, reader)
+	if target.get('blank_evals'):
+		reader = BlankFieldReader(reader, csv_reader)
 	field_map = FieldMap(templates, reader, target['transform_prefix'],
 		stanza_names=args.stanza_names, hash_match=args.hash_match, timestamp_values=args.timestamp_values,
 		keep=keep, refused=refused, mixed_names=args.mixed_names,
@@ -4360,6 +4819,9 @@ def build_parser():
 		p.add_argument('--app-name')
 		p.add_argument('--indexed-value-false', help='comma-separated field names for fields.conf')
 		p.add_argument('--leave-out', help='comma-separated field names the map does not write')
+		p.add_argument('--columns', help='csv reader: the column names, in order, separated by commas (a header list); '
+			'without it the names come from the add-on (--addon)')
+		p.add_argument('--delimiter', help='csv reader with --columns: the delimiter (default a comma)')
 		p.add_argument('--fields', choices=('all', 'cim'), default='all',
 			help='all: every field the reader finds (default); cim: only the fields the CIM data models and the add-on\'s '
 				'event types read, through the add-on\'s rules (needs --addon and --cim; see "The fields the data models '
