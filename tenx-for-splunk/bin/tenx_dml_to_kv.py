@@ -494,7 +494,8 @@ def plan_slices(minutes, start, end, slice_records=None):
 
 
 def read_state(state_intf):
-	state = state_intf.get_entry(STATE_KEY)
+	"""The checkpoint record, {} when there is none; raises when it cannot be read."""
+	state = state_intf.get_record(STATE_KEY)
 	return state if isinstance(state, dict) else {}
 
 

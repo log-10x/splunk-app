@@ -148,6 +148,18 @@ class TenxKVInterface:
 			logger.error("Failed fetching record for {} - {}".format(record_key, e), exc_info=1)
 			return None
 
+	def get_record(self, record_key):
+		"""
+		The record stored under record_key, or None when there is none. Raises on any other
+		failure, so a caller never takes an unread record for a missing one.
+		"""
+		try:
+			return self.server_connection.get(self.build_record_url(self.kv_key(record_key)))
+		except urllib.error.HTTPError as e:
+			if e.code == 404:
+				return None
+			raise
+
 	def create_entry(self, record_key, record_data):
 		"""
 		Adds a new entry to the KV store, based on the provided record_key and record_data

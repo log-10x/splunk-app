@@ -57,6 +57,11 @@ class StoreKV:
 		record = self.records.get(self.kv_key(record_key))
 		return dict(record, _user='nobody') if record is not None else None
 
+	def get_record(self, record_key):
+		if getattr(self, 'unreadable', False):
+			raise RuntimeError('KV store not ready')
+		return self.get_entry(record_key)
+
 	def batch_limits(self):
 		return 1000, 50.0
 
@@ -576,3 +581,17 @@ def test_the_overlap_is_read_again_while_the_checkpoint_moved_recently(monkeypat
 
 	assert len([q for q in splunk.searches if 'fields templateHash' in q]) == 1
 	assert state.records['consume_kv']['rechecked'] == 0
+
+
+def test_a_checkpoint_that_cannot_be_read_is_not_taken_for_a_first_run(monkeypatch, tmp_path):
+	base = int(time.time()) - 3600
+	splunk, kv, state = FakeSplunk(flood(100, base)), StoreKV(), StoreKV()
+	consume(monkeypatch, tmp_path, splunk, kv, state)
+	through = state.records['consume_kv']['loaded_through']
+	splunk.searches.clear()
+
+	state.unreadable = True
+	assert consume(monkeypatch, tmp_path, splunk, kv, state) == -1
+
+	assert splunk.searches == []
+	assert state.records['consume_kv']['loaded_through'] == through
