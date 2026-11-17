@@ -160,11 +160,16 @@ class TestDictionary:
 
 	def test_the_dictionary_search_names_each_piece(self):
 		s = p.dictionary_search({"error", "warn"})
-		assert '("error" OR "warn")' in s and 'split("error warn", " ")' in s and s.startswith("search `tenx-templates`")
+		assert s.startswith("| inputlookup tenx-dml-lookup ")
+		assert '"(^|[^\\p{L}\\p{N}])(error|warn)([^\\p{L}\\p{N}]|$)"' in s
+		assert 'm0=if(match(tenx_t, "(^|[^\\p{L}\\p{N}])error([^\\p{L}\\p{N}]|$)"), 1, null())' in s
+		assert 'values(eval(if(m1=1, h, null()))) as hs1, count(m1) as n1' in s
 
 	def test_rows_with_one_or_many_terms(self):
 		d = p.dictionary_from_rows([{"piece": "a", "n": "1", "hs": "TERM(~a)"}, {"piece": "b", "n": "2", "hs": ["TERM(~b)", "TERM(~c)"]}])
 		assert d == {"a": (1, ["TERM(~a)"]), "b": (2, ["TERM(~b)", "TERM(~c)"])}
+		d = p.dictionary_from_rows([{"n0": "1", "hs0": "TERM(~a)", "n1": "2", "hs1": ["TERM(~b)", "TERM(~c)"], "n2": "0"}], {"b", "a", "c"})
+		assert d == {"a": (1, ["TERM(~a)"]), "b": (2, ["TERM(~b)", "TERM(~c)"]), "c": (0, [])}
 
 
 class TestHashTerm:

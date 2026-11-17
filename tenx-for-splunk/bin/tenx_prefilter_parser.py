@@ -969,34 +969,70 @@ def hash_term(dml_hash):
 	return runs[0][0]
 
 
+# The word boundary of the template dictionary's matching: a letter or a digit may not touch a piece.
+NOT_WORD = "[^\\p{L}\\p{N}]"
+
+
+def piece_regex(piece):
+	"""The SPL regex that finds `piece` (a usable piece: a-z, 0-9, '*' at its ends) in lowered template text."""
+	return "(^|%s)%s(%s|$)" % (NOT_WORD, piece.replace("*", "[\\p{L}\\p{N}]*"), NOT_WORD)
+
+
 def dictionary_search(pieces):
 	"""
-	The search that answers, for each piece, which templates carry it, as the TERM() clause of
-	each template's hash_term, computed in SPL: the runs with '*' on both sides are blanked, the
-	text is split at the major breakers, and the longest run of at least two characters with a
-	letter or a digit is taken, else the first run.
+	The search that answers, for each piece, which templates carry it in their text, as the
+	TERM() clause of each template's hash_term.
+
+	It reads the templates from the KV store (tenx-dml-lookup), the store tenx-inflate expands
+	from, so every template that can expand an event is asked about. The searchable copy in the
+	template index (`tenx-templates`) is written later, by the Consume KV alert action, and a
+	template whose copy is not written yet expands its events but is not in that index: read from
+	there, a word in its text selected none of its events (Splunk Enterprise 10.4.3, 175,480
+	templates in the KV store with their copies pending: `tx` jsmith 0 events, raw 905; copies
+	written: 905). The text is the record's pattern_search, the same text the copy holds (or its
+	pattern with the value separators removed, for a record stored before that field).
+
+	The term is computed in SPL from the hash as the engine wrote it (pattern_hash; the record
+	key is trimmed): the runs with '*' on both sides are blanked, the text is split at the major
+	breakers, and the longest run of at least two characters with a letter or a digit is taken,
+	else the first run. One row comes back, n<i> and hs<i> for the i-th piece of sorted(pieces);
+	no command in it caps the rows it passes on (no mvexpand, head or subsearch).
 	"""
 	plist = sorted(pieces)
+	marks = ", ".join('m%d=if(match(tenx_t, "%s"), 1, null())' % (i, piece_regex(piece)) for i, piece in enumerate(plist))
+	counts = ", ".join('values(eval(if(m%d=1, h, null()))) as hs%d, count(m%d) as n%d' % (i, i, i, i)
+					   for i in range(len(plist)))
 	return (
-		'search `tenx-templates` earliest=0 latest=now ("%s") | fields dml_hash, _raw'
-		' | eval piece=split("%s", " ") | mvexpand piece'
-		' | where match(lower(_raw), "(^|[^\\p{L}\\p{N}])" . replace(piece, "\\*", "[\\p{L}\\p{N}]*") . "([^\\p{L}\\p{N}]|$)")'
-		' | stats count by piece, dml_hash'
-		' | eval segs=split(replace(replace(replace("~" . dml_hash, "--|%%[0-9A-Fa-f]{2}", " "),'
+		'| inputlookup tenx-dml-lookup | fields _key, pattern_hash, pattern_search, pattern'
+		' | eval tenx_t=lower(coalesce(pattern_search, replace(pattern, "[$]", "")))'
+		' | where match(tenx_t, "(^|' + NOT_WORD + ')(' + "|".join(p.replace("*", "[\\p{L}\\p{N}]*") for p in plist)
+		+ ')(' + NOT_WORD + '|$)")'
+		' | eval ' + marks +
+		' | eval dml_hash=coalesce(pattern_hash, _key)'
+		' | eval segs=split(replace(replace(replace("~" . dml_hash, "--|%[0-9A-Fa-f]{2}", " "),'
 		' "(?<=\\*)[^ !;<>{}|&?+\\[\\]*,()\'\\"]+(?=\\*)", " "), "[ !;<>{}|&?+\\[\\]*,()\'\\"]", " "), " ")'
 		' | eval cand=mvfilter(len(segs) >= 2 AND match(segs, "[\\p{L}\\p{N}]"))'
-		' | eval best=substr(mvindex(mvsort(mvmap(cand, printf("%%03d", len(cand)) . cand)), -1), 4)'
+		' | eval best=substr(mvindex(mvsort(mvmap(cand, printf("%03d", len(cand)) . cand)), -1), 4)'
 		' | eval h="TERM(" . coalesce(best, mvindex(segs, 0)) . ")"'
-		' | stats values(h) as hs count as n by piece'
-	) % ('" OR "'.join(plist), " ".join(plist))
+		' | stats ' + counts
+	)
 
 
-def dictionary_from_rows(rows):
+def dictionary_from_rows(rows, pieces=None):
+	"""
+	The dictionary of dictionary_search()'s answer: piece -> (templates carrying it, [TERM() of
+	each]). `pieces` are the pieces the search was built for; rows in the earlier form (one row a
+	piece, with piece, n and hs) are read as well.
+	"""
 	dictionary = {}
 	for row in rows:
-		terms = row.get("hs") or []
-		terms = [terms] if isinstance(terms, str) else list(terms)
-		dictionary[row["piece"]] = (int(row.get("n") or 0), terms)
+		if "piece" in row:
+			terms = row.get("hs") or []
+			dictionary[row["piece"]] = (int(row.get("n") or 0), [terms] if isinstance(terms, str) else list(terms))
+			continue
+		for i, piece in enumerate(sorted(pieces or ())):
+			terms = row.get("hs%d" % i) or []
+			dictionary[piece] = (int(row.get("n%d" % i) or 0), [terms] if isinstance(terms, str) else list(terms))
 	return dictionary
 
 
