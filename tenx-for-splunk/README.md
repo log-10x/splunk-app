@@ -784,9 +784,8 @@ record that can be `userIdentity.sessionContext.attributes.creationDate`, which 
 `eventTime`. A CloudTrail field map built with `--time-props` (below) gives every compact
 CloudTrail event the raw event's `_time`.
 
-A FortiGate line has its date and time in two fields, `date=` and `time=`. The Receiver reads the
-time and supplies the date, so a compact FortiGate event's `_time` can fall on another day. A
-FortiGate field map (below) gives every compact FortiGate event the raw event's `_time`.
+A FortiGate line has its date and time in two fields, `date=` and `time=`; a compact FortiGate
+event's `_time` is the line's own date and time, with a field map or without one.
 
 A timestamp without a year takes its year from the time the event is processed, so a replayed or
 backfilled file from an earlier year gets the wrong year. Splunk guesses the year for such lines
@@ -798,7 +797,7 @@ Needs the Receiver at release 1.1.181 or later.
 
 Data models, their accelerations, `tstats` and saved searches that do not use `tx` read the
 fields Splunk stored with an event. The field map writes a compact event's original fields while
-it is indexed, so these searches read them. With a field map, the index is larger than raw on disk, from about 10% larger to about 3.5 times raw depending on the source and the fields left out, while license goes down; without one, the index is smaller than raw.
+it is indexed, so these searches read them. With a field map, the index on disk is anywhere from about the size of raw to about 3.5 times raw, depending on the source and the fields left out, while license goes down; without one, the index is smaller than raw.
 
 Put field terms before the macro (`` index=wineventlog EventCode=4625 `txf(XmlWinEventLog)` ``) and run
 statistics, time charts and detections without it: Splunk answers from indexed fields. Use `tx` for

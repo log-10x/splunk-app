@@ -124,8 +124,6 @@ README = {
 	'ct_time': 'A compact event\'s `_time` is the first timestamp the Receiver found in the line. In a CloudTrail record '
 		'that can be `userIdentity.sessionContext.attributes.creationDate`, which comes before `eventTime`. A CloudTrail '
 		'field map built with `--time-props` (below) gives every compact CloudTrail event the raw event\'s `_time`.',
-	'fgt_date': 'A FortiGate line has its date and time in two fields, `date=` and `time=`. The Receiver reads the time '
-		'and supplies the date, so a compact FortiGate event\'s `_time` can fall on another day.',
 	'date_fields': 'Mapped events carry no `date_*` fields (`date_hour`, `date_wday` and the others), which Splunk '
 		'gives raw events it reads from a file, so a detection that reads them, such as a business-hours one, '
 		'matches no mapped event.',
@@ -179,7 +177,8 @@ LIMIT_FIELDS = (
 )
 # Sources whose compact events can carry another `_time` than their raw events (README): patterns of the original
 # sourcetype, the README sentence, and whether a field map (built with --time-props, as the README says) removes it.
-TIME_SOURCES = ((('fortigate_*', 'fgt_*'), 'fgt_date', True), (('aws:cloudtrail',), 'ct_time', True))
+# FortiGate is not one: on Receiver 1.1.181 a compact FortiGate event's `_time` is the line's own date= and time=.
+TIME_SOURCES = ((('aws:cloudtrail',), 'ct_time', True),)
 # Commands and functions whose results depend on the events' times or their order.
 TIME_COMMANDS = frozenset(('timechart', 'bin', 'bucket', 'transaction', 'streamstats', 'head', 'tail', 'dedup', 'reverse',
 	'delta', 'autoregress', 'trendline', 'predict', 'timewrap', 'concurrency', 'localize', 'sitimechart', 'accum'))
