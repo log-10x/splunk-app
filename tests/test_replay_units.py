@@ -62,15 +62,26 @@ def without_guard(definition):
 
 # The empty-expansion guard of tenx-inflate and tenx-inflate-debug (test_inflate_one_row_no_silent_empty.py),
 # as the expansion was written before it: the text went straight to _raw.
-EMPTY_GUARD = (' | eval tenx_expand_refused=if(isnotnull(tenx_log_term) AND coalesce(len(tenx_text),0)==0,'
-	' if(len(mvjoin(tenx_expand_refused,""))>0, tenx_expand_refused, "empty-expansion"), tenx_expand_refused),'
+EMPTY_GUARD = (' | eval tenx_expand_refused=case(isnull(tenx_log_term) AND match(_raw, "^~"), "no-template",'
+	' isnotnull(tenx_log_term) AND coalesce(len(tenx_text),0)==0,'
+	' if(len(mvjoin(tenx_expand_refused,""))>0, tenx_expand_refused, "empty-expansion"), true(), tenx_expand_refused),'
 	' _raw=if(len(tenx_text)>0, tenx_text, _raw)')
+
+# The rows the template lookup matched, and each row's values once (test_inflate_one_row_no_silent_empty.py).
+ROWS_OUTPUT = 'OUTPUT _key AS tenx_rows, part_0 AS tenx_part_0, '
+ONE_COPY = (' | eval tenx_n=mvcount(tenx_rows)'
+	' | eval tenx_log_parts=if(tenx_n>1, mvindex(tenx_log_parts, 0, floor(mvcount(tenx_log_parts)/tenx_n)-1), tenx_log_parts),'
+	' tenx_part_0=if(tenx_n>1, coalesce(mvindex(tenx_part_0, 0), ""), tenx_part_0),'
+	' tenx_log_term=if(tenx_n>1, coalesce(mvindex(tenx_log_term, 0), ""), tenx_log_term),'
+	' tenx_ts_f=if(tenx_n>1, coalesce(mvindex(tenx_ts_f, 0), ""), tenx_ts_f),'
+	' tenx_expand_refused=if(tenx_n>1, coalesce(mvindex(tenx_expand_refused, 0), ""), tenx_expand_refused)')
 
 
 def without_empty_guard(text):
 	text = text.replace('eval tenx_text=if(isnull(tenx_log_term) OR coalesce(tenx_expand_refused,"")!="", null(), ',
 						'eval _raw=if(isnull(tenx_log_term) OR coalesce(tenx_expand_refused,"")!="", _raw, ')
-	return text.replace(EMPTY_GUARD, '').replace(' | fields  - tenx_text, ', ' | fields  - ')
+	text = text.replace(ROWS_OUTPUT, 'OUTPUT part_0 AS tenx_part_0, ').replace(ONE_COPY, '')
+	return text.replace(EMPTY_GUARD, '').replace(' | fields  - tenx_text, tenx_rows, tenx_n, ', ' | fields  - ')
 
 
 # The first step of tenx-inflate and tenx-inflate-debug (test_inflate_values_from_raw.py), which reads the values
