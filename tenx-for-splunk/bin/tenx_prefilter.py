@@ -199,23 +199,28 @@ class TenxPrefilterCommand(GeneratingCommand):
 			self.error_exit(RuntimeError("original sourcetype"), parser.original_sourcetype_message(rows, macro))
 		# The setting is read only when it can change the prefilter (see narrowing_matters).
 		text_field = self._text_field() if parser.narrowing_matters(tree) else None
-		dictionary = {}
-		pieces = parser.lookup_pieces(tree, text_field=text_field)
+		# Runs of digits are looked up like words; the same read of the KV store returns the stored
+		# timestamp formats, which decide the runs that narrow (digit_pieces_cleared).
+		candidates = parser.digit_candidates(tree, text_field)
+		dictionary, digits = {}, frozenset()
+		pieces = parser.lookup_pieces(tree, text_field=text_field, digits=candidates)
 		if pieces:
 			try:
 				result = self._rest(
 					"/servicesNS/%s/%s/search/jobs" % (urllib.parse.quote(self._metadata.searchinfo.username), APP_NAME),
-					{"search": parser.dictionary_search(pieces), "exec_mode": "oneshot", "output_mode": "json",
+					{"search": parser.dictionary_search(pieces, formats=bool(candidates)), "exec_mode": "oneshot", "output_mode": "json",
 					 "count": "0", "earliest_time": "0", "latest_time": "now"})
 				if dictionary_failed(result):
 					raise RuntimeError("the template lookup reported: %s" % dictionary_failed(result))
 				dictionary = parser.dictionary_from_rows(result.get("results", []), pieces)
+				if candidates:
+					digits = parser.digit_pieces_cleared(candidates, parser.formats_from_rows(result.get("results", [])))
 			except Exception as e:
 				self.logger.warning("tx: the template lookup failed: %s", e)
 				self.write_warning("tx: the template lookup did not complete; every compact event in range is expanded.")
 				yield {"search": EVERY_EVENT}
 				return
-		yield {"search": parser.prefilter(tree, dictionary, text_field) or EVERY_EVENT}
+		yield {"search": parser.prefilter(tree, dictionary, text_field, digits) or EVERY_EVENT}
 
 
 dispatch(TenxPrefilterCommand, sys.argv, sys.stdin, sys.stdout, __name__)
