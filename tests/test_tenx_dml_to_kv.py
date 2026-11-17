@@ -84,7 +84,7 @@ class PureCopies:
 		self.writes = 0
 		PureCopies.last = self
 
-	def write_pending(self):
+	def write_pending(self, known=None):
 		self.writes += 1
 		return 0
 
@@ -250,9 +250,10 @@ class FakeSplunk:
 		a = int(re.search(r'_index_earliest=(\d+)', search).group(1))
 		b = int(re.search(r'_index_latest=(\d+)', search).group(1))
 		rows = [r for r in self.records if a <= r[0] < b]
-		if 'stats count by tenx_kv_minute' in search:
-			counts = collections.Counter(t - t % 60 for t, _, _ in rows)
-			lines = [{'result': {'tenx_kv_minute': str(m), 'count': str(c)}} for m, c in counts.items()]
+		if 'stats count by tenx_kv_step' in search:
+			step = int(re.search(r'_indextime%(\d+)', search).group(1))
+			counts = collections.Counter(t - t % step for t, _, _ in rows)
+			lines = [{'result': {'tenx_kv_step': str(m), 'count': str(c)}} for m, c in counts.items()]
 		else:
 			lines = [{'preview': False, 'result': {'templateHash': h, 'template': p, '_indextime': str(t)}} for t, h, p in rows]
 		return [(json.dumps(line) + '\n').encode() for line in lines]
@@ -409,6 +410,19 @@ def test_records_in_the_results_are_stored_in_batches(monkeypatch, tmp_path):
 
 	assert len(kv.records) == 4500
 	assert kv.finds == 3  # one batch_find per 2,000 records
+
+
+def test_a_minute_over_the_slice_size_is_cut_by_second(monkeypatch, tmp_path):
+	monkeypatch.setattr(tenx_dml_to_kv, 'SLICE_RECORDS', 1000)
+	base = int(time.time()) - 3600
+	base -= base % 60
+	splunk, kv, state = FakeSplunk(flood(5000, base, per_second=100)), StoreKV(), StoreKV()
+
+	consume(monkeypatch, tmp_path, splunk, kv, state)
+
+	reads = [q for q in splunk.searches if 'fields templateHash' in q]
+	assert len(reads) == 5
+	assert len(kv.records) == 5000
 
 
 def test_slices_split_at_minutes_and_cover_the_range():

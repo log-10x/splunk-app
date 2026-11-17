@@ -233,6 +233,9 @@ SLICE_RECORDS = 25000
 RUN_BUDGET_SECONDS = 240
 # Records handed to the KV store together (one batch_find, then batch_save calls).
 CHUNK_RECORDS = 2000
+# New templates whose searchable copy is written together: one copy search returns at most
+# 50,000 keys (limits.conf [restapi] maxresultrows), so it is run before that many are pending.
+COPY_EVERY = 20000
 
 
 def reconcile(dml_builder, existing, record_key, pattern):
@@ -327,6 +330,8 @@ class TemplateStore:
 			RECONCILE_CONFLICT, RECONCILE_REFRESHED), 0)
 		self.invalid = 0
 		self.written = 0
+		# Records written with their searchable copy pending since the last copy (copy_pending).
+		self.pending = {}
 
 	def store(self, records):
 		"""
@@ -366,6 +371,23 @@ class TemplateStore:
 			raise RuntimeError("the KV store did not take {} template records".format(len(writes)))
 
 		self.written += len(writes)
+		for key, record in writes.items():
+			if record.get(tenx_dml_intf.SEARCH_COPY) == tenx_dml_intf.SEARCH_COPY_PENDING:
+				self.pending[key] = record
+			else:
+				self.pending.pop(key, None)
+
+	def copy_pending(self, dml_intf):
+		"""
+		Writes the searchable copy of the templates stored since the last call (and of any other
+		record still pending) and marks them written. A copy that fails leaves them pending for
+		the next run.
+		"""
+		if not self.pending:
+			return
+		known, self.pending = list(self.pending.values()), {}
+		if dml_intf.write_pending(known) < 0:
+			logger.warning("The searchable copy of new templates was not written; they stay pending for the next run.")
 
 	def summary(self):
 		return "added={}, refreshed={}, replaced={}, conflicts={}, unchanged={}, invalid={}".format(
@@ -399,22 +421,38 @@ def export_results(server_connection, search):
 				raise RuntimeError("search failed: {}".format(note.get('text')))
 
 
-def index_time_minutes(server_connection, source, start, end):
+def index_time_counts(server_connection, source, start, end, step):
 	"""
-	The number of template records indexed in each minute of [start, end), as sorted
-	(minute, count) pairs.
+	The number of template records indexed in each step (60: minute, 1: second) of [start, end),
+	as sorted (step start, count) pairs.
 	"""
 	search = ('search {} _index_earliest={} _index_latest={}'
-		' | eval tenx_kv_minute=_indextime-(_indextime%60) | stats count by tenx_kv_minute').format(source, int(start), int(end))
-	minutes = [(int(float(r['tenx_kv_minute'])), int(float(r['count'])))
-		for r in export_results(server_connection, search) if r.get('tenx_kv_minute') not in (None, '')]
-	return sorted(minutes)
+		' | eval tenx_kv_step=_indextime-(_indextime%{}) | stats count by tenx_kv_step').format(source, int(start), int(end), int(step))
+	counts = [(int(float(r['tenx_kv_step'])), int(float(r['count'])))
+		for r in export_results(server_connection, search) if r.get('tenx_kv_step') not in (None, '')]
+	return sorted(counts)
+
+
+def index_time_plan(server_connection, source, start, end, slice_records=None):
+	"""
+	The record counts of [start, end) by minute, and by second inside a minute that holds more
+	than slice_records, so plan_slices can cut there.
+	"""
+	slice_records = SLICE_RECORDS if slice_records is None else slice_records
+	plan = []
+	for minute, count in index_time_counts(server_connection, source, start, end, 60):
+		if count > slice_records:
+			plan.extend(index_time_counts(server_connection, source, max(start, minute), min(end, minute + 60), 1))
+		else:
+			plan.append((minute, count))
+	return plan
 
 
 def plan_slices(minutes, start, end, slice_records=None):
 	"""
-	Splits [start, end) of index time into consecutive [a, b) slices at minute boundaries, each
-	with about slice_records records or one minute. Returns [(a, b, records)].
+	Splits [start, end) of index time into consecutive [a, b) slices at the step boundaries of
+	`minutes` (index_time_plan), each with about slice_records records or one step. Returns
+	[(a, b, records)].
 	"""
 	slice_records = SLICE_RECORDS if slice_records is None else slice_records
 	slices, a, n = [], start, 0
@@ -471,7 +509,7 @@ def load_since(server_connection, store, state_intf, dml_intf, source, start_fro
 	if end <= start:
 		return 0
 
-	slices = plan_slices(index_time_minutes(server_connection, source, start, end), start, end, SLICE_RECORDS)
+	slices = plan_slices(index_time_plan(server_connection, source, start, end), start, end, SLICE_RECORDS)
 	read = 0
 
 	for index, (a, b, planned) in enumerate(slices):
@@ -480,24 +518,31 @@ def load_since(server_connection, store, state_intf, dml_intf, source, start_fro
 			logger.info("Stopped after {} s; the next run continues from index time {}.".format(int(time.time() - began), a))
 			return read
 
-		records = []
 		last = None
+		count = 0
+		slice_began = time.time()
 		if planned:
 			search = 'search {} _index_earliest={} _index_latest={} | fields templateHash, template, _indextime | fields - _raw'.format(source, int(a), int(b))
+			chunk = []
 			for result in export_results(server_connection, search):
-				records.append((result.get('templateHash'), result.get('template')))
+				chunk.append((result.get('templateHash'), result.get('template')))
 				try:
 					seen = int(float(result.get('_indextime')))
 					last = seen if last is None else max(last, seen)
 				except (TypeError, ValueError):
 					pass
-
-		changed_before = store.changed()
-		store.store(records)
-		read += len(records)
-
-		if store.changed() > changed_before and dml_intf.write_pending() < 0:
-			logger.warning("The searchable copy of new templates was not written; they stay pending for the next run.")
+				if len(chunk) >= CHUNK_RECORDS:
+					store.store(chunk)
+					count += len(chunk)
+					chunk = []
+					if len(store.pending) >= COPY_EVERY:
+						store.copy_pending(dml_intf)
+			store.store(chunk)
+			count += len(chunk)
+		store.copy_pending(dml_intf)
+		read += count
+		if planned:
+			logger.info("Index time {} to {}: {} records read and stored in {:.1f} s ({}).".format(int(a), int(b), count, time.time() - slice_began, store.summary()))
 
 		# The last slice ends at the newest record seen, not at this host's clock, so a record
 		# an indexer stamps with a clock behind this one's is still read by the next run.
@@ -582,14 +627,14 @@ def update_kv_store(settings):
 			records = []
 			for result in reader:
 				records.append((result.get('templateHash'), result.get('template')))
-				if len(records) >= SLICE_RECORDS:
+				if len(records) >= CHUNK_RECORDS:
 					store.store(records)
 					records = []
+					if len(store.pending) >= COPY_EVERY:
+						store.copy_pending(dml_intf)
 			store.store(records)
+			store.copy_pending(dml_intf)
 			read = sum(store.counts.values()) + store.invalid
-
-			if dml_intf.write_pending() < 0:
-				logger.warning("The searchable copy of new templates was not written; they stay pending for the next run.")
 		else:
 			source = (configuration.get('source') or DEFAULT_SOURCE).strip()
 			if source.startswith('|'):

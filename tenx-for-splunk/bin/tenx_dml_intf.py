@@ -112,20 +112,24 @@ class TenxDmlInterface:
 			records.extend(new)
 			keys.update(r.get('_key') for r in new)
 
-	def write_pending(self):
+	def write_pending(self, known=None):
 		"""
 		Writes the searchable copy of every pending template and marks those records written.
+
+		known: the pending records the caller just wrote, whole; the collection is then not read
+		for them (a read of every pending record pages through the collection). A record the copy
+		search copied that is not among them, pending from an earlier run, is read by its key.
 
 		Returns the number of templates copied, or -1 when the copy could not be written; the
 		records then stay pending for the next run.
 		"""
 		try:
-			pending = self.pending_records()
+			pending = self.pending_records() if known is None else list(known)
 		except Exception as e:
 			logger.error("Could not read pending templates - {}".format(e), exc_info=1)
 			return -1
 
-		if not pending:
+		if not pending and known is None:
 			return 0
 
 		copied_keys = self.run_copy_search()
@@ -134,6 +138,15 @@ class TenxDmlInterface:
 			return -1
 
 		copied = set(copied_keys)
+		held = {r.get('_key') for r in pending}
+		others = [k for k in copied if k not in held]
+
+		if others:
+			try:
+				pending.extend(self.kv_intf.find_many(others).values())
+			except Exception as e:
+				logger.warning("Could not read {} templates copied from an earlier run; they are copied again later - {}".format(len(others), e))
+
 		done = []
 
 		for record in pending:
