@@ -166,7 +166,7 @@ Repository name: `log-10x/splunk-app`. Repository URL: https://github.com/log-10
 
 | Field | Value |
 |---|---|
-| Version | 1.2.3, read from the package |
+| Version | 1.2.4, read from the package |
 | Splunk platform compatibility | Splunk Enterprise 9.4, 10.0, 10.2, 10.4, 10.6 |
 | CIM | None |
 
@@ -184,6 +184,10 @@ Splunkbase requires a release to run on every version it names.
 **Release notes**
 
 Paste the block for the version being uploaded. Splunkbase keeps notes per release.
+
+1.2.4:
+
+> - App icon updated.
 
 1.2.3:
 
@@ -349,7 +353,7 @@ From the repository root:
 rm -rf /tmp/sbpkg && mkdir -p /tmp/sbpkg
 rsync -a --exclude 'local/' --exclude '__pycache__/' --exclude '*.pyc' --exclude '*.pyo' --exclude '.*' \
   tenx-for-splunk/ /tmp/sbpkg/tenx-for-splunk/
-cd /tmp/sbpkg && COPYFILE_DISABLE=1 tar --format ustar -czf tenx-for-splunk-1.2.3.tar.gz tenx-for-splunk
+cd /tmp/sbpkg && COPYFILE_DISABLE=1 tar --format ustar -czf tenx-for-splunk-1.2.4.tar.gz tenx-for-splunk
 ```
 
 ## Submitting

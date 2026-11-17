@@ -5,7 +5,7 @@
     "id": {
       "group": null,
       "name": "tenx-for-splunk",
-      "version": "1.2.3"
+      "version": "1.2.4"
     },
     "author": [
       {
