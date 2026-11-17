@@ -640,11 +640,11 @@ so three fields that depend on that indexing (`xmlns`, `vendor_privilege`, `priv
 on expanded events. `linecount` and `punct` are computed by Splunk from the compact text it indexes,
 so on expanded events they differ from the raw event's.
 
-An index-time `SEDCMD` mask of the original sourcetype does not apply to compact events, so `txf`
-shows the value as the sender sent it; `tenxreplay` names such a rule in `masked_at_index_time`.
-Other index-time rules of the original sourcetype that read the text, such as a host taken from a
-syslog header (`TRANSFORMS = syslog-host`), do not run on compact events either, which keep the
-host the sender gave.
+With the Receiver on each host, before the heavy forwarder, the heavy forwarder's index-time rules
+do not apply to compact events: index overrides, masks (`SEDCMD`, `_raw` rewrites), `nullQueue`
+filters and index-time fields. A value such a mask hides on raw events is readable after expansion,
+and events such a filter drops are indexed and counted against the license. To keep these rules,
+[place the Receiver after the heavy forwarder's parsing](#receiver-beside-a-heavy-forwarder).
 
 Through `txf`, a field whose name holds `*`, such as the JSON key `"a*"`, has each value twice on an
 event the sender passed whole; on a compact event it is as on the raw event.
@@ -667,7 +667,7 @@ too, and the two guesses can differ.
 
 ## Data Models and Detections: the Field Map
 
-Needs the Receiver at release 1.1.180 or later.
+Needs the Receiver at release 1.1.181 or later.
 
 Data models, their accelerations, `tstats` and saved searches that do not use `tx` read the
 fields Splunk stored with an event. The field map writes a compact event's original fields while
@@ -716,7 +716,7 @@ has its own cap file and its own scheduled `check`.
    with these arguments:
 
    ```
-   @run/input/forwarder/fluentbit @apps/receiver varMaxRecurIndexes 0 timestampZone UTC timestampMaxPerObject 1 compactReceiverLookupFile /etc/tenx/win/compact-cap.csv
+   @run/input/forwarder/fluentbit @apps/receiver varMaxRecurIndexes 0 timestampZone UTC timestampMaxPerObject 1 groupJoinLines false compactReceiverLookupFile /etc/tenx/win/compact-cap.csv
    ```
 
    Leave `receiverOptimize true` out of them: with it the Receiver compacts every template, listed or
@@ -727,7 +727,7 @@ has its own cap file and its own scheduled `check`.
    These lines copy the shipped file out of the image:
 
    ```sh
-   docker create --name tenx-config log10x/edge-10x:1.1.180
+   docker create --name tenx-config log10x/edge-10x:1.1.181
    docker cp tenx-config:/etc/tenx/config/pipelines/run/receive/compact/config.yaml compact-config.yaml
    docker rm tenx-config
    ```
@@ -740,9 +740,9 @@ has its own cap file and its own scheduled `check`.
      -v <parsers file>:/fluent-bit/etc/win-parsers.conf:ro -v <log folder>:/logs fluent/fluent-bit:5.1.5
    docker run -d --name tenx-receiver --network container:tenx-fluentbit \
      -v <edited compact config.yaml>:/etc/tenx/config/pipelines/run/receive/compact/config.yaml:ro \
-     -v <host folder of the cap file>:/etc/tenx/win log10x/edge-10x:1.1.180 \
+     -v <host folder of the cap file>:/etc/tenx/win log10x/edge-10x:1.1.181 \
      @run/input/forwarder/fluentbit @apps/receiver varMaxRecurIndexes 0 timestampZone UTC \
-     timestampMaxPerObject 1 compactReceiverLookupFile /etc/tenx/win/compact-cap.csv
+     timestampMaxPerObject 1 groupJoinLines false compactReceiverLookupFile /etc/tenx/win/compact-cap.csv
    ```
 
    `<network>` is a Docker network from which the HTTP Event Collector is reachable. The env file
@@ -1131,6 +1131,18 @@ the reverse, takes one rolling restart; updating the whole app in place takes no
 collection reaches the indexers in the knowledge bundle, so `tx` and `txf` need nothing more on
 them.
 
+### Receiver Beside a Heavy Forwarder
+
+Where Universal Forwarders send to a heavy forwarder, the Receiver can run on the heavy forwarder's
+host, and the Universal Forwarders stay as they are. The heavy forwarder parses the events with its
+add-ons and writes the chosen sourcetypes to its ingest actions file destination, one JSON line per
+event with its time, host, source, sourcetype and index. Fluent Bit reads those files, hands each
+event to the Receiver and sends what comes back to the indexers' HTTP Event Collector, so the heavy
+forwarder's index-time rules apply before compaction. The steps are in the Log10x documentation:
+[Receiver beside a heavy forwarder](https://doc.log10x.com/run/input/forwarder/splunkUF/#receiver-beside-a-heavy-forwarder).
+In that arrangement, a customer's `WRITE_META` fields must be named on the Fluent Bit output; route
+by sourcetype when an index override runs first.
+
 ## Getting Started
 
 ### Step 1: Configure the Receiver
@@ -1147,7 +1159,7 @@ of the Log10x documentation describes, so that they send:
    - Format: `~<hash>,<var0>,<var1>,...`
 
 3. **Receiver settings** this app relies on: the arguments `receiverOptimize true`,
-   `varMaxRecurIndexes 0`, `timestampZone UTC` and `timestampMaxPerObject 1`. The [repository README](https://github.com/log-10x/splunk-app/blob/main/README.md#receiver-side-configuration)
+   `varMaxRecurIndexes 0`, `timestampZone UTC`, `timestampMaxPerObject 1` and `groupJoinLines false`. The [repository README](https://github.com/log-10x/splunk-app/blob/main/README.md#receiver-side-configuration)
    explains each one.
 
 ### Step 2: Verify Template Ingestion
