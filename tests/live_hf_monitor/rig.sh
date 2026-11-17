@@ -4,7 +4,7 @@
 #
 #   tests/live_hf_monitor/rig.sh <phase> [...]
 #
-#   phases, in order: build, config, pass t, maps, pass m, drill, clean, report; down removes everything
+#   phases, in order: build, config, pass t, clean, maps, pass m, drill, clean, report; down removes everything
 #
 # Environment:
 #   W        work folder on the Docker host (required): secret/, data/, opt/tenx/, apps/, res/
@@ -168,7 +168,7 @@ fluent(){
   { printf '[SERVICE]\n    Flush                      1\n    HTTP_Server                On\n    HTTP_Port                  2021\n    storage.path               /opt/tenx/state/%s/storage-back\n    storage.sync               normal\n    storage.backlog.mem_limit  16M\n\n[INPUT]\n    Name          forward\n    Listen        0.0.0.0\n    Port          24225\n    Tag_Prefix    tenx.\n    storage.type  filesystem\n' "$pass"
     [ "$pass" = d ] || file_out 'tenx.rfs.wxml.*' "/opt/tenx/compact/events/$pass-wxml" ""
     file_out 'tenx.rfs.fgt.*' "/opt/tenx/compact/events/$pass-fgt" ""
-    file_out tenx.tenx-template /opt/tenx/compact/templates "$pass.ndjson"; } > "$C/back/fluent-bit.conf"
+    file_out tenx.tenx-template /opt/tenx/compact/templates templates.ndjson; } > "$C/back/fluent-bit.conf"
   fluent_down
   docker run -d --name $P-fbback --hostname $P-fbback --network $NET --ip $FBIP --cpus=1 -m 1g -v "$C/back:/fluent-bit/etc:ro" \
     -v "$W/opt/tenx/state:/opt/tenx/state" -v "$W/opt/tenx/compact:/opt/tenx/compact" "$FB" >/dev/null && log "fbback up ($pass)"
@@ -233,7 +233,7 @@ hops(){ local p=$1
     curl -s http://$FBIP:2020/api/v1/metrics | python3 -c 'import json,sys; m=json.load(sys.stdin); print("fluent bit in, tail records:", {k:v["records"] for k,v in m["input"].items()}); print("fluent bit in, to the Receivers (records, retried, dropped):", {k:(v["proc_records"],v.get("retried_records",0),v.get("dropped_records",0)) for k,v in m["output"].items()})'
     curl -s http://$FBIP:2021/api/v1/metrics | python3 -c 'import json,sys; m=json.load(sys.stdin); print("fluent bit back, from the Receivers:", {k:v["records"] for k,v in m["input"].items()}); print("fluent bit back, file outputs (records, retried, dropped):", {k:(v["proc_records"],v.get("retried_records",0),v.get("dropped_records",0)) for k,v in m["output"].items()})'
     for d in "$W"/opt/tenx/compact/events/$p-*; do echo "compact folder $(basename "$d"): $(find "$d" -type f | wc -l) files, $(cat "$d"/* 2>/dev/null | wc -l) lines"; done
-    echo "compact folder templates/$p.ndjson: $(cat "$W/opt/tenx/compact/templates/$p.ndjson" 2>/dev/null | wc -l) lines"
+    echo "compact folder templates/templates.ndjson: $(cat "$W/opt/tenx/compact/templates/templates.ndjson" 2>/dev/null | wc -l) lines; tenx_dml template records indexed: $(n1 "| tstats count where index=tenx_dml sourcetype=tenx_dml_raw_json")"
     echo "heavy forwarder, compact files finished reading: $(finished | grep -c '^/opt/tenx/compact/') of $(sudo -n find "$W/opt/tenx/compact" -type f | wc -l)"
     echo "indexed (search head), by index and sourcetype:"; spq "| tstats count where index=hfm_${p}_* OR index=hfm_${p}r_* OR index=hfm_fallback by index sourcetype | sort index sourcetype" | sed 's/^/  /'
     echo "events marked tenx_unwrap=failed: $(n1 "| tstats count where index=hfm_* tenx_unwrap=failed")"
@@ -320,8 +320,10 @@ clean(){ local before after files left bad
   docker cp "$HERE/compact-clean.sh" $P-hf:/tmp/compact-clean.sh >/dev/null
   pw | docker exec -i -u root $P-hf sh -c 'umask 077; printf "user = \"admin:%s\"\n" "$(cat)" > /opt/tenx/splunk-auth'
   sudo -n find "$W/opt/tenx/compact" -type f | sed "s#^$W##" | sort > "$W/res/clean_files_before.txt"; finished | sort > "$W/res/clean_finished_before.txt"
+  local tl; tl=$(cat "$W/opt/tenx/compact/templates/templates.ndjson" 2>/dev/null | wc -l)
   docker exec -u root -e MINUTES=${MINUTES:-2} $P-hf sh /tmp/compact-clean.sh > "$W/res/clean.txt" 2>&1
   docker exec -u root $P-hf rm -f /opt/tenx/splunk-auth
+  [ -f "$W/opt/tenx/compact/templates/templates.ndjson" ] || echo "$tl" >> "$W/res/templates_deleted.txt"
   sudo -n find "$W/opt/tenx/compact" -type f | sed "s#^$W##" | sort > "$W/res/clean_files_after.txt"
   files=$(wc -l < "$W/res/clean_files_before.txt"); left=$(wc -l < "$W/res/clean_files_after.txt")
   # a deleted file the heavy forwarder had not finished
@@ -330,7 +332,11 @@ clean(){ local before after files left bad
   [ "$before" = "$after" ] && [ "$left" -lt "$files" ] && [ "$bad" = 0 ] && r=PASS || r=FAIL
   ok $r "clean-up: $files compact files before, $left after, $bad deleted unfinished; indexed events $before before, $after two minutes after"; }
 
-report(){ echo "== summary"; cat "$SUM"; echo "PASS $(grep -c '^PASS' "$SUM"), FAIL $(grep -c '^FAIL' "$SUM")"; }
+# template records: the lines of every templates.ndjson the clean-up deleted, and of the current one, against tenx_dml
+report(){ local written indexed; written=$(( $(awk '{s+=$1} END{print s+0}' "$W/res/templates_deleted.txt" 2>/dev/null || echo 0) + $(cat "$W/opt/tenx/compact/templates/templates.ndjson" 2>/dev/null | wc -l) ))
+  indexed=$(n1 "| tstats count where index=tenx_dml sourcetype=tenx_dml_raw_json")
+  [ "$written" = "$indexed" ] && r=PASS || r=FAIL; ok $r "template records: $written written to templates.ndjson (also after the clean-up deleted it), $indexed indexed in tenx_dml"
+  echo "== summary"; cat "$SUM"; echo "PASS $(grep -c '^PASS' "$SUM"), FAIL $(grep -c '^FAIL' "$SUM")"; }
 down(){ fluent_down; for c in $P-uf $P-hf $P-sh $P-idx; do docker rm -f -v $c >/dev/null 2>&1; done; docker network rm $NET >/dev/null 2>&1; log down; }
 
 case "${1:-}" in

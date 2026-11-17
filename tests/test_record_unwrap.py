@@ -137,8 +137,9 @@ class TestWhereTheRuleRuns:
 		assert [k for k, _ in props.items('tenx_encoded') if k.startswith('TRANSFORMS-')] == ['TRANSFORMS-tenx_time']
 
 	def test_the_class_sorts_before_event_time_and_every_field_map(self):
-		# Splunk applies the TRANSFORMS- classes of the source, sourcetype and host stanzas that match an event in the
-		# ASCII order of their names, so the line is unwrapped before tenx-event-time or a field map reads _raw.
+		# The TRANSFORMS- classes of the source and sourcetype stanzas that match an event run in the order of their
+		# names: on Splunk Enterprise 10.4.3 the unwrap (class 00_...) ran before tenx-event-time and before the
+		# FortiGate field map's rule on every event (tests/live_hf_monitor/).
 		classes = ['tenx_time'] + [t.get('transforms_class', fm.sanitize(t['sourcetype'])) for t in fm.TARGETS.values()]
 		assert 'tenx_fgt' in classes and 'tenx_win' in classes
 		assert sorted(classes + [CLASS[len('TRANSFORMS-'):]])[0] == '00_tenx_unwrap'

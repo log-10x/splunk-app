@@ -9,7 +9,7 @@ A separate search head searches the indexer.
 
 ```sh
 export W=<work folder> PKG=<tenx-for-splunk package> SAMPLES=<samples folder> ADDONS=<add-ons folder>
-for phase in build config "pass t" maps "pass m" drill clean report; do tests/live_hf_monitor/rig.sh $phase; done
+for phase in build config "pass t" clean maps "pass m" drill clean report; do tests/live_hf_monitor/rig.sh $phase; done
 tests/live_hf_monitor/rig.sh down
 ```
 
