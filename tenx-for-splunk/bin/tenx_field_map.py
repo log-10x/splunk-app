@@ -272,14 +272,18 @@ MARK_FIELD = 'tenx_mapped'
 # Indexed field every event of the compact sourcetype gets, for tenx-events (see the docstring).
 SOURCETYPE_FIELD = 'tenx_compact_st'
 # Search-time hash and values of a compact event under the rename target (see the docstring).
-HASH_TRANSFORM = 'tenx_fm_hash_vars'
+# Named after the map's transform prefix (hash_stanza), as is every name a generated app defines, so two maps of one
+# target coexist on one instance; where both put a class in the same original sourcetype's stanza, Splunk Enterprise
+# 10.4.3 keeps the value of the first class that extracts a field and adds none (three REPORT- classes writing one
+# field gave it one value).
+HASH_TRANSFORM = 'hash_vars'
 HASH_REGEX = '^~(?<tenx_hash>[^,]+)(?:,(?<tenx_var_0>[^,]+)(?:,(?<tenx_vars>.*))?)?'
 # --reserved-names restore: one search-time transform per reserved name, under the rename target's stanza,
 # that reads the indexed <reserved_prefix><name> and writes <name>. A search-time field may carry such a
 # name: KV_MODE = json gives eventType on uncompacted CloudTrail events. Extractions run before field
 # aliases, calculated fields and lookups (props.conf.spec), so the add-on's rules that read the name
 # (FIELDALIAS-... = eventType AS app, EVAL-user's eventType="AwsConsoleSignIn") find it.
-RESTORE_TRANSFORM = 'tenx_fm_restore_'
+RESTORE_TRANSFORM = 'restore_'
 RESTORE_REGEX = '^([\\s\\S]*)$'
 
 # re.escape's set of escaped characters on Python 3.7 and later, written out so the generated
@@ -351,8 +355,6 @@ TARGETS = {
 		# The source the compact events carry (Fluent Bit: event_source): the add-on's
 		# [source::XmlWinEventLog:Security] rules apply to them only with it.
 		'source': 'XmlWinEventLog:Security',
-		'transform_prefix': 'tenx_win',
-		'transforms_class': 'tenx_win',
 		# Fields ESCU's EventCode 4663 detections match with wildcard values.
 		'indexed_value_false': list(WINDOWS_WILDCARD_FIELDS),
 		'description': 'Compact Windows Security events',
@@ -365,8 +367,6 @@ TARGETS = {
 		'sourcetype': 'tenx_wincl',
 		'rename': 'WinEventLog',
 		'source': 'WinEventLog:Security',
-		'transform_prefix': 'tenx_wincl',
-		'transforms_class': 'tenx_wincl',
 		# EventType= in the header is a Splunk default field name (eventtype, any case).
 		'reserved_names': 'restore',
 		# Stored as WinEventLog while indexed, like the raw event after the add-on's own index-time fix-up, so tstats
@@ -381,8 +381,6 @@ TARGETS = {
 		'reader': 'delims',
 		'sourcetype': 'tenx_fgt',
 		'rename': ['fortigate_traffic', 'fortigate_utm', 'fortigate_event', 'fortigate_anomaly'],
-		'transform_prefix': 'tenx_fgt',
-		'transforms_class': 'tenx_fgt',
 		# The UTM lines' eventtype= is a Splunk default field name; Splunk gives the raw event's text value
 		# under eventtype, beside the event types.
 		'reserved_names': 'restore',
@@ -3091,8 +3089,16 @@ def restored_names(field_map):
 	return sorted(field_map.reserved)
 
 
-def restore_stanza(name):
-	return RESTORE_TRANSFORM + sanitize(name)
+def map_prefix(target):
+	return target['transform_prefix'] if target else 'tenx_fm'
+
+
+def restore_stanza(target, name):
+	return '%s_%s%s' % (map_prefix(target), RESTORE_TRANSFORM, sanitize(name))
+
+
+def hash_stanza(target):
+	return '%s_%s' % (map_prefix(target), HASH_TRANSFORM)
 
 
 def props_text(target, field_map, settings, search_hash=True, sourcetype_field=SOURCETYPE_FIELD, text_rules=()):
@@ -3144,7 +3150,7 @@ def props_text(target, field_map, settings, search_hash=True, sourcetype_field=S
 					'# with "~" (every uncompacted %s event) gets nothing from it.' % rename]
 			else:
 				lines += ['', '# As above, for %s.' % rename]
-			lines += ['[%s]' % rename, 'REPORT-%s = %s' % (HASH_TRANSFORM, HASH_TRANSFORM)]
+			lines += ['[%s]' % rename, 'REPORT-%s = %s' % (hash_stanza(target), hash_stanza(target))]
 			in_rename = True
 		if restored:
 			if not in_rename:
@@ -3152,7 +3158,7 @@ def props_text(target, field_map, settings, search_hash=True, sourcetype_field=S
 				in_rename = True
 			lines += ['# Search-time: each name Splunk does not keep for an indexed field, given back from %s<name>.'
 				% field_map.reserved_prefix,
-				'REPORT-tenx_fm_restore = %s' % ', '.join(restore_stanza(n) for n in restored)]
+				'REPORT-%s_restore = %s' % (map_prefix(target), ', '.join(restore_stanza(target, n) for n in restored))]
 		if rename in by_stanza:
 			if not in_rename:
 				lines += ['', '[%s]' % rename]
@@ -3189,10 +3195,10 @@ def transforms_text(field_map, search_hash=True, target=None, sourcetype_field=S
 	text = header + '\n'.join(stanzas)
 	if search_hash:
 		text += ('\n# Search-time: tenx-hash-vars-extraction (tenx-for-splunk) with the leading "~" required.\n'
-			'[%s]\nREGEX = %s\n' % (HASH_TRANSFORM, HASH_REGEX))
+			'[%s]\nREGEX = %s\n' % (hash_stanza(target), HASH_REGEX))
 	for name in restored_names(field_map):
 		text += ('\n# Search-time: %s, written at index time as %s%s.\n[%s]\nSOURCE_KEY = %s%s\nREGEX = %s\n'
-			'FORMAT = %s::$1\n' % (name, field_map.reserved_prefix, name, restore_stanza(name), field_map.reserved_prefix,
+			'FORMAT = %s::$1\n' % (name, field_map.reserved_prefix, name, restore_stanza(target, name), field_map.reserved_prefix,
 				name, RESTORE_REGEX, name))
 	if text_rules:
 		text += '\n' + text_rule_transforms(text_rules)

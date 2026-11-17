@@ -426,7 +426,7 @@ class TestGenerated:
 		props = open(str(out / 'default' / 'props.conf'), encoding='utf-8').read()
 		transforms = open(str(out / 'default' / 'transforms.conf'), encoding='utf-8').read()
 		head, sec = props.split('\n[source::XmlWinEventLog:Security]\n', 1)
-		assert 'REPORT-tenx_fm_hash_vars = tenx_fm_hash_vars\n' in head.split('[XmlWinEventLog]\n', 1)[1]
+		assert 'REPORT-tenx_win_hash_vars = tenx_win_hash_vars\n' in head.split('[XmlWinEventLog]\n', 1)[1]
 		assert 'REPORT-EventCode_from_xml-tenx_win = tenx_win_text_EventID_any_as_EventCode\n' in head
 		assert 'REPORT-dest_for_security-tenx_win = tenx_win_text_Computer_text_as_dest\n' in sec
 		assert 'REPORT-1ip_from_xml-tenx_win = tenx_win_text_ip_text_as_src_ip\n' in sec

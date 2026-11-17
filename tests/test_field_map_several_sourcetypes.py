@@ -38,8 +38,8 @@ class TestFortigateTarget:
 		assert '\nrename = ' not in props
 		for st in ('fortigate_traffic', 'fortigate_utm', 'fortigate_event', 'fortigate_anomaly'):
 			stanza = props.split('[%s]\n' % st)[1].split('\n[')[0]
-			assert 'REPORT-tenx_fm_hash_vars = tenx_fm_hash_vars\n' in stanza
-			assert 'REPORT-tenx_fm_restore = tenx_fm_restore_eventtype' in stanza
+			assert 'REPORT-tenx_fgt_hash_vars = tenx_fgt_hash_vars\n' in stanza
+			assert 'REPORT-tenx_fgt_restore = tenx_fgt_restore_eventtype' in stanza
 		transforms = read(tmp_path / 'fm_fgt' / 'default' / 'transforms.conf')
 		assert ('[tenx_fgt_rename]\nSOURCE_KEY = field:tenx_sourcetype\n'
 			'REGEX = ^(fortigate_traffic|fortigate_utm|fortigate_event|fortigate_anomaly)$\n'
