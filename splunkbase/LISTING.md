@@ -185,11 +185,7 @@ Splunkbase requires a release to run on every version it names.
 
 Paste the block for the version being uploaded. Splunkbase keeps notes per release.
 
-1.2.4:
-
-> - App icon updated.
-
-1.2.3:
+1.2.4 and 1.2.3:
 
 > - The field map tool generates maps for Windows Security as classic text (`WinEventLog:Security`), FortiGate and Palo Alto Networks, beside Windows Security as rendered XML and CloudTrail. With a FortiGate map, the Network_Traffic data model, `tstats` and the Splunk Security Content (ESCU) detections give the same results as on raw events. With a Palo Alto map, the Network_Traffic and Change data models, `tstats` and ESCU detections give the same results on compact PAN-OS traffic and system events as on raw ones; threat events are passed whole.
 > - The field map's `check` also counts the compact events indexed without their fields and those Splunk dropped because it could not load the map's lookup file, and fails with the count. When its probe arrives late, `check` keeps the template list unless Splunk's log shows events of the map dropped. The new Field Map Dropped Events alert reports dropped events by node every five minutes.
