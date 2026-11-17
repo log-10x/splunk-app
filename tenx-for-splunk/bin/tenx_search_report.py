@@ -112,7 +112,7 @@ README = {
 		'map, so `tstats` by or on the original sourcetype counts no compact event; `tenx_sourcetype` holds the '
 		'original. Use `where (sourcetype=XmlWinEventLog OR tenx_sourcetype=XmlWinEventLog)`, or a data model, which '
 		'applies the rename.',
-	'eventtype_words': 'Event types that match words of the original text, such as `err0r` in the Windows add-on '
+	'eventtype_words': 'Event types that match words of the original text, such as `err0r` in the CIM add-on '
 		'and `aws_cloudtrail_delete_events` in the AWS add-on, match a mapped event only where its compact text holds '
 		'the word.',
 	'dest_4798': 'On Windows EventID 4798, 5156 and 5157, `dest` is the event\'s Computer and `src_ip` and '

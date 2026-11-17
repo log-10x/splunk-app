@@ -1218,9 +1218,7 @@ same at either value.
 Checked with the Windows add-on 12.0.0, the AWS add-on 8.3.1, the Fortinet FortiGate Add-on 1.6.10
 and CIM 8.8.0 against the same events indexed raw; the results are in the
 [listing's checks](https://github.com/log-10x/splunk-app/blob/main/splunkbase/LISTING.md#checks-run-on-this-package).
-These limits remain. Event types that match words of the original text, such as `err0r` in the
-Windows add-on and `aws_cloudtrail_delete_events` in the AWS add-on, match a mapped event only where
-its compact text holds the word. On
+These limits remain. Event types that match words of the original text, such as `err0r` in the CIM add-on and `aws_cloudtrail_delete_events` in the AWS add-on, match a mapped event only where its compact text holds the word. On
 Windows EventID 4798, 5156 and 5157, `dest` is the event's Computer and `src_ip` and `dest_ip` are
 not written. The add-on's XML block fields `EventData_Xml` and `System_Props_Xml` are not written.
 `vendor_privilege` and `privilege_id` carry `-` on events where the raw event has neither. A value
