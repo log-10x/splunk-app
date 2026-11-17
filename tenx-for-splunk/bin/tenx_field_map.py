@@ -3790,10 +3790,16 @@ def _same_setting(key, written, held):
 
 
 def not_installed(splunkd, app_dir, app_name):
-	"""The stanzas of the app's transforms.conf and props.conf the instance does not hold as written."""
+	"""The stanzas of the app's transforms.conf and props.conf the instance does not hold as written. An instance
+	without the app at all answers 404 for its namespace: one entry says so."""
 	differ = []
 	for conf in ('transforms', 'props'):
-		have = splunkd.stanzas(app_name, conf)
+		try:
+			have = splunkd.stanzas(app_name, conf)
+		except urllib.error.HTTPError as e:
+			if e.code != 404:
+				raise
+			return ['app %s is not on the instance' % app_name]
 		for name, settings in read_conf(os.path.join(app_dir, 'default', conf + '.conf')).items():
 			got = have.get(name)
 			if got is None:
@@ -3897,6 +3903,25 @@ def lookup_refresh_secs(splunkd):
 	return float(LOOKUP_REFRESH_DEFAULT), False
 
 
+def _netloc(url):
+	return urllib.parse.urlsplit(url).netloc
+
+
+def parsing_endpoints(splunkd):
+	"""The URLs the probes go to: each HTTP Event Collector given, or the management port named by --splunkd
+	(receivers/simple) when none is."""
+	if not splunkd.hec_url:
+		return [splunkd.url]
+	return [splunkd.hec_url] if splunkd.nodes == [None] else list(splunkd.nodes)
+
+
+def probes_parsed_on(splunkd):
+	"""True when the instance --splunkd names parses the probes: no HTTP Event Collector given, or one on the same
+	host. False when they go to other hosts, such as a search head's indexers or heavy forwarders."""
+	host = (urllib.parse.urlsplit(splunkd.url).hostname or '').lower()
+	return any((urllib.parse.urlsplit(u).hostname or '').lower() == host for u in parsing_endpoints(splunkd))
+
+
 def activate(app_dir, cap_file, splunkd, app_name=None, probe_index=None, timeout=None, poll=10, out=sys.stdout,
 		clock=time.time, sleep=time.sleep, check_timeout=60, rng=None):
 	"""
@@ -3938,10 +3963,19 @@ def activate(app_dir, cap_file, splunkd, app_name=None, probe_index=None, timeou
 			differ[0]))
 		return 1
 	floor = floor_dir(app_dir)
-	if added and os.path.isdir(floor) and not_installed(splunkd, floor, app_name + FLOOR_SUFFIX):
-		out.write('activate: the instance does not hold the floor app %s, without which a missing lookup file drops compact '
-			'events; cap file left as it was\n' % (app_name + FLOOR_SUFFIX))
-		return 1
+	if added and os.path.isdir(floor):
+		if probes_parsed_on(splunkd):
+			if not_installed(splunkd, floor, app_name + FLOOR_SUFFIX):
+				out.write('activate: the instance does not hold the floor app %s, without which a missing lookup file drops '
+					'compact events; cap file left as it was\n' % (app_name + FLOOR_SUFFIX))
+				return 1
+		else:
+			# The floor app acts only where the compact events are parsed. A search head named by --splunkd, apart from
+			# the HTTP Event Collector that takes the probes, does not need it, and this tool cannot read the parsing
+			# instances' apps from here.
+			out.write('activate: %s was not checked: the compact events are parsed at %s, not at %s, the one instance this '
+				'tool reads apps from; install the floor app on each instance that parses them\n' % (app_name + FLOOR_SUFFIX,
+				', '.join(_netloc(n) for n in parsing_endpoints(splunkd)), _netloc(splunkd.url)))
 	confirmed, failed = set(), {}
 	if added:
 		if not probe_index:
