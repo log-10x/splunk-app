@@ -417,7 +417,7 @@ def quoted_term(text):
 	return '"' + tenx_util.escape_spl_string_literal(text) + '"'
 
 
-def hash_predicate(dml_hash):
+def hash_predicate(dml_hash, saved=False):
 	"""
 	The SPL that selects the compact events of one template.
 
@@ -433,18 +433,25 @@ def hash_predicate(dml_hash):
 	none of the events of 6 of 74 such templates on 17,011 events (Splunk 10.4.3).
 	"""
 	if '*' not in dml_hash:
-		return quoted_term('~' + dml_hash)
+		predicate = quoted_term('~' + dml_hash)
+	else:
+		predicate = 'TERM(' + tenx_prefilter_parser.hash_term(dml_hash) + ')'
 
-	return 'TERM(' + tenx_prefilter_parser.hash_term(dml_hash) + ')'
+	# A saved search's text goes through Splunk's token substitution when it is dispatched,
+	# which reads `$$` as one `$` and `$name$` as a token: TERM(JVSWh$$) saved ran as
+	# TERM(JVSWh$) and selected none of its template's events (Splunk Enterprise 10.4.3; 21,439 of
+	# 175,480 hashes measured hold a `$`). Written for a saved search, each `$` is doubled.
+	return predicate.replace('$', '$$') if saved else predicate
 
 
-def hash_clause(hashes):
+def hash_clause(hashes, saved=False):
 	"""
 	One parenthesised OR over the predicates for a set of hashes, sorted and de-duplicated so
 	the same template set always compiles to the same text (the compiled search is persisted
-	in savedsearches.conf, and a recompile pass rewrites only when the text changed).
+	in savedsearches.conf, and a recompile pass rewrites only when the text changed). `saved`:
+	the text is for a saved search (hash_predicate).
 	"""
-	return '(' + ' OR '.join(sorted(set(hash_predicate(dml_hash) for dml_hash in hashes))) + ')'
+	return '(' + ' OR '.join(sorted(set(hash_predicate(dml_hash, saved) for dml_hash in hashes))) + ')'
 
 
 def conjoin(parts):
@@ -629,6 +636,8 @@ class TenxSearchCommand(TenxSplCommand):
 
 		self.search_manager = search_manager
 		self.server_connection = server_connection
+		# True when the rewritten text is stored as a saved search (TenxAlertCompiler): hash_predicate.
+		self.saved_search = False
 		self.too_complex = False
 		self.needs_tenx = False
 		self.force_tenx = force_tenx
@@ -801,7 +810,7 @@ class TenxSearchCommand(TenxSplCommand):
 			self._template_hits += 1
 
 			if len(hashes) <= PER_PIECE_HASH_LIMIT:
-				conjuncts.append('(' + quoted_term(piece) + ' OR ' + hash_clause(hashes) + ')')
+				conjuncts.append('(' + quoted_term(piece) + ' OR ' + hash_clause(hashes, self.saved_search) + ')')
 				continue
 
 			shared_pieces.append(piece)
@@ -811,7 +820,7 @@ class TenxSearchCommand(TenxSplCommand):
 			shared = ' OR '.join(quoted_term(piece) for piece in shared_pieces)
 
 			if shared_hashes:
-				shared = '(' + shared + ') OR ' + hash_clause(shared_hashes)
+				shared = '(' + shared + ') OR ' + hash_clause(shared_hashes, self.saved_search)
 
 			conjuncts.append('(' + shared + ')')
 
@@ -1366,6 +1375,8 @@ class TenxSearchBuilder:
 
 		self.force_tenx = force_tenx
 		self.debug = debug
+		# True when what it builds is stored as a saved search (set by TenxAlertCompiler).
+		self.saved_search = False
 
 	def get_search_commands(self, search):
 		"""
@@ -1438,6 +1449,7 @@ class TenxSearchBuilder:
 				# Any other chained searches are now working on decoded data and can be left as is.
 				#
 				tenx_command = TenxSearchCommand(raw_command, self.server_connection, self.tenx_config, self.search_manager, self.force_tenx, self.debug)
+				tenx_command.saved_search = self.saved_search
 				leading_search = tenx_command
 			else:
 				tenx_command = TenxSplCommand(raw_command, self.tenx_config, self.debug)

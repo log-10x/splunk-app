@@ -121,6 +121,7 @@ class TestTheCompiledSearchSelectsEveryTemplate:
 			builder._probe_cache, builder._probe_deadline, builder._template_hits = {}, None, 0
 			builder._timestamp_patterns, builder._timestamp_patterns_read = [], True
 			builder.timestamp_text = builder.dml_truncated = False
+			builder.saved_search = False
 			clause = builder._term_prefilter('jsmith')
 			for r in kv:
 				text = (r.get('pattern_search') or r['pattern'].replace('$', '')).lower()

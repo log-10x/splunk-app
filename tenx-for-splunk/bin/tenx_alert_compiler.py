@@ -241,6 +241,12 @@ class TenxAlertCompiler:
 	"""
 	def __init__(self, builder):
 		self.builder = builder
+		# What it compiles is stored as a saved search, whose text Splunk token-substitutes on
+		# dispatch: the builder writes each `$` of a template hash as `$$` (hash_predicate).
+		try:
+			builder.saved_search = True
+		except AttributeError:
+			pass
 
 	def compile(self, user_search):
 		"""
