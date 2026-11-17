@@ -199,7 +199,7 @@ Paste the block for the version being uploaded. Splunkbase keeps notes per relea
 > - Splunk reads each entry of the app's own logs as one event, and the app reads its settings without broken-pipe warnings in `splunkd.log`.
 > - Word searches through `tx`, dashboards and compiled alerts find the events of every stored template, including templates stored in the last few minutes.
 > - Consume KV stores every template record, a burst of new templates included; its first run after the upgrade stores templates earlier versions skipped.
-> - `tx` expands events whose template the indexers hold twice. An expansion that gives no text keeps the compact event and marks it in `tenx_expand_refused`.
+> - `tx` expands events whose template the indexers hold twice. An event `tx` cannot expand keeps its compact text and says why in `tenx_expand_refused`.
 > - `tx` and `txf` expand an event whose values begin or end with white space or a carriage return, such as a Windows event with CR LF line ends, to its full text.
 > - Compiled alerts select the events of templates whose hash holds a `$`; alerts compiled earlier are rewritten by the recompile pass.
 > - An epoch-seconds timestamp with a fraction, such as `msg=audit(1723042099.699:13369)`, expands as written and sets the event's time.

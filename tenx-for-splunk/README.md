@@ -473,8 +473,8 @@ searches written with them keep working. The search they run must name the compa
   word is a value, and a search with no keywords returns compact `~hash,...` rows. Keep
   compact indexes out of default index sets and name them in searches.
 - A template appears in the dictionary when the Consume KV search stores it, every five
-  minutes. Until then its events stay compact, and a search for a word of that template does
-  not select them.
+  minutes. Until then its events stay compact, with `tenx_expand_refused` set to `no-template`, and a
+  search for a word of that template does not select them.
 - While the KV store is loaded again after it was emptied or restored, `tx` expands events but a
   search for a word of a template not yet stored does not select them; Diagnostics shows the load.
 

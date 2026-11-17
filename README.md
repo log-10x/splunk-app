@@ -125,7 +125,8 @@ backfill search in Step 5. A Receiver's clock zone leaves no trace in the data, 
 `timestampZone: UTC` is required rather than checked.
 
 An event whose template is found but whose expansion gives no text also stays compact, with
-`tenx_expand_refused` set to `empty-expansion`.
+`tenx_expand_refused` set to `empty-expansion`; an event whose template is not found, with
+`no-template`.
 
 ### Event time on compact events
 
