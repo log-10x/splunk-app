@@ -436,7 +436,10 @@ their SPL. To cover another app's dashboards, copy the file into that app's
   first what to write; it is whole when it names one sourcetype of up to 21 characters.
 - `tx` inside another subsearch (`append`, `join`) or wrapped in another macro cannot read
   its own words. It then expands every compact event in range and applies the words after,
-  with a warning: the same result, more slowly.
+  with a warning: the same result, more slowly. A search that holds more than one `tx` or `txf`
+  does the same for each of them. There, and in a search that holds more than one `tx` or `txf`,
+  a wildcard inside a word (`Se*Privilege`) and `TERM()` of part of a longer term match as after a
+  pipe, so they can return more events than the same search on the original lines.
 - A compact event is one record the forwarder sent: a stack trace the forwarder joined into one
   record is one event, a count counts events, and words joined with AND can match on different lines
   of one event.
