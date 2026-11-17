@@ -1101,7 +1101,10 @@ gets no row, and its events arrive whole. An event whose compact value holds a l
 control character, such as a NUL byte in a FortiGate line, gets no fields and is marked
 `tenx_unmapped=no_match`. With `--reserved-names restore`, a mapped CloudTrail
 event carries `extracted_eventType` beside `eventType`, and a mapped FortiGate UTM event
-`extracted_eventtype` beside `eventtype`. Mapped events carry no `date_*` fields
+`extracted_eventtype` beside `eventtype`, and a mapped Palo Alto decryption event `extracted_timestamp`
+beside `timestamp`. A Palo Alto template in which the Receiver made the line's log type (its fourth
+value) a value gets no fields, and its events arrive whole (458 of the 729 lines of the elastic panw
+test files, 15 log types; none of the 1,902,151 BOTS v2 lines). Mapped events carry no `date_*` fields
 (`date_hour`, `date_wday` and the others), which Splunk gives raw events it reads from a file, so a
 detection that reads them, such as a business-hours one, matches no mapped event. On classic
 Windows events, values such as `Access_Reasons` have spaces in place of line breaks and tabs, as do
