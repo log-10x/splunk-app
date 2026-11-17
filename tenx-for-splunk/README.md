@@ -684,8 +684,10 @@ Security; CloudTrail and FortiGate follow them. Steps 1, 6 and 7 keep the Receiv
 the events of a template before its fields can be written; they were measured with the Windows,
 CloudTrail and FortiGate maps, each through its own Receiver.
 
-A field map has its own Receiver and its own cap file. Send the mapped source, and only that
-source, through that Receiver: with the cap list on, an event of any template that is not listed
+A field map has its own Receiver and its own cap file. Two maps of one target, for two fleets, each
+take their own `--sourcetype` and `--app-name` as well: every name the tool writes follows the
+compact sourcetype, so the two apps can be installed side by side. Send the mapped source, and only
+that source, through that Receiver: with the cap list on, an event of any template that is not listed
 arrives whole. A map lists the templates of the forwarder whose records it was generated from: the
 same Windows events sent through the OpenTelemetry Collector, Fluentd or Vector instead of Fluent
 Bit have other templates, and arrive whole until a map is generated from them.
