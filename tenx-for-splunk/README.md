@@ -1022,9 +1022,10 @@ has its own cap file and its own scheduled `check`.
      --probe-index tenx_probe --timeout 20 --poll 5
    ```
 
-   Add `--tls-verify off` as in step 6. `check` sends the probe of a listed template. When it comes
-   back without its fields, or is not indexed within `--timeout`, `check` empties `compact-cap.csv`,
-   and the Receiver sends every event whole until `activate` has proven the templates again. Events
+   Add `--tls-verify off` as in step 6. `check` sends the probe of a listed template. When it comes back without its fields, `check` empties `compact-cap.csv`, and the Receiver sends
+   every event whole until `activate` has proven the templates again. When it is not indexed within
+   `--timeout`, `check` empties the list only if Splunk's log shows events of the map dropped in that
+   time; otherwise it leaves the list as it is, names the templates it did not check, and exits with 2. Events
    indexed between the moment a listed template stops getting its fields and that `check` are kept,
    marked `tenx_unmapped`, and lack their index-time fields. After `check` empties the list, events
    the Receiver compacts before it rereads the file, within about 10 seconds, are kept and marked

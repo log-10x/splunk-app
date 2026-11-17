@@ -208,6 +208,7 @@ Paste the block for the version being uploaded. Splunkbase keeps notes per relea
 > - With a Palo Alto field map, the Network_Traffic and Change data models, `tstats` and ESCU detections give the same results on compact PAN-OS traffic and system events as on raw ones; threat events are passed whole.
 > - Two field maps of one target, each with its own sourcetype, install side by side.
 > - `activate` against a search head without the floor app says the floor app was not checked instead of stopping.
+> - `check` keeps the field map's template list when its probe arrives late, unless Splunk's log shows events of the map dropped.
 > - An event with the indexed field `tenx_time=sender` keeps its sender's time.
 > - The README's Fluent Bit recipe runs two processes beside the Receiver with their buffers on disk, so records survive a restart and a slow HEC.
 
