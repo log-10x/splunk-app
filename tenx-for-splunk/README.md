@@ -1067,7 +1067,9 @@ from it and the Endpoint data model reads that on event 5154 (none among these e
 `SystemTime`, mapped events carry no `event_time`. A Palo Alto line holds five date and time columns;
 `--leave-out generated_time,receive_time,future_use3,start_time` leaves out the four nothing reads,
 and the fifth, the syslog header (`future_use1`), is read by the add-on for authentication events.
-Bloom filters are left out of the Palo Alto row.
+`--fields cim` leaves out 21 Palo Alto columns, `session_flags` among them, and the add-on's `flags`,
+calculated from it, then lists every flag on a mapped event. Bloom filters are left out of the Palo
+Alto row.
 
 `tstats` reads the indexed sourcetype, which stays the compact one with or without a field map, so
 `tstats` by or on the original sourcetype counts no compact event; `tenx_sourcetype` holds the
