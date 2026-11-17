@@ -244,7 +244,13 @@ hops(){ local p=$1
   [ "$loop" = 0 ] && [ "$routed" = "$rawn" ] && [ "$compactn" = "$rawn" ] && [ "$(n1 "| tstats count where index=hfm_fallback")" = "" -o "$(n1 "| tstats count where index=hfm_fallback")" = 0 ] && r=PASS || r=FAIL
   ok $r "hops pass $p: raw arm $rawn, file destination $routed, compact indexed $compactn, compact-sourcetype folders in the file destination $loop"; }
 
-pass_t(){ fluent t opt; uf_pass t; settle t; hops t; kv_load
+# waits until `tx` leaves no event of pass <p> compact: right after the KV store load, events of the last templates
+# loaded stayed compact for a minute or two
+expanded(){ local p=$1 n; for i in $(seq 1 40); do n=$(n1 "search index=hfm_${p}_* \`tx\` | where like(_raw, \"~%\") | stats count")
+    [ "${n:-0}" = 0 ] && { log "pass $p: tx leaves no event compact"; return 0; }; log "pass $p: $n events still compact after tx"; sleep 15; done; return 1; }
+
+pass_t(){ fluent t opt; uf_pass t; settle t; hops t; kv_load; check_t; }
+check_t(){ expanded t
   spq "| tenxreplay" > "$W/res/replay_t.csv"
   for s in win win2 fgt fgt2; do keys t $s tx; done
   python3 "$HERE/fields.py" "$W" $SH t_win _rawmd5,host "search index=hfm_tr_win | eval _rawmd5=md5(_raw)" "search index=hfm_t_win \`txf\` | eval _rawmd5=md5(_raw)"
@@ -279,7 +285,8 @@ dmodel(){ local p=$1 s=$2 dm=$3 by=$4 a b
   [ "$rows" -gt 0 ] && [ "$a" = "$b" ] && r=PASS || r=FAIL
   ok $r "data model pass $p $s $dm by $by: raw $rows rows / $ev events, compact $(printf '%s\n' "$b" | grep -c .) rows, identical $( [ "$a" = "$b" ] && echo yes || echo no)"; }
 
-pass_m(){ sudo -n find "$W/opt/tenx/rfs" -name '*.ndjson' -delete; fluent m map; uf_pass m; settle m; hops m
+pass_m(){ sudo -n find "$W/opt/tenx/rfs" -name '*.ndjson' -delete; fluent m map; uf_pass m; settle m; hops m; check_m; }
+check_m(){ expanded m
   spq "| tenxreplay" > "$W/res/replay_m.csv"
   for s in win win2 fgt fgt2; do keys m $s tx; done
   python3 "$HERE/fields.py" "$W" $SH m_win _rawmd5,host "search index=hfm_mr_win | eval _rawmd5=md5(_raw)" "search index=hfm_m_win \`txf\` | eval _rawmd5=md5(_raw)"
@@ -310,7 +317,7 @@ drill(){ local N=${N:-30000} RATE=${RATE:-200} OUT=${OUT:-300} L=$W/res/drill.lo
   docker start $P-rx-fgt >/dev/null; local back; back=$(date +%s); log "Receiver started" | tee -a "$L"; wait $wp
   until [ "$(n1 "| tstats count where index=hfm_d_fgt")" = "$N" ] || [ $(( $(date +%s) - back )) -gt 3600 ]; do sleep 15; done
   log "compact reached $(n1 "| tstats count where index=hfm_d_fgt") of $N, $(( $(date +%s) - back )) s after the Receiver started" | tee -a "$L"
-  sleep 60; hops d; keys d fgt tx
+  sleep 60; hops d; expanded d; keys d fgt tx
   local retried; retried=$(curl -s http://$FBIP:2020/api/v1/metrics | python3 -c 'import json,sys; m=json.load(sys.stdin); print(sum(v.get("retried_records",0) for v in m["output"].values()), sum(v.get("dropped_records",0) for v in m["output"].values()))')
   log "fluent bit in, retried and dropped records: $retried" | tee -a "$L"; }
 
@@ -340,6 +347,7 @@ report(){ local written indexed; written=$(( $(awk '{s+=$1} END{print s+0}' "$W/
 down(){ fluent_down; for c in $P-uf $P-hf $P-sh $P-idx; do docker rm -f -v $c >/dev/null 2>&1; done; docker network rm $NET >/dev/null 2>&1; log down; }
 
 case "${1:-}" in
-  build) build;; config) config;; pass) case "${2:-}" in t) pass_t;; m) pass_m;; esac;; maps) maps;; drill) drill;; clean) clean;;
+  build) build;; config) config;; pass) case "${2:-}" in t) pass_t;; m) pass_m;; esac;; check) case "${2:-}" in t) check_t;; m) check_m;; esac;;
+  maps) maps;; drill) drill;; clean) clean;;
   report) report;; down) down;; *) sed -n 2,40p "$0";;
 esac

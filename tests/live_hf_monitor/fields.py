@@ -61,7 +61,13 @@ def by_key(rows, keys):
 	return out, dup
 
 
-def norm(v):
+def norm(v, name=''):
+	if name == '_subsecond':
+		# Splunk prints the same fraction with or without its trailing zeros (.10639, .106390)
+		try:
+			return (round(float(v), 9),)
+		except (TypeError, ValueError):
+			pass
 	return tuple(sorted(v)) if isinstance(v, list) else (v,)
 
 
@@ -84,7 +90,7 @@ for k in common:
 			only_compact[name] += 1
 		elif vb is None:
 			only_raw[name] += 1
-		elif norm(va) == norm(vb):
+		elif norm(va, name) == norm(vb, name):
 			continue
 		else:
 			diff[name] += 1
