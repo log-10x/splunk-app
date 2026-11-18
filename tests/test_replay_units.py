@@ -45,7 +45,7 @@ REFUSED_STEP = ' | eval tenx_expand_refused=if(len(tenx_expand_refused)>0, tenx_
 # index matches it, not as its prefix alone (test_wildcard_inside_a_word.py).
 # [tx] now: the same, with the field-map guard around `extract` and REFUSED_STEP before the final
 # search (see TestTxIsTheShippedMacro)
-TX_DEFINITION = ('`tenx-events` [| tenxprefilter] | eval tenx_passed=if(match(_raw, "^~"), null(), 1) | `tenx-inflate` | '
+TX_DEFINITION = ('((`tenx-events`) OR (`tenx-raw-events`)) [| tenxprefilter] | eval tenx_passed=if(match(_raw, "^~"), null(), 1) | `tenx-inflate` | '
 				 '`tenx-mapped-hide` | `tenx-whole-hide` | fields - _kv | extract | `tenx-whole-restore` | '
 				 '`tenx-mapped-restore` | fields - tenx_hash, tenx_var_0, tenx_vars' + REFUSED_STEP + b.WILD_STEP + ' | search *')
 # the field-map guard, and the whole-event guard with the marks that select its events
@@ -75,6 +75,21 @@ ONE_COPY = (' | eval tenx_n=mvcount(tenx_rows)'
 	' tenx_log_term=if(tenx_n>1, coalesce(mvindex(tenx_log_term, 0), ""), tenx_log_term),'
 	' tenx_ts_f=if(tenx_n>1, coalesce(mvindex(tenx_ts_f, 0), ""), tenx_ts_f),'
 	' tenx_expand_refused=if(tenx_n>1, coalesce(mvindex(tenx_expand_refused, 0), ""), tenx_expand_refused)')
+
+
+# The sub-second step of tenx-inflate and tenx-inflate-debug (test_raw_events_and_left_out.py), and the comment
+# above the macros that says why.
+SUBSECOND_STEP = (', _subsecond=if(len(tenx_text)>0 AND len(tenx_ts_f)>0 AND tenx_ts_f!="__TENX_EPOCH__" AND '
+				  'NOT match(tenx_ts_f, "%\\d+Q"), null(), _subsecond)')
+
+
+def without_subsecond(text):
+	lines = text.split('\n')
+	if '# Sub-seconds. tenx-event-time (transforms.conf) gives every compact event with a timestamp a time with a' in lines:
+		start = lines.index('# Sub-seconds. tenx-event-time (transforms.conf) gives every compact event with a timestamp a time with a')
+		end = lines.index('#', start)
+		lines = lines[:start] + lines[end + 1:]
+	return '\n'.join(lines).replace(SUBSECOND_STEP, '')
 
 
 def without_empty_guard(text):
@@ -156,11 +171,13 @@ class TestTxIsTheShippedMacro:
 	foreach over tenx_mapped*, which runs only on a chunk of results holding such an event, and
 	each eval is guarded per event; TestTheMappedGuard runs both on events with and without it.
 	And REFUSED_STEP before its final search, which removes the empty tenx_expand_refused the
-	template lookup leaves on every expanded event (TestTheRefusedStep).
+	template lookup leaves on every expanded event (TestTheRefusedStep). And it reads
+	(`tenx-events`) OR (`tenx-raw-events`), whose shipped definition selects no event.
 	"""
 	def test_the_definition(self):
 		assert macros().get('tx', 'definition') == TX_DEFINITION
-		assert without_guard(TX_DEFINITION).replace(REFUSED_STEP, '').replace(b.WILD_STEP, '') == TX_SHIPPED
+		assert without_guard(TX_DEFINITION).replace(REFUSED_STEP, '').replace(b.WILD_STEP, '').replace(
+			b.EVENTS, '`tenx-events`') == TX_SHIPPED
 
 	def test_every_other_shipped_stanza_is_unchanged_character_for_character(self):
 		try:
@@ -174,14 +191,14 @@ class TestTxIsTheShippedMacro:
 		shipped = configparser.RawConfigParser(strict=False)
 		shipped.read_string(base.stdout)
 		assert macros().get('tx', 'definition') != shipped.get('tx', 'definition')
-		assert without_guard(macros().get('tx', 'definition')).replace(REFUSED_STEP, '').replace(b.WILD_STEP, '') == (
-			shipped.get('tx', 'definition'))
+		assert without_guard(macros().get('tx', 'definition')).replace(REFUSED_STEP, '').replace(b.WILD_STEP, '').replace(
+			b.EVENTS, '`tenx-events`') == shipped.get('tx', 'definition')
 		# every other stanza shipped at e12ec4e is unchanged, its comments included; the two inflate
-		# macros differ by the empty-expansion guard (test_inflate_one_row_no_silent_empty.py) and by the
-		# values read from _raw (test_inflate_values_from_raw.py) alone
+		# macros differ by the empty-expansion guard (test_inflate_one_row_no_silent_empty.py), by the
+		# values read from _raw (test_inflate_values_from_raw.py) and by the sub-second step alone
 		for name in shipped.sections():
 			if name != 'tx':
-				assert without_values_from_raw(without_empty_guard(stanza_text(ours, name))) == (
+				assert without_values_from_raw(without_empty_guard(without_subsecond(stanza_text(ours, name)))) == (
 					stanza_text(base.stdout, name)), name
 
 	def test_tx_runs_no_replay(self):
@@ -190,7 +207,7 @@ class TestTxIsTheShippedMacro:
 	def test_txf_is_tx_with_the_replay(self):
 		conf = macros()
 		mark = 'tenx_passed=if(match(_raw, "^~") OR isnotnull(tenx_sourcetype), null(), 1)'
-		head = ('`tenx-events` [| tenxprefilter] | eval tenx_compact_raw=_raw, %s | `tenx-inflate` | fields - _kv | '
+		head = ('((`tenx-events`) OR (`tenx-raw-events`)) [| tenxprefilter] | eval tenx_compact_raw=_raw, %s | `tenx-inflate` | fields - _kv | '
 				'`tenx-mapped-hide` | `tenx-whole-hide` | ')
 		tail = (' | `tenx-whole-restore` | `tenx-mapped-restore` | fields - tenx_compact_raw, tenx_rst, tenx_hash, '
 				'tenx_var_0, tenx_vars' + REFUSED_STEP + b.WILD_STEP + ' | search *')
@@ -202,7 +219,7 @@ class TestTxIsTheShippedMacro:
 			'"' + head % mark.replace('"', '\\"') + '`tenx-replay-u" . substr(md5("$st$"), 1, 12) . "` | `tenx-replay-tags`'
 			+ tail + '"')
 		assert without_guard(conf.get('txf', 'definition')) == (
-			'`tenx-events` [| tenxprefilter] | eval tenx_compact_raw=_raw | `tenx-inflate` | fields - _kv | '
+			'((`tenx-events`) OR (`tenx-raw-events`)) [| tenxprefilter] | eval tenx_compact_raw=_raw | `tenx-inflate` | fields - _kv | '
 			'`tenx-replay` | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars' + REFUSED_STEP + b.WILD_STEP +
 			' | search *')
 		assert conf.get('txf(1)', 'args') == 'st'
@@ -1049,7 +1066,7 @@ class TestTheWholeGuard:
 	@staticmethod
 	def tx():
 		d = macros().get('tx', 'definition')
-		head, tail = '`tenx-events` [| tenxprefilter] | ', ' | search *'
+		head, tail = '((`tenx-events`) OR (`tenx-raw-events`)) [| tenxprefilter] | ', ' | search *'
 		assert d.startswith(head) and d.endswith(tail)
 		return d[len(head):-len(tail)]
 

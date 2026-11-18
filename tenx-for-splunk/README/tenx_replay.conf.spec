@@ -41,6 +41,12 @@ unit = <macro name>
 * The macro that replays this sourcetype alone (tenx-replay-u<hash>); txf(<sourcetype>) reaches it
   through tenx-replay-st-<sourcetype>.
 
+left_out = txf|unit|txf,unit|<empty>
+* txf: the tenx-replay macro, which `txf` runs, leaves this sourcetype out, because the busier
+  sourcetypes fill replay_max_macro_chars (tenx_config.conf); its unit still replays it, and the
+  search rewrite chains its unit for the indexes listed here. unit: its own unit is over that size
+  and replays nothing. `txf` and txf(<sourcetype>) show a warning in either case. Empty: neither.
+
 last_seen = <epoch seconds>
 * Start of the UTC day a rebuild last saw a compact event of this sourcetype. The replay of a
   sourcetype not seen for replay_expire_days (tenx_config.conf) is removed once no compact event

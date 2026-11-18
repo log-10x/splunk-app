@@ -1437,7 +1437,10 @@ MAX_LISTED = MAX_LISTED_SOURCES
 # Before the final search of `tx`, `txf` and txf(<sourcetype>): the step that matches a wildcard inside a
 # word, TERM() and CASE() as a base search on the index matches them (macros.conf [tenx-wild]).
 WILD_STEP = ' | `tenx-wild`'
-TXF_ONE_UNIT = ('"`tenx-events` [| tenxprefilter] | eval tenx_compact_raw=_raw, tenx_passed=if(match(_raw, \\"^~\\") OR '
+# What `tx`, `txf` and txf(<sourcetype>) read (macros.conf [tenx-raw-events]): the compact events, and
+# the raw events of the same sources that the deployment names there, which are returned as they are.
+EVENTS = '((`tenx-events`) OR (`tenx-raw-events`))'
+TXF_ONE_UNIT = ('"' + EVENTS + ' [| tenxprefilter] | eval tenx_compact_raw=_raw, tenx_passed=if(match(_raw, \\"^~\\") OR '
 				'isnotnull(tenx_sourcetype), null(), 1) | `tenx-inflate` | fields - _kv | '
 				'`tenx-mapped-hide` | `tenx-whole-hide` | `tenx-replay-u" . substr(md5("$st$"), 1, 12) . "` | `tenx-replay-tags` | '
 				'`tenx-whole-restore` | `tenx-mapped-restore` | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars | '
@@ -1558,8 +1561,37 @@ def build_unit(stanzas, sourcetype, seen, lookup_fields=None, keep_fields=(), re
 		cut = build(stanzas, [], only=True)
 		cut.warnings.append('the unit of %r (%d characters) is over replay_max_macro_chars = %d and replays nothing'
 							% (sourcetype, len(unit.spl()), limit))
+		# What the sourcetype's stanza records still holds; LEFT_OUT_KEY says the unit replays nothing.
+		cut.per_sourcetype = unit.per_sourcetype
+		cut.replays_nothing = True
 		return cut
 	return unit
+
+
+# The tenx_replay.conf key that says what leaves a sourcetype's events without its rules, for the
+# warning the prefilter shows on `txf` and txf(<sourcetype>) (tenx_prefilter_parser.replay_left_out):
+# 'txf' when the `tenx-replay` macro leaves it out (replay_max_macro_chars keeps the busiest
+# sourcetypes in it), 'unit' when its own unit is over that size and replays nothing. Empty: neither.
+LEFT_OUT_KEY = 'left_out'
+
+
+def left_out_value(in_macro, replays_nothing):
+	"""The LEFT_OUT_KEY value of a sourcetype."""
+	return ','.join(w for w, on in (('txf', not in_macro), ('unit', replays_nothing)) if on)
+
+
+def unit_sourcetypes(present, last_seen=None, settings=None):
+	"""
+	The original sourcetypes that get a unit and a tenx_replay.conf stanza: every usable one of
+	`present`, the busiest first, held to replay_max_sourcetypes. Not held to replay_max_macro_chars,
+	which limits the `tenx-replay` macro alone: each unit has its own limit (build_unit()), and a
+	sourcetype the macro leaves out keeps its unit, so txf(<sourcetype>) and the search rewrite still
+	give its events their fields.
+	"""
+	settings = settings or DEFAULT_SETTINGS
+	ranked = ranked_sourcetypes(present, last_seen)
+	cap = settings['replay_max_sourcetypes']
+	return ranked[:cap] if cap else ranked
 
 
 def build_units(stanzas, cov, sourcetypes, lookup_fields=None, keep_fields=(), settings=None, rejected=None,
@@ -1649,9 +1681,9 @@ def rewrite_replay(covered, indexes):
 	Unreadable: `tenx-replay`, which replays whatever the install has (and is the shipped
 	extract alone where nothing carries tenx_sourcetype). No covered sourcetype: none. No index
 	named, an index named that no stanza records, a wildcard, or every covered sourcetype
-	recorded for the indexes named: `tenx-replay`. Otherwise the units of the sourcetypes
-	recorded for those indexes, or `tenx-replay` when one of them has no working unit (its
-	stanza says `unit =`).
+	recorded for the indexes named, none of them left out of `tenx-replay` (LEFT_OUT_KEY):
+	`tenx-replay`. Otherwise the units of the sourcetypes recorded for those indexes, or
+	`tenx-replay` when one of them has no working unit (its stanza says `unit =`).
 
 	Correct results first: the record of indexes lags the data (the next "When New" rebuild,
 	5 minutes; longer while a rebuild fails), and an index it does not know may hold events of
@@ -1698,7 +1730,10 @@ def rewrite_replay(covered, indexes):
 			chosen.append(st)
 	if not chosen:
 		return None
-	if len(chosen) == len(sts):
+	# `tenx-replay` leaves out the sourcetypes past replay_max_macro_chars; their units replay them.
+	left_out = any('txf' in str((covered[st] if isinstance(covered[st], dict) else {}).get(LEFT_OUT_KEY) or '').split(',')
+				   for st in chosen)
+	if len(chosen) == len(sts) and not left_out:
 		return FULL
 	return compose_units(chosen)
 

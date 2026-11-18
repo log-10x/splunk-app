@@ -157,6 +157,7 @@ The `tenx_dml` collection stores parsed template data with fields:
 | `tx` | Written in front of a search: searches compact events by what the original lines say (see Usage) |
 | `txf`, `txf(<sourcetype>)` | `tx` with the search-time fields of the original sourcetype (see [Fields of the Original Sourcetype](#fields-of-the-original-sourcetype-txf)) |
 | `tenx-events` | Where the compact events are: the index and sourcetype `tx` and the dashboards read |
+| `tenx-raw-events` | Raw events of the same sources, such as those indexed before the Receiver, that `tx` and `txf` return as they are; names none by default (see [Raw Events from Before the Receiver](#raw-events-from-before-the-receiver)) |
 | `tenx-templates` | Where the searchable copies of the templates are, for `tx` |
 
 #### Search Surfaces
@@ -376,7 +377,31 @@ Several compact indexes, one of them with a field map:
 (index=app_compact OR index=win_compact) (sourcetype::tenx_encoded OR tenx_compact_st::tenx_win)
 ```
 
-Naming the index makes every panel faster.
+Naming the index makes every panel faster. Raw events of the same sources, such as those
+indexed before the Receiver, are named in a second macro; see the next section.
+
+### Raw Events from Before the Receiver
+
+A source that sent raw events before the Receiver was installed keeps them in its index, next to
+its compact events. `tx` and `txf` read the compact events (`tenx-events`) and the raw events the
+`tenx-raw-events` macro names. That macro names none by default, so a search over both periods
+returns only the compact events. To have one search return both, name the raw events there by
+index and sourcetype, in the indexed form:
+
+```spl
+index=web (sourcetype::access_combined OR sourcetype::fortigate_traffic)
+```
+
+Raw events come back as they were indexed, with the fields Splunk gives them; compact events are
+expanded. Search fields across both periods with `txf`: through `tx`, a compact event has only the
+fields in its text, while a raw event also has its add-on's fields. Only `tx` and `txf` read this
+macro; the dashboards and the field replay read `tenx-events` alone.
+
+When the indexes a `tx` or `txf` search reads hold raw events of the original sourcetype of its
+compact events, in its time range, and `tenx-raw-events` does not name them, the search shows a
+warning. The check needs compact events that carry `tenx_sourcetype` (see
+[Fields of the Original Sourcetype](#fields-of-the-original-sourcetype-txf)); without it, set the
+macro when a source moves to the Receiver.
 
 ---
 
@@ -669,7 +694,10 @@ index=wineventlog `txf(XmlWinEventLog)` EventCode=4625 | stats count by user
 ```
 
 `txf(<sourcetype>)` applies the rules of that one sourcetype and starts faster. It returns the other compact events in range as well, without those rules, so where an index holds other sourcetypes, name the sourcetype too: `tenx_sourcetype=<sourcetype>` before the macro, or `sourcetype=<sourcetype>` after it. `txf` applies the
-rules of every original sourcetype the app has recorded in the compact indexes.
+rules of every original sourcetype the app has recorded in the compact indexes, up to
+`replay_max_macro_chars` characters (tenx_config.conf); past that it holds the busiest
+sourcetypes, a `txf` search over an index that holds one of the others shows a warning naming it,
+and `txf(<sourcetype>)` applies that sourcetype's rules.
 
 A field comparison after `txf` reads every compact event in range. When the value is written in the
 event (an event code, a user name), write it as a word too (`EventCode=4625 4625`): the same events,
@@ -1324,7 +1352,17 @@ The whole app also works on indexers and heavy forwarders, and its scheduled sea
 there with nothing to do. Replacing the whole app with the `_indexers` package on the indexers, or
 the reverse, takes one rolling restart; updating the whole app in place takes none. The template
 collection reaches the indexers in the knowledge bundle, so `tx` and `txf` need nothing more on
-them.
+them. A template stored by Consume KV reaches them with the next bundle, about a minute later;
+until then its events come back compact, with `tenx_expand_refused` set to `no-template`. For about
+a minute after the app is installed or upgraded on a search head, the template lookup itself has
+not reached the indexers yet: a `tx` search then reads no event and says so; retry in a minute.
+
+Consume KV writes the searchable copies of the templates with `collect` into the `tenx_dml` index,
+as events of the search head it runs on. Create that index where the search head's own events are
+indexed: on the search head, or on the indexers when the search head forwards its data to them.
+Where it is missing, Splunk drops the copies with a warning in `splunkd.log`, and the search
+rewrite (the `| tx` and `| tenxsearch` commands, the dashboard hook, compiled alerts) misses words
+that only templates hold. The `tx` and `txf` macros read the KV store and do not use the copies.
 
 ### Receiver Beside a Heavy Forwarder
 
