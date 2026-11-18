@@ -1354,8 +1354,8 @@ the reverse, takes one rolling restart; updating the whole app in place takes no
 collection reaches the indexers in the knowledge bundle, so `tx` and `txf` need nothing more on
 them. A template stored by Consume KV reaches them with the next bundle, about a minute later;
 until then its events come back compact, with `tenx_expand_refused` set to `no-template`. For about
-a minute after the app is installed or upgraded on a search head, the template lookup itself has
-not reached the indexers yet: a `tx` search then reads no event and says so; retry in a minute.
+a minute after the app is installed on a search head, its template lookup has not reached the
+indexers yet: a `tx` search then reads no event and says so; retry in a minute.
 
 Consume KV writes the searchable copies of the templates with `collect` into the `tenx_dml` index,
 as events of the search head it runs on. Create that index where the search head's own events are
