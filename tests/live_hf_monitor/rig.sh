@@ -13,7 +13,8 @@
 #            (FortiGate key=value lines); hard-linked, never changed
 #   ADDONS   folder holding Splunk_TA_windows, Splunk_TA_fortinet_fortigate, Splunk_SA_CIM (unpacked)
 #   P        container prefix (default tenx-hfm), SUB the /24 of its Docker network (default 172.87.0)
-#   RX       Receiver image (default log10x/edge-10x:1.1.181), FB fluent/fluent-bit:5.1.5,
+#   RX       Receiver image (default log10x/edge-10x:1.1.181), RXENV docker run options for the Receivers (such as
+#            "-e templateCreateAfter=3", for a build with that option), FB fluent/fluent-bit:5.1.5,
 #            SPLUNK splunk/splunk:10.4.3, UFIMG splunk/universalforwarder:10.4.3
 #
 # Four Splunk boxes: a Universal Forwarder sends the samples to a heavy forwarder, which parses them, writes
@@ -175,12 +176,12 @@ fluent(){
   local ARGS="@run/input/forwarder/fluentbit @apps/receiver" R=$W/opt/tenx/receiver n port
   for nm in wxml:24224 fgt:24226; do n=${nm%:*}; port=${nm#*:}; [ "$pass" = d ] && [ $n = wxml ] && continue
     if [ "$mode" = opt ]; then
-      docker run -d --name $P-rx-$n --network container:$P-fbback --cpus=1.5 -m 4g "$RX" $ARGS receiverOptimize true varMaxRecurIndexes 0 \
+      docker run -d --name $P-rx-$n --network container:$P-fbback --cpus=1.5 -m 4g ${RXENV:-} "$RX" $ARGS receiverOptimize true varMaxRecurIndexes 0 \
         timestampZone UTC timestampMaxPerObject 1 groupJoinLines false fluentbitInputPort $port fluentbitOutputHost 127.0.0.1 \
         fluentbitOutputPort 24225 fluentbitInputMessageField event >/dev/null
     else
       docker run -d --name $P-rx-$n --network container:$P-fbback --cpus=1.5 -m 4g \
-        -v "$R/compact-config.yaml:/etc/tenx/config/pipelines/run/receive/compact/config.yaml:ro" -v "$R/$n:/opt/tenx/receiver/$n" "$RX" $ARGS \
+        -v "$R/compact-config.yaml:/etc/tenx/config/pipelines/run/receive/compact/config.yaml:ro" -v "$R/$n:/opt/tenx/receiver/$n" ${RXENV:-} "$RX" $ARGS \
         varMaxRecurIndexes 0 timestampZone UTC timestampMaxPerObject 1 groupJoinLines false fluentbitInputPort $port \
         fluentbitOutputHost 127.0.0.1 fluentbitOutputPort 24225 fluentbitInputMessageField event \
         compactReceiverLookupFile /opt/tenx/receiver/$n/compact-cap.csv >/dev/null

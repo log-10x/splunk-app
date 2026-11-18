@@ -1817,7 +1817,7 @@ def read_lookup_file(path):
 
 def _lookup_groups(transform, compact_line):
 	"""The groups the static rule's regex gives for one compact line (groups[0] the whole subject), or None."""
-	head = re.match(r'^~?([^,]*)', compact_line)
+	head = re.match(r'^~([^,]*)', compact_line)
 	if head is None:
 		return None
 	ts = ''
@@ -3752,7 +3752,9 @@ def format_timestamp(epoch, fmt):
 
 
 def split_compact(line):
-	m = re.match(r'^~?([^,]+)(?:,(.*))?$', line)
+	"""(hash as written, values) of a compact line; (None, []) for a line that does not start with "~", an event
+	the Receiver sent as its own text."""
+	m = re.match(r'^~([^,]+)(?:,(.*))?$', line)
 	if m is None:
 		return None, []
 	return m.group(1), ([] if m.group(2) is None else m.group(2).split(','))
@@ -3820,6 +3822,7 @@ def verify(templates, field_map, encoded_path, raw_path, raw_split=None, out=sys
 	time_examples = []
 
 	lines = ok = 0
+	as_text = as_text_equal = 0
 	differs, no_template, no_transform, no_match = [], 0, 0, 0
 	fields_equal = explained_only = 0
 	reserved_dynamic = collections.Counter()
@@ -3833,6 +3836,16 @@ def verify(templates, field_map, encoded_path, raw_path, raw_split=None, out=sys
 		if not line:
 			continue
 		lines += 1
+		if not line.startswith('~'):
+			# An event sent as its own text (its template not made yet, or 65,535 characters or more): Splunk reads
+			# its text under the map's target sourcetype, so no transform applies; it must equal a raw event.
+			as_text += 1
+			if remaining[line.replace('\r', '')] > 0:
+				remaining[line.replace('\r', '')] -= 1
+				as_text_equal += 1
+			else:
+				differs.append(('(sent as text)', line[:120]))
+			continue
 		written, values = split_compact(line)
 		key = (written or '').strip()
 		t = templates.get(key)
@@ -3906,6 +3919,7 @@ def verify(templates, field_map, encoded_path, raw_path, raw_split=None, out=sys
 
 	result = collections.OrderedDict([
 		('compact_lines', lines), ('raw_events', raw_total), ('expanded_equal_raw', ok),
+		('lines_sent_as_text', as_text), ('sent_as_text_equal_raw', as_text_equal),
 		('expanded_differ', len(differs)), ('lines_without_template', no_template),
 		('lines_without_transform', no_transform), ('transform_regex_did_not_match', no_match),
 		('events_all_fields_equal', fields_equal), ('events_differing_only_as_reported', explained_only),
@@ -3915,7 +3929,9 @@ def verify(templates, field_map, encoded_path, raw_path, raw_split=None, out=sys
 	if rule is not None:
 		result['event_time_text'] = dict(time_counts)
 
-	out.write('expansion from marked text equals a raw event (CR removed): %d of %d\n' % (ok, lines))
+	out.write('expansion from marked text equals a raw event (CR removed): %d of %d\n' % (ok, lines - as_text))
+	if as_text:
+		out.write('lines sent as their own text (no leading "~") equal to a raw event: %d of %d\n' % (as_text_equal, as_text))
 	for d in differs[:5]:
 		out.write('  differs: %r\n' % (d,))
 	out.write('lines whose template is not in the records: %d\n' % no_template)
