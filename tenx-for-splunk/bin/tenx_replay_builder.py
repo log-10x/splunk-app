@@ -1621,6 +1621,10 @@ def build_unit(stanzas, sourcetype, seen, lookup_fields=None, keep_fields=(), re
 # replays nothing. Empty: neither.
 LEFT_OUT_KEY = 'left_out'
 
+# The tenx_replay.conf key that holds the top-level commands of a sourcetype's unit, for rewrite_replay() to
+# keep a chain of units within REPLAY_MAX_COMMANDS.
+COMMANDS_KEY = 'commands'
+
 
 def left_out_value(in_macro, replays_nothing):
 	"""The LEFT_OUT_KEY value of a sourcetype."""
@@ -1711,6 +1715,21 @@ def compose_units(sourcetypes):
 	return ' | '.join(parts)
 
 
+def chained_commands(counts):
+	"""The top-level commands of compose_units() over units of `counts` commands each, `tenx-replay-tags` included."""
+	k = len(counts)
+	return sum(counts) + 2 * (k - 1) + (1 if k > 1 else 0) + top_level_commands(' | '.join(TAGS_STEPS))
+
+
+def _recorded_commands(value):
+	"""A stanza's COMMANDS_KEY as a number, or None when it holds none."""
+	try:
+		n = int(str(value.get(COMMANDS_KEY, '') or '').strip())
+	except ValueError:
+		return None
+	return n if n > 0 else None
+
+
 def _index_regex(pattern):
 	return re.compile('^' + '.*'.join(re.escape(p) for p in pattern.lower().split('*')) + '$')
 
@@ -1730,7 +1749,9 @@ def rewrite_replay(covered, indexes):
 	named, an index named that no stanza records, a wildcard, or every covered sourcetype
 	recorded for the indexes named, none of them left out of `tenx-replay` (LEFT_OUT_KEY):
 	`tenx-replay`. Otherwise the units of the sourcetypes recorded for those indexes, or
-	`tenx-replay` when one of them has no working unit (its stanza says `unit =`).
+	`tenx-replay` when one of them has no working unit (its stanza says `unit =`), when their
+	chain would hold more than REPLAY_MAX_COMMANDS top-level commands, or when a stanza does not
+	say how many its unit holds (COMMANDS_KEY).
 
 	Correct results first: the record of indexes lags the data (the next "When New" rebuild,
 	5 minutes; longer while a rebuild fails), and an index it does not know may hold events of
@@ -1781,6 +1802,11 @@ def rewrite_replay(covered, indexes):
 	left_out = any('txf' in str((covered[st] if isinstance(covered[st], dict) else {}).get(LEFT_OUT_KEY) or '').split(',')
 				   for st in chosen)
 	if len(chosen) == len(sts) and not left_out:
+		return FULL
+	# Splunk refuses a search past its command limit, and a chain of units has none of its own: a chain past
+	# REPLAY_MAX_COMMANDS, or of a unit whose size the record does not hold, is `tenx-replay`, which keeps to it.
+	counts = [_recorded_commands(covered[st] if isinstance(covered[st], dict) else {}) for st in chosen]
+	if None in counts or chained_commands(counts) > REPLAY_MAX_COMMANDS:
 		return FULL
 	return compose_units(chosen)
 

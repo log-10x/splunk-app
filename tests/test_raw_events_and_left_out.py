@@ -205,7 +205,8 @@ class TestTheRecordAndTheRewrite:
 		assert b.unit_sourcetypes(present, settings=dict(b.DEFAULT_SETTINGS, replay_max_sourcetypes=2)) == ['a', 'b']
 
 	def test_the_rewrite_chains_units_where_the_macro_leaves_a_sourcetype_out(self):
-		covered = {'a': {'indexes': 'x', 'unit': b.unit_macro('a')}, 'b': {'indexes': 'x', 'unit': b.unit_macro('b')}}
+		covered = {'a': {'indexes': 'x', 'unit': b.unit_macro('a'), b.COMMANDS_KEY: '40'},
+				   'b': {'indexes': 'x', 'unit': b.unit_macro('b'), b.COMMANDS_KEY: '30'}}
 		assert b.rewrite_replay(covered, ['x']) == b.FULL
 		covered['b']['left_out'] = 'txf'
 		assert b.rewrite_replay(covered, ['x']) == b.compose_units(['a', 'b'])
@@ -381,6 +382,25 @@ class TestTheLookupOnTheIndexers:
 				'the particular search.')
 		assert pp.lookup_failed({'messages': [{'type': 'ERROR', 'text': peer}]}) == peer[:300]
 		assert pp.lookup_failed({'messages': [{'type': 'WARN', 'text': peer}]}) is None
+		missing = "The lookup table 'tenx-dml-lookup' does not exist or is not available."
+		assert pp.lookup_failed({'messages': [{'type': 'ERROR', 'text': missing}]}) == missing
+
+	def test_another_lookup_error_is_not_the_template_lookups(self):
+		# an add-on's automatic lookup failing on the probe's events, or the KV store starting on the search head:
+		# neither is the bundle that has not reached the indexers, so the search runs and shows its own error
+		for text in ("Streamed search execute failed because: Error in 'lookup' command: Could not construct lookup "
+					 "'cisco_asa_action_lookup, action, OUTPUT, vendor_action'. See search.log for more details.",
+					 "The lookup table 'fortinet_fortigate_action_lookup' does not exist or is not available.",
+					 "Could not create KvStore External command based lookup 'tenx-dml-lookup': KV Store initializing",
+					 "External search command 'addon_cmd' ended prematurely."):
+			assert pp.lookup_failed({'messages': [{'type': 'ERROR', 'text': text}]}) is None, text
+
+	def test_an_add_on_lookup_error_does_not_hold_the_search(self):
+		addon = {'messages': [{'type': 'ERROR', 'text': "Error in 'lookup' command: Could not construct lookup "
+														"'cisco_asa_action_lookup, action, OUTPUT, vendor_action'."}],
+				 'results': []}
+		out = self.run('absent', 2, addon)
+		assert out['out'][0]['search'] != pp.ON_SEARCH_HEAD and pp.NOT_ON_INDEXERS not in out['warnings']
 
 	def test_while_the_lookup_fails_on_the_indexers_the_search_stays_on_the_search_head(self):
 		out = self.run('absent', 2, FAILED)

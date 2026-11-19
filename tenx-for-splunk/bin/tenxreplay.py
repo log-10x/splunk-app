@@ -517,6 +517,9 @@ class TenxReplayCommand(GeneratingCommand):
 			if seen:
 				want.update(hosts=builder.listed_value(seen['hosts']), indexes=builder.listed_value(seen['indexes']),
 							unit='' if st in failed else builder.unit_macro(st))
+				# The unit's size, which keeps the search rewrite's chain of units within Splunk's command limit.
+				want[builder.COMMANDS_KEY] = ('' if st in failed or st not in (units or {}) else
+											  str(builder.top_level_commands(units[st].spl())))
 			have = existing.get(st)
 			if have is None:
 				self._rest(self._ns('configs/conf-%s' % CONF), dict(want, name=st))
@@ -525,7 +528,8 @@ class TenxReplayCommand(GeneratingCommand):
 			elif any(have.get(k, '') != v for k, v in want.items()):
 				self._rest(self._ns('configs/conf-%s/%s' % (CONF, urllib.parse.quote(st, safe=''))), want)
 				changed.append(st)
-				if any(k in want and have.get(k, '') != want[k] for k in ('indexes', 'unit', builder.LEFT_OUT_KEY)):
+				if any(k in want and have.get(k, '') != want[k] for k in ('indexes', 'unit', builder.LEFT_OUT_KEY,
+																		  builder.COMMANDS_KEY)):
 					self.rewrite_changed.append(st)
 		if nocarrier is not None:
 			moved = self._write_nocarrier(existing.get(builder.NOCARRIER_STANZA), nocarrier)
