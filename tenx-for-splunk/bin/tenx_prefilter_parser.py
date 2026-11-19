@@ -735,7 +735,7 @@ def narrowing_on(config):
 	return str((config or {}).get("field_narrowing", "") or "").strip().lower() in ("1", "true", "t", "yes", "y")
 
 
-# Field narrowing from Splunk's own index terms (tenx_config.conf field_narrowing = splunk, the default).
+# Field narrowing from Splunk's own index terms (tenx_config.conf field_narrowing = splunk; off by default).
 #
 # A field comparison on raw events reads only the events that hold the index terms Splunk derives
 # for it: Splunk expands the field's aliases, event types and tags, and leaves out a value it cannot
@@ -802,13 +802,23 @@ def lispy_probe(text, macro):
 
 
 def lispy_from_log(log):
-	"""The last base lispy a search.log text holds, or None."""
-	found = None
+	"""
+	The base lispy a search.log text holds, or None: none at all, or lines that do not all say the
+	same, are not read (which one is the search's own is not known, so nothing is narrowed).
+	"""
+	found = set()
 	for line in (log or "").splitlines():
 		m = LISPY_LINE.search(line)
 		if m:
-			found = m.group(1)
-	return found
+			found.add(m.group(1))
+	return found.pop() if len(found) == 1 else None
+
+
+# The warning of a search whose field comparisons could have narrowed with field_narrowing = splunk, when
+# Splunk's index terms for them could not be read (no probe, no base lispy in its log, or one this does not
+# read): the comparisons then narrow nothing, as with field_narrowing = false.
+SPLUNK_TERMS_UNREAD = ("tx: field_narrowing = splunk, but Splunk's index terms for the field comparisons could not be "
+					   "read, so they do not narrow which compact events are read.")
 
 
 def lispy_tree(lispy):
@@ -1410,11 +1420,16 @@ def dictionary_from_rows(rows, pieces=None):
 # written again (refreshed, replaced, marked hash-conflict) gets a new hour and is read again; a
 # template removed from the store stays in the kept answer, which can only select more events. A
 # record counted twice can only raise n past MAX_TEMPLATES, which narrows less. Every
-# CACHE_FULL_SECONDS, or when a piece has no kept answer, every record is read again.
+# CACHE_FULL_SECONDS, or when a piece has no kept answer, every record is read again, and so it is after
+# an install or an upgrade and after a load from the start of the index (cache_valid_from): records
+# restored into the store come back with the hours they had. The margin CACHE_LAG_SECONDS covers the
+# save of one chunk, the KV store's copy to the other members of a search head cluster and the
+# difference of their clocks together; a record that takes longer to become readable on a member is
+# missed there by the partial reads until the next full read.
 CACHE_PATH = "/servicesNS/nobody/tenx-for-splunk/storage/collections/data/tenx_dict_cache"
 STORED_HOUR = "stored_hour"
-# Longer than the Consume KV alert action may run (alert_actions.conf maxtime 10m) and than the clocks
-# of search heads in one cluster may differ.
+# Longer than the Consume KV alert action may run (alert_actions.conf maxtime 10m), with what the clocks
+# of search heads in one cluster may differ added.
 CACHE_LAG_SECONDS = 900
 CACHE_FULL_SECONDS = 86400
 FORMATS_KEY = "formats"
@@ -1433,13 +1448,36 @@ def cache_keys(pieces, formats=False):
 	return sorted(cache_key(p) for p in pieces) + ([FORMATS_KEY] if formats else [])
 
 
-def cache_hours(entries, pieces, formats, now):
+def cache_valid_from(state):
+	"""
+	The time before which no kept answer is used, from the Consume KV record `state`: the start of
+	this version's first run (version_since: an install or an upgrade, which may read templates
+	differently) or of the last load from the start of the index (dict_reset: the documented step after
+	the template store was emptied or restored, whose records come back with the hours they had).
+	None when there is no record or it cannot be read: then every record is read.
+	"""
+	if not isinstance(state, dict) or not state:
+		return None
+	times = []
+	for key in ("version_since", "dict_reset"):
+		try:
+			times.append(float(state.get(key) or 0))
+		except (TypeError, ValueError):
+			return None
+	return max(times)
+
+
+def cache_hours(entries, pieces, formats, now, valid_from=None):
 	"""
 	The stored_hour values a search reads to complete the kept answers `entries` ({key: record}) for
 	`pieces` (and the timestamp formats when `formats`): every hour from the earliest through_hour
-	among them to the hour of `now`. None, read every record, when one is missing or unreadable, was
-	last read in full more than CACHE_FULL_SECONDS ago, or carries a time after `now`.
+	among them to the hour of `now` + CACHE_LAG_SECONDS (a record stamped by a clock ahead of this
+	one). None, read every record, when one is missing or unreadable, was last read in full more than
+	CACHE_FULL_SECONDS ago or before `valid_from` (cache_valid_from(); None: no kept answer is
+	used), or carries a time after `now`.
 	"""
+	if valid_from is None:
+		return None
 	starts = []
 	for key in cache_keys(pieces, formats):
 		entry = (entries or {}).get(key)
@@ -1447,12 +1485,12 @@ def cache_hours(entries, pieces, formats, now):
 			full_at, through = float(entry["full_at"]), int(float(entry["through_hour"]))
 		except (KeyError, TypeError, ValueError):
 			return None
-		if not 0 <= now - full_at <= CACHE_FULL_SECONDS or through > hour_of(now):
+		if not 0 <= now - full_at <= CACHE_FULL_SECONDS or full_at < valid_from or through > hour_of(now):
 			return None
 		starts.append(through)
 	if not starts:
 		return None
-	return [str(h) for h in range(min(starts), hour_of(now) + 1)]
+	return [str(h) for h in range(min(starts), hour_of(now + CACHE_LAG_SECONDS) + 1)]
 
 
 def format_keys_from_rows(rows):

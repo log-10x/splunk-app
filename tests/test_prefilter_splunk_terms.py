@@ -1,5 +1,5 @@
 """
-Field narrowing from Splunk's own index terms (tenx_config.conf field_narrowing = splunk, the default).
+Field narrowing from Splunk's own index terms (tenx_config.conf field_narrowing = splunk; the default is false).
 
 A field comparison after `tx` or `txf` narrows the compact events by the index terms Splunk requires of
 raw events for that comparison (its base lispy, read from a probe job's search.log). Each term is
@@ -19,7 +19,7 @@ ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
 STORED = [("%Y-%m-%dT%H:%M:%S.%7QZ", False, False), ("%H:%M:%S", False, False)]
 D = {"error": (10, ["TERM(~e1)"]), "success": (4, ["TERM(~s1)", "TERM(~s2)"]), "kerberos": (2, ["TERM(~k1)"])}
 LOG = """11-19-2026 10:00:00.100 INFO  SearchParser [123 searchOrchestrator] - PARSING: search EventCode=4625 | head 1
-11-19-2026 10:00:00.200 INFO  UnifiedSearch [123 searchOrchestrator] - base lispy: [ AND 4625 index::main ]
+11-19-2026 10:00:00.200 INFO  UnifiedSearch [123 searchOrchestrator] - base lispy: [ AND 4625 [ OR kerberos error ] ]
 11-19-2026 10:00:00.300 INFO  UnifiedSearch [123 searchOrchestrator] - base lispy: [ AND 4625 [ OR kerberos error ] ]
 """
 
@@ -57,9 +57,10 @@ class TestTheSetting:
 		for off in ({'field_narrowing': 'false'}, {'field_narrowing': ''}, {}, None, {'field_narrowing': 'maybe'}):
 			assert p.narrowing_mode(off) == 'off', off
 
-	def test_shipped_default_is_splunk_and_the_list_stays_off(self):
+	def test_shipped_default_is_off(self):
+		# splunk is not the default until a live run has shown the base lispy in a probe's log
 		app = os.path.join(ROOT, 'tenx-for-splunk')
-		assert p.narrowing_mode_on_disk(app) == 'splunk'
+		assert p.narrowing_mode_on_disk(app) == 'off'
 		assert not p.narrowing_on_disk(app)
 
 	def test_unreadable_is_off(self, tmp_path):
@@ -91,10 +92,15 @@ class TestTheProbe:
 
 class TestReadingTheLispy:
 
-	def test_the_last_base_lispy_of_the_log(self):
+	def test_the_base_lispy_of_the_log(self):
 		assert p.lispy_from_log(LOG) == "[ AND 4625 [ OR kerberos error ] ]"
 		assert p.lispy_from_log("no such line\n") is None
 		assert p.lispy_from_log(None) is None
+
+	def test_lines_that_differ_are_not_read(self):
+		# which one is the search's own is not known: nothing is narrowed on a guess
+		two = LOG + "11-19-2026 10:00:00.400 INFO  UnifiedSearch [123 searchOrchestrator] - base lispy: [ AND 4625 ]\n"
+		assert p.lispy_from_log(two) is None
 
 	def test_terms_and_operators(self):
 		assert p.lispy_tree("[ AND 4625 index::main ]") == ("text", "4625")
@@ -228,3 +234,79 @@ class TestTheCommand:
 	def test_a_subsearch_starts_no_probe(self):
 		out = self.run('user=[| inputlookup users | return user]')
 		assert out == {'terms': None, 'calls': []}
+
+
+GENERATE = r"""
+import json, os, sys, types
+
+root, home, text, mode, terms = sys.argv[1:6]
+os.makedirs(os.path.join(home, 'var', 'log', 'splunk'), exist_ok=True)
+os.environ['SPLUNK_HOME'] = home
+splunk = types.ModuleType('splunk')
+clilib = types.ModuleType('splunk.clilib')
+bundle_paths = types.ModuleType('splunk.clilib.bundle_paths')
+bundle_paths.get_base_path = lambda: root
+clilib.bundle_paths = bundle_paths
+splunk.clilib = clilib
+sys.modules.update({'splunk': splunk, 'splunk.clilib': clilib, 'splunk.clilib.bundle_paths': bundle_paths})
+sys.path.insert(0, os.path.join(root, 'tenx-for-splunk', 'lib'))
+sys.path.insert(0, os.path.join(root, 'tenx-for-splunk', 'bin'))
+import tenx_prefilter
+tenx_prefilter.parser.narrowing_mode_on_disk = lambda home: mode
+
+cmd = tenx_prefilter.TenxPrefilterCommand()
+warnings, probes, looked = [], [], []
+cmd._store_check = lambda: True
+cmd._search_text = lambda: text
+cmd._store_wild_plan = lambda t: None
+cmd._original_sourcetype_rows = lambda tree: ([], '`txf`')
+cmd._record_checks = lambda macro: None
+cmd._text_field = lambda: None
+def splunk_terms(t):
+	probes.append(t)
+	return None if terms == 'none' else tenx_prefilter.parser.lispy_tree(terms)
+cmd._splunk_terms = splunk_terms
+def dictionary(pieces, formats):
+	looked.append(sorted(pieces))
+	return dict((x, (1, ['TERM(~h_%s)' % x])) for x in pieces), None
+cmd._dictionary = dictionary
+cmd.write_warning = warnings.append
+out = list(cmd.generate())
+print(json.dumps({'out': out, 'warnings': warnings, 'probes': probes, 'looked': looked}))
+"""
+
+
+class TestTheSearch:
+	"""What tenxprefilter does with the setting, the probe's answer and the words."""
+
+	def run(self, text, mode, terms):
+		import json
+		import subprocess
+		import sys
+		import tempfile
+		with tempfile.TemporaryDirectory() as home:
+			proc = subprocess.run([sys.executable, '-c', GENERATE, ROOT, home, text, mode, terms],
+								  capture_output=True, text=True, timeout=60)
+		assert proc.returncode == 0, proc.stderr[-3000:]
+		return json.loads(proc.stdout.strip().splitlines()[-1])
+
+	def test_off_runs_no_probe_and_narrows_nothing(self):
+		out = self.run('EventCode=4625', 'off', '[ AND 4625 ]')
+		assert out['probes'] == [] and out['warnings'] == [] and out['out'] == [{'search': '(*)'}]
+
+	def test_splunk_narrows_by_the_terms_it_read(self):
+		out = self.run('EventCode=4625 kerberos', 'splunk', '[ AND alice ]')
+		assert out['probes'] == ['EventCode=4625 kerberos'] and out['warnings'] == []
+		assert out['looked'] == [['alice', 'kerberos']]
+		assert 'TERM(alice)' in out['out'][0]['search'] and 'TERM(kerberos)' in out['out'][0]['search']
+
+	def test_terms_it_cannot_read_narrow_nothing_and_the_search_says_so(self):
+		out = self.run('EventCode=4625 kerberos', 'splunk', 'none')
+		assert out['warnings'] == [p.SPLUNK_TERMS_UNREAD] and len(p.SPLUNK_TERMS_UNREAD) <= 256
+		# the search is narrowed by its words alone, as with field_narrowing = false
+		assert out['looked'] == [['kerberos']] and out['out'] == [{'search': '(((TERM(kerberos) OR TERM(~h_kerberos))))'}]
+		assert self.run('EventCode=4625 kerberos', 'off', 'none')['out'] == out['out']
+
+	def test_terms_that_require_nothing_narrow_nothing_without_a_warning(self):
+		out = self.run('EventCode=4625', 'splunk', '[ AND index::main ]')
+		assert out['warnings'] == [] and out['out'] == [{'search': '(*)'}]

@@ -8,11 +8,11 @@ after `tx` (tenx_prefilter_parser), asks the KV store of templates which templat
 word, and returns one row whose `search` field is the prefilter.
 
 A field comparison (field=value, field IN (...)) narrows by tenx_config.conf [config] field_narrowing.
-splunk (the default): the compact events must hold the index terms Splunk itself requires of raw
-events for the comparison, read from a probe job's base lispy (_splunk_terms); when they cannot be
-read, no field comparison restricts the prefilter. true: like the value written as a word, once
-tenxreplay has written the list of fields whose value is not text of the event, and the field is
-not on it. false: no field comparison restricts the prefilter.
+false (the default): no field comparison restricts the prefilter. splunk: the compact events must
+hold the index terms Splunk itself requires of raw events for the comparison, read from a probe
+job's base lispy (_splunk_terms); when they cannot be read, no field comparison restricts the
+prefilter and the search shows a warning. true: like the value written as a word, once tenxreplay
+has written the list of fields whose value is not text of the event, and the field is not on it.
 
 The template dictionary (which templates carry each piece of the words) is read from the KV store the
 expansion uses. The answer for each piece is kept in the tenx_dict_cache collection, and a later search
@@ -264,6 +264,8 @@ class TenxPrefilterCommand(GeneratingCommand):
 				self.write_warning(parser.KV_NOT_READY)
 		except Exception:
 			state = False
+		# The record also says since when the prefilter's kept template answers may be used (_dictionary).
+		self.store_state = state if isinstance(state, dict) else None
 		if state is not False:
 			note = parser.store_warning(state, time.time())
 			if note:
@@ -330,7 +332,8 @@ class TenxPrefilterCommand(GeneratingCommand):
 		except Exception as e:
 			self.logger.info("tx: the kept template answers could not be read: %s", e)
 			entries = {}
-		hours = parser.cache_hours(entries, pieces, formats, started)
+		hours = parser.cache_hours(entries, pieces, formats, started,
+								   parser.cache_valid_from(getattr(self, "store_state", None)))
 		result = self._rest(
 			"/servicesNS/%s/%s/search/jobs" % (urllib.parse.quote(self._metadata.searchinfo.username), APP_NAME),
 			{"search": parser.dictionary_search(pieces, formats=formats, hours=hours), "exec_mode": "oneshot", "output_mode": "json",
@@ -391,7 +394,9 @@ class TenxPrefilterCommand(GeneratingCommand):
 			# field_narrowing = splunk: a field comparison requires the index terms Splunk itself
 			# requires of raw events for it, read as words (lookup_pieces, prefilter).
 			terms = self._splunk_terms(text)
-			if terms not in (None, parser.TRUE):
+			if terms is None:
+				self.write_warning(parser.SPLUNK_TERMS_UNREAD)
+			elif terms != parser.TRUE:
 				tree = ("and", [tree, terms])
 		# Runs of digits are looked up like words; the same read of the KV store returns the stored
 		# timestamp formats, which decide the runs that narrow (digit_pieces_cleared).

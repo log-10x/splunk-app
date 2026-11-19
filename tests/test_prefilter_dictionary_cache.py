@@ -59,20 +59,39 @@ class TestWhenToReadEverything:
 				p.FORMATS_KEY: {"formats": ["00|%H:%M:%S"], "full_at": full_at, "through_hour": through}}
 
 	def test_hours_since_the_kept_answer(self):
-		hours = p.cache_hours(self.records(), {"jsmith"}, True, NOW)
-		assert hours == [str(h) for h in range(p.hour_of(NOW - 60 - p.CACHE_LAG_SECONDS), p.hour_of(NOW) + 1)]
-		assert len(hours) in (1, 2)
+		hours = p.cache_hours(self.records(), {"jsmith"}, True, NOW, 0)
+		assert hours == [str(h) for h in range(p.hour_of(NOW - 60 - p.CACHE_LAG_SECONDS),
+											   p.hour_of(NOW + p.CACHE_LAG_SECONDS) + 1)]
+		assert len(hours) in (1, 2, 3)
+
+	def test_a_record_stamped_by_a_clock_ahead_is_read(self):
+		# Consume KV's clock up to CACHE_LAG_SECONDS ahead of this one stamps the next hour
+		now = (p.hour_of(NOW) + 1) * H - 60
+		hours = p.cache_hours(self.records(full_at=now - 60), {"jsmith"}, False, now, 0)
+		assert str(p.hour_of(now + 300)) in hours and p.hour_of(now + 300) == p.hour_of(now) + 1
+
+	def test_no_kept_answer_from_before_an_upgrade_or_a_reload(self):
+		records = self.records(full_at=NOW - 600)
+		# no Consume KV record, or one this cannot read: every record is read
+		assert p.cache_hours(records, {"jsmith"}, True, NOW, None) is None
+		assert p.cache_hours(records, {"jsmith"}, True, NOW, NOW - 601) is not None
+		assert p.cache_hours(records, {"jsmith"}, True, NOW, NOW - 599) is None
+		assert p.cache_valid_from(None) is None and p.cache_valid_from(False) is None and p.cache_valid_from({}) is None
+		assert p.cache_valid_from({"version_since": NOW - 900, "dict_reset": NOW - 300}) == NOW - 300
+		assert p.cache_valid_from({"version_since": str(NOW - 900)}) == NOW - 900
+		assert p.cache_valid_from({"updated": NOW}) == 0
+		assert p.cache_valid_from({"version_since": "x"}) is None
 
 	def test_everything_when_an_answer_is_missing_or_old(self):
-		assert p.cache_hours({}, {"jsmith"}, False, NOW) is None
-		assert p.cache_hours(self.records(), {"jsmith", "error"}, False, NOW) is None
-		assert p.cache_hours({p.cache_key("jsmith"): self.records()[p.cache_key("jsmith")]}, {"jsmith"}, True, NOW) is None
-		assert p.cache_hours(self.records(full_at=NOW - p.CACHE_FULL_SECONDS - 1), {"jsmith"}, False, NOW) is None
-		assert p.cache_hours(self.records(full_at=NOW + 60), {"jsmith"}, False, NOW) is None
-		assert p.cache_hours(self.records(through=p.hour_of(NOW) + 1), {"jsmith"}, False, NOW) is None
+		assert p.cache_hours({}, {"jsmith"}, False, NOW, 0) is None
+		assert p.cache_hours(self.records(), {"jsmith", "error"}, False, NOW, 0) is None
+		assert p.cache_hours({p.cache_key("jsmith"): self.records()[p.cache_key("jsmith")]}, {"jsmith"}, True, NOW, 0) is None
+		assert p.cache_hours(self.records(full_at=NOW - p.CACHE_FULL_SECONDS - 1), {"jsmith"}, False, NOW, 0) is None
+		assert p.cache_hours(self.records(full_at=NOW + 60), {"jsmith"}, False, NOW, 0) is None
+		assert p.cache_hours(self.records(through=p.hour_of(NOW) + 1), {"jsmith"}, False, NOW, 0) is None
 		bad = self.records()
 		bad[p.cache_key("jsmith")]["full_at"] = "x"
-		assert p.cache_hours(bad, {"jsmith"}, False, NOW) is None
+		assert p.cache_hours(bad, {"jsmith"}, False, NOW, 0) is None
 
 	def test_keys(self):
 		assert p.cache_key("valkey*") == "p_valkey-" and p.cache_key("*key") == "p_-key"
@@ -107,7 +126,7 @@ class TestNeverNarrowerThanEveryRecord:
 			seen = [t for t, w in zip(templates, times) if w + rnd.randint(0, p.CACHE_LAG_SECONDS - 1) < S]
 			kept = entries_of(p.cache_records(self.answer(pieces, seen), set(), pieces, False, S))
 			later = NOW
-			hours = p.cache_hours(kept, pieces, False, later)
+			hours = p.cache_hours(kept, pieces, False, later, 0)
 			assert hours is not None
 			read = [t for t, w in zip(templates, times) if str(p.hour_of(w)) in hours]
 			merged, _ = p.cache_merge(kept, self.answer(pieces, read), set(), pieces, False)
@@ -122,7 +141,7 @@ class TestNeverNarrowerThanEveryRecord:
 		pieces = {"jsmith"}
 		kept = entries_of(p.cache_records(self.answer(pieces, [("h1", "nothing here")]), set(), pieces, False, NOW - 2 * H))
 		# h1 refreshed later with new text, stamped with its new hour
-		hours = p.cache_hours(kept, pieces, False, NOW)
+		hours = p.cache_hours(kept, pieces, False, NOW, 0)
 		merged, _ = p.cache_merge(kept, self.answer(pieces, [("h1", "jsmith logged in")]), set(), pieces, False)
 		assert str(p.hour_of(NOW)) in hours and merged["jsmith"] == (1, ["TERM(~h1)"])
 
@@ -174,11 +193,27 @@ class TestConsumeKvStampsTheHour:
 		assert kv.records['h1'][tenx_dml_intf.STORED_HOUR] == str(p.hour_of(NOW + 3 * H))
 		assert p.STORED_HOUR == tenx_dml_intf.STORED_HOUR
 
+	def test_a_load_from_the_start_of_the_index_marks_the_kept_answers_old(self, monkeypatch, tmp_path):
+		# the step after the store was emptied or restored: records restored come back with the hours they had,
+		# so no answer kept before this load is used again
+		from test_tenx_dml_to_kv import FakeSplunk, consume, flood
+		import time
+		splunk, kv, state = FakeSplunk(flood(10, 1700000000)), StoreKV(), StoreKV()
+		consume(monkeypatch, tmp_path, splunk, kv, state)
+		assert p.cache_valid_from(state.records['consume_kv']) == float(state.records['consume_kv']['version_since'])
+		before = int(time.time())
+		consume(monkeypatch, tmp_path, splunk, kv, state, configuration={'from': '0'})
+		reset = state.records['consume_kv'][tenx_dml_to_kv.STATE_DICT_RESET]
+		assert before <= int(reset) <= int(time.time()) and p.cache_valid_from(state.records['consume_kv']) == float(reset)
+		# a scheduled run after it keeps the mark
+		consume(monkeypatch, tmp_path, splunk, kv, state)
+		assert state.records['consume_kv'][tenx_dml_to_kv.STATE_DICT_RESET] == reset
+
 
 COMMAND = r'''
 import json, os, sys, types, urllib.parse
 
-root, home, cached, rows, now = sys.argv[1:6]
+root, home, cached, rows, now, state = sys.argv[1:7]
 os.makedirs(os.path.join(home, 'var', 'log', 'splunk'), exist_ok=True)
 os.environ['SPLUNK_HOME'] = home
 splunk = types.ModuleType('splunk')
@@ -206,6 +241,8 @@ def rest(path, data=None, answer=True, method=None):
 	calls.append(['search', data['search']])
 	return {'results': json.loads(rows)}
 cmd._kv, cmd._rest = kv, rest
+# the Consume KV record _store_check read
+cmd.store_state = json.loads(state)
 d, f = cmd._dictionary({'jsmith'}, True)
 print(json.dumps({'dictionary': d, 'formats': f, 'calls': calls}))
 '''
@@ -213,9 +250,10 @@ print(json.dumps({'dictionary': d, 'formats': f, 'calls': calls}))
 
 class TestTheCommand:
 
-	def run(self, cached, rows):
+	def run(self, cached, rows, state={'version_since': NOW - 3600}):
 		with tempfile.TemporaryDirectory() as home:
-			proc = subprocess.run([sys.executable, '-c', COMMAND, ROOT, home, cached, json.dumps(rows), str(NOW)],
+			proc = subprocess.run([sys.executable, '-c', COMMAND, ROOT, home, cached, json.dumps(rows), str(NOW),
+								   json.dumps(state)],
 								  capture_output=True, text=True, timeout=60)
 		assert proc.returncode == 0, proc.stderr[-3000:]
 		return json.loads(proc.stdout.strip().splitlines()[-1])
@@ -233,10 +271,19 @@ class TestTheCommand:
 		kept = p.cache_records({'jsmith': (2, ['TERM(~a)', 'TERM(~b)'])}, {'00|%H:%M:%S'}, {'jsmith'}, True, NOW - 600)
 		out = self.run(json.dumps(kept), [{"n0": "1", "hs0": "TERM(~c)", "tenx_formats": "11|%Y"}])
 		assert len(out['calls']) == 2
-		hours = p.cache_hours(entries_of(kept), {'jsmith'}, True, NOW)
+		hours = p.cache_hours(entries_of(kept), {'jsmith'}, True, NOW, NOW - 3600)
 		assert out['calls'][1][1] == p.dictionary_search({'jsmith'}, formats=True, hours=hours)
 		assert out['dictionary'] == {'jsmith': [3, ['TERM(~a)', 'TERM(~b)', 'TERM(~c)']]}
 		assert sorted(map(tuple, out['formats'])) == [('%H:%M:%S', False, False), ('%Y', True, True)]
+
+	def test_a_kept_answer_from_before_a_reload_is_not_used(self):
+		kept = p.cache_records({'jsmith': (2, ['TERM(~a)', 'TERM(~b)'])}, {'00|%H:%M:%S'}, {'jsmith'}, True, NOW - 600)
+		out = self.run(json.dumps(kept), [{"n0": "1", "hs0": "TERM(~c)"}], state={'version_since': NOW - 3600, 'dict_reset': NOW - 300})
+		assert out['calls'][1][1] == p.dictionary_search({'jsmith'}, formats=True)
+		assert out['dictionary'] == {'jsmith': [1, ['TERM(~c)']]}
+		# no Consume KV record read: no kept answer is used
+		out = self.run(json.dumps(kept), [{"n0": "1", "hs0": "TERM(~c)"}], state=None)
+		assert out['calls'][1][1] == p.dictionary_search({'jsmith'}, formats=True)
 
 	def test_a_cache_it_cannot_read_or_write_means_a_full_read(self):
 		out = self.run('fail', [{"n0": "1", "hs0": "TERM(~a)"}])
