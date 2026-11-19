@@ -375,6 +375,24 @@ class TestTheLookupOnTheIndexers:
 		assert pp.lookup_failed(FAILED).startswith("Streamed search execute failed")
 		assert pp.lookup_failed({'messages': [{'type': 'WARN', 'text': 'lookup slow'}]}) is None
 		assert pp.lookup_failed({'results': [{'tenx_probe': 'x'}]}) is None
+		missing = "The lookup table 'tenx-dml-lookup' does not exist or is not available."
+		assert pp.lookup_failed({'messages': [{'type': 'ERROR', 'text': missing}]}) == missing
+
+	def test_another_lookup_error_is_not_the_template_lookups(self):
+		# an add-on's automatic lookup failing on the probe's events, or the KV store starting on the search head:
+		# neither is the bundle that has not reached the indexers, so the search runs and shows its own error
+		for text in ("Streamed search execute failed because: Error in 'lookup' command: Could not construct lookup "
+					 "'cisco_asa_action_lookup, action, OUTPUT, vendor_action'. See search.log for more details.",
+					 "The lookup table 'fortinet_fortigate_action_lookup' does not exist or is not available.",
+					 "Could not create KvStore External command based lookup 'tenx-dml-lookup': KV Store initializing"):
+			assert pp.lookup_failed({'messages': [{'type': 'ERROR', 'text': text}]}) is None, text
+
+	def test_an_add_on_lookup_error_does_not_hold_the_search(self):
+		addon = {'messages': [{'type': 'ERROR', 'text': "Error in 'lookup' command: Could not construct lookup "
+														"'cisco_asa_action_lookup, action, OUTPUT, vendor_action'."}],
+				 'results': []}
+		out = self.run('absent', 2, addon)
+		assert out['out'][0]['search'] != pp.ON_SEARCH_HEAD and pp.NOT_ON_INDEXERS not in out['warnings']
 
 	def test_while_the_lookup_fails_on_the_indexers_the_search_stays_on_the_search_head(self):
 		out = self.run('absent', 2, FAILED)

@@ -1687,11 +1687,21 @@ def new_version(state, version, now):
 		return False
 
 
+# What says the template lookup is not on the indexers: Splunk's error naming tenx-dml-lookup as one it cannot
+# construct or find (the message measured above). Any other error of the probe is not this one: an add-on's
+# automatic lookup that fails on the probe's events, or the KV store starting on the search head. The search
+# then runs as it would and shows its own error.
+LOOKUP_NAME = "tenx-dml-lookup"
+LOOKUP_MISSING = ("could not construct lookup", "does not exist or is not available")
+
+
 def lookup_failed(result):
-	"""The text of an error of LOOKUP_PROBE's answer that says the template lookup cannot run, or None."""
+	"""The text of an error of LOOKUP_PROBE's answer that says the template lookup cannot run on the indexers
+	(LOOKUP_NAME with one of LOOKUP_MISSING), or None."""
 	for message in (result or {}).get("messages", []) or []:
 		kind, text = str(message.get("type", "")).upper(), str(message.get("text", ""))
-		if kind in ("ERROR", "FATAL") and "lookup" in text.lower():
+		low = text.lower()
+		if kind in ("ERROR", "FATAL") and LOOKUP_NAME in low and any(m in low for m in LOOKUP_MISSING):
 			return text[:300]
 	return None
 
