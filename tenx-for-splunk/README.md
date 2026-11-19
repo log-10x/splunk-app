@@ -933,6 +933,12 @@ has its own cap file and its own scheduled `check`.
    event on, send the mapped source with the map's compact sourcetype (`tenx_win` below), so whole
    and compact events of that source share it.
 
+   Install the map before the first event: run the `gen` command of step 4 without its `--records`
+   arguments, then step 5; step 4 later adds the templates. The map's rules apply to whole events as
+   well, mostly while Splunk indexes them, so an event indexed before the map is installed can keep
+   the compact sourcetype, lack the field `tx` finds it by, or, where a heavy forwarder reads the
+   Receiver's output, be merged with the lines after it.
+
 2. Let the **Consume KV** saved search store the template records (it runs every five minutes).
 
 3. Export the stored templates from the search head's KV store, 2,000 rows a page, until a page
@@ -982,7 +988,7 @@ has its own cap file and its own scheduled `check`.
    [Fields of the Original Sourcetype](#fields-of-the-original-sourcetype-txf), step 1, with
    `event_sourcetype tenx_win` and `event_source XmlWinEventLog:Security`: the add-on's Security
    rules apply only to events with that source. Restart a standalone instance or heavy forwarder
-   after the first install. On an indexer cluster, put both apps in `manager-apps` on the cluster
+   after installing them. On an indexer cluster, put both apps in `manager-apps` on the cluster
    manager and push the bundle; a new field map app reaches the peers without a restart.
 
 6. Create the probe index where the compact events are parsed: on a standalone instance or heavy
@@ -1358,7 +1364,8 @@ Collector sender can set the same field. A line the rule cannot read is indexed 
 when a rule of the heavy forwarder's own sets the index first.
 
 In this arrangement the heavy forwarder parses the compact events: it takes the `_indexers` package,
-the add-ons, and the field map apps with their floor apps, and the indexers take only the indexes
+the add-ons, and the field map apps with their floor apps, installed before the first event (field
+map, step 1), and the indexers take only the indexes
 (`tenx_dml`, `tenx_probe` and the compact indexes). Run `activate` and `check` with `--splunkd`
 naming the heavy forwarder and without `--probe-hec`: the probes are then parsed on the heavy
 forwarder, and `activate` checks the floor app there. Create `tenx_probe` on the heavy forwarder as
