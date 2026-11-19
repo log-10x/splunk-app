@@ -142,6 +142,7 @@ Usage
         --target windows-security | windows-security-classic | fortigate | <target.json> [--sourcetype ...] [--rename ...]
         [--addon <add-on dir>] --out <app dir>
     tenx_field_map.py gen --rules lookup --target ... --out <app dir>        (no --records: before the first event)
+    tenx_field_map.py gen --target fortigate --out <app dir>                 (no --records, no lookup: fields from the Receiver)
     tenx_field_map.py verify --records ... --target ... --encoded <encoded.log> --raw <raw.log>
     tenx_field_map.py gen --rules lookup ... --cap-file <compact cap file> [--splunkd <management URL> --probe-index <index>]
     tenx_field_map.py activate --app <app dir> --cap-file <compact cap file> --splunkd <management URL> --probe-index <index>
@@ -165,6 +166,15 @@ forwarder reads the Receiver's output folder), the compact sourcetype with sever
 empty lookup file and the floor app, to install before the first event of the source. A later gen with the records
 writes the same rules, the template rows, and the search-time rules some templates need (a restored reserved name, a
 copy of an add-on rule); activate names any stanza the installed app lacks.
+
+Fields from the Receiver
+------------------------
+With splunkFieldsForm, the Receiver sends each compact event's fields with it (HEC fields, or a line's meta that
+[tenx-record-unwrap] adds to _meta), and its time with the line. Splunk then needs no template row, lookup rule or
+time rule, only the rules that do not depend on templates: gen without --records and without --rules lookup writes
+those (parsing, tenx_compact_st, the original sourcetype, the search-time hash), and leaves out the target's time
+rule, which reads template rows. With --records, or with --time-props, --time-prefix or --time-format, a time rule
+still needs --rules lookup.
 
 Standard library only.
 """
@@ -4756,6 +4766,10 @@ def _build(args):
 			keep |= hash_keys_in(p)
 	time_rule = None
 	time_prefix, time_formats = target.get('time_prefix'), target.get('time_format') or ()
+	if (args.rules != RULES_LOOKUP and not args.records and not args.time_props and not args.time_format
+			and args.time_prefix is None):
+		# No template rows for a target's time rule to read (see "Fields from the Receiver").
+		time_prefix, time_formats = None, ()
 	if args.time_props or time_formats or time_prefix is not None:
 		settings = {}
 		if args.time_props:

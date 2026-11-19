@@ -128,3 +128,49 @@ class TestWithoutRecords:
 		with pytest.raises(SystemExit):
 			fm.main(['verify', '--target', 'fortigate', '--encoded', 'e', '--raw', 'r'])
 		assert '--records' in capsys.readouterr().err
+
+
+class TestRulesForReceiverFields:
+	"""
+	gen without --records and without --rules lookup: the rules a source needs when the Receiver sends each compact
+	event's fields itself (splunkFieldsForm), so Splunk applies no template rows: one event per line, tenx_compact_st,
+	the original sourcetype, and the search-time hash for `tx`. No lookup rule, lookup file or floor app.
+	"""
+
+	def gen(self, out, *more):
+		return fm.main(['gen', '--target', 'fortigate', '--out', str(out)] + list(more))
+
+	def test_the_fortigate_rules(self, tmp_path):
+		app = tmp_path / 'fm_fgt'
+		assert self.gen(app) == 0
+		props, transforms = conf(app, 'props'), conf(app, 'transforms')
+		stanza = props['tenx_fgt']
+		assert stanza['SHOULD_LINEMERGE'] == 'false' and stanza['LINE_BREAKER'] == '([\\r\\n]+)'
+		assert stanza['TRUNCATE'] == '262144'
+		assert stanza['TRANSFORMS-tenx_fgt'] == 'tenx_fgt_sourcetype, tenx_fgt_rename'
+		assert transforms['tenx_fgt_sourcetype']['FORMAT'] == 'tenx_compact_st::"tenx_fgt"'
+		assert transforms['tenx_fgt_rename']['SOURCE_KEY'] == 'field:tenx_sourcetype'
+		assert transforms['tenx_fgt_rename']['DEST_KEY'] == 'MetaData:Sourcetype'
+		for st in ('fortigate_traffic', 'fortigate_utm', 'fortigate_event', 'fortigate_anomaly'):
+			assert props[st]['REPORT-tenx_fgt_hash_vars'] == 'tenx_fgt_hash_vars'
+
+	def test_no_lookup(self, tmp_path):
+		app = tmp_path / 'fm_fgt'
+		assert self.gen(app) == 0
+		assert not os.path.exists(str(app / 'lookups'))
+		assert not os.path.exists(str(tmp_path / 'fm_fgt_floor'))
+		assert not [t for t, s in conf(app, 'transforms').items() if 'INGEST_EVAL' in s]
+
+	def test_the_same_static_rules_as_the_lookup_map(self, tmp_path):
+		assert self.gen(tmp_path / 'static') == 0
+		assert gen(tmp_path / 'lookup', 'fortigate', []) == 0
+		static, lookup = conf(tmp_path / 'static', 'transforms'), conf(tmp_path / 'lookup', 'transforms')
+		for name in ('tenx_fgt_sourcetype', 'tenx_fgt_rename', 'tenx_fgt_hash_vars'):
+			assert static[name] == lookup[name]
+		parsing = ('LINE_BREAKER', 'SHOULD_LINEMERGE', 'TRUNCATE', 'NO_BINARY_CHECK', 'DATETIME_CONFIG')
+		assert ([conf(tmp_path / 'static', 'props')['tenx_fgt'][k] for k in parsing] ==
+			[conf(tmp_path / 'lookup', 'props')['tenx_fgt'][k] for k in parsing])
+
+	def test_a_map_with_templates_still_needs_the_time_rule(self, tmp_path, capsys):
+		assert self.gen(tmp_path / 'fm_fgt', '--records', records(tmp_path, FGT)) != 0
+		assert 'an event time rule needs --rules lookup' in capsys.readouterr().err

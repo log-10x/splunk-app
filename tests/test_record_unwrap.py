@@ -5,8 +5,8 @@ The rule a heavy forwarder runs on the compact events it reads back from files (
 Fluent Bit's file output with Format plain writes each record the Receiver returns as one JSON object
 per line, with the keys the heavy forwarder's ingest actions file destination wrote: time, event, host,
 source, sourcetype, index. The rule gives the event back host, source, index and _time from the line,
-marks the time tenx_time=sender, writes the original sourcetype as tenx_sourcetype, and makes the
-compact text _raw. What Splunk does with it was measured on Splunk Enterprise 10.4.3 (tests/live_hf_monitor/);
+marks the time tenx_time=sender, writes the original sourcetype as tenx_sourcetype, adds the line's meta (the
+Receiver's splunkFieldsForm meta) to _meta, and makes the compact text _raw. What Splunk does with it was measured on Splunk Enterprise 10.4.3 (tests/live_hf_monitor/);
 these tests pin the text, and run it through a small model of the eval functions it uses.
 """
 import configparser
@@ -72,9 +72,39 @@ def assignments():
 	return out
 
 
+def split_concat(text):
+	"""Splits at the string concatenation operator " . " outside parentheses and double-quoted strings."""
+	parts, depth, quoted, start, i = [], 0, False, 0, 0
+	while i < len(text):
+		c = text[i]
+		if quoted:
+			if c == '\\':
+				i += 1
+			elif c == '"':
+				quoted = False
+		elif c == '"':
+			quoted = True
+		elif c == '(':
+			depth += 1
+		elif c == ')':
+			depth -= 1
+		elif depth == 0 and text.startswith(' . ', i):
+			parts.append(text[start:i])
+			start = i + 3
+			i += 2
+		i += 1
+	parts.append(text[start:])
+	return parts
+
+
 def evaluate(expr, event):
 	"""The value of one expression of the rule on an event (a dict of fields), for the functions it uses."""
 	expr = expr.strip()
+	parts = split_concat(expr)
+	if len(parts) > 1:
+		values = [evaluate(p, event) for p in parts]
+		# eval's "." gives null when any operand is null
+		return None if any(v is None for v in values) else ''.join(values)
 	if expr.startswith('"'):
 		return json.loads(expr)
 	m = re.match(r'^([a-z_]+)\((.*)\)$', expr, re.S)
@@ -83,6 +113,9 @@ def evaluate(expr, event):
 	name, args = m.group(1), split_top(m.group(2)) if m.group(2).strip() else []
 	if name == 'null':
 		return None
+	if name == 'coalesce':
+		values = [evaluate(a, event) for a in args]
+		return next((v for v in values if v is not None), None)
 	if name == 'if':
 		cond = evaluate(args[0], event)
 		return evaluate(args[1], event) if cond else evaluate(args[2], event)
@@ -148,11 +181,12 @@ class TestWhereTheRuleRuns:
 class TestTheRuleText:
 	def test_raw_is_replaced_last(self):
 		fields = [f for f, _, _ in assignments()]
-		assert fields == ['host', 'source', 'index', 'tenx_sourcetype', 'tenx_time', '_time', 'tenx_unwrap', '_raw']
+		assert fields == ['host', 'source', 'index', 'tenx_sourcetype', 'tenx_time', '_time', 'tenx_unwrap', '_meta',
+			'_raw']
 
 	def test_metadata_is_set_and_the_rest_indexed(self):
 		ops = dict((f, op) for f, op, _ in assignments())
-		assert [f for f in ops if ops[f] == '='] == ['host', 'source', 'index', '_time', '_raw']
+		assert [f for f in ops if ops[f] == '='] == ['host', 'source', 'index', '_time', '_meta', '_raw']
 		assert [f for f in ops if ops[f] == ':='] == ['tenx_sourcetype', 'tenx_time', 'tenx_unwrap']
 
 	def test_the_time_keeps_its_fraction(self):
@@ -163,7 +197,12 @@ class TestTheRuleText:
 
 	def test_only_functions_index_time_eval_takes(self):
 		names = set(re.findall(r'([a-z_]+)\(', ingest_eval()))
-		assert names == {'if', 'isnotnull', 'isnull', 'json_extract', 'tonumber', 'tostring', 'null'}
+		assert names == {'if', 'isnotnull', 'isnull', 'json_extract', 'tonumber', 'tostring', 'null', 'coalesce'}
+
+	def test_the_meta_term_is_the_one_measured(self):
+		# The term Splunk Enterprise 10.4.3 indexed the fields of 100,000 lines with, at 0 licence bytes.
+		assert ('_meta=if(isnotnull(json_extract(_raw, "meta")), coalesce(_meta, "") . " " . json_extract(_raw, "meta"), '
+			'_meta)') in ingest_eval()
 
 
 class TestTheRuleOnLines:
@@ -188,3 +227,29 @@ class TestTheRuleOnLines:
 	def test_a_line_without_an_event_keeps_its_text_and_is_marked(self, raw):
 		e = run(raw, **MONITOR)
 		assert e['_raw'] == raw and e['tenx_unwrap'] == 'failed'
+
+
+# The Receiver's splunkFieldsForm meta: the fields as name::"value" pairs, \ and " in a value escaped with \.
+META = 'srcip::"10.1.2.3" action::"close" attack::"a \\"q\\" b" tenx_mapped::"1"'
+FGT = dict(LINE, event='~-x,1,2', source='/var/log/fgt.log', sourcetype='fortigate_traffic', index='fgt')
+
+
+class TestTheMetaTerm:
+	def test_a_line_with_meta_adds_its_fields(self):
+		e = run(json.dumps(dict(FGT, meta=META)), **MONITOR)
+		assert e['_meta'] == ' ' + META and e['_raw'] == FGT['event']
+		assert fm.parse_meta(e['_meta']) == [('srcip', '10.1.2.3'), ('action', 'close'), ('attack', 'a "q" b'),
+			('tenx_mapped', '1')]
+
+	def test_fields_already_in_meta_are_kept(self):
+		e = run(json.dumps(dict(FGT, meta=META)), _meta='tenx_sourcetype::fgt', **MONITOR)
+		assert e['_meta'] == 'tenx_sourcetype::fgt ' + META
+
+	def test_a_line_without_meta_leaves_it_as_it_was(self):
+		assert '_meta' not in run(json.dumps(FGT), **MONITOR)
+		assert run(json.dumps(FGT), _meta='tenx_sourcetype::fgt', **MONITOR)['_meta'] == 'tenx_sourcetype::fgt'
+
+	def test_a_whole_event_has_no_meta(self):
+		raw = 'date=2026-11-02 time=10:15:30 devname="fw-lab-01" type="traffic" srcip=10.1.2.3'
+		e = run(json.dumps(dict(FGT, event=raw)), **MONITOR)
+		assert e['_raw'] == raw and '_meta' not in e

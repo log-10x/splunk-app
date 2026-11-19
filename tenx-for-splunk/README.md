@@ -1256,6 +1256,24 @@ Windows events, values such as `Access_Reasons` have spaces in place of line bre
 (`privilege_id`, `vendor_privilege`, `privilege`) and `event_time` are not written, and `src_nt_domain` takes every
 value of `Security_ID` where the raw event takes the subject's.
 
+### Fields Sent by the Receiver
+
+For FortiGate events, the Receiver can send each compact event's fields with it, as the add-on's
+`name=value` extraction finds them in the event's text, in place of a field map's template rows. Its
+launch option `splunkFieldsForm json` puts them in the HTTP Event Collector's `fields`;
+`splunkFieldsForm meta` puts them in the line a heavy forwarder reads back, where
+`[tenx-record-unwrap]` adds them to the event. An event whose fields the Receiver cannot give
+exactly as Splunk extracts them is sent whole.
+
+The source still needs one event per line, `tenx_compact_st` and the add-on's sourcetype. `gen`
+without `--records` and without `--rules lookup` writes only these rules, with no lookup:
+
+```sh
+python3 tenx-for-splunk/bin/tenx_field_map.py gen --target fortigate --out fm_fgt
+```
+
+Install `fm_fgt` where the compact events are parsed, as a field map's app.
+
 ## Which Searches Change When a Source Moves
 
 `tenx_search_report.py`, in the app's `bin` folder, reads the saved searches, alerts and dashboards
