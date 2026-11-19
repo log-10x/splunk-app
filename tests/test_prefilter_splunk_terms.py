@@ -1,0 +1,230 @@
+"""
+Field narrowing from Splunk's own index terms (tenx_config.conf field_narrowing = splunk, the default).
+
+A field comparison after `tx` or `txf` narrows the compact events by the index terms Splunk requires of
+raw events for that comparison (its base lispy, read from a probe job's search.log). Each term is
+required exactly as the same text written as a word after the macro, so the guarantees of word search
+carry over: every raw event the search returns holds each term, its compact event expands to that text,
+and so it holds each piece of the term as a value or through its template.
+
+What the prefilter cannot read with certainty places no restriction: an indexed term (name::value), a
+NOT, an OR with any such branch, a term with a quote, backslash, parenthesis or bracket in it, a lispy it
+cannot parse, a probe it cannot run (subsearch in the words). Then nothing is narrowed, as before.
+"""
+import os
+
+import tenx_prefilter_parser as p
+
+ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), '..'))
+STORED = [("%Y-%m-%dT%H:%M:%S.%7QZ", False, False), ("%H:%M:%S", False, False)]
+D = {"error": (10, ["TERM(~e1)"]), "success": (4, ["TERM(~s1)", "TERM(~s2)"]), "kerberos": (2, ["TERM(~k1)"])}
+LOG = """11-19-2026 10:00:00.100 INFO  SearchParser [123 searchOrchestrator] - PARSING: search EventCode=4625 | head 1
+11-19-2026 10:00:00.200 INFO  UnifiedSearch [123 searchOrchestrator] - base lispy: [ AND 4625 index::main ]
+11-19-2026 10:00:00.300 INFO  UnifiedSearch [123 searchOrchestrator] - base lispy: [ AND 4625 [ OR kerberos error ] ]
+"""
+
+
+def tree(text):
+	return p.Parser(p.tokenize(text)).parse()
+
+
+def narrowed(text, lispy, formats=STORED):
+	"""The prefilter of `text` with Splunk's terms `lispy` ANDed in, as tenxprefilter builds it."""
+	t = tree(text)
+	terms = p.lispy_tree(lispy)
+	if terms not in (None, p.TRUE):
+		t = ("and", [t, terms])
+	digits = p.digit_pieces_cleared(p.digit_candidates(t), formats)
+	return p.prefilter(t, D, None, digits)
+
+
+def as_words(text, extra=None, formats=STORED):
+	"""The prefilter of `text`, and of `extra` written as words after it (ANDed in the same shape)."""
+	t = tree(text)
+	if extra is not None:
+		t = ("and", [t, tree(extra)])
+	digits = p.digit_pieces_cleared(p.digit_candidates(t), formats)
+	return p.prefilter(t, D, None, digits)
+
+
+class TestTheSetting:
+
+	def test_modes(self):
+		assert p.narrowing_mode({'field_narrowing': 'splunk'}) == 'splunk'
+		assert p.narrowing_mode({'field_narrowing': ' Splunk '}) == 'splunk'
+		assert p.narrowing_mode({'field_narrowing': 'true'}) == 'list'
+		assert p.narrowing_mode({'field_narrowing': '1'}) == 'list'
+		for off in ({'field_narrowing': 'false'}, {'field_narrowing': ''}, {}, None, {'field_narrowing': 'maybe'}):
+			assert p.narrowing_mode(off) == 'off', off
+
+	def test_shipped_default_is_splunk_and_the_list_stays_off(self):
+		app = os.path.join(ROOT, 'tenx-for-splunk')
+		assert p.narrowing_mode_on_disk(app) == 'splunk'
+		assert not p.narrowing_on_disk(app)
+
+	def test_unreadable_is_off(self, tmp_path):
+		assert p.narrowing_mode_on_disk(str(tmp_path / 'missing')) == 'off'
+
+	def test_only_field_comparisons_start_a_probe(self):
+		assert p.compares_fields(tree("EventCode=4625"))
+		assert p.compares_fields(tree("error user IN (a, b)"))
+		assert p.compares_fields(tree("NOT action=success"))
+		assert p.compares_fields(tree("tag=authentication"))
+		assert not p.compares_fields(tree("error kerberos"))
+		assert not p.compares_fields(tree("host::web01 error"))
+		assert not p.compares_fields(tree("count>5"))
+
+
+class TestTheProbe:
+
+	def test_the_words_alone(self):
+		assert p.lispy_probe("EventCode=4625 user=bob", "`txf`") == "search EventCode=4625 user=bob | head 1"
+		assert p.lispy_probe(" tag=authentication ", "`tx`") == "search tag=authentication | head 1"
+
+	def test_txf_of_a_sourcetype_names_it(self):
+		assert p.lispy_probe("EventCode=4625", "`txf(XmlWinEventLog)`") == 'search sourcetype="XmlWinEventLog" EventCode=4625 | head 1'
+		assert p.lispy_probe("x=1", '`txf(a"b)`') == 'search sourcetype="a\\"b" x=1 | head 1'
+
+	def test_a_subsearch_is_never_run_by_the_probe(self):
+		assert p.lispy_probe("user=[| inputlookup users | return user]", "`txf`") is None
+
+
+class TestReadingTheLispy:
+
+	def test_the_last_base_lispy_of_the_log(self):
+		assert p.lispy_from_log(LOG) == "[ AND 4625 [ OR kerberos error ] ]"
+		assert p.lispy_from_log("no such line\n") is None
+		assert p.lispy_from_log(None) is None
+
+	def test_terms_and_operators(self):
+		assert p.lispy_tree("[ AND 4625 index::main ]") == ("text", "4625")
+		assert p.lispy_tree("[ AND 4625 bob index::main sourcetype::xmlwineventlog ]") == ("and", [("text", "4625"), ("text", "bob")])
+		assert p.lispy_tree("[ AND [ OR 4624 4625 ] index::main ]") == ("or", [("text", "4624"), ("text", "4625")])
+		assert p.lispy_tree("4625") == ("text", "4625")
+
+	def test_what_places_no_restriction(self):
+		# an OR with an indexed-term branch: events of that sourcetype need no term
+		assert p.lispy_tree("[ OR 4625 sourcetype::xmlwineventlog ]") == p.TRUE
+		assert p.lispy_tree("[ AND index::main [ NOT 4625 ] ]") == p.TRUE
+		assert p.lispy_tree('[ AND "a b" ]') == p.TRUE
+		assert p.lispy_tree("[ AND a\\b ]") == p.TRUE
+		assert p.lispy_tree("[ AND index::main ]") == p.TRUE
+		assert p.lispy_tree("[ AND x[1] ]") == p.TRUE
+
+	def test_what_it_cannot_read_narrows_nothing(self):
+		for bad in ("", None, "[ AND 4625", "[ AND 4625 ] ]", "]", "[ XOR a b ]", "[ AND a ] b", "["):
+			assert p.lispy_tree(bad) is None, bad
+
+
+class TestTheNarrowing:
+
+	def test_a_field_comparison_narrows_by_its_index_terms(self):
+		# off before: a field comparison placed no restriction
+		assert as_words("EventCode=4625") is None
+		assert narrowed("EventCode=4625", "[ AND 4625 index::main ]") == "((TERM(4625)))"
+
+	def test_each_term_is_required_exactly_as_the_word(self):
+		# the guarantees of word search carry over: the same clause as the term written after the macro
+		cases = [
+			("EventCode=4625", "[ AND 4625 ]", "4625"),
+			("action=success user=bob", "[ AND success bob index::main ]", "success bob"),
+			("EventCode IN (4624, 4625)", "[ AND [ OR 4624 4625 ] ]", "4624 OR 4625"),
+			("tag=authentication", "[ AND [ OR kerberos error ] ]", "kerberos OR error"),
+			("src=10.0.1.14", "[ AND 10.0.1.14 ]", "10.0.1.14"),
+			("user=adm*", "[ AND adm* ]", "adm*"),
+			("error EventCode=4625", "[ AND 4625 error ]", "4625 error"),
+		]
+		for text, lispy, words in cases:
+			assert narrowed(text, lispy) == as_words(text, words), (text, lispy)
+			assert narrowed(text, lispy) is not None
+
+	def test_terms_a_timestamp_could_print_place_no_restriction(self):
+		# 2023 is a year the stored formats print, so it never narrows, as a word does not
+		assert narrowed("year=2023", "[ AND 2023 ]") is None
+
+	def test_no_lispy_leaves_the_search_as_before(self):
+		for text in ("EventCode=4625", "error action=success", "user IN (a, b) kerberos"):
+			assert narrowed(text, None) == as_words(text)
+			assert narrowed(text, "[ OR 4625 sourcetype::x ]") == as_words(text)
+
+	def test_it_only_ever_adds_requirements(self):
+		# every clause of the search without Splunk's terms is still in it: AND only narrows
+		before = as_words("error action=success")
+		after = narrowed("error action=success", "[ AND success ]")
+		assert before == "(((TERM(error) OR TERM(~e1))))"
+		assert after == "((((TERM(error) OR TERM(~e1)))) AND ((TERM(success) OR TERM(~s1) OR TERM(~s2))))"
+
+	def test_the_terms_are_looked_up_in_the_dictionary(self):
+		t = ("and", [tree("action=success"), p.lispy_tree("[ AND success 4625 ]")])
+		assert p.lookup_pieces(t) == {"success"}
+		assert p.digit_candidates(t) == {"4625"}
+
+
+COMMAND = r'''
+import json, os, sys, types
+
+root, home, text, macro, log, fail = sys.argv[1:7]
+os.makedirs(os.path.join(home, 'var', 'log', 'splunk'), exist_ok=True)
+os.environ['SPLUNK_HOME'] = home
+splunk = types.ModuleType('splunk')
+clilib = types.ModuleType('splunk.clilib')
+bundle_paths = types.ModuleType('splunk.clilib.bundle_paths')
+bundle_paths.get_base_path = lambda: root
+clilib.bundle_paths = bundle_paths
+splunk.clilib = clilib
+sys.modules.update({'splunk': splunk, 'splunk.clilib': clilib, 'splunk.clilib.bundle_paths': bundle_paths})
+sys.path.insert(0, os.path.join(root, 'tenx-for-splunk', 'lib'))
+sys.path.insert(0, os.path.join(root, 'tenx-for-splunk', 'bin'))
+import tenx_prefilter
+
+cmd = tenx_prefilter.TenxPrefilterCommand()
+cmd.before = ('index=wineventlog ', macro)
+cmd.parent_app = 'search'
+cmd._metadata = types.SimpleNamespace(searchinfo=types.SimpleNamespace(
+	username='u', splunkd_uri='https://127.0.0.1:8089', session_key='k', earliest_time='0', latest_time='now'))
+calls = []
+def rest(path, data=None, answer=True, method=None):
+	calls.append([path, data, answer, method])
+	if fail == 'post' and data:
+		raise RuntimeError('refused')
+	if path.endswith('/search/jobs'):
+		return {'sid': 'probe_1'}
+	if path.endswith('/search.log'):
+		return log
+	return None
+cmd._rest = rest
+terms = cmd._splunk_terms(text)
+print(json.dumps({'terms': terms, 'calls': calls}))
+'''
+
+
+class TestTheCommand:
+
+	def run(self, text, macro='`txf`', log=LOG, fail=''):
+		import json
+		import subprocess
+		import sys
+		import tempfile
+		with tempfile.TemporaryDirectory() as home:
+			proc = subprocess.run([sys.executable, '-c', COMMAND, ROOT, home, text, macro, log, fail],
+								  capture_output=True, text=True, timeout=60)
+		assert proc.returncode == 0, proc.stderr[-3000:]
+		return json.loads(proc.stdout.strip().splitlines()[-1])
+
+	def test_one_probe_in_the_searchs_app_over_no_event_then_removed(self):
+		out = self.run('EventCode=4625', macro='`txf(XmlWinEventLog)`')
+		post, read, delete = out['calls']
+		assert post[0] == '/servicesNS/u/search/search/jobs'
+		assert post[1] == {'search': 'search sourcetype="XmlWinEventLog" EventCode=4625 | head 1', 'exec_mode': 'blocking',
+						   'earliest_time': '1', 'latest_time': '2', 'output_mode': 'json'}
+		assert read[0] == '/services/search/jobs/probe_1/search.log' and read[2] == 'text'
+		assert delete[0] == '/services/search/jobs/probe_1' and delete[3] == 'DELETE'
+		assert out['terms'] == ['and', [['text', '4625'], ['or', [['text', 'kerberos'], ['text', 'error']]]]]
+
+	def test_a_failed_probe_narrows_nothing(self):
+		assert self.run('EventCode=4625', fail='post')['terms'] is None
+		assert self.run('EventCode=4625', log='no lispy here')['terms'] is None
+
+	def test_a_subsearch_starts_no_probe(self):
+		out = self.run('user=[| inputlookup users | return user]')
+		assert out == {'terms': None, 'calls': []}

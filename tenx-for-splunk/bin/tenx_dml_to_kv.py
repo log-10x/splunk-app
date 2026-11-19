@@ -387,6 +387,9 @@ class TemplateStore:
 		self.seconds['find'] += time.time() - began
 		began = time.time()
 		writes = {}
+		# Taken before the records are built and saved, so every record of the chunk becomes readable
+		# after the start of its hour, which the prefilter's partial reads rely on.
+		hour = str(int(began) // 3600)
 
 		for record_key, pattern in valid:
 			key = self.kv_intf.kv_key(record_key)
@@ -396,6 +399,7 @@ class TemplateStore:
 			if record is not None:
 				record = dict(record)
 				record[self.kv_intf.KV_KEY] = key
+				record[tenx_dml_intf.STORED_HOUR] = hour
 				current[key] = record
 				writes[key] = record
 

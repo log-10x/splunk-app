@@ -49,6 +49,10 @@ logger = logging.getLogger(__name__)
 SEARCH_COPY = "search_copy"
 SEARCH_COPY_PENDING = "pending"
 SEARCH_COPY_WRITTEN = "written"
+# The hour (epoch seconds // 3600, as text) in which Consume KV last wrote the record. The `tx`
+# prefilter reads only the records of recent hours when it holds an earlier answer for its words
+# (tenx_prefilter_parser.cache_hours); collections.conf indexes the field.
+STORED_HOUR = "stored_hour"
 
 # Records marked written are saved with TenxKVInterface.save_many, within the KV store's batch limits.
 

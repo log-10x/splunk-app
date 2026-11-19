@@ -7,9 +7,17 @@ subsearch: it reads the running job's own search text through the REST API, pars
 after `tx` (tenx_prefilter_parser), asks the KV store of templates which templates carry each
 word, and returns one row whose `search` field is the prefilter.
 
-A field comparison (field=value, field IN (...)) narrows only when tenx_config.conf [config] has
-field_narrowing = true, tenxreplay has written the list of fields whose value is not text of the
-event, and the field is not on it. Off (the default), no field comparison restricts the prefilter.
+A field comparison (field=value, field IN (...)) narrows by tenx_config.conf [config] field_narrowing.
+splunk (the default): the compact events must hold the index terms Splunk itself requires of raw
+events for the comparison, read from a probe job's base lispy (_splunk_terms); when they cannot be
+read, no field comparison restricts the prefilter. true: like the value written as a word, once
+tenxreplay has written the list of fields whose value is not text of the event, and the field is
+not on it. false: no field comparison restricts the prefilter.
+
+The template dictionary (which templates carry each piece of the words) is read from the KV store the
+expansion uses. The answer for each piece is kept in the tenx_dict_cache collection, and a later search
+for the same pieces reads only the records written in the hours since, every record again once a day
+(tenx_prefilter_parser.cache_hours, _dictionary).
 
 When it cannot read the search (tx inside another subsearch, or wrapped in another macro) or
 cannot parse the words, it returns `(*)`, so every compact event in range is expanded and the
@@ -89,7 +97,8 @@ def dictionary_failed(result):
 @Configuration()
 class TenxPrefilterCommand(GeneratingCommand):
 
-	def _rest(self, path, data=None, answer=True):
+	def _rest(self, path, data=None, answer=True, method=None):
+		"""splunkd REST as the searching user: the JSON answer, its text (answer="text"), or None."""
 		info = self._metadata.searchinfo
 		context = ssl.create_default_context()
 		context.check_hostname = False
@@ -97,11 +106,11 @@ class TenxPrefilterCommand(GeneratingCommand):
 		request = urllib.request.Request(
 			info.splunkd_uri + path,
 			data=urllib.parse.urlencode(data).encode() if data else None,
-			method="POST" if data else "GET",
+			method=method or ("POST" if data else "GET"),
 			headers={"Authorization": "Splunk " + info.session_key})
 		with urllib.request.urlopen(request, context=context, timeout=60) as response:
-			body = response.read().decode()
-			return json.loads(body) if answer else None
+			body = response.read().decode("utf-8", "replace")
+			return body if answer == "text" else json.loads(body) if answer else None
 
 	def _search_text(self):
 		match = SUBSEARCH_SID.match(self._metadata.searchinfo.sid or "")
@@ -110,6 +119,9 @@ class TenxPrefilterCommand(GeneratingCommand):
 		self.parent = match.group(1)
 		job = self._rest("/services/search/jobs/%s?output_mode=json" % urllib.parse.quote(match.group(1), safe=""))
 		search = job["entry"][0]["content"].get("search", "")
+		# The app the search runs from: its aliases, event types and tags are the ones the probe of
+		# _splunk_terms must see.
+		self.parent_app = (job["entry"][0].get("acl") or {}).get("app") or APP_NAME
 		self.before = parser.macro_call(search)
 		self.calls = parser.macro_calls(search)
 		return parser.text_after_macro(search)
@@ -167,6 +179,36 @@ class TenxPrefilterCommand(GeneratingCommand):
 		rows = [r for r in result.get("results", []) if str(r.get("count", "0")) not in ("0", "")]
 		if rows:
 			self.write_warning(parser.raw_history_message(rows, macro))
+
+	def _splunk_terms(self, text):
+		"""
+		The index terms Splunk derives for the words after the macro, as a parsed search to AND with
+		them (tenx_prefilter_parser.lispy_tree), or None: then field comparisons narrow nothing, as
+		before. One probe job over a time range that holds no event, in the app the search runs from;
+		its search.log holds the base lispy. The job is removed afterwards.
+		"""
+		macro = self.before[1] if getattr(self, "before", None) else "`tx`"
+		probe = parser.lispy_probe(text, macro)
+		if probe is None:
+			return None
+		info = self._metadata.searchinfo
+		app = getattr(self, "parent_app", None) or APP_NAME
+		sid = None
+		try:
+			job = self._rest("/servicesNS/%s/%s/search/jobs" % (urllib.parse.quote(info.username, safe=""), urllib.parse.quote(app, safe="")),
+							 {"search": probe, "exec_mode": "blocking", "earliest_time": "1", "latest_time": "2", "output_mode": "json"})
+			sid = job.get("sid")
+			log = self._rest("/services/search/jobs/%s/search.log" % urllib.parse.quote(sid, safe=""), answer="text")
+			return parser.lispy_tree(parser.lispy_from_log(log))
+		except Exception as e:
+			self.logger.warning("tx: Splunk's index terms for the field comparisons could not be read: %s", e)
+			return None
+		finally:
+			if sid:
+				try:
+					self._rest("/services/search/jobs/%s" % urllib.parse.quote(sid, safe=""), answer=False, method="DELETE")
+				except Exception:
+					pass
 
 	def _text_field(self):
 		"""
@@ -258,6 +300,54 @@ class TenxPrefilterCommand(GeneratingCommand):
 		self.write_warning(parser.NOT_ON_INDEXERS)
 		return False
 
+	def _kv(self, path, records=None):
+		"""The prefilter's KV store reads and writes as the searching user: JSON in, JSON out."""
+		info = self._metadata.searchinfo
+		context = ssl.create_default_context()
+		context.check_hostname = False
+		context.verify_mode = ssl.CERT_NONE
+		request = urllib.request.Request(
+			info.splunkd_uri + path, data=json.dumps(records).encode() if records is not None else None,
+			method="POST" if records is not None else "GET",
+			headers={"Authorization": "Splunk " + info.session_key, "Content-Type": "application/json"})
+		with urllib.request.urlopen(request, context=context, timeout=60) as response:
+			return json.loads(response.read().decode() or "null")
+
+	def _dictionary(self, pieces, formats):
+		"""
+		(the template dictionary of `pieces`, the stored timestamp formats or None), as
+		tenx_prefilter_parser.dictionary_search() answers them over every record. With an earlier answer
+		for every piece in tenx_dict_cache (cache_hours), only the records written in the hours since are
+		read and added to it (cache_merge); otherwise every record is read and the answer is kept. A
+		cache that cannot be read or written only means every record is read. Raises when the template
+		lookup fails or reports cut rows.
+		"""
+		started = time.time()
+		try:
+			query = json.dumps({"_key": {"$in": parser.cache_keys(pieces, formats)}})
+			found = self._kv(parser.CACHE_PATH + "?output_mode=json&query=" + urllib.parse.quote(query, safe=""))
+			entries = dict((r.get("_key"), r) for r in (found or []) if isinstance(r, dict))
+		except Exception as e:
+			self.logger.info("tx: the kept template answers could not be read: %s", e)
+			entries = {}
+		hours = parser.cache_hours(entries, pieces, formats, started)
+		result = self._rest(
+			"/servicesNS/%s/%s/search/jobs" % (urllib.parse.quote(self._metadata.searchinfo.username), APP_NAME),
+			{"search": parser.dictionary_search(pieces, formats=formats, hours=hours), "exec_mode": "oneshot", "output_mode": "json",
+			 "count": "0", "earliest_time": "0", "latest_time": "now"})
+		if dictionary_failed(result):
+			raise RuntimeError("the template lookup reported: %s" % dictionary_failed(result))
+		rows = result.get("results", [])
+		dictionary = parser.dictionary_from_rows(rows, pieces)
+		if hours is not None:
+			return parser.cache_merge(entries, dictionary, parser.format_keys_from_rows(rows), pieces, formats)
+		try:
+			self._kv(parser.CACHE_PATH + "/batch_save?output_mode=json",
+					 parser.cache_records(dictionary, parser.format_keys_from_rows(rows), pieces, formats, started))
+		except Exception as e:
+			self.logger.info("tx: the template answer was not kept: %s", e)
+		return dictionary, (parser.formats_from_rows(rows) if formats else None)
+
 	def generate(self):
 		if not self._store_check():
 			yield {"search": parser.ON_SEARCH_HEAD}
@@ -297,6 +387,12 @@ class TenxPrefilterCommand(GeneratingCommand):
 			return
 		# The setting is read only when it can change the prefilter (see narrowing_matters).
 		text_field = self._text_field() if parser.narrowing_matters(tree) else None
+		if text_field is None and parser.compares_fields(tree) and parser.narrowing_mode_on_disk(apphome) == parser.SPLUNK_MODE:
+			# field_narrowing = splunk: a field comparison requires the index terms Splunk itself
+			# requires of raw events for it, read as words (lookup_pieces, prefilter).
+			terms = self._splunk_terms(text)
+			if terms not in (None, parser.TRUE):
+				tree = ("and", [tree, terms])
 		# Runs of digits are looked up like words; the same read of the KV store returns the stored
 		# timestamp formats, which decide the runs that narrow (digit_pieces_cleared).
 		candidates = parser.digit_candidates(tree, text_field)
@@ -304,15 +400,9 @@ class TenxPrefilterCommand(GeneratingCommand):
 		pieces = parser.lookup_pieces(tree, text_field=text_field, digits=candidates)
 		if pieces:
 			try:
-				result = self._rest(
-					"/servicesNS/%s/%s/search/jobs" % (urllib.parse.quote(self._metadata.searchinfo.username), APP_NAME),
-					{"search": parser.dictionary_search(pieces, formats=bool(candidates)), "exec_mode": "oneshot", "output_mode": "json",
-					 "count": "0", "earliest_time": "0", "latest_time": "now"})
-				if dictionary_failed(result):
-					raise RuntimeError("the template lookup reported: %s" % dictionary_failed(result))
-				dictionary = parser.dictionary_from_rows(result.get("results", []), pieces)
+				dictionary, formats = self._dictionary(pieces, bool(candidates))
 				if candidates:
-					digits = parser.digit_pieces_cleared(candidates, parser.formats_from_rows(result.get("results", [])))
+					digits = parser.digit_pieces_cleared(candidates, formats)
 			except Exception as e:
 				self.logger.warning("tx: the template lookup failed: %s", e)
 				self.write_warning("tx: the template lookup did not complete; every compact event in range is expanded.")

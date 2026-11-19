@@ -509,11 +509,16 @@ search. The command reads the search's own text, takes the words after `tx`, fin
 templates carry each word, and selects the compact events that carry each word as a value
 or through their template. Templates are read from the KV store the expansion uses. A word a
 rendered timestamp could print, a word with a character outside a-z and 0-9, and a word carried
-by more than 5,000 templates select nothing on their own, and a `NOT`, a field comparison, or an
-`OR` with any of these selects every event in range. A run of digits narrows unless a stored
+by more than 5,000 templates select nothing on their own, and a `NOT`, or an `OR` with any of these,
+selects every event in range. A field comparison selects the events that hold the index terms Splunk
+requires of raw events for it (`field_narrowing` in tenx_config.conf); where Splunk requires none, it
+selects every event in range. A run of digits narrows unless a stored
 template's timestamp could print it (a year, two digits of a time, a fraction of that length).
 The search after `tx` then applies the full terms, so the selection may be wider than
-the result, never narrower. A `tx` word search reads the template store, which adds a few seconds per search where it holds hundreds of thousands of templates.
+the result, never narrower. A `tx` word search reads the template store, which adds a few seconds per
+search where it holds hundreds of thousands of templates. The answer for each word is kept in the
+`tenx_dict_cache` collection, and a later search for the same word reads only the templates stored in
+the hours since, and every template again once a day.
 
 **The `tx` and `tenxsearch` commands.** `| tx index=myindex sourcetype=tenx_encoded error`
 and `| tenxsearch searchstring="..."` run a rewritten search and write every event out
@@ -724,11 +729,8 @@ commands than one Splunk search runs, or more characters than `replay_max_macro_
 set, it holds the busiest sourcetypes, a `txf` search over an index that holds one of the others
 shows a warning naming it, and `txf(<sourcetype>)` applies that sourcetype's rules.
 
-A field comparison after `txf` reads every compact event in range. When the value is written in the
-event (an event code, a user name), write it as a word too (`EventCode=4625 4625`): the same events,
-read from those holding it. With the Windows add-on, a comparison on a Windows field does not narrow
-the search, because the add-on computes or renames those fields; write the value as a word too, as
-above.
+A field comparison after `txf` reads the compact events that hold the index terms Splunk requires of
+raw events for that comparison, and every compact event in range where Splunk requires none.
 
 To set it up:
 
