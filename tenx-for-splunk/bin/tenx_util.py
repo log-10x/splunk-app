@@ -92,13 +92,16 @@ SPLUNK_SOURCE_PREFIX = 'source::'
 CONFIG_LOADED = 'config_loaded'
 
 # Key on the config dict get_tenx_config returns: the field replay's coverage, read from
-# tenx_replay.conf (written by the tenxreplay command), as {original sourcetype: {'indexes':
-# <its list as written>}}. {} when the conf does not exist or lists no sourcetype: no compact
+# tenx_replay.conf (written by the tenxreplay command), as {original sourcetype: {key: its value
+# as written}} for the REPLAY_KEYS. {} when the conf does not exist or lists no sourcetype: no compact
 # event carries tenx_sourcetype, and the search rewrite has no replay steps. None when it could
 # not be read: the rewrite then runs the tenx-replay macro. See
 # tenx_replay_builder.rewrite_replay().
 REPLAY_COVERAGE = 'tenx_replay'
 REPLAY_RESERVED = ('default', 'tenx:narrowing', 'tenx:retired')
+# What the rewrite reads of each stanza: tenx_replay_builder.rewrite_replay() and the keys it names
+# (LEFT_OUT_KEY, COMMANDS_KEY).
+REPLAY_KEYS = ('indexes', 'unit', 'left_out', 'commands')
 
 
 def get_replay_coverage(service):
@@ -120,8 +123,7 @@ def get_replay_coverage(service):
 		logger.warning("Failed reading tenx_replay.conf - {}".format(e), exc_info=1)
 		return None
 	try:
-		return dict((stanza.name, {'indexes': str(stanza.content.get('indexes', '') or ''),
-								   'unit': str(stanza.content.get('unit', '') or '')})
+		return dict((stanza.name, dict((k, str(stanza.content.get(k, '') or '')) for k in REPLAY_KEYS))
 					for stanza in conf if stanza.name not in REPLAY_RESERVED)
 	except Exception as e:
 		logger.warning("Failed reading tenx_replay.conf - {}".format(e), exc_info=1)

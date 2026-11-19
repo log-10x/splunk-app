@@ -30,7 +30,7 @@ class TestTheRewriteCoverageReplicates:
 		# What a cluster member that never ran the rebuild reads: no stanza (get_replay_coverage
 		# gives {}), so the text without replay, while the member that ran it replays.
 		search = 'index=wineventlog sourcetype=tenx_encoded EventCode=4625'
-		_, here = compiled(search, {'XmlWinEventLog': {'indexes': 'wineventlog'}, 'app:kv': {'indexes': 'app'}})
+		_, here = compiled(search, {'XmlWinEventLog': {'indexes': 'wineventlog', 'commands': '10'}, 'app:kv': {'indexes': 'app', 'commands': '10'}})
 		_, there = compiled(search, {})
 		assert b.unit_macro('XmlWinEventLog') in here
 		assert 'tenx-replay' not in there and 'tenx_rst' not in there
@@ -137,8 +137,8 @@ def test_a_unit_whose_acl_write_failed_is_shared_by_the_next_rebuild():
 
 
 class TestNeverLessThanTheFullReplay:
-	COVERED = {'XmlWinEventLog': {'indexes': 'wineventlog', 'unit': b.unit_macro('XmlWinEventLog')},
-			   'app:kv': {'indexes': 'app', 'unit': b.unit_macro('app:kv')}}
+	COVERED = {'XmlWinEventLog': {'indexes': 'wineventlog', 'unit': b.unit_macro('XmlWinEventLog'), 'commands': '10'},
+			   'app:kv': {'indexes': 'app', 'unit': b.unit_macro('app:kv'), 'commands': '10'}}
 
 	def test_an_index_recorded_after_the_last_rebuild(self):
 		assert b.rewrite_replay(self.COVERED, ['newidx']) == b.FULL
@@ -149,7 +149,7 @@ class TestNeverLessThanTheFullReplay:
 		assert b.rewrite_replay({}, ['newidx']) is None
 
 	def test_a_sourcetype_whose_unit_did_not_run(self):
-		covered = dict(self.COVERED, XmlWinEventLog={'indexes': 'wineventlog', 'unit': ''})
+		covered = dict(self.COVERED, XmlWinEventLog={'indexes': 'wineventlog', 'unit': '', 'commands': '10'})
 		assert b.rewrite_replay(covered, ['wineventlog']) == b.FULL
 		assert b.rewrite_replay(covered, ['app']) == b.compose_units(['app:kv'])
 
@@ -205,8 +205,8 @@ class TestUnreadableCoverageIsTheFullReplay:
 # ---------------------------------------------------------------------------
 
 class TestThreeCases:
-	COVERED = {'XmlWinEventLog': {'indexes': 'wineventlog', 'unit': b.unit_macro('XmlWinEventLog')},
-			   'app:kv': {'indexes': 'app', 'unit': b.unit_macro('app:kv')},
+	COVERED = {'XmlWinEventLog': {'indexes': 'wineventlog', 'unit': b.unit_macro('XmlWinEventLog'), 'commands': '10'},
+			   'app:kv': {'indexes': 'app', 'unit': b.unit_macro('app:kv'), 'commands': '10'},
 			   b.NOCARRIER_STANZA: {'indexes': 'main,sec_compact,sec_compact4663', 'unit': ''}}
 
 	def test_recorded_with_sourcetypes_chains_their_units(self):
@@ -279,11 +279,11 @@ def test_an_index_that_gets_the_field_leaves_the_negative_record_at_the_check():
 	# record and adds it to app:kv's indexes: from that write on, the rewrite chains app:kv's unit
 	assert at_rebuild is not None and ['conf~', 'tenx:nocarrier'] in at_rebuild and ['conf~', 'app:kv'] in at_rebuild, at_rebuild
 	assert after == {'indexes': 'sec_compact'} and 'quiet' in kv_indexes.split(',')
-	covered = {'app:kv': {'indexes': kv_indexes, 'unit': b.unit_macro('app:kv')},
-			   'other': {'indexes': 'elsewhere', 'unit': b.unit_macro('other')}, b.NOCARRIER_STANZA: after}
+	covered = {'app:kv': {'indexes': kv_indexes, 'unit': b.unit_macro('app:kv'), 'commands': '10'},
+			   'other': {'indexes': 'elsewhere', 'unit': b.unit_macro('other'), 'commands': '10'}, b.NOCARRIER_STANZA: after}
 	assert b.rewrite_replay(covered, ['quiet']) == b.compose_units(['app:kv'])
 	# and before the check wrote, the same search had no replay: the window
-	stale = dict(covered, **{'app:kv': {'indexes': 'app', 'unit': b.unit_macro('app:kv')},
+	stale = dict(covered, **{'app:kv': {'indexes': 'app', 'unit': b.unit_macro('app:kv'), 'commands': '10'},
 						   b.NOCARRIER_STANZA: before})
 	assert b.rewrite_replay(stale, ['quiet']) is None
 

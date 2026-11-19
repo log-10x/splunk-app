@@ -291,7 +291,7 @@ class TestRewriteWithoutCarrierMatchesTheBaseline:
 	def test_an_index_the_record_does_not_know_gets_the_full_replay(self, search):
 		# Where any compact event carries tenx_sourcetype, an index no stanza records may hold
 		# such events not recorded yet, so it gets `tenx-replay`, never the text without replay.
-		covered = {'XmlWinEventLog': {'indexes': 'wineventlog'}}
+		covered = {'XmlWinEventLog': {'indexes': 'wineventlog', 'commands': '10'}}
 		state, text = compiled(search, covered)
 		base_state, base_text = compiled(search, False, baseline_builder)
 		if 'tenx-inflate' in base_text:
@@ -306,8 +306,8 @@ class TestRewriteWithoutCarrierMatchesTheBaseline:
 		assert 'tenx-replay' not in text and 'tenx_compact_raw' not in text
 
 
-COVERED = {'XmlWinEventLog': {'indexes': 'wineventlog'}, 'app:kv': {'indexes': 'app,shared'},
-		   'app:json': {'indexes': 'shared'}}
+COVERED = {'XmlWinEventLog': {'indexes': 'wineventlog', 'commands': '10'}, 'app:kv': {'indexes': 'app,shared', 'commands': '10'},
+		   'app:json': {'indexes': 'shared', 'commands': '10'}}
 
 
 def with_replay(replay):
@@ -364,7 +364,7 @@ class TestRewriteReplay:
 
 	def test_a_sourcetype_listed_with_every_index_or_none_matches_any(self):
 		# * past 200 indexes; empty in a stanza that records no index
-		covered = {'a': {'indexes': '*'}, 'b': {'indexes': ''}, 'c': {'indexes': 'only_c'}, 'd': {'indexes': 'only_d'}}
+		covered = {'a': {'indexes': '*', 'commands': '10'}, 'b': {'indexes': '', 'commands': '10'}, 'c': {'indexes': 'only_c', 'commands': '10'}, 'd': {'indexes': 'only_d', 'commands': '10'}}
 		assert b.rewrite_replay(covered, ['only_c']) == b.compose_units(['a', 'b', 'c'])
 
 	def test_reserved_and_unusable_names_are_not_sourcetypes(self):
@@ -987,7 +987,8 @@ class TestTheRewriteReadsTheCoverage:
 		import tenx_util
 		got = tenx_util.get_replay_coverage(self.service({'XmlWinEventLog': {'indexes': 'wineventlog', 'sources': 'x'},
 														 'demo:kv': {}}))
-		assert got == {'XmlWinEventLog': {'indexes': 'wineventlog', 'unit': ''}, 'demo:kv': {'indexes': '', 'unit': ''}}
+		empty = {'left_out': '', 'commands': ''}
+		assert got == {'XmlWinEventLog': dict(empty, indexes='wineventlog', unit=''), 'demo:kv': dict(empty, indexes='', unit='')}
 		# JSON-safe: the search handler logs the config with json.dumps
 		json.dumps(got)
 

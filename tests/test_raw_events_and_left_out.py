@@ -205,7 +205,8 @@ class TestTheRecordAndTheRewrite:
 		assert b.unit_sourcetypes(present, settings=dict(b.DEFAULT_SETTINGS, replay_max_sourcetypes=2)) == ['a', 'b']
 
 	def test_the_rewrite_chains_units_where_the_macro_leaves_a_sourcetype_out(self):
-		covered = {'a': {'indexes': 'x', 'unit': b.unit_macro('a')}, 'b': {'indexes': 'x', 'unit': b.unit_macro('b')}}
+		covered = {'a': {'indexes': 'x', 'unit': b.unit_macro('a'), b.COMMANDS_KEY: '40'},
+				   'b': {'indexes': 'x', 'unit': b.unit_macro('b'), b.COMMANDS_KEY: '30'}}
 		assert b.rewrite_replay(covered, ['x']) == b.FULL
 		covered['b']['left_out'] = 'txf'
 		assert b.rewrite_replay(covered, ['x']) == b.compose_units(['a', 'b'])

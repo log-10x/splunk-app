@@ -1547,6 +1547,39 @@ def uncovered_values(rows, covered):
 	return out
 
 
+# Splunk refuses a search whose pipeline holds more than 1,000 commands ("The pipeline size for this search
+# exceeds a search command limit : 1000"), counted at the top level: a foreach block counts once whatever it
+# holds, and a subsearch is a search of its own (Splunk Enterprise 10.4.3 and 9.4.15: 1,000 top-level commands
+# ran, 1,010 were refused; 600 with a foreach of 500 commands inside ran). It sets no limit on the length of a
+# macro or of the search a macro expands to: a macro of 400,152 characters, written through REST and read back
+# after a restart, and three chained macros of 454,221 characters together ran, on a search head over two
+# indexers as well. txf holds about 40 top-level commands of its own around the replay, so the replay keeps to
+# this many, which leaves room for the commands a search adds after txf.
+REPLAY_MAX_COMMANDS = 900
+
+
+def top_level_commands(text):
+	"""The commands of a search text at its top level: one more than its pipes outside brackets and quotes."""
+	depth, n, quoted, i = 0, 1, False, 0
+	while i < len(text):
+		ch = text[i]
+		if quoted:
+			if ch == '\\':
+				i += 1
+			elif ch == '"':
+				quoted = False
+		elif ch == '"':
+			quoted = True
+		elif ch == '[':
+			depth += 1
+		elif ch == ']':
+			depth = max(depth - 1, 0)
+		elif ch == '|' and depth == 0:
+			n += 1
+		i += 1
+	return n
+
+
 def build_unit(stanzas, sourcetype, seen, lookup_fields=None, keep_fields=(), rejected=None, bad_lookups=None,
 			   transforms=None, limit=0, keep_by_sourcetype=None):
 	"""
@@ -1573,6 +1606,10 @@ def build_unit(stanzas, sourcetype, seen, lookup_fields=None, keep_fields=(), re
 # 'txf' when the `tenx-replay` macro leaves it out (replay_max_macro_chars keeps the busiest
 # sourcetypes in it), 'unit' when its own unit is over that size and replays nothing. Empty: neither.
 LEFT_OUT_KEY = 'left_out'
+
+# The tenx_replay.conf key that holds the top-level commands of a sourcetype's unit, for rewrite_replay() to
+# keep a chain of units within REPLAY_MAX_COMMANDS.
+COMMANDS_KEY = 'commands'
 
 
 def left_out_value(in_macro, replays_nothing):
@@ -1664,6 +1701,21 @@ def compose_units(sourcetypes):
 	return ' | '.join(parts)
 
 
+def chained_commands(counts):
+	"""The top-level commands of compose_units() over units of `counts` commands each, `tenx-replay-tags` included."""
+	k = len(counts)
+	return sum(counts) + 2 * (k - 1) + (1 if k > 1 else 0) + top_level_commands(' | '.join(TAGS_STEPS))
+
+
+def _recorded_commands(value):
+	"""A stanza's COMMANDS_KEY as a number, or None when it holds none."""
+	try:
+		n = int(str(value.get(COMMANDS_KEY, '') or '').strip())
+	except ValueError:
+		return None
+	return n if n > 0 else None
+
+
 def _index_regex(pattern):
 	return re.compile('^' + '.*'.join(re.escape(p) for p in pattern.lower().split('*')) + '$')
 
@@ -1683,7 +1735,9 @@ def rewrite_replay(covered, indexes):
 	named, an index named that no stanza records, a wildcard, or every covered sourcetype
 	recorded for the indexes named, none of them left out of `tenx-replay` (LEFT_OUT_KEY):
 	`tenx-replay`. Otherwise the units of the sourcetypes recorded for those indexes, or
-	`tenx-replay` when one of them has no working unit (its stanza says `unit =`).
+	`tenx-replay` when one of them has no working unit (its stanza says `unit =`), when their
+	chain would hold more than REPLAY_MAX_COMMANDS top-level commands, or when a stanza does not
+	say how many its unit holds (COMMANDS_KEY).
 
 	Correct results first: the record of indexes lags the data (the next "When New" rebuild,
 	5 minutes; longer while a rebuild fails), and an index it does not know may hold events of
@@ -1734,6 +1788,11 @@ def rewrite_replay(covered, indexes):
 	left_out = any('txf' in str((covered[st] if isinstance(covered[st], dict) else {}).get(LEFT_OUT_KEY) or '').split(',')
 				   for st in chosen)
 	if len(chosen) == len(sts) and not left_out:
+		return FULL
+	# Splunk refuses a search past its command limit, and a chain of units has none of its own: a chain past
+	# REPLAY_MAX_COMMANDS, or of a unit whose size the record does not hold, is `tenx-replay`, which keeps to it.
+	counts = [_recorded_commands(covered[st] if isinstance(covered[st], dict) else {}) for st in chosen]
+	if None in counts or chained_commands(counts) > REPLAY_MAX_COMMANDS:
 		return FULL
 	return compose_units(chosen)
 
