@@ -86,6 +86,11 @@ export = system
 access = read : [ * ], write : [ admin, sc_admin, power ]
 export = system
 
+# The prefilter's earlier answers (collections.conf): every user reads them; the roles that can
+# write the template store write them, so no other user can make another's search select less.
+[collections/tenx_dict_cache]
+access = read : [ * ], write : [ admin, sc_admin, power ]
+
 [transforms/tenx-dml-lookup]
 access = read : [ * ], write : [ admin, sc_admin, power ]
 export = system

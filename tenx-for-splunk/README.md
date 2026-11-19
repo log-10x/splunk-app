@@ -513,7 +513,11 @@ by more than 5,000 templates select nothing on their own, and a `NOT`, a field c
 `OR` with any of these selects every event in range. A run of digits narrows unless a stored
 template's timestamp could print it (a year, two digits of a time, a fraction of that length).
 The search after `tx` then applies the full terms, so the selection may be wider than
-the result, never narrower. A `tx` word search reads the template store, which adds a few seconds per search where it holds hundreds of thousands of templates.
+the result, never narrower. A `tx` word search reads the template store, which adds a few seconds per
+search where it holds hundreds of thousands of templates. The answer for each word is kept in the
+`tenx_dict_cache` collection, and a later search for the same word reads only the templates stored in
+the hours since. Every template is read again once a day, after the app is installed or upgraded, and
+after the template load is run from the start of the index.
 
 **The `tx` and `tenxsearch` commands.** `| tx index=myindex sourcetype=tenx_encoded error`
 and `| tenxsearch searchstring="..."` run a rewritten search and write every event out
