@@ -411,6 +411,9 @@ yet, and, with its `templateCreateAfter` option, an event whose template it has 
 compact event starts with `~`; an event sent as text never does, so the app tells the two apart by
 that first character.
 
+The Receiver's Forward output, which Fluent Bit, Fluentd and Vector read back, starts every compact
+event with `~`. A compact event that reaches Splunk without it is returned as it is, as text.
+
 `tx`, `txf`, the `| tx` command, the dashboard hook and compiled alerts find such an event by the
 words of its text and return it as it is, without `tenx_expand_refused`. Its `_time`, and through
 `txf` its fields, are those of a compact event of the same line. A field map writes no index-time
