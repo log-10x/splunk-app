@@ -270,6 +270,8 @@ def dictionary(pieces, formats):
 	looked.append(sorted(pieces))
 	return dict((x, (1, ['TERM(~h_%s)' % x])) for x in pieces), None
 cmd._dictionary = dictionary
+# the word index check (_without_words) found every compact event indexed with its words
+cmd._without_words = lambda prefilter: prefilter
 cmd.write_warning = warnings.append
 out = list(cmd.generate())
 print(json.dumps({'out': out, 'warnings': warnings, 'probes': probes, 'looked': looked}))

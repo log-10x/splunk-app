@@ -1921,6 +1921,32 @@ def raw_history_probe(record, before):
 		times + " " if times else "", where, " OR ".join(pairs), RAW_EVENTS_MACRO)
 
 
+def word_index_probe(before):
+	"""
+	The tstats that finds, by index, host and source, compact events (`tenx-events`) in the search's range
+	that hold no word term. Every compact event starts with ~ and its template hash, which segmentation
+	indexes as a term starting with ~; a group with more events than events holding such a term was
+	indexed without words (SEGMENTATION = none on the compact sourcetype, its source or host), so a word
+	prefilter cannot find its events. Restricted to the indexes written before the macro (`before`).
+	"""
+	quote = lambda v: '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+	named = named_indexes(before)
+	where = "(%s) " % " OR ".join("index=%s" % quote(i) for i in sorted(named)) if named else ""
+	return ("| tstats count where %s`tenx-events` by index, host, source | eval tenx_w=0 | append [| tstats count "
+			"where %s`tenx-events` TERM(~*) by index, host, source | eval tenx_w=1] | stats sum(eval(if(tenx_w==0, "
+			"count, 0))) as tenx_all, sum(eval(if(tenx_w==1, count, 0))) as tenx_words by index, host, source "
+			"| where tenx_all > tenx_words" % (where, where))
+
+
+def word_index_branch(rows, most=200):
+	"""The OR branch that reads every compact event of the groups word_index_probe found (by index alone past `most`)."""
+	quote = lambda v: '"' + str(v).replace("\\", "\\\\").replace('"', '\\"') + '"'
+	if len(rows) > most:
+		return " OR ".join("index=%s" % quote(i) for i in sorted(set(r.get("index", "") for r in rows)))
+	return " OR ".join("(index=%s host=%s source=%s)" % (quote(r.get("index", "")), quote(r.get("host", "")),
+														   quote(r.get("source", ""))) for r in rows)
+
+
 def raw_history_message(rows, macro):
 	"""
 	The warning of a `tx` or `txf` search whose indexes hold, in its time range, events of the original

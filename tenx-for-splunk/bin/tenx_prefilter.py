@@ -230,6 +230,28 @@ class TenxPrefilterCommand(GeneratingCommand):
 		names = [n.strip() for n in str(entry.get("fields_not_in_text", "") or "").split(",") if n.strip()]
 		return parser.text_field_predicate(names)
 
+	def _without_words(self, prefilter):
+		"""
+		The prefilter, with an OR branch that reads every compact event of the index, host and source groups
+		indexed without words (word_index_probe), which the prefilter's terms cannot find. Every compact event
+		in range is expanded when the check cannot run.
+		"""
+		before = self.before[0] if getattr(self, "before", None) else ""
+		try:
+			info = self._metadata.searchinfo
+			result = self._rest(
+				"/servicesNS/%s/%s/search/jobs" % (urllib.parse.quote(info.username), APP_NAME),
+				{"search": parser.word_index_probe(before), "exec_mode": "oneshot", "output_mode": "json", "count": "0",
+				 "earliest_time": str(info.earliest_time or "0"), "latest_time": str(info.latest_time or "now")})
+			if dictionary_failed(result):
+				raise RuntimeError(dictionary_failed(result))
+		except Exception as e:
+			self.logger.warning("tx: the word index check failed: %s", e)
+			self.write_warning("tx: could not check that the compact events hold words; every compact event in range is expanded.")
+			return EVERY_EVENT
+		rows = result.get("results", [])
+		return "(%s OR %s)" % (prefilter, parser.word_index_branch(rows)) if rows else prefilter
+
 	def _store_wild_plan(self, text):
 		"""
 		Stores on the running job what the step before the final search of `tx` and `txf` applies
@@ -413,7 +435,8 @@ class TenxPrefilterCommand(GeneratingCommand):
 				self.write_warning("tx: the template lookup did not complete; every compact event in range is expanded.")
 				yield {"search": EVERY_EVENT}
 				return
-		yield {"search": parser.prefilter(tree, dictionary, text_field, digits) or EVERY_EVENT}
+		prefilter = parser.prefilter(tree, dictionary, text_field, digits) or EVERY_EVENT
+		yield {"search": prefilter if prefilter == EVERY_EVENT else self._without_words(prefilter)}
 
 
 dispatch(TenxPrefilterCommand, sys.argv, sys.stdin, sys.stdout, __name__)
