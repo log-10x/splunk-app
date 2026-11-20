@@ -551,6 +551,23 @@ UNCHANGED = tuple(extract_steps())
 ANY = 'tenx_go0z'
 
 
+def _union_guard(shared):
+	"""
+	The condition that some source:: or host:: stanza of `shared` applies to the replayed event: the patterns
+	of each field joined into one, each as its Stanza.guard() tests it (a literal host without case).
+	"""
+	tests = []
+	for kind in ('source', 'host'):
+		alts = []
+		for s in (x for x in shared if x.kind == kind):
+			rx = re.escape(s.pattern) if s.literal else s.regex()
+			nocase = kind == 'host' and (s.literal or '(?-i)' not in rx)
+			alts.append(('(?i:^(?:%s)$)' if nocase else '(?:^(?:%s)$)') % rx)
+		if alts:
+			tests.append('match(%s, %s)' % (kind, spl_string('|'.join(alts))))
+	return 'isnotnull(%s) AND (%s)' % (RST, ' OR '.join(tests))
+
+
 def _cond(stanza, ids, flags):
 	"""
 	The eval condition for 'this stanza applies to the event being replayed'. Never null: a
@@ -644,7 +661,12 @@ def _rules(chosen, flags, lookup_fields, warnings, stats, rejected=None, bad_loo
 	items = []
 	shared = [s for s in chosen if s.kind in ('source', 'host')]
 	if shared:
-		items.append((ANY, 'eval ' + ', '.join('tenx_rg%d=if(%s,1,0)' % (ids[s.name], s.guard()) for s in shared)))
+		# One pattern per field tests every source:: and host:: stanza at once; only a chunk where some event
+		# matches one runs the per-stanza tests. Elsewhere tenx_rg<n> stays null, which _cond() reads as 0.
+		items.append((ANY, 'eval tenx_srcm=if(%s, 1, null())' % _union_guard(shared)))
+		items.append((ANY, 'foreach tenx_srcm* fieldstr="@@TENXG@@" matchstr="@@TENXH@@" [eval %s]' % ', '.join(
+			'tenx_rg%d=if(%s,1,0)' % (ids[s.name], s.guard()) for s in shared)))
+		items.append((ANY, 'fields - tenx_srcm'))
 	homes = [ANY] + [flags[st] for st in sorted(flags)]
 
 	# Field aliases: every alias reads the values from before any alias ran.
