@@ -58,6 +58,10 @@ export = system
 access = read : [ * ], write : [ admin, sc_admin, power ]
 export = system
 
+[macros/tenx-replay-plan]
+access = read : [ * ], write : [ admin, sc_admin, power ]
+export = system
+
 [macros/tenx-replay-tags]
 access = read : [ * ], write : [ admin, sc_admin, power ]
 export = system

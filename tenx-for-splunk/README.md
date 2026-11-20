@@ -728,6 +728,11 @@ commands than one Splunk search runs, or more characters than `replay_max_macro_
 set, it holds the busiest sourcetypes, a `txf` search over an index that holds one of the others
 shows a warning naming it, and `txf(<sourcetype>)` applies that sourcetype's rules.
 
+When a `txf` search transforms its events (`stats`, `chart`, `timechart`, `top`, `rare`, `table`,
+or `fields` naming the fields kept), `txf` applies only the rules that produce the fields the search
+reads. It applies every rule in verbose mode, when the search returns events, and when it cannot tell
+which fields the search reads.
+
 A field comparison after `txf` reads every compact event in range. When the value is written in the
 event (an event code, a user name), write it as a word too (`EventCode=4625 4625`): the same events,
 read from those holding it. With the Windows add-on, a comparison on a Windows field does not narrow

@@ -62,7 +62,7 @@ for rnd in range(8):
 	run(fake)
 	units = [n for n in fake.macros if n.startswith(tenxreplay.builder.UNIT_PREFIX)]
 	stanzas = [n for n in fake.conf if n not in ('default', tenxreplay.builder.NARROWING_STANZA,
-												  tenxreplay.builder.RETIRED_STANZA)]
+												  tenxreplay.builder.RETIRED_STANZA, tenxreplay.builder.PLAN_STANZA)]
 	counts.append((len(units), len(stanzas)))
 # the grace period: every retired unit dated long ago is deleted at the next rebuild, with its alias
 retired = sorted(fake.conf[tenxreplay.builder.RETIRED_STANZA])

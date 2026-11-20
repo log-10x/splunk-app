@@ -745,7 +745,8 @@ def narrowing_on(config):
 # requires a word (pieces, template dictionary). Every raw event the search returns holds each of
 # those terms; its compact event expands to the same text, so it holds each piece as a value or
 # through its template, and it is selected. A term the prefilter cannot read as a word, an indexed
-# term (name::value), a NOT, an OR with any of those, or no answer at all, place no restriction.
+# term (name::value) other than as an OR's alternative to terms it reads (lispy_tree), a NOT, an OR
+# with any of those, or no answer at all, place no restriction.
 SPLUNK_MODE = "splunk"
 LISPY_LINE = re.compile(r"base lispy: (\[.*\])\s*$")
 LISPY_WORD = re.compile(r"^[^\s\"'\\()\[\]`]+$")
@@ -821,12 +822,36 @@ SPLUNK_TERMS_UNREAD = ("tx: field_narrowing = splunk, but Splunk's index terms f
 					   "read, so they do not narrow which compact events are read.")
 
 
+# An indexed term of the base lispy (name::value) whose field the compact events can carry as Splunk's raw
+# events do: not a default field (a compact event has its own sourcetype, source, host and index).
+LISPY_INDEXED = re.compile(r"^([A-Za-z0-9_.@-]+)::([^\s\"'\\()\[\]`]+)$")
+
+
+def _indexed_term(token):
+	"""("indexed", token) for a name::value term the prefilter may keep as an alternative, or None."""
+	m = LISPY_INDEXED.match(token)
+	if not m:
+		return None
+	name = m.group(1).lower()
+	if name in NOT_IN_TEXT or any(fnmatch.fnmatchcase(name, p) for p in NOT_IN_TEXT_PATTERNS):
+		return None
+	return ("indexed", token)
+
+
 def lispy_tree(lispy):
 	"""
 	A base lispy ("[ AND 4625 index::main [ OR alice bob ] ]") as a parsed search the prefilter reads:
-	("text", term), ("and", [...]), ("or", [...]) or ("true",). Brackets are tokens of their own. A
-	term with name::value, a quote, a backslash, a parenthesis or a bracket inside it, a NOT, and an OR
-	with any such branch place no restriction. None when the text is not a lispy this reads (then no
+	("text", term), ("indexed", name::value), ("and", [...]), ("or", [...]) or ("true",). Brackets are
+	tokens of their own. A term with a quote, a backslash, a parenthesis or a bracket inside it, a NOT, and
+	an OR with any such branch place no restriction.
+
+	An indexed term (name::value) restricts only as a branch of an OR beside a branch that does: Splunk
+	writes [ OR dstip::10.1.2.3 [ AND 10 1 2 3 ] ] for dstip=10.1.2.3 by default (limits.conf
+	always_include_indexedfield_lispy = true), and a raw event it returns holds either the indexed field or
+	the terms; its compact event holds the same terms, or carries the same indexed field (a field map, fields
+	sent with the event). Required on its own, or in an OR of indexed terms only, it places no restriction (a
+	compact event can get the field at search time instead), nor does one on a default field (sourcetype,
+	source, host, index: a compact event has its own). None when the text is not a lispy this reads (then no
 	narrowing at all).
 	"""
 	if not lispy:
@@ -835,7 +860,9 @@ def lispy_tree(lispy):
 	pos = [0]
 
 	def term(token):
-		if "::" in token or not LISPY_WORD.match(token) or token.upper() in ("AND", "OR", "NOT"):
+		if "::" in token:
+			return _indexed_term(token) or TRUE
+		if not LISPY_WORD.match(token) or token.upper() in ("AND", "OR", "NOT"):
 			return TRUE
 		return ("text", token)
 
@@ -861,10 +888,12 @@ def lispy_tree(lispy):
 				break
 			children.append(node())
 		if op == "AND":
-			kept = [c for c in children if c != TRUE]
+			kept = [c for c in children if c != TRUE and c[0] != "indexed"]
 			return TRUE if not kept else kept[0] if len(kept) == 1 else ("and", kept)
 		if op == "OR":
-			return TRUE if not children or TRUE in children else children[0] if len(children) == 1 else ("or", children)
+			if not children or TRUE in children or all(c[0] == "indexed" for c in children):
+				return TRUE
+			return children[0] if len(children) == 1 else ("or", children)
 		if op == "NOT":
 			return TRUE
 		raise Unparsed("lispy: operator %s" % op)
@@ -875,7 +904,7 @@ def lispy_tree(lispy):
 			raise Unparsed("lispy: text after the expression")
 	except Unparsed:
 		return None
-	return tree
+	return TRUE if tree[0] == "indexed" else tree
 
 
 # Written forms the compact event does not keep (FORMAT_SPEC.md S2.2 and S4.4, log10x-format):
@@ -1299,6 +1328,9 @@ def prefilter(node, dictionary, text_field=None, digits=frozenset()):
 	if kind == "or":
 		clauses = [prefilter(child, dictionary, text_field, digits) for child in node[1]]
 		return None if any(c is None for c in clauses) else "(" + " OR ".join(clauses) + ")"
+	if kind == "indexed":
+		# a name::value alternative of Splunk's base lispy (lispy_tree), matched on the indexed fields
+		return node[1]
 	return None
 
 

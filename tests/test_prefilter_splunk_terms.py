@@ -7,8 +7,8 @@ required exactly as the same text written as a word after the macro, so the guar
 carry over: every raw event the search returns holds each term, its compact event expands to that text,
 and so it holds each piece of the term as a value or through its template.
 
-What the prefilter cannot read with certainty places no restriction: an indexed term (name::value), a
-NOT, an OR with any such branch, a term with a quote, backslash, parenthesis or bracket in it, a lispy it
+What the prefilter cannot read with certainty places no restriction: an indexed term (name::value) on its
+own or of a default field, a NOT, an OR with any such branch, a term with a quote, backslash, parenthesis or bracket in it, a lispy it
 cannot parse, a probe it cannot run (subsearch in the words). Then nothing is narrowed, as before.
 """
 import os
@@ -109,13 +109,31 @@ class TestReadingTheLispy:
 		assert p.lispy_tree("4625") == ("text", "4625")
 
 	def test_what_places_no_restriction(self):
-		# an OR with an indexed-term branch: events of that sourcetype need no term
+		# an OR with an indexed term of a default field: a compact event has its own sourcetype, source, host and index
 		assert p.lispy_tree("[ OR 4625 sourcetype::xmlwineventlog ]") == p.TRUE
+		assert p.lispy_tree("[ OR 4625 index::main ]") == p.TRUE
+		assert p.lispy_tree("[ OR 4625 host::web01 ]") == p.TRUE
+		assert p.lispy_tree("[ OR 4625 tenx_sourcetype::x ]") == p.TRUE
+		# an indexed term required alone, or an OR of indexed terms only: a compact event can get the field at
+		# search time instead
+		assert p.lispy_tree("[ AND dstip::10.1.2.3 ]") == p.TRUE
+		assert p.lispy_tree("[ OR a::1 b::2 ]") == p.TRUE
+		assert p.lispy_tree('[ OR "a::1" 4625 ]') == p.TRUE
 		assert p.lispy_tree("[ AND index::main [ NOT 4625 ] ]") == p.TRUE
 		assert p.lispy_tree('[ AND "a b" ]') == p.TRUE
 		assert p.lispy_tree("[ AND a\\b ]") == p.TRUE
 		assert p.lispy_tree("[ AND index::main ]") == p.TRUE
 		assert p.lispy_tree("[ AND x[1] ]") == p.TRUE
+
+	def test_an_indexed_alternative_beside_the_terms(self):
+		# Splunk's default (limits.conf always_include_indexedfield_lispy = true) for dstip=10.1.2.30: the indexed
+		# form OR the terms of the value. The OR was read as no restriction, so field_narrowing = splunk narrowed
+		# no field comparison (Splunk Enterprise 10.4.3, FortiGate: every compact event read).
+		lispy = "[ AND [ OR dstip::10.1.2.30 [ AND 10 1 2 30 ] ] ]"
+		assert p.lispy_tree(lispy) == ("or", [("indexed", "dstip::10.1.2.30"),
+											  ("and", [("text", "10"), ("text", "1"), ("text", "2"), ("text", "30")])])
+		assert p.lispy_tree("[ AND 4625 [ OR eventcode::4625 4625 ] ]") == ("and", [
+			("text", "4625"), ("or", [("indexed", "eventcode::4625"), ("text", "4625")])])
 
 	def test_what_it_cannot_read_narrows_nothing(self):
 		for bad in ("", None, "[ AND 4625", "[ AND 4625 ] ]", "]", "[ XOR a b ]", "[ AND a ] b", "["):
@@ -147,6 +165,15 @@ class TestTheNarrowing:
 	def test_terms_a_timestamp_could_print_place_no_restriction(self):
 		# 2023 is a year the stored formats print, so it never narrows, as a word does not
 		assert narrowed("year=2023", "[ AND 2023 ]") is None
+
+	def test_an_indexed_alternative_keeps_the_narrowing_of_the_terms(self):
+		# the compact event holding the terms is selected as before; one carrying the indexed field (a field
+		# map, fields sent with the event) is selected by it
+		got = narrowed("user=kerberos", "[ AND [ OR user::kerberos kerberos ] ]")
+		assert got == "((user::kerberos OR ((TERM(kerberos) OR TERM(~k1)))))"
+		# a branch that places no restriction leaves the whole OR without one
+		assert narrowed("year=2023", "[ AND [ OR year::2023 2023 ] ]") is None
+		assert narrowed("user=kerberos", "[ AND [ OR sourcetype::x kerberos ] ]") is None
 
 	def test_no_lispy_leaves_the_search_as_before(self):
 		for text in ("EventCode=4625", "error action=success", "user IN (a, b) kerberos"):
@@ -258,7 +285,7 @@ cmd = tenx_prefilter.TenxPrefilterCommand()
 warnings, probes, looked = [], [], []
 cmd._store_check = lambda: True
 cmd._search_text = lambda: text
-cmd._store_wild_plan = lambda t: None
+cmd._store_plans = lambda t: None
 cmd._original_sourcetype_rows = lambda tree: ([], '`txf`')
 cmd._record_checks = lambda macro: None
 cmd._text_field = lambda: None

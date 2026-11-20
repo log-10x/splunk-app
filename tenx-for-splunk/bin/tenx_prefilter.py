@@ -34,6 +34,10 @@ find each such word as the index does (tenx_prefilter_parser.wild_marks), and th
 such word replaced by its mark. `tx` and `txf` read them back in the step before their final
 search (macros.conf [tenx-wild]).
 
+For a search that runs plain `txf` once, it also stores custom.tenx_replay_plan: the rules of the field
+replay that feed the fields the rest of the search reads, which `txf` reads back right before the replay
+(macros.conf [tenx-replay-plan]; tenx_replay_plan.py says when the whole replay runs instead).
+
 It also warns, from the record tenxreplay keeps of the original sourcetypes (tenx_replay.conf), when
 the search reads compact events whose original sourcetype the field replay of `txf` leaves out, and
 when its indexes hold raw events of those sourcetypes, in its time range, that the tenx-raw-events
@@ -69,6 +73,7 @@ sys.path.append(os.path.join(apphome, 'lib'))
 from splunklib.searchcommands import dispatch, Configuration, GeneratingCommand
 
 import tenx_prefilter_parser as parser
+import tenx_replay_plan as replay_plan
 
 # Splunk names a subsearch's job subsearch_<parent sid>_<epoch>.<n>.
 # Matches every event like *, and gives Splunk Web no keyword to highlight (* lit every event).
@@ -76,8 +81,12 @@ EVERY_EVENT = "(*)"
 
 # The tenx_replay.conf stanza tenxreplay writes: fields whose value is not text of the event.
 NARROWING_STANZA = "tenx:narrowing"
+# ... and the rule table of the field replay (tenx_replay_builder.Selection).
+PLAN_STANZA = "tenx:plan"
 
 SUBSEARCH_SID = re.compile(r"^subsearch_(.+)_\d+\.\d+$")
+# A word plan not computed yet (_store_plans).
+UNREAD = object()
 
 
 def dictionary_failed(result):
@@ -119,6 +128,8 @@ class TenxPrefilterCommand(GeneratingCommand):
 		self.parent = match.group(1)
 		job = self._rest("/services/search/jobs/%s?output_mode=json" % urllib.parse.quote(match.group(1), safe=""))
 		search = job["entry"][0]["content"].get("search", "")
+		# The whole search and the job's settings: the replay plan reads both (_replay_plan).
+		self.search, self.job = search, job["entry"][0]["content"]
 		# The app the search runs from: its aliases, event types and tags are the ones the probe of
 		# _splunk_terms must see.
 		self.parent_app = (job["entry"][0].get("acl") or {}).get("app") or APP_NAME
@@ -252,23 +263,56 @@ class TenxPrefilterCommand(GeneratingCommand):
 		rows = result.get("results", [])
 		return "(%s OR %s)" % (prefilter, parser.word_index_branch(rows)) if rows else prefilter
 
-	def _store_wild_plan(self, text):
+	def _replay_plan(self):
 		"""
-		Stores on the running job what the step before the final search of `tx` and `txf` applies
-		(macros.conf [tenx-wild]). Nothing when no word needs it: that step then marks nothing and
-		searches `*`. If it cannot be stored, such a word is matched as after any pipe.
+		For a search running plain `txf` once: which rules of the field replay it reads, as the fields the
+		replay step puts on its events (tenx_replay_plan.plan_value), from the rule table tenxreplay wrote
+		with the macro ([tenx:plan] in tenx_replay.conf, read from disk). None, and the whole replay runs,
+		when that cannot be told (tenx_replay_plan.needed_fields), when Splunk keeps the search's events
+		(statusBuckets above 0, verbose mode: every field of them is shown), or when there is no table.
 		"""
 		try:
-			plan = parser.wild_marks(text)
-			if plan is None:
+			needed = replay_plan.needed_fields(getattr(self, "search", None), parser)
+			if needed is None:
+				return None
+			job = getattr(self, "job", None) or {}
+			level = str((job.get("request") or {}).get("adhoc_search_level", "") or "").lower()
+			if "statusBuckets" not in job or float(job.get("statusBuckets") or 0) > 0 or level == "verbose":
+				return None
+			stanzas = parser.conf_stanzas([os.path.join(apphome, d, "tenx_replay.conf") for d in ("default", "local")])
+			return replay_plan.plan_value(replay_plan.read_table(stanzas.get(PLAN_STANZA) or {}), needed)
+		except Exception as e:
+			self.logger.info("tx: no replay plan: %s", e)
+			return None
+
+	def _store_plans(self, text):
+		"""
+		Stores on the running job what the tx macros read back before their last steps: for words that need
+		it, the step before the final search (macros.conf [tenx-wild]: custom.tenx_wild_marks and
+		custom.tenx_wild_search); for plain `txf`, the replay plan (macros.conf [tenx-replay-plan]:
+		custom.tenx_replay_plan). One request, none when neither applies. If the word plan cannot be stored,
+		such a word is matched as after any pipe; without a replay plan the whole replay runs.
+		"""
+		wild = UNREAD
+		try:
+			wild = parser.wild_marks(text)
+			data = {}
+			if wild is not None:
+				data.update({"custom.tenx_wild_marks": wild[0], "custom.tenx_wild_search": wild[1]})
+			replay = self._replay_plan()
+			if replay is not None:
+				data["custom.tenx_replay_plan"] = replay
+			if not data:
 				return
 			self._rest("/services/search/jobs/%s?output_mode=json" % urllib.parse.quote(self.parent, safe=""),
-					   {"custom.tenx_wild_marks": plan[0], "custom.tenx_wild_search": plan[1]}, answer=False)
+					   data, answer=False)
 		except Exception as e:
-			self.logger.warning("tx: storing the wildcard plan failed: %s", e)
-			self.write_warning("tx: a word with a wildcard inside it, TERM() or CASE() is matched in this search as after a "
-							   "pipe, which can differ from the same search on the index: the step that matches it as the "
-							   "index does could not be prepared.")
+			self.logger.warning("tx: storing the search plans failed: %s", e)
+			if wild is not None:
+				# a word plan that was needed, or could not be computed
+				self.write_warning("tx: a word with a wildcard inside it, TERM() or CASE() is matched in this search as after a "
+								   "pipe, which can differ from the same search on the index: the step that matches it as the "
+								   "index does could not be prepared.")
 
 	def _store_check(self):
 		"""
@@ -401,7 +445,7 @@ class TenxPrefilterCommand(GeneratingCommand):
 				"tx: a comma after `tx` is matched literally, so this search would miss events. Remove it, or put the text in quotes.")
 		several = getattr(self, "calls", 1) > 1
 		if not several:
-			self._store_wild_plan(text)
+			self._store_plans(text)
 		rows, macro = self._original_sourcetype_rows(tree)
 		if rows:
 			self.error_exit(RuntimeError("original sourcetype"), parser.original_sourcetype_message(rows, macro))

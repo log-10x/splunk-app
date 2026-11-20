@@ -36,9 +36,11 @@ the alias tenx-replay-st-<sourcetype>; the validation of txf(1), which lets txf(
 for a sourcetype that has a unit and stops it with a message for one that has none; one tenx_replay.conf stanza
 per original sourcetype listing the fields a calculated field or a lookup produces and the
 sources, hosts and indexes recorded (the search rewrite reads `indexes` to pick the units a search
-needs); and the stanza [tenx:narrowing]: every field whose value some props stanza takes from
+needs); the stanza [tenx:narrowing]: every field whose value some props stanza takes from
 somewhere other than the event's text, which the prefilter must not narrow on (see
-tenx_prefilter_parser.py). Every rule, the macro and the units are run against this Splunk before
+tenx_prefilter_parser.py), written whatever field_narrowing says so that the setting takes effect
+however it is changed; and the stanza [tenx:plan]: the macro's rule table, from which the prefilter
+chooses the rules a `txf` search reads (tenx_replay_plan.py). Every rule, the macro and the units are run against this Splunk before
 anything is written. Nothing is written when the result is unchanged. One row per original
 sourcetype is returned. The "Rebuild Field Replay" saved search runs it hourly. "Rebuild Field
 Replay When New" runs `| tenxreplay only_new=true` every five minutes over the last ten: one
@@ -487,6 +489,27 @@ class TenxReplayCommand(GeneratingCommand):
 		self._rest(self._macro_path(name) + '/acl', {'sharing': 'global', 'owner': 'nobody', 'perms.read': '*',
 													 'perms.write': 'admin,sc_admin,power'})
 
+	def _write_plan(self, have, selection):
+		"""
+		The [tenx:plan] stanza: the generation and rule table of the macro just written (builder.Selection),
+		which tenxprefilter reads to choose the rules a `txf` search needs; removed when the macro has none.
+		A table of another generation than the macro's is never used (the macro then runs whole).
+		"""
+		path = self._ns('configs/conf-%s/%s' % (CONF, urllib.parse.quote(builder.PLAN_STANZA, safe='')))
+		if selection is None:
+			if have is not None:
+				self._rest(path, method='DELETE')
+				return ['-' + builder.PLAN_STANZA]
+			return []
+		want = {'generation': selection[0], 'rules': json.dumps(selection[1], separators=(',', ':'))}
+		if have is None:
+			self._rest(self._ns('configs/conf-%s' % CONF), dict(want, name=builder.PLAN_STANZA))
+		elif any(str(have.get(k, '')) != v for k, v in want.items()):
+			self._rest(path, want)
+		else:
+			return []
+		return [builder.PLAN_STANZA]
+
 	def _write(self, replay, not_in_text, last_seen, narrowing, units=None, cov=None, failed=(), now=None,
 			   settings=None, nocarrier=None):
 		try:
@@ -507,6 +530,7 @@ class TenxReplayCommand(GeneratingCommand):
 		if definition != replay.spl():
 			self._rest(self._ns('configs/conf-macros/%s' % urllib.parse.quote(MACRO, safe='')), {'definition': replay.spl()})
 			changed.append(MACRO)
+		changed += self._write_plan(existing.get(builder.PLAN_STANZA), replay.selection)
 		infos = self._recorded_infos(replay, units or {}, failed)
 		for st, info in infos.items():
 			seen = cov.get(st)
@@ -538,7 +562,7 @@ class TenxReplayCommand(GeneratingCommand):
 		want = ','.join(not_in_text)
 		have = existing.get(builder.NARROWING_STANZA)
 		if not narrowing:
-			# Field narrowing off, or no compact event carries tenx_sourcetype: no list, so no
+			# No compact event carries tenx_sourcetype: no list, so with field_narrowing = true no
 			# field comparison restricts the prefilter.
 			if have is not None:
 				self._rest(self._ns('configs/conf-%s/%s' % (CONF, urllib.parse.quote(builder.NARROWING_STANZA, safe=''))),
@@ -553,7 +577,7 @@ class TenxReplayCommand(GeneratingCommand):
 			changed.append(builder.NARROWING_STANZA)
 		for st in existing:
 			if st not in infos and st not in ('default', builder.NARROWING_STANZA, builder.RETIRED_STANZA,
-															  builder.NOCARRIER_STANZA):
+															  builder.NOCARRIER_STANZA, builder.PLAN_STANZA):
 				self._rest(self._ns('configs/conf-%s/%s' % (CONF, urllib.parse.quote(st, safe=''))), method='DELETE')
 				changed.append('-' + st)
 				self.rewrite_changed.append('-' + st)
@@ -606,7 +630,7 @@ class TenxReplayCommand(GeneratingCommand):
 		return dict((e['name'], dict((k, str(e.get('content', {}).get(k, '') or ''))
 									 for k in ('sources', 'hosts', 'indexes', 'last_seen')))
 					for e in entries if e['name'] not in ('default', builder.NARROWING_STANZA, builder.RETIRED_STANZA,
-														  builder.NOCARRIER_STANZA))
+														  builder.NOCARRIER_STANZA, builder.PLAN_STANZA))
 
 	def generate(self):
 		self.rewrite_changed, self.dispatched = [], []
@@ -681,7 +705,7 @@ class TenxReplayCommand(GeneratingCommand):
 			return
 		last_seen = builder.last_seen_of(present, covered, now)
 		replay = builder.build_capped(stanzas, present, lookups, keep, settings, last_seen, transforms=transforms,
-									  keep_by_sourcetype=keep_by_st)
+									  keep_by_sourcetype=keep_by_st, select=True)
 		# Every covered sourcetype gets a unit, including those the macro's size limits leave out of it:
 		# their units are what txf(<sourcetype>) and the search rewrite replay them with.
 		unit_sts = builder.unit_sourcetypes(present, last_seen, settings)
@@ -692,14 +716,15 @@ class TenxReplayCommand(GeneratingCommand):
 			try:
 				bad_lookups = self._lookup_problems()
 				replay = builder.build_capped(stanzas, present, lookups, keep, settings, last_seen,
-											  bad_lookups=bad_lookups, transforms=transforms, keep_by_sourcetype=keep_by_st)
+											  bad_lookups=bad_lookups, transforms=transforms, keep_by_sourcetype=keep_by_st,
+											  select=True)
 				units = builder.build_units(stanzas, cov, unit_sts, lookups, keep, settings,
 											bad_lookups=bad_lookups, transforms=transforms, keep_by_sourcetype=keep_by_st)
 				rejected = builder.failing_rules(builder.all_rules(replay, units), self._dry_run)
 				if rejected:
 					replay = builder.build_capped(stanzas, present, lookups, keep, settings, last_seen,
 												  rejected=rejected, bad_lookups=bad_lookups, transforms=transforms,
-												  keep_by_sourcetype=keep_by_st)
+												  keep_by_sourcetype=keep_by_st, select=True)
 					units = builder.build_units(stanzas, cov, unit_sts, lookups, keep, settings,
 												rejected=rejected, bad_lookups=bad_lookups, transforms=transforms,
 												keep_by_sourcetype=keep_by_st)

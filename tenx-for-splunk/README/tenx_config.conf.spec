@@ -52,9 +52,9 @@ field_narrowing = splunk|<boolean>
   comparison, read from a probe search over a time range that holds no event. When they cannot
   be read, the comparison does not narrow, and the search shows a warning.
 * true: like the value written as a word. Needs the [tenx:narrowing] list in tenx_replay.conf,
-  which tenxreplay writes only while this is true and some compact event carries
-  tenx_sourcetype. A field whose value is not text of the event and that the list does not name
-  (a rule defined only in another app, or private to a user) can then make `tx` return fewer
-  events than the same search on raw events.
+  which tenxreplay writes while some compact event carries tenx_sourcetype. A field whose value
+  is not text of the event and that the list does not name (a rule defined only in another app,
+  or private to a user) can then make `tx` return fewer events than the same search on raw
+  events.
 * false: a field comparison does not narrow.
 * Default: false

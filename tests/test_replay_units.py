@@ -241,7 +241,9 @@ class TestTxIsTheShippedMacro:
 				'`tenx-mapped-hide` | `tenx-whole-hide` | ')
 		tail = (' | `tenx-whole-restore` | `tenx-mapped-restore` | fields - tenx_compact_raw, tenx_rst, tenx_hash, '
 				'tenx_var_0, tenx_vars' + REFUSED_STEP + b.WILD_STEP + ' | search *')
-		assert conf.get('txf', 'definition') == head % mark + '`tenx-replay`' + tail
+		# plain txf reads its replay plan right before the replay, and removes the plan's fields after it
+		assert conf.get('txf', 'definition') == head % mark + '`tenx-replay-plan` | `tenx-replay`' + tail.replace(
+			'tenx_var_0, tenx_vars', 'tenx_var_0, tenx_vars, tenx_nd*')
 		# Splunk Enterprise 10.4.3 refuses a colon in a macro name, so txf(1) computes the unit's
 		# name with md5() in eval; on 10.4.3, md5 in eval equals hashlib's for the five names tried
 		assert conf.get('txf(1)', 'iseval') == '1'
@@ -250,8 +252,8 @@ class TestTxIsTheShippedMacro:
 			+ tail + '"')
 		assert without_guard(conf.get('txf', 'definition')) == (
 			'((`tenx-events`) OR (`tenx-raw-events`)) [| tenxprefilter] | eval tenx_compact_raw=_raw | `tenx-inflate` | fields - _kv | '
-			'`tenx-replay` | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars' + REFUSED_STEP + b.WILD_STEP +
-			' | search *')
+			'`tenx-replay-plan` | `tenx-replay` | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars, tenx_nd*'
+			+ REFUSED_STEP + b.WILD_STEP + ' | search *')
 		assert conf.get('txf(1)', 'args') == 'st'
 		# shipped, the validation names no unit; tenxreplay writes the units it has written into it
 		assert conf.get('txf(1)', 'validation') == b.txf_one_validation([]) == (
@@ -907,6 +909,8 @@ out['macros'] = sorted(fake.macros)
 out['acl'] = sorted((k, v['sharing']) for k, v in fake.acl.items())
 out['conf'] = fake.conf
 out['kv_unit'] = fake.macros[tenxreplay.builder.unit_macro('app:kv')]
+out['replay'] = fake.macros['tenx-replay']
+out['plan'] = dict(fake.conf.get(tenxreplay.builder.PLAN_STANZA, {}))
 out['alias'] = fake.macros.get('tenx-replay-st-app:kv')
 out['txf_one'] = fake.validations.get('txf(1)')
 run(fake)
@@ -945,6 +949,16 @@ def test_the_command_writes_units_aliases_and_what_they_cover():
 	assert out['conf']['app:kv']['sources'] == '/var/app/a.log,/var/app/old.log' and out['conf']['app:kv']['unit'] == kv
 	# the old source's events get the source stanza; the host stanza applies (web-0, web-1)
 	assert '"src"' in out['kv_unit'] and '"host"' in out['kv_unit'] and 'mvindex(tenx_sourcetype,0)=="app:kv"' in out['kv_unit']
+	# the macro's rule table, with the generation its guards carry; the list of fields not in text whatever
+	# field_narrowing says (here unset)
+	table = out['plan']
+	generation, rules = table['generation'], json.loads(table['rules'])
+	assert re.fullmatch(r'[0-9a-f]{8}', generation) and ('tenx_nd%s*_' % generation) in out['replay']
+	assert ('tenx_ndm%s' % generation) in out['replay'] and b.GEN not in out['replay']
+	assert sorted(tuple(r[1]) for r in rules) == [('h',), ('j',), ('k',), ('s',), ('y',)]
+	assert b.NARROWING_STANZA in out['conf']
+	# units carry no guard
+	assert 'tenx_nd' not in out['kv_unit']
 	# the next rebuild over the same events writes nothing
 	assert out['writes_second'] == []
 	# an expired sourcetype loses its stanza; its unit becomes the no-op unit, its alias stays
