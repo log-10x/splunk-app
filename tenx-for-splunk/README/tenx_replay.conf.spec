@@ -64,3 +64,10 @@ fields_not_in_text = <comma-separated list>
 * Fields that some props stanza gives a value not taken from the event's text: calculated
   fields, lookup outputs, extractions from metadata, aliases of those, and the indexed fields of
   compact events. The tx prefilter does not narrow a field comparison on these. * alone: on none.
+
+[tenx:plan]
+generation = <8 hex digits>
+rules = <JSON list>
+* The rules of the tenx-replay macro, for `txf` to replay only those that feed the fields a search
+  reads: [id, fields written, fields read, needs the source:: and host:: stanza tests] each. Used
+  only with the macro of the same generation.

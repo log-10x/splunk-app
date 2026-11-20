@@ -513,7 +513,11 @@ by more than 5,000 templates select nothing on their own, and a `NOT`, a field c
 `OR` with any of these selects every event in range. A run of digits narrows unless a stored
 template's timestamp could print it (a year, two digits of a time, a fraction of that length).
 The search after `tx` then applies the full terms, so the selection may be wider than
-the result, never narrower. A `tx` word search reads the template store, which adds a few seconds per search where it holds hundreds of thousands of templates.
+the result, never narrower. A `tx` word search reads the template store, which adds a few seconds per
+search where it holds hundreds of thousands of templates. The answer for each word is kept in the
+`tenx_dict_cache` collection, and a later search for the same word reads only the templates stored in
+the hours since. Every template is read again once a day, after the app is installed or upgraded, and
+after the template load is run from the start of the index.
 
 **The `tx` and `tenxsearch` commands.** `| tx index=myindex sourcetype=tenx_encoded error`
 and `| tenxsearch searchstring="..."` run a rewritten search and write every event out
@@ -723,6 +727,11 @@ rules of every original sourcetype the app has recorded in the compact indexes, 
 commands than one Splunk search runs, or more characters than `replay_max_macro_chars` when it is
 set, it holds the busiest sourcetypes, a `txf` search over an index that holds one of the others
 shows a warning naming it, and `txf(<sourcetype>)` applies that sourcetype's rules.
+
+When a `txf` search transforms its events (`stats`, `chart`, `timechart`, `top`, `rare`, `table`,
+or `fields` naming the fields kept), `txf` applies only the rules that produce the fields the search
+reads. It applies every rule in verbose mode, when the search returns events, and when it cannot tell
+which fields the search reads.
 
 A field comparison after `txf` reads every compact event in range. When the value is written in the
 event (an event code, a user name), write it as a word too (`EventCode=4625 4625`): the same events,

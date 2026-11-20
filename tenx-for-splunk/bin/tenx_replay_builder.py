@@ -93,8 +93,12 @@ Not covered (reported as warnings): index-time fields of the original sourcetype
 (INDEXED_EXTRACTIONS, TRANSFORMS that write fields), KV_MODE multi, a sourcetype rewrite that reads
 a field other than _raw, lookups whose definition this app cannot see.
 """
+import hashlib
+import json
 import math
 import re
+
+import tenx_replay_plan as plan
 
 CARRIER_FIELD = 'tenx_sourcetype'
 # Written by every transform of a field map (tenx_field_map.py MARK_FIELD); tenx-mapped-hide keeps
@@ -196,7 +200,7 @@ def usable_sourcetype(name):
 	sender) may be written into the macro and become a tenx_replay.conf stanza. [default] and
 	[tenx:narrowing] are read back as something else, and brackets would end the stanza name.
 	"""
-	return safe_text(name) and name not in ('default', NARROWING_STANZA, RETIRED_STANZA, NOCARRIER_STANZA) \
+	return safe_text(name) and name not in ('default', NARROWING_STANZA, RETIRED_STANZA, NOCARRIER_STANZA, PLAN_STANZA) \
 		and '[' not in name and ']' not in name
 
 
@@ -523,6 +527,8 @@ class Replay(object):
 		self.warnings = []
 		self.per_sourcetype = {}
 		self.dropped = []
+		# (generation, rule table) when built with select (see Selection); None otherwise.
+		self.selection = None
 		# Every calculated field and lookup written, with a search that runs it alone
 		# (failing_rules() checks them against the running Splunk): dicts with key, stanza, test.
 		self.rules = []
@@ -549,6 +555,23 @@ UNCHANGED = tuple(extract_steps())
 
 
 ANY = 'tenx_go0z'
+
+
+def _union_guard(shared):
+	"""
+	The condition that some source:: or host:: stanza of `shared` applies to the replayed event: the patterns
+	of each field joined into one, each as its Stanza.guard() tests it (a literal host without case).
+	"""
+	tests = []
+	for kind in ('source', 'host'):
+		alts = []
+		for s in (x for x in shared if x.kind == kind):
+			rx = re.escape(s.pattern) if s.literal else s.regex()
+			nocase = kind == 'host' and (s.literal or '(?-i)' not in rx)
+			alts.append(('(?i:^(?:%s)$)' if nocase else '(?:^(?:%s)$)') % rx)
+		if alts:
+			tests.append('match(%s, %s)' % (kind, spl_string('|'.join(alts))))
+	return 'isnotnull(%s) AND (%s)' % (RST, ' OR '.join(tests))
 
 
 def _cond(stanza, ids, flags):
@@ -615,7 +638,46 @@ def _placed(items):
 	return out
 
 
-def _rules(chosen, flags, lookup_fields, warnings, stats, rejected=None, bad_lookups=None, rules=None):
+class Selection(object):
+	"""
+	The rules of the `tenx-replay` macro that a `txf` search can leave out (tenx_replay_plan.py): each
+	alias, calculated field and lookup class, and the source:: and host:: stanza tests, runs inside a
+	guard that passes when tenx_ndall exists or when the plan on the event names its id. `rules` is the
+	table tenxprefilter reads: [id, fields written, fields read ('*': not known), needs the stanza tests].
+	The guards carry GEN until build() replaces it with the macro's generation.
+	"""
+
+	def __init__(self):
+		self.rules = []
+
+	def add(self, writes, reads, shared):
+		rid = len(self.rules) + 1
+		self.rules.append([rid, sorted(set(writes)), sorted(set(reads)), bool(shared)])
+		return rid
+
+	@staticmethod
+	def guard(rid, body):
+		return 'foreach %s* %s%s*_%d_* fieldstr="@@TENXN@@" matchstr="@@TENXO@@" [%s]' % (
+			plan.ALL, plan.PREFIX, GEN, rid, ' | '.join(body))
+
+
+# Stands for the macro's generation in the guards until build() knows it (see generation()).
+GEN = '@@TENXGEN@@'
+
+
+def every_rule(body):
+	"""Steps that run only when the whole replay runs (tenx_ndall exists): event types and tags."""
+	return 'foreach %s* fieldstr="@@TENXN@@" matchstr="@@TENXO@@" [%s]' % (plan.ALL, ' | '.join(body))
+
+
+def _expression_reads(expr):
+	try:
+		return plan.expression_fields(expr)
+	except plan.Unknown:
+		return set(['*'])
+
+
+def _rules(chosen, flags, lookup_fields, warnings, stats, rejected=None, bad_lookups=None, rules=None, sel=None):
 	"""
 	The aliases, calculated fields and lookups of every chosen stanza, each written once.
 	Rules of a sourcetype stanza run in that sourcetype's block; rules of [default] and of
@@ -624,11 +686,17 @@ def _rules(chosen, flags, lookup_fields, warnings, stats, rejected=None, bad_loo
 	writes, every calculated field reads before any writes, and lookups run in ASCII order of
 	their class names. `stats` collects per stanza what was written.
 
+	Field aliases are written one assignment each (alias = original where the stanza applies) when
+	that cannot differ from all reading first: no alias reads a field an alias writes, and no field is
+	written by aliases of two classes. Otherwise every alias first copies its original and then all
+	write.
+
 	rejected      {(rule key, stanza name): reason} of rules the running Splunk refused (see
 	              failing_rules()); they are left out like a rule that fails the offline checks.
 	bad_lookups   {lookup definition: reason} of lookups not every user can run (see
 	              lookup_problems()); their rules are left out.
 	rules         a list that receives each written calculated field and lookup with its test.
+	sel           a Selection: each rule class runs in its own guard and is entered in its table.
 	"""
 	rejected, bad_lookups = rejected or {}, bad_lookups or {}
 	rules = rules if rules is not None else []
@@ -641,15 +709,28 @@ def _rules(chosen, flags, lookup_fields, warnings, stats, rejected=None, bad_loo
 		return stats.setdefault(stanza.name, {'aliases': 0, 'calculated': 0, 'lookups': 0,
 											  'computed': set(), 'aliased': set()})
 
+	def tested(text):
+		# a condition that reads a source:: or host:: stanza test
+		return 'tenx_rg' in text
+
 	items = []
 	shared = [s for s in chosen if s.kind in ('source', 'host')]
 	if shared:
-		items.append((ANY, 'eval ' + ', '.join('tenx_rg%d=if(%s,1,0)' % (ids[s.name], s.guard()) for s in shared)))
+		# One pattern per field tests every source:: and host:: stanza at once; only a chunk where some event
+		# matches one runs the per-stanza tests. Elsewhere tenx_rg<n> stays null, which _cond() reads as 0.
+		tests = ['eval tenx_srcm=if(%s, 1, null())' % _union_guard(shared),
+				 'foreach tenx_srcm* fieldstr="@@TENXG@@" matchstr="@@TENXH@@" [eval %s]' % ', '.join(
+					 'tenx_rg%d=if(%s,1,0)' % (ids[s.name], s.guard()) for s in shared),
+				 'fields - tenx_srcm']
+		if sel is not None:
+			items.append((ANY, sel.guard(plan.SHARED, tests)))
+		else:
+			items.extend((ANY, t) for t in tests)
 	homes = [ANY] + [flags[st] for st in sorted(flags)]
 
 	# Field aliases: every alias reads the values from before any alias ran.
 	aliases = _by_key(chosen, ALIAS_KEY)
-	reads, writes, n = dict((h, []) for h in homes), [], 0
+	parsed = []
 	for key in sorted(aliases):
 		cands = aliases[key]
 		for i, (stanza, value) in enumerate(cands):
@@ -660,19 +741,64 @@ def _rules(chosen, flags, lookup_fields, warnings, stats, rejected=None, bad_loo
 			except ReplayError as e:
 				warnings.append('%s in [%s]: %s' % (key, stanza.name, e))
 				continue
+			parsed.append((key, i, stanza, pairs))
+	written_by = {}
+	for key, _, _, pairs in parsed:
+		for _, _, alias in pairs:
+			written_by.setdefault(alias.lower(), set()).add(key)
+	origins = set(orig.lower() for _, _, _, pairs in parsed for orig, _, _ in pairs)
+	single = all(len(keys) == 1 for keys in written_by.values()) and not (origins & set(written_by))
+	alias_id = {}
+	if sel is not None:
+		for key in sorted(aliases):
+			got = [(i, st, pairs) for k, i, st, pairs in parsed if k == key]
+			if got:
+				winners = ' '.join(_winner(aliases[key], i, cond) for i, _, _ in got)
+				alias_id[key] = sel.add([a for _, _, pairs in got for _, _, a in pairs],
+										[o for _, _, pairs in got for o, _, _ in pairs] +
+										[a for _, _, pairs in got for _, m, a in pairs if m == 'ASNEW'], tested(winners))
+	if single:
+		# Each alias written once, from a field no alias writes: one assignment where its stanza wins.
+		by_home = dict((h, []) for h in homes)
+		for key, i, stanza, pairs in parsed:
+			w = _winner(aliases[key], i, cond)
+			for orig, mode, alias in pairs:
+				value = field_ref(orig) if mode == 'AS' else 'coalesce(%s, %s)' % (field_ref(alias), field_ref(orig))
+				assign = '%s=if(%s, %s, %s)' % (field_lhs(alias), w, value, field_ref(alias))
+				by_home[_home(stanza, flags)].append(assign if sel is None else sel.guard(alias_id[key], ['eval ' + assign]))
+			stat(stanza)['aliases'] += 1
+			stat(stanza)['aliased'].update(p[2] for p in pairs)
+		if sel is None:
+			items.extend((h, 'eval ' + ', '.join(by_home[h])) for h in homes if by_home[h])
+		else:
+			items.extend((h, step) for h in homes for step in by_home[h])
+	else:
+		reads, writes, n = dict((h, []) for h in homes), [], 0
+		for key, i, stanza, pairs in parsed:
 			home = _home(stanza, flags)
-			reads[home].append('tenx_rw%d=if(%s,1,0)' % (n, _winner(cands, i, cond)))
+			read = ['tenx_rw%d=if(%s,1,0)' % (n, _winner(aliases[key], i, cond))]
+			write = []
 			for k, (orig, mode, alias) in enumerate(pairs):
-				reads[home].append('tenx_ra%d_%d=%s' % (n, k, field_ref(orig)))
+				read.append('tenx_ra%d_%d=%s' % (n, k, field_ref(orig)))
 				value_expr = 'tenx_ra%d_%d' % (n, k) if mode == 'AS' else 'coalesce(%s, tenx_ra%d_%d)' % (field_ref(alias), n, k)
-				writes.append('%s=if(tenx_rw%d==1, %s, %s)' % (field_lhs(alias), n, value_expr, field_ref(alias)))
+				write.append('%s=if(tenx_rw%d==1, %s, %s)' % (field_lhs(alias), n, value_expr, field_ref(alias)))
+			if sel is None:
+				reads[home].extend(read)
+				writes.extend(write)
+			else:
+				reads[home].append(sel.guard(alias_id[key], ['eval ' + ', '.join(read)]))
+				writes.append(sel.guard(alias_id[key], ['eval ' + ', '.join(write)]))
 			stat(stanza)['aliases'] += 1
 			stat(stanza)['aliased'].update(p[2] for p in pairs)
 			n += 1
-	if writes:
-		items.extend((h, 'eval ' + ', '.join(reads[h])) for h in homes if reads[h])
-		items.append((ANY, 'eval ' + ', '.join(writes)))
-		items.append((ANY, 'fields - tenx_rw*, tenx_ra*'))
+		if writes:
+			if sel is None:
+				items.extend((h, 'eval ' + ', '.join(reads[h])) for h in homes if reads[h])
+				items.append((ANY, 'eval ' + ', '.join(writes)))
+			else:
+				items.extend((h, r) for h in homes for r in reads[h])
+				items.extend((ANY, w) for w in writes)
+			items.append((ANY, 'fields - tenx_rw*, tenx_ra*'))
 
 	# Calculated fields: all computed from the values before any of them ran, then written,
 	# each by the first stanza in precedence order that applies.
@@ -689,7 +815,7 @@ def _rules(chosen, flags, lookup_fields, warnings, stats, rejected=None, bad_loo
 		# A candidate whose expression cannot be pasted is written as "leave the field as it
 		# is": it still hides the lower-precedence candidates, as an empty EVAL- in a local
 		# props.conf hides the shipped one.
-		cases, written = [], 0
+		cases, written, mine, read_fields = [], 0, [], set()
 		for stanza, expr in cands:
 			try:
 				check_expression(expr)
@@ -699,7 +825,8 @@ def _rules(chosen, flags, lookup_fields, warnings, stats, rejected=None, bad_loo
 				warnings.append('%s in [%s]: %s' % (key, stanza.name, e))
 				cases.append('%s, %s' % (cond(stanza), field_ref(name)))
 				continue
-			reads[_home(stanza, flags)].append('tenx_rc%d=if(%s, (%s), null())' % (n, cond(stanza), expr))
+			mine.append((_home(stanza, flags), 'tenx_rc%d=if(%s, (%s), null())' % (n, cond(stanza), expr)))
+			read_fields |= _expression_reads(expr)
 			rules.append({'key': key, 'stanza': stanza.name, 'test': 'eval tenx_dry_run=(%s)' % expr})
 			cases.append('%s, tenx_rc%d' % (cond(stanza), n))
 			stat(stanza)['calculated'] += 1
@@ -707,10 +834,25 @@ def _rules(chosen, flags, lookup_fields, warnings, stats, rejected=None, bad_loo
 			written += 1
 			n += 1
 		if written:
-			writes.append('%s=case(%s, true(), %s)' % (field_lhs(name), ', '.join(cases), field_ref(name)))
+			write = '%s=case(%s, true(), %s)' % (field_lhs(name), ', '.join(cases), field_ref(name))
+			if sel is None:
+				for home, read in mine:
+					reads[home].append(read)
+				writes.append(write)
+			else:
+				rid = sel.add([name], read_fields, tested(write))
+				for home in homes:
+					here = [r for h, r in mine if h == home]
+					if here:
+						reads[home].append(sel.guard(rid, ['eval ' + ', '.join(here)]))
+				writes.append(sel.guard(rid, ['eval ' + write]))
 	if writes:
-		items.extend((h, 'eval ' + ', '.join(reads[h])) for h in homes if reads[h])
-		items.append((ANY, 'eval ' + ', '.join(writes)))
+		if sel is None:
+			items.extend((h, 'eval ' + ', '.join(reads[h])) for h in homes if reads[h])
+			items.append((ANY, 'eval ' + ', '.join(writes)))
+		else:
+			items.extend((h, r) for h in homes for r in reads[h])
+			items.extend((ANY, w) for w in writes)
 		items.append((ANY, 'fields - tenx_rc*'))
 
 	# Lookups, in ASCII order of their keys; each runs the real lookup command, with input values
@@ -719,6 +861,7 @@ def _rules(chosen, flags, lookup_fields, warnings, stats, rejected=None, bad_loo
 	n, used = 0, False
 	for key in sorted(lookups):
 		cands = lookups[key]
+		steps_of_key, writes_of_key, reads_of_key, tests_of_key = [], set(), set(), False
 		for i, (stanza, value) in enumerate(cands):
 			try:
 				table, inputs, mode, outputs = parse_lookup(value)
@@ -750,9 +893,10 @@ def _rules(chosen, flags, lookup_fields, warnings, stats, rejected=None, bad_loo
 				continue
 			home, w = _home(stanza, flags), _winner(cands, i, cond)
 			inputs_set = ['tenx_ri%d_%d=if(%s, %s, null())' % (n, k, w, field_ref(evt)) for k, (_, evt) in enumerate(inputs)]
+			mine = []
 			if mode == 'OUTPUTNEW':
-				items.append((home, 'eval ' + ', '.join(inputs_set)))
-				items.append((home, 'lookup %s %s%s' % (lookup_name(table), args, out)))
+				mine.append('eval ' + ', '.join(inputs_set))
+				mine.append('lookup %s %s%s' % (lookup_name(table), args, out))
 			else:
 				# The lookup command removes its OUTPUT fields on an event whose input is null
 				# (measured on Splunk 10.4.3, CSV and KV store lookups; OUTPUTNEW does not), and a
@@ -762,17 +906,29 @@ def _rules(chosen, flags, lookup_fields, warnings, stats, rejected=None, bad_loo
 				off = ' OR '.join('isnull(tenx_ri%d_%d)' % (n, k) for k in range(len(inputs)))
 				keep = ['tenx_rl%d=if(%s, 1, 0)' % (n, off)] + [
 					'tenx_ro%d_%d=if(tenx_rl%d==1, %s, null())' % (n, j, n, field_ref(f)) for j, f in enumerate(produced)]
-				items.append((home, 'eval ' + ', '.join(inputs_set + keep)))
-				items.append((home, 'lookup %s %s%s' % (lookup_name(table), args, out)))
+				mine.append('eval ' + ', '.join(inputs_set + keep))
+				mine.append('lookup %s %s%s' % (lookup_name(table), args, out))
 				if produced:
-					items.append((home, 'eval ' + ', '.join('%s=if(tenx_rl%d==1, tenx_ro%d_%d, %s)' % (
-						field_lhs(f), n, n, j, field_ref(f)) for j, f in enumerate(produced))))
+					mine.append('eval ' + ', '.join('%s=if(tenx_rl%d==1, tenx_ro%d_%d, %s)' % (
+						field_lhs(f), n, n, j, field_ref(f)) for j, f in enumerate(produced)))
+			steps_of_key.append((home, mine))
+			writes_of_key.update(produced)
+			reads_of_key.update(evt for _, evt in inputs)
+			if mode == 'OUTPUTNEW':
+				reads_of_key.update(produced)
+			tests_of_key = tests_of_key or tested(w)
 			rules.append({'key': key, 'stanza': stanza.name, 'test': 'eval %s | lookup %s %s%s' % (
 				', '.join('tenx_ri%d_%d="tenx_dry_run"' % (n, k) for k in range(len(inputs))), lookup_name(table), args, out)})
 			stat(stanza)['lookups'] += 1
 			stat(stanza)['computed'].update(produced)
 			n += 1
 			used = True
+		if steps_of_key:
+			if sel is None:
+				items.extend((home, step) for home, mine in steps_of_key for step in mine)
+			else:
+				rid = sel.add(writes_of_key, reads_of_key, tests_of_key)
+				items.extend((home, sel.guard(rid, mine)) for home, mine in steps_of_key)
 	if used:
 		items.append((ANY, 'fields - tenx_ri*, tenx_ro*, tenx_rl*'))
 	if shared:
@@ -1016,7 +1172,7 @@ def effective_sourcetypes(stanzas, transforms, sourcetypes):
 
 
 def build(stanzas, present, lookup_fields=None, keep_fields=(), all_shared=True, rejected=None, bad_lookups=None,
-		  transforms=None, only=False, seen=None, with_tags=True, keep_by_sourcetype=None):
+		  transforms=None, only=False, seen=None, with_tags=True, keep_by_sourcetype=None, select=False):
 	"""
 	Build the replay pipeline.
 
@@ -1041,6 +1197,9 @@ def build(stanzas, present, lookup_fields=None, keep_fields=(), all_shared=True,
 	               and for the fields cleared (a unit).
 	with_tags      end with event types and tags (tags_block()); a unit leaves them to the
 	               `tenx-replay-tags` macro, which runs once after every unit of a search.
+	select         each rule class in a guard a `txf` search's plan can leave closed, and its
+	               table in replay.selection (see Selection and tenx_replay_plan.py); event types
+	               and tags then run only with the whole replay.
 
 	Cost: every step that only replayed events need sits in a block (see block()) keyed on a
 	flag that only those events carry: tenx_go0z on every replayed event, and one flag per
@@ -1096,6 +1255,10 @@ def build(stanzas, present, lookup_fields=None, keep_fields=(), all_shared=True,
 	keep_rx = '^(%s)$' % '|'.join(list(KEEP_PATTERNS) + [re.escape(f) for f in names])
 
 	steps = replay.steps
+	sel = Selection() if select else None
+	if sel is not None:
+		# The whole replay, unless the plan txf put on the events was made for this very macro.
+		steps.append('eval %s=if(isnull(%s%s), 1, null())' % (plan.ALL, plan.MARK, GEN))
 	which = ''
 	if only:
 		which = ' AND (%s)' % ' OR '.join('mvindex(%s,0)==%s' % (CARRIER_FIELD, spl_string(st)) for st in originals)
@@ -1131,7 +1294,7 @@ def build(stanzas, present, lookup_fields=None, keep_fields=(), all_shared=True,
 	steps.extend(extract_steps(as_read=True))
 
 	stats = {}
-	steps.extend(_rules(chosen, flags, lookup_fields, replay.warnings, stats, rejected, bad_lookups, replay.rules))
+	steps.extend(_rules(chosen, flags, lookup_fields, replay.warnings, stats, rejected, bad_lookups, replay.rules, sel))
 
 	info = replay.per_sourcetype
 	for st in originals:
@@ -1181,11 +1344,21 @@ def build(stanzas, present, lookup_fields=None, keep_fields=(), all_shared=True,
 	replay.warnings[:] = sorted(set(replay.warnings))
 
 	if with_tags:
-		steps.append(tags_block())
+		steps.append(tags_block() if sel is None else every_rule([tags_block()]))
 	steps.append(block(AS_READ, ['eval %s=if(isnotnull(%s) AND isnotnull(%s), 1, %s)' % (AS_IS, HIDE, AS_READ, AS_IS)]))
 	# tenx_rst and AS_IS stay: the search rewrite reads them after the macro. Callers remove them.
 	steps.append('fields - tenx_go*')
+	if sel is not None:
+		steps.append('fields - %s*' % plan.PREFIX)
+		replay.selection = generation(steps, sel.rules), sel.rules
+		steps[:] = [st.replace(GEN, replay.selection[0]) for st in steps]
 	return replay
+
+
+def generation(steps, rules):
+	"""Eight hex digits that change with the macro's text and its rule table: a plan is used only by the
+	macro it was made for."""
+	return hashlib.md5((' | '.join(steps) + json.dumps(rules, sort_keys=True)).encode('utf-8')).hexdigest()[:8]
 
 
 def tags_block():
@@ -1222,6 +1395,9 @@ RETIRED_STANZA = 'tenx:retired'
 # tenx_replay.conf stanza: indexes = the compact indexes the last rebuild saw with no event
 # carrying tenx_sourcetype (the negative record), at most MAX_NOCARRIER, busiest first.
 NOCARRIER_STANZA = 'tenx:nocarrier'
+# tenx_replay.conf stanza: the rule table of the `tenx-replay` macro (Selection), which tenxprefilter reads from
+# disk to choose the rules a `txf` search needs: generation = <the macro's>, rules = <JSON>.
+PLAN_STANZA = 'tenx:plan'
 MAX_NOCARRIER = 200
 
 
@@ -1316,12 +1492,14 @@ def fields_not_in_text(stanzas, transforms=None, lookup_fields=None, keep_fields
 
 def narrowing_wanted(config, replay):
 	"""
-	Whether tenxreplay keeps the [tenx:narrowing] stanza the prefilter narrows field comparisons
-	with: only when tenx_config.conf [config] has field_narrowing = true and some compact event
-	carries tenx_sourcetype. Otherwise an existing stanza is removed.
+	Whether tenxreplay keeps the [tenx:narrowing] stanza the prefilter narrows field comparisons with:
+	whenever some compact event carries tenx_sourcetype, whatever field_narrowing says. The prefilter
+	reads the setting from the app's files on disk on every search, and this command reads it through
+	splunkd, which does not see a file edited in local/ until a restart or reload; writing the list only
+	while splunkd saw the setting on left `true` set that way with no list, and so with no narrowing.
+	Otherwise an existing stanza is removed. `config` is not read.
 	"""
-	on = str((config or {}).get('field_narrowing', '') or '').strip().lower() in ('1', 'true', 't', 'yes', 'y')
-	return bool(on and replay.per_sourcetype)
+	return bool(replay.per_sourcetype)
 
 
 MAX_LISTED_SOURCES = 200
@@ -1943,7 +2121,7 @@ def _listed(names, n=20):
 
 
 def build_capped(stanzas, present, lookup_fields=None, keep_fields=(), settings=None, last_seen=None,
-				 rejected=None, bad_lookups=None, transforms=None, keep_by_sourcetype=None):
+				 rejected=None, bad_lookups=None, transforms=None, keep_by_sourcetype=None, select=False):
 	"""
 	build(), held to replay_max_sourcetypes, to replay_max_macro_chars when it is set, and to
 	REPLAY_MAX_COMMANDS. Past the sourcetype cap the least busy sourcetypes are left out. Past a size
@@ -1967,7 +2145,7 @@ def build_capped(stanzas, present, lookup_fields=None, keep_fields=(), settings=
 	def attempt(names, all_shared):
 		keep = set(names)
 		return build(stanzas, [p for p in present if p[0] in keep], lookup_fields, keep_fields, all_shared,
-					 rejected, bad_lookups, transforms, keep_by_sourcetype=keep_by_sourcetype)
+					 rejected, bad_lookups, transforms, keep_by_sourcetype=keep_by_sourcetype, select=select)
 
 	replay = attempt(ranked, True)
 	limit = settings['replay_max_macro_chars']

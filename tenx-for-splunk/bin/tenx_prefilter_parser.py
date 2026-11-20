@@ -735,6 +735,178 @@ def narrowing_on(config):
 	return str((config or {}).get("field_narrowing", "") or "").strip().lower() in ("1", "true", "t", "yes", "y")
 
 
+# Field narrowing from Splunk's own index terms (tenx_config.conf field_narrowing = splunk; off by default).
+#
+# A field comparison on raw events reads only the events that hold the index terms Splunk derives
+# for it: Splunk expands the field's aliases, event types and tags, and leaves out a value it cannot
+# expect in the text. It writes those terms in the job's search.log as its "base lispy". The
+# prefilter asks for them with a probe: the words after the macro as a search of their own, over a
+# time range that holds no event, and requires the same terms of the compact events the way it
+# requires a word (pieces, template dictionary). Every raw event the search returns holds each of
+# those terms; its compact event expands to the same text, so it holds each piece as a value or
+# through its template, and it is selected. A term the prefilter cannot read as a word, an indexed
+# term (name::value) other than as an OR's alternative to terms it reads (lispy_tree), a NOT, an OR
+# with any of those, or no answer at all, place no restriction.
+SPLUNK_MODE = "splunk"
+LISPY_LINE = re.compile(r"base lispy: (\[.*\])\s*$")
+LISPY_WORD = re.compile(r"^[^\s\"'\\()\[\]`]+$")
+TRUE = ("true",)
+
+
+def narrowing_mode(config):
+	"""
+	How field comparisons narrow, from tenx_config.conf [config] field_narrowing: "splunk" (Splunk's
+	own index terms for the comparison, read with a probe), "list" (true: the field's value as a word,
+	unless tenxreplay's list names the field), or "off" (false, missing or unreadable).
+	"""
+	value = str((config or {}).get("field_narrowing", "") or "").strip().lower()
+	if value == SPLUNK_MODE:
+		return SPLUNK_MODE
+	return "list" if narrowing_on(config) else "off"
+
+
+def narrowing_mode_on_disk(apphome):
+	"""narrowing_mode() from the app's tenx_config.conf on disk (default, then local); no REST call."""
+	import os
+	paths = [os.path.join(apphome, d, "tenx_config.conf") for d in ("default", "local")]
+	return narrowing_mode({"field_narrowing": conf_setting(paths, "config", "field_narrowing")})
+
+
+def compares_fields(node):
+	"""Whether a parsed search compares a field with = or IN (an indexed term name::value does not count)."""
+	kind = node[0]
+	if kind == "field":
+		return node[2] == "="
+	if kind == "in":
+		return True
+	if kind in ("and", "or"):
+		return any(compares_fields(child) for child in node[1])
+	if kind == "not":
+		return compares_fields(node[1])
+	return False
+
+
+def lispy_probe(text, macro):
+	"""
+	The probe whose search.log holds Splunk's index terms for `text` (the words after the macro):
+	the words as a search of their own, with sourcetype="<st>" for txf(<st>), which says which
+	sourcetype's aliases and rules apply. Its caller runs it over a time range that holds no event.
+	None when the words hold a subsearch, which the probe would run.
+	"""
+	if any(kind == "subsearch" for kind, _ in tokenize(text or "")):
+		return None
+	clause = ""
+	m = re.match(r"^`txf\((.*)\)`$", macro or "")
+	if m and m.group(1).strip():
+		clause = 'sourcetype="%s" ' % m.group(1).strip().replace("\\", "\\\\").replace('"', '\\"')
+	return "search %s%s | head 1" % (clause, (text or "").strip())
+
+
+def lispy_from_log(log):
+	"""
+	The base lispy a search.log text holds, or None: none at all, or lines that do not all say the
+	same, are not read (which one is the search's own is not known, so nothing is narrowed).
+	"""
+	found = set()
+	for line in (log or "").splitlines():
+		m = LISPY_LINE.search(line)
+		if m:
+			found.add(m.group(1))
+	return found.pop() if len(found) == 1 else None
+
+
+# The warning of a search whose field comparisons could have narrowed with field_narrowing = splunk, when
+# Splunk's index terms for them could not be read (no probe, no base lispy in its log, or one this does not
+# read): the comparisons then narrow nothing, as with field_narrowing = false.
+SPLUNK_TERMS_UNREAD = ("tx: field_narrowing = splunk, but Splunk's index terms for the field comparisons could not be "
+					   "read, so they do not narrow which compact events are read.")
+
+
+# An indexed term of the base lispy (name::value) whose field the compact events can carry as Splunk's raw
+# events do: not a default field (a compact event has its own sourcetype, source, host and index).
+LISPY_INDEXED = re.compile(r"^([A-Za-z0-9_.@-]+)::([^\s\"'\\()\[\]`]+)$")
+
+
+def _indexed_term(token):
+	"""("indexed", token) for a name::value term the prefilter may keep as an alternative, or None."""
+	m = LISPY_INDEXED.match(token)
+	if not m:
+		return None
+	name = m.group(1).lower()
+	if name in NOT_IN_TEXT or any(fnmatch.fnmatchcase(name, p) for p in NOT_IN_TEXT_PATTERNS):
+		return None
+	return ("indexed", token)
+
+
+def lispy_tree(lispy):
+	"""
+	A base lispy ("[ AND 4625 index::main [ OR alice bob ] ]") as a parsed search the prefilter reads:
+	("text", term), ("indexed", name::value), ("and", [...]), ("or", [...]) or ("true",). Brackets are
+	tokens of their own. A term with a quote, a backslash, a parenthesis or a bracket inside it, a NOT, and
+	an OR with any such branch place no restriction.
+
+	An indexed term (name::value) restricts only as a branch of an OR beside a branch that does: Splunk
+	writes [ OR dstip::10.1.2.3 [ AND 10 1 2 3 ] ] for dstip=10.1.2.3 by default (limits.conf
+	always_include_indexedfield_lispy = true), and a raw event it returns holds either the indexed field or
+	the terms; its compact event holds the same terms, or carries the same indexed field (a field map, fields
+	sent with the event). Required on its own, or in an OR of indexed terms only, it places no restriction (a
+	compact event can get the field at search time instead), nor does one on a default field (sourcetype,
+	source, host, index: a compact event has its own). None when the text is not a lispy this reads (then no
+	narrowing at all).
+	"""
+	if not lispy:
+		return None
+	tokens = lispy.split()
+	pos = [0]
+
+	def term(token):
+		if "::" in token:
+			return _indexed_term(token) or TRUE
+		if not LISPY_WORD.match(token) or token.upper() in ("AND", "OR", "NOT"):
+			return TRUE
+		return ("text", token)
+
+	def node():
+		if pos[0] >= len(tokens):
+			raise Unparsed("lispy ended early")
+		token = tokens[pos[0]]
+		pos[0] += 1
+		if token == "]":
+			raise Unparsed("lispy: ] where a term should be")
+		if token != "[":
+			return term(token)
+		if pos[0] >= len(tokens):
+			raise Unparsed("lispy ended early")
+		op = tokens[pos[0]].upper()
+		pos[0] += 1
+		children = []
+		while True:
+			if pos[0] >= len(tokens):
+				raise Unparsed("lispy: unbalanced brackets")
+			if tokens[pos[0]] == "]":
+				pos[0] += 1
+				break
+			children.append(node())
+		if op == "AND":
+			kept = [c for c in children if c != TRUE and c[0] != "indexed"]
+			return TRUE if not kept else kept[0] if len(kept) == 1 else ("and", kept)
+		if op == "OR":
+			if not children or TRUE in children or all(c[0] == "indexed" for c in children):
+				return TRUE
+			return children[0] if len(children) == 1 else ("or", children)
+		if op == "NOT":
+			return TRUE
+		raise Unparsed("lispy: operator %s" % op)
+
+	try:
+		tree = node()
+		if pos[0] != len(tokens):
+			raise Unparsed("lispy: text after the expression")
+	except Unparsed:
+		return None
+	return TRUE if tree[0] == "indexed" else tree
+
+
 # Written forms the compact event does not keep (FORMAT_SPEC.md S2.2 and S4.4, log10x-format):
 # a timestamp is stored as an epoch and printed again by tenx-inflate, so none of its digits is a
 # term of the compact event; and the sign rule stores a '-' with the digits after it ("-4320"),
@@ -1156,6 +1328,9 @@ def prefilter(node, dictionary, text_field=None, digits=frozenset()):
 	if kind == "or":
 		clauses = [prefilter(child, dictionary, text_field, digits) for child in node[1]]
 		return None if any(c is None for c in clauses) else "(" + " OR ".join(clauses) + ")"
+	if kind == "indexed":
+		# a name::value alternative of Splunk's base lispy (lispy_tree), matched on the indexed fields
+		return node[1]
 	return None
 
 
@@ -1195,7 +1370,7 @@ def piece_regex(piece):
 	return "(^|%s)%s(%s|$)" % (NOT_WORD, piece.replace("*", "[\\p{L}\\p{N}]*"), NOT_WORD)
 
 
-def dictionary_search(pieces, formats=False):
+def dictionary_search(pieces, formats=False, hours=None):
 	"""
 	The search that answers, for each piece, which templates carry it in their text, as the
 	TERM() clause of each template's hash_term.
@@ -1218,6 +1393,9 @@ def dictionary_search(pieces, formats=False):
 	formats: also return, in tenx_formats, the timestamp format of every stored template with its
 	glue (FORMAT_KEY_STEPS), for the runs of digits (digit_pieces_cleared()). Every record then reaches
 	the stats; the term is computed only on records that hold some piece.
+
+	hours: read only the records Consume KV wrote in these hours (stored_hour, an indexed field of the
+	collection), to complete an earlier answer (cache_hours()); None reads every record.
 	"""
 	plist = sorted(pieces)
 	marks = ", ".join('m%d=if(match(tenx_t, "%s"), 1, null())' % (i, piece_regex(piece)) for i, piece in enumerate(plist))
@@ -1229,8 +1407,9 @@ def dictionary_search(pieces, formats=False):
 				' | eval dml_hash=if(isnotnull(tenx_any), coalesce(pattern_hash, _key), null())')
 	else:
 		head = ' | where ' + prune + ' | eval dml_hash=coalesce(pattern_hash, _key)'
+	where = (' where (' + ' OR '.join('%s="%s"' % (STORED_HOUR, h) for h in hours) + ')') if hours else ''
 	return (
-		'| inputlookup tenx-dml-lookup | fields _key, pattern_hash, pattern_search, pattern'
+		'| inputlookup tenx-dml-lookup' + where + ' | fields _key, pattern_hash, pattern_search, pattern'
 		+ (', timestamp_format, part_0, pattern_parts, pattern_terminator' if formats else '') +
 		' | eval tenx_t=lower(coalesce(pattern_search, replace(pattern, "[$]", "")))'
 		+ head +
@@ -1260,6 +1439,138 @@ def dictionary_from_rows(rows, pieces=None):
 			terms = row.get("hs%d" % i) or []
 			dictionary[piece] = (int(row.get("n%d" % i) or 0), [terms] if isinstance(terms, str) else list(terms))
 	return dictionary
+
+
+# The template dictionary read in part. Reading every record of the KV store for each search costs
+# seconds of search head CPU per search at hundreds of thousands of templates. The prefilter keeps its
+# answer for each piece in the collection tenx_dict_cache, and a later search for the same pieces reads
+# only the records Consume KV wrote in the hours since (stored_hour, an indexed field), adding them to
+# the kept answer. Why that is every template: a full read that starts at time S sees every record
+# readable at S; a record that became readable later was stamped with its hour before it was saved,
+# at most CACHE_LAG_SECONDS before it became readable, so its stored_hour is at least the hour of
+# S - CACHE_LAG_SECONDS, which is the first hour a later search reads again (through_hour). A record
+# written again (refreshed, replaced, marked hash-conflict) gets a new hour and is read again; a
+# template removed from the store stays in the kept answer, which can only select more events. A
+# record counted twice can only raise n past MAX_TEMPLATES, which narrows less. Every
+# CACHE_FULL_SECONDS, or when a piece has no kept answer, every record is read again, and so it is after
+# an install or an upgrade and after a load from the start of the index (cache_valid_from): records
+# restored into the store come back with the hours they had. The margin CACHE_LAG_SECONDS covers the
+# save of one chunk, the KV store's copy to the other members of a search head cluster and the
+# difference of their clocks together; a record that takes longer to become readable on a member is
+# missed there by the partial reads until the next full read.
+CACHE_PATH = "/servicesNS/nobody/tenx-for-splunk/storage/collections/data/tenx_dict_cache"
+STORED_HOUR = "stored_hour"
+# Longer than the Consume KV alert action may run (alert_actions.conf maxtime 10m), with what the clocks
+# of search heads in one cluster may differ added.
+CACHE_LAG_SECONDS = 900
+CACHE_FULL_SECONDS = 86400
+FORMATS_KEY = "formats"
+
+
+def hour_of(t):
+	return int(t) // 3600
+
+
+def cache_key(piece):
+	"""The tenx_dict_cache key of a piece (a-z, 0-9 and '*', so '*' -> '-' is one to one)."""
+	return "p_" + piece.replace("*", "-")
+
+
+def cache_keys(pieces, formats=False):
+	return sorted(cache_key(p) for p in pieces) + ([FORMATS_KEY] if formats else [])
+
+
+def cache_valid_from(state):
+	"""
+	The time before which no kept answer is used, from the Consume KV record `state`: the start of
+	this version's first run (version_since: an install or an upgrade, which may read templates
+	differently) or of the last load from the start of the index (dict_reset: the documented step after
+	the template store was emptied or restored, whose records come back with the hours they had).
+	None when there is no record or it cannot be read: then every record is read.
+	"""
+	if not isinstance(state, dict) or not state:
+		return None
+	times = []
+	for key in ("version_since", "dict_reset"):
+		try:
+			times.append(float(state.get(key) or 0))
+		except (TypeError, ValueError):
+			return None
+	return max(times)
+
+
+def cache_hours(entries, pieces, formats, now, valid_from=None):
+	"""
+	The stored_hour values a search reads to complete the kept answers `entries` ({key: record}) for
+	`pieces` (and the timestamp formats when `formats`): every hour from the earliest through_hour
+	among them to the hour of `now` + CACHE_LAG_SECONDS (a record stamped by a clock ahead of this
+	one). None, read every record, when one is missing or unreadable, was last read in full more than
+	CACHE_FULL_SECONDS ago or before `valid_from` (cache_valid_from(); None: no kept answer is
+	used), or carries a time after `now`.
+	"""
+	if valid_from is None:
+		return None
+	starts = []
+	for key in cache_keys(pieces, formats):
+		entry = (entries or {}).get(key)
+		try:
+			full_at, through = float(entry["full_at"]), int(float(entry["through_hour"]))
+		except (KeyError, TypeError, ValueError):
+			return None
+		if not 0 <= now - full_at <= CACHE_FULL_SECONDS or full_at < valid_from or through > hour_of(now):
+			return None
+		starts.append(through)
+	if not starts:
+		return None
+	return [str(h) for h in range(min(starts), hour_of(now + CACHE_LAG_SECONDS) + 1)]
+
+
+def format_keys_from_rows(rows):
+	"""The tenx_formats keys ("<lg><rg>|<timestamp_format>") of dictionary_search(formats=True)'s answer."""
+	keys = set()
+	for row in rows or []:
+		value = row.get("tenx_formats")
+		if value is not None:
+			keys.update(str(k) for k in ([value] if isinstance(value, str) else value))
+	return keys
+
+
+def _values(value):
+	"""A KV field read back as a list of strings (a multivalue, one string, or nothing)."""
+	return [] if value is None else [str(value)] if isinstance(value, str) else [str(v) for v in value]
+
+
+def cache_merge(entries, fresh, fresh_format_keys, pieces, formats):
+	"""
+	(dictionary, formats) from the kept answers `entries` and the answer `fresh` of the records read
+	since (dictionary_from_rows, format_keys_from_rows): the templates of both for each piece, the
+	formats of both. formats is None when not asked for.
+	"""
+	dictionary = {}
+	for piece in pieces:
+		entry = entries[cache_key(piece)]
+		n, terms = fresh.get(piece, (0, []))
+		dictionary[piece] = (int(float(entry.get("n") or 0)) + n, sorted(set(_values(entry.get("hs"))) | set(terms)))
+	if not formats:
+		return dictionary, None
+	keys = set(_values(entries[FORMATS_KEY].get("formats"))) | set(fresh_format_keys or ())
+	return dictionary, formats_from_rows([{"tenx_formats": sorted(keys)}])
+
+
+def cache_records(dictionary, format_keys, pieces, formats, started):
+	"""
+	The tenx_dict_cache records of a full read that started at `started`: through_hour is the hour of
+	started - CACHE_LAG_SECONDS. A piece carried by more than MAX_TEMPLATES templates keeps its count
+	alone, which is enough to leave it out.
+	"""
+	through, records = hour_of(started - CACHE_LAG_SECONDS), []
+	for piece in sorted(pieces):
+		n, terms = dictionary.get(piece, (0, []))
+		records.append({"_key": cache_key(piece), "n": n, "hs": sorted(terms) if n <= MAX_TEMPLATES else [],
+						"full_at": int(started), "through_hour": through})
+	if formats:
+		records.append({"_key": FORMATS_KEY, "formats": sorted(format_keys or ()), "full_at": int(started), "through_hour": through})
+	return records
 
 
 # A wildcard inside a word, TERM() and CASE() after `tx` (Splunk Enterprise 10.4.3). `tx` applies the
@@ -1640,6 +1951,32 @@ def raw_history_probe(record, before):
 	where = "(%s) " % " OR ".join("index=%s" % quote(i) for i in sorted(named)) if named else ""
 	return "| tstats count where %s%s(%s) NOT tenx_sourcetype=* NOT tenx_mapped=* NOT (%s) by index, sourcetype" % (
 		times + " " if times else "", where, " OR ".join(pairs), RAW_EVENTS_MACRO)
+
+
+def word_index_probe(before):
+	"""
+	The tstats that finds, by index, host and source, compact events (`tenx-events`) in the search's range
+	that hold no word term. Every compact event starts with ~ and its template hash, which segmentation
+	indexes as a term starting with ~; a group with more events than events holding such a term was
+	indexed without words (SEGMENTATION = none on the compact sourcetype, its source or host), so a word
+	prefilter cannot find its events. Restricted to the indexes written before the macro (`before`).
+	"""
+	quote = lambda v: '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+	named = named_indexes(before)
+	where = "(%s) " % " OR ".join("index=%s" % quote(i) for i in sorted(named)) if named else ""
+	return ("| tstats count where %s`tenx-events` by index, host, source | eval tenx_w=0 | append [| tstats count "
+			"where %s`tenx-events` TERM(~*) by index, host, source | eval tenx_w=1] | stats sum(eval(if(tenx_w==0, "
+			"count, 0))) as tenx_all, sum(eval(if(tenx_w==1, count, 0))) as tenx_words by index, host, source "
+			"| where tenx_all > tenx_words" % (where, where))
+
+
+def word_index_branch(rows, most=200):
+	"""The OR branch that reads every compact event of the groups word_index_probe found (by index alone past `most`)."""
+	quote = lambda v: '"' + str(v).replace("\\", "\\\\").replace('"', '\\"') + '"'
+	if len(rows) > most:
+		return " OR ".join("index=%s" % quote(i) for i in sorted(set(r.get("index", "") for r in rows)))
+	return " OR ".join("(index=%s host=%s source=%s)" % (quote(r.get("index", "")), quote(r.get("host", "")),
+														   quote(r.get("source", ""))) for r in rows)
 
 
 def raw_history_message(rows, macro):

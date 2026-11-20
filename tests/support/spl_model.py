@@ -15,6 +15,8 @@ Modelled behaviour, as observed on Splunk Enterprise 10.4.3:
   false, so NOT (a==1) is TRUE when a is null (not three-valued logic); if() and case() take a
   null condition as false; case() returns the value of the first true branch even when that
   value is null. An eval that yields null removes the field (fieldsummary count 0).
+- fillnull value=<v> <names>: each named field set to <v> where it has no value (the model's only form); a
+  name given twice is refused, as Splunk refuses the search.
 - foreach <pattern>: the body runs once per field name that matches the pattern on any event of
   the result set (the whole list is one chunk), over every event, and not at all when none
   matches; fieldstr and matchstr rename the placeholders, and a nested foreach keeps its own.
@@ -251,10 +253,13 @@ class Model(object):
 	_raw, sourcetype, source and host it saw).
 	"""
 
-	def __init__(self, commands=None, lookups=None, macros=None):
+	def __init__(self, commands=None, lookups=None, macros=None, plan=None):
 		self.commands = commands or {}
 		self.lookups = lookups or {}
 		self.macros = macros or {}
+		# What the step before the replay of `txf` reads back from the job (macros.conf [tenx-replay-plan]):
+		# the fields of a stored replay plan, or tenx_ndnoplan when none was stored.
+		self.plan = plan or 'tenx_ndnoplan'
 
 	def run(self, pipeline, events):
 		for step in split_top(self.expand(pipeline), '|'):
@@ -264,7 +269,8 @@ class Model(object):
 
 	def expand(self, text):
 		for _ in range(5):
-			new = re.sub(r'`([^`]+)`', lambda m: WILD_STEP if m.group(1) == 'tenx-wild' else self.macros[m.group(1)], text)
+			new = re.sub(r'`([^`]+)`', lambda m: WILD_STEP if m.group(1) == 'tenx-wild' else (
+				'fillnull value=1 tenx_ndnone ' + self.plan if m.group(1) == 'tenx-replay-plan' else self.macros[m.group(1)]), text)
 			if new == text:
 				return text
 			text = new
@@ -305,6 +311,19 @@ class Model(object):
 				for f in list(event):
 					if not f.startswith('__') and any(fnmatch.fnmatchcase(f, p) for p in pats):
 						del event[f]
+			return
+		if word == 'fillnull':
+			m = re.match(r'^value=(\S+)\s+(.+)$', rest)
+			if not m:
+				raise Unsupported(step)
+			if len(set(m.group(2).split())) != len(m.group(2).split()):
+				# Splunk Enterprise 10.4.3: "Error in 'fillnull' command: Field '<name>' cannot be specified
+				# multiple times." (the search does not run)
+				raise Unsupported('fillnull names a field twice: %r' % step)
+			for event in events:
+				for name in m.group(2).split():
+					if event.get(name) is None:
+						event[name] = m.group(1)
 			return
 		if word == 'foreach':
 			# One pattern or several (`foreach a b c [...]`, the units' clearing step): the body

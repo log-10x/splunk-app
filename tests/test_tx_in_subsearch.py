@@ -141,18 +141,22 @@ def prefilter(search):
 	cmd._metadata = types.SimpleNamespace(searchinfo=types.SimpleNamespace(
 		sid='subsearch_1794937815.59_1794937816.89', username='admin', earliest_time=0, latest_time=0,
 		splunkd_uri='https://127.0.0.1:8089', session_key='key'))
-	calls, warnings = [], []
+	calls, warnings, searches = [], [], []
 	def rest(path, data=None, answer=True):
 		calls.append([path.split('?')[0], sorted((data or {}).keys())])
 		if path.startswith('/services/search/jobs/1794937815.59') and not data:
 			return {'entry': [{'content': {'search': search}}]}
+		if path.endswith('/search/jobs') and data and 'search' in data:
+			searches.append(data['search'])
+		# the dictionary read finds nothing; the word index check finds every compact event indexed with its words
 		return {'results': []}
 	cmd._rest = rest
 	cmd.write_warning = lambda m, *a: warnings.append(m)
 	rows = list(cmd.generate())
 	stored = [c for c in calls if c[0].startswith('/services/search/jobs/1794937815.59') and c[1]]
-	lookups = [c for c in calls if c[0].endswith('/search/jobs') and 'search' in c[1]]
-	return {'rows': rows, 'warnings': warnings, 'stored': stored, 'lookups': len(lookups)}
+	lookups = [s for s in searches if 'tenx-dml-lookup' in s]
+	word_checks = [s for s in searches if 'TERM(~*)' in s]
+	return {'rows': rows, 'warnings': warnings, 'stored': stored, 'lookups': len(lookups), 'word_checks': len(word_checks)}
 
 out = {
 	'one': prefilter('search index=c `tx` Se*Privilege | stats count'),
@@ -261,13 +265,15 @@ class TestSeveralInOneSearch:
 	def test_one_call_in_a_union_is_read_as_before(self):
 		one = child()['one_txf']
 		assert one['warnings'] == [] and one['lookups'] == 1 and one['stored'] == []
+		# a prefilter of terms is checked against compact events indexed without words, once
+		assert one['word_checks'] == 1
 
 	@pytest.mark.parametrize("name", ['two', 'three'])
 	def test_more_than_one_selects_every_compact_event_and_stores_no_plan(self, name):
 		got = child()[name]
 		assert got['rows'] == [{'search': '(*)'}]
 		assert got['warnings'] == ['tx: this search holds more than one tx or txf; every compact event in range is expanded.']
-		assert got['stored'] == [] and got['lookups'] == 0
+		assert got['stored'] == [] and got['lookups'] == 0 and got['word_checks'] == 0
 
 	def test_a_call_inside_quotes_is_not_counted(self):
 		got = child()['quoted']

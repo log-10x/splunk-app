@@ -98,7 +98,7 @@ CONFIG_LOADED = 'config_loaded'
 # not be read: the rewrite then runs the tenx-replay macro. See
 # tenx_replay_builder.rewrite_replay().
 REPLAY_COVERAGE = 'tenx_replay'
-REPLAY_RESERVED = ('default', 'tenx:narrowing', 'tenx:retired')
+REPLAY_RESERVED = ('default', 'tenx:narrowing', 'tenx:retired', 'tenx:plan')
 # What the rewrite reads of each stanza: tenx_replay_builder.rewrite_replay() and the keys it names
 # (LEFT_OUT_KEY, COMMANDS_KEY).
 REPLAY_KEYS = ('indexes', 'unit', 'left_out', 'commands')

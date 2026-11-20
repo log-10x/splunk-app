@@ -115,10 +115,11 @@ ROWS = [('app:kv', '/var/app/a.log', 'web-1', 5, 'app', True, True),
 out = {}
 before = IndexTimeSplunk(ROWS)
 go(before, False)
-out['event_time'] = sorted(before.conf)
+# the sourcetype stanzas (not tenx:narrowing, tenx:plan: written whenever a sourcetype is covered)
+out['event_time'] = sorted(n for n in before.conf if not n.startswith('tenx:'))
 fake = IndexTimeSplunk(ROWS)
 rows = go(fake, True)
-out['index_time'] = sorted(fake.conf)
+out['index_time'] = sorted(n for n in fake.conf if not n.startswith('tenx:'))
 out['jobs'] = fake.jobs
 out['units'] = sorted(n for n in fake.macros if n.startswith(b.UNIT_PREFIX))
 out['txf_one'] = fake.validations.get('txf(1)')
