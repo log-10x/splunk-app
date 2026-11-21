@@ -213,15 +213,17 @@ Start the Receiver with `receiverOptimize true`, `varMaxRecurIndexes 0`, `timest
 
 Set the `tenx-events` macro to your compact index under **Settings > Advanced search > Search macros**, for example `index=my_compact_index sourcetype::tenx_encoded`. Every `tx` search starts with this macro too, so it uses the indexed form `sourcetype::`.
 
+Where an index also holds raw events of the same sources, such as those indexed before the Receiver, name them in the `tenx-raw-events` macro so that `tx` and `txf` return them too: see [Raw Events from Before the Receiver](tenx-for-splunk/README.md#raw-events-from-before-the-receiver).
+
 ### Step 5: Load Existing Templates
 
-The **Consume KV** saved search stores new templates every five minutes. To load templates indexed before the app was installed, or during an outage of that search, run this search once as an admin or power user:
+The **Consume KV** saved search stores new templates every five minutes, and its first run after an install or an upgrade reads every template record in the index. To load them again after the KV collection was emptied or restored, run this once as an admin or power user:
 
 ```spl
-index=tenx_dml sourcetype=tenx_dml_raw_json earliest=-30d | sendalert tenx_dml_to_kv
+| makeresults | sendalert tenx_dml_to_kv param.from=0
 ```
 
-Widen `earliest` to reach older templates. Running it again is safe: templates already stored are kept, and their records are brought up to date when this version of the app derives them differently. The app's **Backfill KV** saved search holds the same search; its alert action fires only when the search runs on a schedule or with `sendalert`, not from the **Run** button. To load every template record ever indexed, use `earliest=0`.
+The app's **Backfill KV** saved search holds the same search; the **Run** button does not fire its alert action, so run the search above. See [Loading Templates Indexed Earlier](tenx-for-splunk/README.md#loading-templates-indexed-earlier).
 
 ### Step 6: Verify End-to-End
 
@@ -279,10 +281,11 @@ The Analytics dashboard finds compact events through the `tenx-events` macro.
 | **KV Store** | Template patterns for event reconstruction |
 | **Inflate Macro** | SPL macro joining events with templates |
 | **Consume KV Search** | Scheduled search storing new templates in the KV Store |
-| **Backfill KV Search** | The same template load over 30 days, for templates indexed before the app was installed |
+| **Backfill KV Search** | The same template load from the start of the index, after the KV store was emptied or restored |
 | **Recompile Compiled Alerts Search** | Runs `tenxrecompile` every 15 minutes |
 | **Rebuild Field Replay Searches** | Run `tenxreplay` every hour, and every five minutes for sourcetypes not yet covered |
 | **Field Map Events Without Fields Search** | Not scheduled; where a field map is installed, counts compact events indexed without their fields by index, sourcetype and reason |
+| **Field Map Dropped Events Alert** | Every 5 minutes, a tracked alert; counts the compact events Splunk dropped at parsing because a field map's index-time lookup failed, by node and sourcetype, from `splunkd.log` |
 | **Analytics Dashboard** | Compression and template metrics |
 | **Diagnostics Dashboard** | Troubleshooting and verification tools |
 

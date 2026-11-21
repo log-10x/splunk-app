@@ -228,6 +228,9 @@ STATE_RUN_STARTED = 'run_started'
 STATE_RUN_ENDED = 'run_ended'
 # The last run stopped from outside, as the next run found it; kept for Diagnostics.
 STATE_LAST_CUT = 'last_cut'
+# When the first run of this version started (an install or an upgrade): for some minutes after it the
+# `tx` prefilter checks that the template lookup runs on the indexers (tenx_prefilter.py).
+STATE_VERSION_SINCE = 'version_since'
 STATUS_CURRENT = 'current'
 STATUS_LOADING = 'loading'
 STATUS_FAILED = 'failed'
@@ -562,7 +565,8 @@ def load_since(server_connection, store, state_intf, dml_intf, source, start_fro
 		start = 0
 		refresh_until = end
 		write_state(state_intf, state, **{STATE_VERSION: app_version(), STATE_REFRESH_UNTIL: end, STATE_LOADED_THROUGH: 0,
-			STATE_STATUS: STATUS_LOADING, STATE_DETAIL: 'reading every template record for version {}'.format(app_version())}, reset=True)
+			STATE_STATUS: STATUS_LOADING, STATE_DETAIL: 'reading every template record for version {}'.format(app_version()),
+			STATE_VERSION_SINCE: now}, reset=True)
 
 	started, ended = float(state.get(STATE_RUN_STARTED) or 0), float(state.get(STATE_RUN_ENDED) or 0)
 	marker = {STATE_RUN_STARTED: now}

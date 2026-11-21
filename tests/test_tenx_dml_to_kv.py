@@ -326,10 +326,17 @@ def test_the_first_run_reads_from_the_start_of_the_index(monkeypatch, tmp_path):
 	old = flood(100, 1700000000, prefix='-Old')
 	splunk, kv, state = FakeSplunk(old), StoreKV(), StoreKV()
 
+	before = int(time.time())
 	consume(monkeypatch, tmp_path, splunk, kv, state)
 
 	assert len(kv.records) == 100
 	assert '_index_earliest=0 ' in splunk.searches[0]
+	# the time this version first ran, which the tx prefilter reads (it checks the lookup on the indexers
+	# for some minutes after it); a later run of the same version keeps it
+	since = state.records['consume_kv']['version_since']
+	assert before <= int(since) <= int(time.time())
+	consume(monkeypatch, tmp_path, splunk, kv, state)
+	assert state.records['consume_kv']['version_since'] == since
 
 
 def test_a_run_that_stops_is_resumed_from_the_checkpoint(monkeypatch, tmp_path):
