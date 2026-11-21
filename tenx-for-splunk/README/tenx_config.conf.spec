@@ -33,10 +33,12 @@ replay_max_sourcetypes = <non-negative integer>
 * Default: 200
 
 replay_max_macro_chars = <non-negative integer>
-* Largest tenx-replay macro definition tenxreplay writes, in characters. Past it, source:: and
-  host:: rules are limited to those matching a source or host seen, then the least busy
-  original sourcetypes are left out. 0 means no limit.
-* Default: 262144
+* Largest tenx-replay macro definition tenxreplay writes, in characters, and the largest unit.
+  Past it, source:: and host:: rules are limited to those matching a source or host seen, then
+  the least busy original sourcetypes are left out; a unit past it replays nothing. 0 means no
+  limit. Splunk sets no limit on a macro's length; it runs at most 1,000 commands in a search,
+  so tenxreplay also keeps the macro and each unit to 900 commands, the same way.
+* Default: 0
 
 replay_expire_days = <non-negative integer>
 * An original sourcetype that no rebuild has seen for this many days, and that no compact event

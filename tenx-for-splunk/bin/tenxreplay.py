@@ -682,8 +682,8 @@ class TenxReplayCommand(GeneratingCommand):
 		last_seen = builder.last_seen_of(present, covered, now)
 		replay = builder.build_capped(stanzas, present, lookups, keep, settings, last_seen, transforms=transforms,
 									  keep_by_sourcetype=keep_by_st)
-		# Every covered sourcetype gets a unit, including those replay_max_macro_chars leaves out of the
-		# macro: their units are what txf(<sourcetype>) and the search rewrite replay them with.
+		# Every covered sourcetype gets a unit, including those the macro's size limits leave out of it:
+		# their units are what txf(<sourcetype>) and the search rewrite replay them with.
 		unit_sts = builder.unit_sourcetypes(present, last_seen, settings)
 		units, failed = {}, set()
 		if unit_sts:

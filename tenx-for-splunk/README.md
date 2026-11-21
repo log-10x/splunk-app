@@ -403,6 +403,30 @@ warning. The check needs compact events that carry `tenx_sourcetype` (see
 [Fields of the Original Sourcetype](#fields-of-the-original-sourcetype-txf)); without it, set the
 macro when a source moves to the Receiver.
 
+### Events Sent as Text
+
+The Receiver sends some events as their own text, in the same stream and sourcetype as the compact
+events: an event of 65,535 characters or more, an event whose template a field map does not list
+yet, and, with its `templateCreateAfter` option, an event whose template it has not made yet. A
+compact event starts with `~`; an event sent as text never does, so the app tells the two apart by
+that first character.
+
+The Receiver's Forward output, which Fluent Bit, Fluentd and Vector read back, starts every compact
+event with `~`. A compact event that reaches Splunk without it is returned as it is, as text.
+
+`tx`, `txf`, the `| tx` command, the dashboard hook and compiled alerts find such an event by the
+words of its text and return it as it is, without `tenx_expand_refused`. Its `_time`, and through
+`txf` its fields, are those of a compact event of the same line. A field map writes no index-time
+fields for it and gives it the same sourcetype as the compact events of its source; the add-on's
+search-time rules read its fields from its text, so a data model search over events
+(`tstats summariesonly=false`) counts it as it counts the raw event. The dashboard counts it in its
+event totals and shows these events as one row, `(sent as text)`, in its template tables.
+
+A log line that itself starts with `~` is never sent as text: the Receiver makes its template on
+first sight, and `tx` expands it back to the line. A raw event named in `tenx-raw-events` whose
+text starts with `~` is read as a compact event: when no template has the text before its first
+comma as its hash, it comes back as it is, with `tenx_expand_refused` set to `no-template`.
+
 ---
 
 ## Usage
@@ -695,9 +719,10 @@ index=wineventlog `txf(XmlWinEventLog)` EventCode=4625 | stats count by user
 
 `txf(<sourcetype>)` applies the rules of that one sourcetype and starts faster. It returns the other compact events in range as well, without those rules, so where an index holds other sourcetypes, name the sourcetype too: `tenx_sourcetype=<sourcetype>` before the macro, or `sourcetype=<sourcetype>` after it. `txf` applies the
 rules of every original sourcetype the app has recorded in the compact indexes, up to
-`replay_max_macro_chars` characters (tenx_config.conf); past that it holds the busiest
-sourcetypes, a `txf` search over an index that holds one of the others shows a warning naming it,
-and `txf(<sourcetype>)` applies that sourcetype's rules.
+`replay_max_sourcetypes` (tenx_config.conf), the busiest first. Where their rules would take more
+commands than one Splunk search runs, or more characters than `replay_max_macro_chars` when it is
+set, it holds the busiest sourcetypes, a `txf` search over an index that holds one of the others
+shows a warning naming it, and `txf(<sourcetype>)` applies that sourcetype's rules.
 
 A field comparison after `txf` reads every compact event in range. When the value is written in the
 event (an event code, a user name), write it as a word too (`EventCode=4625 4625`): the same events,
@@ -822,7 +847,7 @@ event's `_time` is the line's own date and time, with a field map or without one
 
 A timestamp without a year takes its year from the time the event is processed, so a replayed or
 backfilled file from an earlier year gets the wrong year. Splunk guesses the year for such lines
-too, and the two guesses can differ. The Receiver sends an event of 65,535 characters or more whole, without a template: it is licensed at its full size, its `_time` is the time its sender gave it rather than a time in its text, and a field map writes no index-time fields for it, so data models and `tstats` do not count it.
+too, and the two guesses can differ. The Receiver sends an event of 65,535 characters or more whole, without a template: it is licensed at its full size, its `_time` is the time its sender gave it rather than a time in its text, and a field map writes no index-time fields for it (see [Events Sent as Text](#events-sent-as-text)).
 
 ## Data Models and Detections: the Field Map
 
@@ -1500,7 +1525,7 @@ index=* sourcetype=tenx_encoded earliest=-15m
 ~<hash>,<var0>,<var1>,<var2>,...
 ```
 
-- `~`: Optional prefix (handled by extraction regex)
+- `~`: Marks a compact event. A line without it is an event sent as its own text (see [Events Sent as Text](#events-sent-as-text))
 - `<hash>`: Template hash identifier
 - `<var0>`: First variable (typically epoch timestamp in milliseconds or nanoseconds)
 - `<var1>...`: Additional variable values
@@ -1547,10 +1572,10 @@ The `tenx-inflate` macro performs these operations:
 The `tenx-hash-vars-extraction` transform:
 
 ```regex
-^~?(?<tenx_hash>[^,]+)(?:,(?<tenx_var_0>[^,]+)(?:,(?<tenx_vars>.*))?)?
+^~(?<tenx_hash>[^,]+)(?:,(?<tenx_var_0>[^,]+)(?:,(?<tenx_vars>.*))?)?
 ```
 
-- `~?`: Optional tilde prefix
+- `~`: The tilde that starts every compact event; a line sent as text gets none of these fields
 - `(?<tenx_hash>[^,]+)`: Capture hash (everything up to first comma)
 - `(?:,(?<tenx_var_0>[^,]+)...)?`: Optionally capture the first variable (timestamp), so `~<hash>` alone also matches
 - `(?:,(?<tenx_vars>.*))?`: Optionally capture remaining variables

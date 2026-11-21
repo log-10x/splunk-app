@@ -3,14 +3,17 @@
 Live check of the field replay for sourcetypes the `tenx-replay` macro leaves out, against a running Splunk with
 this app installed.
 
-Past replay_max_macro_chars (tenx_config.conf) the macro `txf` runs holds the busiest original sourcetypes only.
-The others keep their own unit, which txf(<sourcetype>) and the search rewrite run; their record in
+The macro `txf` runs holds every original sourcetype that has a unit, up to the commands one Splunk search runs;
+past those, or past replay_max_macro_chars (tenx_config.conf) where an instance sets it, it holds the busiest
+only. The others keep their own unit, which txf(<sourcetype>) and the search rewrite run; their record in
 tenx_replay.conf says left_out=txf, and a `txf` search over their index warns. The instance needs the same
 events twice: raw (--raw-index) and compact with tenx_sourcetype (--txf-index), of the sourcetypes named
 (--sourcetypes). --max-macro-chars sets the limit for the run (and puts the previous value back), so that the
 macro leaves some of them out on an instance where it would not. The rows:
 - after | tenxreplay, every sourcetype named has a unit that replays its rules (not the no-op unit);
 - for each, txf(<sourcetype>) gives every one of its events every field of the raw event;
+- plain `txf` over --txf-index, when the record leaves none of them out, gives every event of them every field of
+  the raw event (events, and fields equal on every event, of the fields the raw events have);
 - a `txf` search over --txf-index warns, naming them, exactly when the record leaves one of them out.
     python3 tests/live_txf_left_out.py --url https://localhost:8089 --user admin --password-file pw \\
         --raw-index fgt_raw --txf-index fgt_compact --sourcetypes fortigate_traffic,fortigate_utm
@@ -70,6 +73,21 @@ def compare(raw, replayed):
 		differ.update(bad)
 		equal += not bad
 	return len(keys), equal, differ
+
+
+def field_tally(raw, replayed):
+	"""(fields the raw events have, those equal on every event matched on k, events matched)."""
+	a, b = dict((r.get('k'), r) for r in raw), dict((r.get('k'), r) for r in replayed)
+	norm = lambda v: None if v is None else (tuple(sorted(v)) if isinstance(v, list) else (v,))
+	names, bad = set(), set()
+	for r in raw:
+		names.update(n for n in r if n not in SKIP and not n.startswith('tenx_'))
+	keys = set(a) & set(b)
+	for k in keys:
+		for n in set(n for n in set(a[k]) | set(b[k]) if n not in SKIP and not n.startswith('tenx_')):
+			if norm(a[k].get(n)) != norm(b[k].get(n)):
+				bad.add(n)
+	return len(names), len(names - bad), len(keys), sorted(bad)
 
 
 def conf_entry(splunk, path):
@@ -132,6 +150,20 @@ def main():
 				  '%d of %d events equal (raw %d, replayed %d)%s' % (
 					  equal, matched, len(raw), len(replayed),
 					  '; differ: ' + ', '.join('%s %d' % kv for kv in differ.most_common(3)) if differ else ''))
+		if sts:
+			where = ' OR '.join('sourcetype="%s"' % st for st in sts)
+			raw = export(splunk, 'search index=%s (%s) | eval k=md5(_raw) | fields * | fields - _raw' % (args.raw_index, where))
+			replayed = export(splunk, 'search index=%s `txf` | where %s | eval k=md5(_raw) | fields * | fields - _raw' % (
+				args.txf_index, ' OR '.join('tenx_sourcetype="%s"' % st for st in sts)))
+			names, equal, matched, bad = field_tally(raw, replayed)
+			detail = '%d of %d fields equal on every event, %d events matched (raw %d, txf %d)%s' % (
+				equal, names, matched, len(raw), len(replayed), '; differ: ' + ', '.join(bad[:5]) if bad else '')
+			if left:
+				# the macro leaves some out by the limits set for this run: those events get only their text's fields
+				print('INFO txf with %s left out: %s' % (', '.join(left), detail), flush=True)
+			else:
+				check('txf gives every event of %s every field of the raw event' % ', '.join(sts),
+					  matched == len(raw) == len(replayed) and equal == names and matched > 0, detail)
 		rows, msgs = search(splunk, 'search index=%s `txf` | stats count' % args.txf_index, '0')
 		warned = [m for m in msgs if WARNING in m]
 		if left:
