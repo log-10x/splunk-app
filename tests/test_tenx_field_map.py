@@ -802,7 +802,7 @@ class TestWhatTxNeeds:
 		conf = configparser.RawConfigParser(strict=False, interpolation=None)
 		conf.read(os.path.join(os.path.dirname(fm.default_app_props()), 'transforms.conf'))
 		app = conf.get('tenx-hash-vars-extraction', 'REGEX')
-		assert app.startswith('^~?') and fm.HASH_REGEX == '^~' + app[len('^~?'):]
+		assert fm.HASH_REGEX == app
 		rx = re.compile(fm.HASH_REGEX.replace('(?<', '(?P<'))
 		assert rx.match('~h1,4625,dc01').groupdict() == {'tenx_hash': 'h1', 'tenx_var_0': '4625', 'tenx_vars': 'dc01'}
 		assert rx.match('<Event xmlns="x"><System>') is None

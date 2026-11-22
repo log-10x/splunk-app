@@ -37,19 +37,19 @@ def spl_strings(expr):
 
 
 def match_pattern():
-	return [s for s in spl_strings(ingest_eval()) if s.startswith('^~?') and '{13}' in s][0]
+	return [s for s in spl_strings(ingest_eval()) if s.startswith('^~') and '{13}' in s][0]
 
 
 def capture_pattern():
-	return [s for s in spl_strings(ingest_eval()) if s.startswith('^~?') and '(\\d+)' in s][0]
+	return [s for s in spl_strings(ingest_eval()) if s.startswith('^~') and '(\\d+)' in s][0]
 
 
 def seconds_match():
-	return [s for s in spl_strings(ingest_eval()) if s.startswith('^~?') and ',\\d{10}\\.' in s][0]
+	return [s for s in spl_strings(ingest_eval()) if s.startswith('^~') and ',\\d{10}\\.' in s][0]
 
 
 def seconds_capture():
-	return [s for s in spl_strings(ingest_eval()) if s.startswith('^~?') and '(\\d{10}\\.\\d{1,9})' in s][0]
+	return [s for s in spl_strings(ingest_eval()) if s.startswith('^~') and '(\\d{10}\\.\\d{1,9})' in s][0]
 
 
 def event_seconds(raw, tenx_time=None):
@@ -91,6 +91,20 @@ class TestEventTime:
 	])
 	def test_any_other_first_variable_keeps_the_index_time(self, raw):
 		assert event_seconds(raw) is None
+
+	@pytest.mark.parametrize('raw', [
+		# events the Receiver sent as their own text (templateCreateAfter): no leading "~"
+		'h,1759386934498,cart,7',
+		'web01,1759386934498123456,x',
+		'auditd,1723042099.699,13369',
+		'2025-11-10T10:00:00.000Z host app: user alice logged in',
+	])
+	def test_a_line_sent_as_text_keeps_the_time_it_arrived_with(self, raw):
+		assert event_seconds(raw) is None
+
+	def test_every_pattern_requires_the_leading_tilde(self):
+		patterns = [s for s in spl_strings(ingest_eval()) if s.startswith('^')]
+		assert len(patterns) == 9 and all(p.startswith('^~[') for p in patterns)
 
 	@pytest.mark.parametrize('raw,seconds', [
 		# $(+%s.%f), engine 1.1.181: seconds, a dot, 1 to 9 fraction digits, as the line wrote them

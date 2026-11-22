@@ -1576,20 +1576,33 @@ def top_level_commands(text):
 	return n
 
 
+def over_limits(replay, limit):
+	"""Whether a replay is longer than `limit` characters (replay_max_macro_chars; 0: no limit) or holds more
+	top-level commands than REPLAY_MAX_COMMANDS."""
+	text = replay.spl()
+	return bool(limit and len(text) > limit) or top_level_commands(text) > REPLAY_MAX_COMMANDS
+
+
+def _size(replay, limit):
+	text = replay.spl()
+	return '%d characters, %d commands; limits: replay_max_macro_chars = %s, %d commands' % (
+		len(text), top_level_commands(text), limit or 'none', REPLAY_MAX_COMMANDS)
+
+
 def build_unit(stanzas, sourcetype, seen, lookup_fields=None, keep_fields=(), rejected=None, bad_lookups=None,
 			   transforms=None, limit=0, keep_by_sourcetype=None):
 	"""
 	The unit of one original sourcetype (see the notes above unit_macro()). `seen` is its entry of
-	coverage(). Past `limit` characters (replay_max_macro_chars) the unit replays nothing, with a
-	warning: then its events are handled as `tx` handles them. keep_by_sourcetype as in build():
-	the unit keeps `keep_fields` and the indexed fields of this sourcetype's compact events.
+	coverage(). Past `limit` characters (replay_max_macro_chars, 0 for none) or REPLAY_MAX_COMMANDS the
+	unit replays nothing, with a warning: then its events are handled as `tx` handles them.
+	keep_by_sourcetype as in build(): the unit keeps `keep_fields` and the indexed fields of this
+	sourcetype's compact events.
 	"""
 	unit = build(stanzas, [(sourcetype, '', '')], lookup_fields, keep_fields, False, rejected, bad_lookups, transforms,
 				 only=True, seen=seen, with_tags=False, keep_by_sourcetype=keep_by_sourcetype)
-	if limit and len(unit.spl()) > limit:
+	if over_limits(unit, limit):
 		cut = build(stanzas, [], only=True)
-		cut.warnings.append('the unit of %r (%d characters) is over replay_max_macro_chars = %d and replays nothing'
-							% (sourcetype, len(unit.spl()), limit))
+		cut.warnings.append('the unit of %r is over its limits (%s) and replays nothing' % (sourcetype, _size(unit, limit)))
 		# What the sourcetype's stanza records still holds; LEFT_OUT_KEY says the unit replays nothing.
 		cut.per_sourcetype = unit.per_sourcetype
 		cut.replays_nothing = True
@@ -1599,8 +1612,9 @@ def build_unit(stanzas, sourcetype, seen, lookup_fields=None, keep_fields=(), re
 
 # The tenx_replay.conf key that says what leaves a sourcetype's events without its rules, for the
 # warning the prefilter shows on `txf` and txf(<sourcetype>) (tenx_prefilter_parser.replay_left_out):
-# 'txf' when the `tenx-replay` macro leaves it out (replay_max_macro_chars keeps the busiest
-# sourcetypes in it), 'unit' when its own unit is over that size and replays nothing. Empty: neither.
+# 'txf' when the `tenx-replay` macro leaves it out (past replay_max_macro_chars, when set, or
+# REPLAY_MAX_COMMANDS it keeps the busiest sourcetypes), 'unit' when its own unit is over those limits and
+# replays nothing. Empty: neither.
 LEFT_OUT_KEY = 'left_out'
 
 # The tenx_replay.conf key that holds the top-level commands of a sourcetype's unit, for rewrite_replay() to
@@ -1616,10 +1630,10 @@ def left_out_value(in_macro, replays_nothing):
 def unit_sourcetypes(present, last_seen=None, settings=None):
 	"""
 	The original sourcetypes that get a unit and a tenx_replay.conf stanza: every usable one of
-	`present`, the busiest first, held to replay_max_sourcetypes. Not held to replay_max_macro_chars,
-	which limits the `tenx-replay` macro alone: each unit has its own limit (build_unit()), and a
-	sourcetype the macro leaves out keeps its unit, so txf(<sourcetype>) and the search rewrite still
-	give its events their fields.
+	`present`, the busiest first, held to replay_max_sourcetypes: the same sourcetypes the `tenx-replay`
+	macro holds unless its size limits leave some out (build_capped()). Each unit has its own limit
+	(build_unit()), and a sourcetype the macro leaves out keeps its unit, so txf(<sourcetype>) and the
+	search rewrite still give its events their fields.
 	"""
 	settings = settings or DEFAULT_SETTINGS
 	ranked = ranked_sourcetypes(present, last_seen)
@@ -1780,7 +1794,7 @@ def rewrite_replay(covered, indexes):
 			chosen.append(st)
 	if not chosen:
 		return None
-	# `tenx-replay` leaves out the sourcetypes past replay_max_macro_chars; their units replay them.
+	# `tenx-replay` leaves out the sourcetypes past its size limits; their units replay them.
 	left_out = any('txf' in str((covered[st] if isinstance(covered[st], dict) else {}).get(LEFT_OUT_KEY) or '').split(',')
 				   for st in chosen)
 	if len(chosen) == len(sts) and not left_out:
@@ -1797,8 +1811,10 @@ def rewrite_replay(covered, indexes):
 DEFAULT_SETTINGS = {
 	# More distinct original sourcetypes than this are not replayed (the busiest are kept).
 	'replay_max_sourcetypes': 200,
-	# The macro is cut down until its definition is at most this many characters.
-	'replay_max_macro_chars': 262144,
+	# The macro is cut down until its definition is at most this many characters; 0, no limit. Splunk sets
+	# no limit on a macro's length (see REPLAY_MAX_COMMANDS), so by default the macro holds every sourcetype
+	# that has a unit, held to REPLAY_MAX_COMMANDS.
+	'replay_max_macro_chars': 0,
 	# A sourcetype no compact event has carried for this many days loses its replay; 0 never.
 	'replay_expire_days': 400,
 	# A unit that has been the no-op unit for this many days is deleted, with its alias; 0 never.
@@ -1925,12 +1941,12 @@ def _listed(names, n=20):
 def build_capped(stanzas, present, lookup_fields=None, keep_fields=(), settings=None, last_seen=None,
 				 rejected=None, bad_lookups=None, transforms=None, keep_by_sourcetype=None):
 	"""
-	build(), held to replay_max_sourcetypes and replay_max_macro_chars. Past the sourcetype cap
-	the least busy sourcetypes are left out. Past the size cap, first the source and host
-	stanzas are limited to those matching a source or host seen (select_stanzas all_shared=False),
-	then sourcetypes are left out, least busy first; if even the shared rules alone do not fit,
-	the macro is the shipped one. Every step is a warning on the result, and `dropped` lists the
-	sourcetypes left out.
+	build(), held to replay_max_sourcetypes, to replay_max_macro_chars when it is set, and to
+	REPLAY_MAX_COMMANDS. Past the sourcetype cap the least busy sourcetypes are left out. Past a size
+	limit, first the source and host stanzas are limited to those matching a source or host seen
+	(select_stanzas all_shared=False), then sourcetypes are left out, least busy first; if even the
+	shared rules alone do not fit, the macro is the shipped one. Every step is a warning on the result,
+	and `dropped` lists the sourcetypes left out.
 	"""
 	settings = settings or DEFAULT_SETTINGS
 	ranked = ranked_sourcetypes(present, last_seen)
@@ -1951,20 +1967,20 @@ def build_capped(stanzas, present, lookup_fields=None, keep_fields=(), settings=
 
 	replay = attempt(ranked, True)
 	limit = settings['replay_max_macro_chars']
-	if limit and len(replay.spl()) > limit:
-		notes.append('the macro (%d characters) is over replay_max_macro_chars = %d: source and host stanzas are '
-					 'limited to those matching a source or host seen in the lookback' % (len(replay.spl()), limit))
+	if over_limits(replay, limit):
+		notes.append('the macro is over its limits (%s): source and host stanzas are limited to those matching a '
+					 'source or host seen in the lookback' % _size(replay, limit))
 		replay = attempt(ranked, False)
 		cut = []
-		while len(replay.spl()) > limit and ranked:
+		while over_limits(replay, limit) and ranked:
 			cut.append(ranked.pop())
 			replay = attempt(ranked, False)
 		if cut:
 			dropped += cut
-			notes.append('%d more original sourcetypes are not replayed to stay within replay_max_macro_chars: %s'
+			notes.append('%d more original sourcetypes are not replayed to stay within the macro\'s limits: %s'
 						 % (len(cut), _listed(cut)))
-		if len(replay.spl()) > limit:
-			notes.append('the rules of [default], source:: and host:: stanzas alone are over replay_max_macro_chars; '
+		if over_limits(replay, limit):
+			notes.append('the rules of [default], source:: and host:: stanzas alone are over the macro\'s limits; '
 						 'the shipped macro is written and nothing is replayed')
 			dropped = ranked_sourcetypes(present, last_seen)
 			replay = build(stanzas, [], lookup_fields, keep_fields, transforms=transforms,
@@ -2111,8 +2127,8 @@ def units_dry_run(units):
 def failing_units(units, run, limit=262144):
 	"""
 	{sourcetype: error} of the units whose dry run fails. Units are run together in searches of
-	at most about `limit` characters; a failing search is split in two until each failing unit
-	is found alone.
+	at most about `limit` characters and REPLAY_MAX_COMMANDS top-level commands; a failing search is
+	split in two until each failing unit is found alone.
 	"""
 	bad = {}
 
@@ -2128,14 +2144,15 @@ def failing_units(units, run, limit=262144):
 		check(sts[:len(sts) // 2])
 		check(sts[len(sts) // 2:])
 
-	batch, size = [], 0
+	batch, size, commands = [], 0, 0
 	for st in sorted(units):
-		n = len(units[st].spl())
-		if batch and size + n > limit:
+		n, c = len(units[st].spl()), top_level_commands(units[st].spl()) + 3
+		if batch and (size + n > limit or commands + c > REPLAY_MAX_COMMANDS):
 			check(batch)
-			batch, size = [], 0
+			batch, size, commands = [], 0, 0
 		batch.append(st)
 		size += n
+		commands += c
 	check(batch)
 	return bad
 

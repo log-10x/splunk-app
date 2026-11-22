@@ -77,7 +77,7 @@ class TestTheLeftOutWarning:
 	def test_txf_names_what_its_macro_leaves_out_in_the_indexes_searched(self):
 		msg = pp.replay_left_out(RECORD, '`txf`', [])
 		assert msg == ('txf: the field replay of txf leaves out fortigate_log and fortigate_utm (over '
-					   'replay_max_macro_chars), so their events get only the fields in their text; txf(<sourcetype>) '
+					   'its size limits), so their events get only the fields in their text; txf(<sourcetype>) '
 					   'gives them all their fields.')
 		assert len(msg) <= 256
 		# fortigate_utm is recorded in fw only; fortigate_log in every index (*)
@@ -92,7 +92,7 @@ class TestTheLeftOutWarning:
 	def test_txf_of_one_warns_only_when_its_own_unit_replays_nothing(self):
 		assert pp.replay_left_out(RECORD, '`txf(fortigate_utm)`', []) is None
 		assert pp.replay_left_out(RECORD, '`txf(fortigate_log)`', []) == (
-			"txf(fortigate_log): this sourcetype's field replay is over replay_max_macro_chars and replays nothing, so "
+			"txf(fortigate_log): this sourcetype's field replay is over its size limits and replays nothing, so "
 			"its events get only the fields in their text.")
 
 
@@ -372,6 +372,12 @@ class TestTheLookupOnTheIndexers:
 		assert pp.lookup_failed(FAILED).startswith("Streamed search execute failed")
 		assert pp.lookup_failed({'messages': [{'type': 'WARN', 'text': 'lookup slow'}]}) is None
 		assert pp.lookup_failed({'results': [{'tenx_probe': 'x'}]}) is None
+		# the search process on each indexer exits before the bundle is usable
+		peer = ('Search results might be incomplete: the search process on the peer:[rg-idx1,rg-idx2]  ended prematurely. '
+				'Check the peer log, such as $SPLUNK_HOME/var/log/splunk/splunkd.log and as well as the search.log for '
+				'the particular search.')
+		assert pp.lookup_failed({'messages': [{'type': 'ERROR', 'text': peer}]}) == peer[:300]
+		assert pp.lookup_failed({'messages': [{'type': 'WARN', 'text': peer}]}) is None
 		missing = "The lookup table 'tenx-dml-lookup' does not exist or is not available."
 		assert pp.lookup_failed({'messages': [{'type': 'ERROR', 'text': missing}]}) == missing
 
@@ -381,7 +387,8 @@ class TestTheLookupOnTheIndexers:
 		for text in ("Streamed search execute failed because: Error in 'lookup' command: Could not construct lookup "
 					 "'cisco_asa_action_lookup, action, OUTPUT, vendor_action'. See search.log for more details.",
 					 "The lookup table 'fortinet_fortigate_action_lookup' does not exist or is not available.",
-					 "Could not create KvStore External command based lookup 'tenx-dml-lookup': KV Store initializing"):
+					 "Could not create KvStore External command based lookup 'tenx-dml-lookup': KV Store initializing",
+					 "External search command 'addon_cmd' ended prematurely."):
 			assert pp.lookup_failed({'messages': [{'type': 'ERROR', 'text': text}]}) is None, text
 
 	def test_an_add_on_lookup_error_does_not_hold_the_search(self):

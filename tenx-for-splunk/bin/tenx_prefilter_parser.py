@@ -1593,22 +1593,23 @@ def replay_left_out(record, macro, indexes):
 	"""
 	The warning of `txf` or txf(<sourcetype>) whose field replay leaves events of a covered sourcetype
 	without its rules, or None. `txf`: the `tenx-replay` macro holds the busiest sourcetypes that fit in
-	replay_max_macro_chars, and the record marks the others left_out=txf; only those recorded in the
-	indexes the search names count. txf(<sourcetype>): that sourcetype's unit is over the same size and
-	replays nothing (left_out has unit). Either way such events get only the fields in their text.
+	its limits (replay_max_macro_chars when set, and the commands of one search), and the record marks the
+	others left_out=txf; only those recorded in the indexes the search names count. txf(<sourcetype>): that
+	sourcetype's unit is over the same limits and replays nothing (left_out has unit). Either way such
+	events get only the fields in their text.
 	"""
 	name = (macro or "").strip("`")
 	if name == "txf":
 		left = [st for st, kv in record.items() if "txf" in str(kv.get("left_out") or "").split(",")
 				and _in_indexes(_listed(kv.get("indexes")), indexes)]
 		if left:
-			return ("txf: the field replay of txf leaves out %s (over replay_max_macro_chars), so %s events get only "
+			return ("txf: the field replay of txf leaves out %s (over its size limits), so %s events get only "
 					"the fields in their text; txf(<sourcetype>) gives them all their fields."
 					% (_names(left), "their" if len(left) > 1 else "its"))
 	elif name.startswith("txf(") and name.endswith(")"):
 		st = name[4:-1].strip()
 		if "unit" in str((record.get(st) or {}).get("left_out") or "").split(","):
-			return ("txf(%s): this sourcetype's field replay is over replay_max_macro_chars and replays nothing, so its "
+			return ("txf(%s): this sourcetype's field replay is over its size limits and replays nothing, so its "
 					"events get only the fields in their text." % st)
 	return None
 
@@ -1653,12 +1654,12 @@ def raw_history_message(rows, macro):
 														 "holds" if len(ixs) == 1 else "hold", _names(sts)))
 
 
-# The minutes after an install or an upgrade. On a search head with separate indexers the app's template
-# lookup reaches them with the next knowledge bundle; until it has, every `tx` search failed there
-# (Splunk Enterprise 10.4.3, a fresh search head over two indexers: "Error in 'lookup' command: Could not
-# construct lookup 'tenx-dml-lookup' ... does not exist or is not available", no rows, for about a minute
-# after the install). For these minutes tenxprefilter runs LOOKUP_PROBE first, and when the lookup fails
-# on the indexers it keeps the search on the search head (ON_SEARCH_HEAD) and warns instead.
+# The minutes after an install or an upgrade. On a search head with separate indexers the
+# template lookup reaches them with the next knowledge bundle, and until then a `tx`
+# search there fails: on Splunk's lookup error, or because the search process on each
+# indexer ends prematurely. For these minutes tenxprefilter runs LOOKUP_PROBE first and,
+# when it fails on the indexers either way, keeps the search on the search head
+# (ON_SEARCH_HEAD) and warns.
 NEW_VERSION_SECONDS = 900
 PEERS_PATH = "/services/search/distributed/peers?output_mode=json&count=0"
 LOOKUP_PROBE = ("search ((`tenx-events`) OR (`tenx-raw-events`)) | lookup tenx-dml-lookup _key AS tenx_hash OUTPUT _key AS "
@@ -1685,21 +1686,24 @@ def new_version(state, version, now):
 		return False
 
 
-# What says the template lookup is not on the indexers: Splunk's error naming tenx-dml-lookup as one it cannot
-# construct or find (the message measured above). Any other error of the probe is not this one: an add-on's
-# automatic lookup that fails on the probe's events, or the KV store starting on the search head. The search
-# then runs as it would and shows its own error.
+# Splunk's error naming tenx-dml-lookup as a lookup it cannot construct or find, or its
+# message that the search process on a peer ended prematurely, says the template lookup is
+# not on the indexers. Any other error of the probe, such as an add-on's automatic lookup
+# failing or the KV store starting, is not this one, and the search runs as it would.
 LOOKUP_NAME = "tenx-dml-lookup"
 LOOKUP_MISSING = ("could not construct lookup", "does not exist or is not available")
+PEER_PROCESS = "search process on the peer"
+PEER_ENDED = "ended prematurely"
 
 
 def lookup_failed(result):
 	"""The text of an error of LOOKUP_PROBE's answer that says the template lookup cannot run on the indexers
-	(LOOKUP_NAME with one of LOOKUP_MISSING), or None."""
+	(LOOKUP_NAME with one of LOOKUP_MISSING, or PEER_PROCESS with PEER_ENDED), or None."""
 	for message in (result or {}).get("messages", []) or []:
 		kind, text = str(message.get("type", "")).upper(), str(message.get("text", ""))
 		low = text.lower()
-		if kind in ("ERROR", "FATAL") and LOOKUP_NAME in low and any(m in low for m in LOOKUP_MISSING):
+		if kind in ("ERROR", "FATAL") and ((LOOKUP_NAME in low and any(m in low for m in LOOKUP_MISSING))
+										   or (PEER_PROCESS in low and PEER_ENDED in low)):
 			return text[:300]
 	return None
 

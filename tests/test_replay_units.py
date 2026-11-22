@@ -105,6 +105,34 @@ VALUES_STEP = 'eval tenx_vars=if(match(_raw, "^~?[^,]+,[^,]+,[\\s\\S]"), replace
 	'eval tenx_var_0=if(match(_raw, "^~?[^,]+,[^,]"), replace(_raw, "^~?[^,]+,([^,]*)[\\s\\S]*$", "\\1"), tenx_var_0) | '
 
 
+# The comment over the inflate macros on events sent as their own text, and the leading "~" those macros require
+# (test_text_events.py).
+TEXT_EVENTS_NOTE = '# Events sent as text. A line that does not start with ~ is an event the Receiver sent as its own'
+
+
+def without_text_events(text):
+	lines = text.split('\n')
+	if TEXT_EVENTS_NOTE in lines:
+		start = lines.index(TEXT_EVENTS_NOTE)
+		end = lines.index('#', start)
+		lines = lines[:start] + lines[end + 1:]
+	return '\n'.join(lines).replace('match(_raw, "^~[^,]', 'match(_raw, "^~?[^,]').replace('replace(_raw, "^~[^,]', 'replace(_raw, "^~?[^,]')
+
+
+TRAILING_CR_NOTE = '# The last CR. An engine that reads a CR LF line end as one line break keeps the CR in the template, so the'
+TRAILING_CR_STEP = ' | eval tenx_text=replace(tenx_text, "\\r(?![\\s\\S])", "")'
+
+
+def without_trailing_cr(text):
+	"""The inflate macros without the step that drops the CR at the end of the text (test_inflate_trailing_cr.py)."""
+	lines = text.split('\n')
+	if TRAILING_CR_NOTE in lines:
+		start = lines.index(TRAILING_CR_NOTE)
+		end = lines.index('#', start)
+		lines = lines[:start] + lines[end + 1:]
+	return '\n'.join(lines).replace(TRAILING_CR_STEP, '')
+
+
 def without_values_from_raw(text):
 	lines = text.split('\n')
 	if '# Values are read from the compact text itself. The search-time extraction of tenx_vars' in lines:
@@ -195,10 +223,12 @@ class TestTxIsTheShippedMacro:
 			b.EVENTS, '`tenx-events`') == shipped.get('tx', 'definition')
 		# every other stanza shipped at e12ec4e is unchanged, its comments included; the two inflate
 		# macros differ by the empty-expansion guard (test_inflate_one_row_no_silent_empty.py), by the
-		# values read from _raw (test_inflate_values_from_raw.py) and by the sub-second step alone
+		# values read from _raw (test_inflate_values_from_raw.py), by the step that drops the last CR
+		# (test_inflate_trailing_cr.py) and by the sub-second step alone
 		for name in shipped.sections():
 			if name != 'tx':
-				assert without_values_from_raw(without_empty_guard(without_subsecond(stanza_text(ours, name)))) == (
+				assert without_values_from_raw(without_empty_guard(without_subsecond(without_text_events(
+					without_trailing_cr(stanza_text(ours, name)))))) == (
 					stanza_text(base.stdout, name)), name
 
 	def test_tx_runs_no_replay(self):

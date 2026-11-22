@@ -181,7 +181,8 @@
       <chart>
         <search>
           <query>`tenx-events`
-| rex field=_raw "^~?(?&lt;hash&gt;[^,]+)"
+| rex field=_raw "^~(?&lt;hash&gt;[^,]+)"
+| eval hash=coalesce(hash, "(sent as text)")
 | stats count by hash
 | sort -count
 | head 10
@@ -203,7 +204,8 @@
       <chart>
         <search>
           <query>`tenx-events`
-| rex field=_raw "^~?(?&lt;hash&gt;[^,]+)"
+| rex field=_raw "^~(?&lt;hash&gt;[^,]+)"
+| where isnotnull(hash)
 | stats count by hash
 | eval usage_bucket=case(
     count&lt;10, "1-9 events",
@@ -231,7 +233,6 @@
         <search>
           <query>`tenx-events`
 | head 1000
-| rex field=_raw "^~?(?&lt;hash&gt;[^,]+)"
 | `tenx-inflate`
 | eval success=if(match(_raw, "^~"), 0, 1)
 | stats sum(success) as successful, count as total
@@ -314,7 +315,8 @@
       <table>
         <search>
           <query>`tenx-events`
-| rex field=_raw "^~?(?&lt;hash&gt;[^,]+)"
+| rex field=_raw "^~(?&lt;hash&gt;[^,]+)"
+| eval hash=coalesce(hash, "(sent as text)")
 | stats count as "Event Count" by hash
 | sort -"Event Count"
 | head 20
