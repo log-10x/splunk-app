@@ -638,6 +638,8 @@ class TenxSearchCommand(TenxSplCommand):
 		self.server_connection = server_connection
 		# True when the rewritten text is stored as a saved search (TenxAlertCompiler): hash_predicate.
 		self.saved_search = False
+		# True when the whole search reads no event type and no tag (TenxSearchBuilder.build): the replay leaves them out.
+		self.tags_unread = False
 		self.too_complex = False
 		self.needs_tenx = False
 		self.force_tenx = force_tenx
@@ -1195,7 +1197,7 @@ class TenxSearchCommand(TenxSplCommand):
 		"""
 		covered = self.tenx_config.get(tenx_util.REPLAY_COVERAGE) if self.tenx_config else None
 		indexes = self.parsed_command.get_passing_specifiers('index_specifier')
-		return tenx_replay_builder.rewrite_replay(covered, indexes)
+		return tenx_replay_builder.rewrite_replay(covered, indexes, tags=not self.tags_unread)
 
 	def replay_restore(self):
 		"""Gives a replayed event back its text, sourcetype, source and host (see inflate_suffix)."""
@@ -1359,6 +1361,18 @@ class TenxSplCommands:
 		return result
 
 
+def tags_unread(leading, rest):
+	"""
+	Whether a search reads no event type and no tag: its leading search's terms and the commands after it,
+	read by the rules of txf's replay plan (tenx_replay_plan.tags_skipped). False when that cannot be told.
+	"""
+	import tenx_replay_plan
+	text = "search `txf(tenx)` " + (leading.get('rawargs') or '')
+	if rest:
+		text += " | " + " | ".join(command.simple_resolved() for command in rest)
+	return tenx_replay_plan.tags_skipped(text, tenx_prefilter_parser)
+
+
 class TenxSearchBuilder:
 	"""
 	Class for building a search on 10x encoded data from a given user search.
@@ -1455,6 +1469,9 @@ class TenxSearchBuilder:
 				tenx_command = TenxSplCommand(raw_command, self.tenx_config, self.debug)
 
 			tenx_commands.append(tenx_command)
+
+		if leading_search is not None and tenx_commands[0] is leading_search:
+			leading_search.tags_unread = tags_unread(leading_search.raw_command, tenx_commands[1:])
 
 		spl_commands = TenxSplCommands(tenx_commands, self.debug)
 		spl_commands.resolve()

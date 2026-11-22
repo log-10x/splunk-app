@@ -82,7 +82,7 @@ def changing_calls(event):
 	hidden form (no text, placeholder metadata) cannot set a field from the event. typer and tags
 	are left out: in a chunk that also holds replayed events they run on every event, and the
 	macro puts back the eventtype and tags of the others (the final fields are compared)."""
-	return [c for c in event.get('__log', []) if c[0] not in ('inflatemodel', 'typer', 'tags') and c[1][0] != '']
+	return [c for c in event.get('__log', []) if c[0].split(' ', 1)[0] not in ('inflatemodel', 'typer', 'tags') and c[1][0] != '']
 
 
 def rewrite_tail(search):
