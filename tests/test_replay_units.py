@@ -248,8 +248,8 @@ class TestTxIsTheShippedMacro:
 		# name with md5() in eval; on 10.4.3, md5 in eval equals hashlib's for the five names tried
 		assert conf.get('txf(1)', 'iseval') == '1'
 		assert conf.get('txf(1)', 'definition') == b.TXF_ONE_UNIT == (
-			'"' + head % mark.replace('"', '\\"') + '`tenx-replay-u" . substr(md5("$st$"), 1, 12) . "` | `tenx-replay-tags`'
-			+ tail + '"')
+			'"' + head % mark.replace('"', '\\"') + '`tenx-replay-u" . substr(md5("$st$"), 1, 12) . "` | `tenx-replay-plan` | `tenx-replay-tags`'
+			+ tail.replace('tenx_var_0, tenx_vars', 'tenx_var_0, tenx_vars, tenx_nd*') + '"')
 		assert without_guard(conf.get('txf', 'definition')) == (
 			'((`tenx-events`) OR (`tenx-raw-events`)) [| tenxprefilter] | eval tenx_compact_raw=_raw | `tenx-inflate` | fields - _kv | '
 			'`tenx-replay-plan` | `tenx-replay` | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars, tenx_nd*'

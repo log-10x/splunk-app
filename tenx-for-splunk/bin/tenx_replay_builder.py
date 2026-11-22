@@ -1386,7 +1386,10 @@ def tags_block():
 # types and tags of every replayed event, once, after the units of a search (txf(<sourcetype>),
 # the search rewrite). It does nothing on a chunk without a replayed event.
 TAGS_MACRO = 'tenx-replay-tags'
-TAGS_STEPS = ('eval %s=if(isnotnull(%s),1,null())' % (ANY, RST), tags_block(), 'fields - %s' % ANY)
+# A txf(<sourcetype>) search that reads no event type and no tag carries tenx_ndnotags (the prefilter's plan,
+# tenx_replay_plan.NOTAGS, put on its events by tenx-replay-plan), and the step leaves them out. The search
+# rewrite never sets it.
+TAGS_STEPS = ('eval %s=if(isnotnull(%s) AND isnull(tenx_ndnotags),1,null())' % (ANY, RST), tags_block(), 'fields - %s' % ANY)
 
 
 NARROWING_STANZA = 'tenx:narrowing'
@@ -1620,8 +1623,8 @@ WILD_STEP = ' | `tenx-wild`'
 EVENTS = '((`tenx-events`) OR (`tenx-raw-events`))'
 TXF_ONE_UNIT = ('"' + EVENTS + ' [| tenxprefilter] | eval tenx_compact_raw=_raw, tenx_passed=if(match(_raw, \\"^~\\") OR '
 				'isnotnull(tenx_sourcetype), null(), 1) | `tenx-inflate` | fields - _kv | '
-				'`tenx-mapped-hide` | `tenx-whole-hide` | `tenx-replay-u" . substr(md5("$st$"), 1, 12) . "` | `tenx-replay-tags` | '
-				'`tenx-whole-restore` | `tenx-mapped-restore` | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars | '
+				'`tenx-mapped-hide` | `tenx-whole-hide` | `tenx-replay-u" . substr(md5("$st$"), 1, 12) . "` | `tenx-replay-plan` | `tenx-replay-tags` | '
+				'`tenx-whole-restore` | `tenx-mapped-restore` | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars, tenx_nd* | '
 				'eval tenx_expand_refused=if(len(tenx_expand_refused)>0, tenx_expand_refused, null())' + WILD_STEP + ' | search *"')
 TXF_ONE = 'txf(1)'
 TXF_ONE_NAME = 'match(st, "^[A-Za-z0-9_.:/-]+$")'

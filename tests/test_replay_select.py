@@ -15,6 +15,7 @@ These tests hold the parts that decide correctness:
 """
 import itertools
 import json
+import re
 import os
 import subprocess
 import sys
@@ -486,6 +487,51 @@ class TestThePrefilterStoresThePlan:
 		assert store(search)['stored'] == []
 
 
+class TestTxfOfASourcetypeLeavesOutTagsNoOneReads:
+	"""
+	txf(<sourcetype>) runs its sourcetype's unit whole, then event types and tags (tenx-replay-tags: `typer`
+	and `tags` on every replayed event). A search that reads no event type and no tag, told by the same
+	rules as the plan of plain `txf`, stores tenx_ndnotags, and tenx-replay-tags leaves those two out.
+	"""
+
+	DETECTION = ('search index=ct `txf(aws:cloudtrail)` sourcetype=aws:cloudtrail eventName=DeletePolicy DeletePolicy '
+				 '(userAgent!=*.amazonaws.com) | rename user_name as user | stats count min(_time) as firstTime max(_time) as '
+				 'lastTime BY signature dest user user_agent src vendor_account vendor_region vendor_product | convert '
+				 'timeformat="%Y-%m-%dT%H:%M:%S" ctime(firstTime) | search *')
+
+	def test_a_detection_that_counts_stores_it(self):
+		out = store(self.DETECTION)
+		assert out['stored'] == [{'custom.tenx_replay_plan': plan.NOTAGS}]
+		assert re.match(r"^tenx_nd[A-Za-z0-9_ ]+$", plan.NOTAGS)
+
+	@pytest.mark.parametrize('search', ['search index=ct `txf(aws:cloudtrail)` tag=authentication | stats count',
+										'search index=ct `txf(aws:cloudtrail)` | stats count by eventtype',
+										'search index=ct `txf(aws:cloudtrail)` | stats values(*) as *',
+										'search index=ct `txf(aws:cloudtrail)` eventName=ConsoleLogin',
+										'search index=ct `txf(aws:cloudtrail)` x | append [search index=ct y] | stats count',
+										'search index=ct `txf(aws:cloudtrail)` x | `some_macro` | stats count'])
+	def test_not_when_a_tag_may_be_read_or_events_are_returned(self, search):
+		assert plan.tags_skipped(search, p) is False
+		assert store(search)['stored'] == []
+
+	def test_not_when_splunk_keeps_the_events(self):
+		assert store(self.DETECTION, {'statusBuckets': 300})['stored'] == []
+
+	def test_plain_txf_and_tx_are_not_read_this_way(self):
+		assert plan.tags_skipped('search index=fw `txf` | stats count', p) is False
+		assert plan.tags_skipped('search index=fw `tx` | stats count', p) is False
+
+	def test_the_tags_step_is_gated_and_the_rewrite_never_sets_the_gate(self):
+		d = macros().get('tenx-replay-tags', 'definition')
+		assert d.startswith('eval tenx_go0z=if(isnotnull(tenx_rst) AND isnull(tenx_ndnotags),1,null()) | foreach tenx_go0z*')
+		assert ' | '.join(b.TAGS_STEPS) == d
+		import glob
+		for f in glob.glob(os.path.join(ROOT, 'tenx-for-splunk', 'bin', '*.py')):
+			if os.path.basename(f) in ('tenx_replay_plan.py', 'tenx_replay_builder.py'):
+				continue
+			assert 'ndnotags' not in open(f).read(), f
+
+
 def macros():
 	import configparser
 	conf = configparser.RawConfigParser(strict=False, interpolation=None)
@@ -498,8 +544,10 @@ class TestTheMacros:
 		d = macros().get('txf', 'definition')
 		assert '| `tenx-replay-plan` | `tenx-replay` |' in d
 		assert 'fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars, tenx_nd* |' in d
-		# txf(<sourcetype>) runs its unit whole
-		assert 'tenx-replay-plan' not in macros().get('txf(1)', 'definition')
+		# txf(<sourcetype>) runs its unit whole; it reads the plan only to leave out event types and tags
+		unit = macros().get('txf(1)', 'definition')
+		assert '. "` | `tenx-replay-plan` | `tenx-replay-tags` |' in unit and 'tenx_vars, tenx_nd* |' in unit
+		assert 'AND isnull(tenx_ndnotags)' in macros().get('tenx-replay-tags', 'definition')
 
 	def test_the_plan_step_reads_the_stored_field_as_tenx_wild_reads_its_marks(self):
 		d = macros().get('tenx-replay-plan', 'definition')

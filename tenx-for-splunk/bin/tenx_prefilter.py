@@ -272,12 +272,16 @@ class TenxPrefilterCommand(GeneratingCommand):
 		(statusBuckets above 0, verbose mode: every field of them is shown), or when there is no table.
 		"""
 		try:
-			needed = replay_plan.needed_fields(getattr(self, "search", None), parser)
-			if needed is None:
-				return None
 			job = getattr(self, "job", None) or {}
 			level = str((job.get("request") or {}).get("adhoc_search_level", "") or "").lower()
 			if "statusBuckets" not in job or float(job.get("statusBuckets") or 0) > 0 or level == "verbose":
+				return None
+			macro = self.before[1] if getattr(self, "before", None) else ""
+			if replay_plan.TXF_UNIT.match(macro):
+				# txf(<sourcetype>): its unit runs whole; event types and tags are left out when nothing reads them
+				return replay_plan.NOTAGS if replay_plan.tags_skipped(getattr(self, "search", None), parser) else None
+			needed = replay_plan.needed_fields(getattr(self, "search", None), parser)
+			if needed is None:
 				return None
 			stanzas = parser.conf_stanzas([os.path.join(apphome, d, "tenx_replay.conf") for d in ("default", "local")])
 			return replay_plan.plan_value(replay_plan.read_table(stanzas.get(PLAN_STANZA) or {}), needed)
