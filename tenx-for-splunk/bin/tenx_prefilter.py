@@ -184,8 +184,8 @@ class TenxPrefilterCommand(GeneratingCommand):
 		"""
 		The index terms Splunk derives for the words after the macro, as a parsed search to AND with
 		them (tenx_prefilter_parser.lispy_tree), or None: then field comparisons narrow nothing, as
-		before. One probe job over a time range that holds no event, in the app the search runs from;
-		its search.log holds the base lispy. The job is removed afterwards.
+		with field_narrowing = false. One probe job over a time range that holds no event, in the app
+		the search runs from; its search.log holds the base lispy. The job is removed afterwards.
 		"""
 		macro = self.before[1] if getattr(self, "before", None) else "`tx`"
 		probe = parser.lispy_probe(text, macro)

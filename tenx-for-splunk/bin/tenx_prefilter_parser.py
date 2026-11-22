@@ -737,15 +737,16 @@ def narrowing_on(config):
 
 # Field narrowing from Splunk's own index terms (tenx_config.conf field_narrowing = splunk; off by default).
 #
-# A field comparison on raw events reads only the events that hold the index terms Splunk derives
-# for it: Splunk expands the field's aliases, event types and tags, and leaves out a value it cannot
-# expect in the text. It writes those terms in the job's search.log as its "base lispy". The
-# prefilter asks for them with a probe: the words after the macro as a search of their own, over a
-# time range that holds no event, and requires the same terms of the compact events the way it
-# requires a word (pieces, template dictionary). Every raw event the search returns holds each of
-# those terms; its compact event expands to the same text, so it holds each piece as a value or
-# through its template, and it is selected. A term the prefilter cannot read as a word, an indexed
-# term (name::value), a NOT, an OR with any of those, or no answer at all, place no restriction.
+# A field comparison on raw events reads only the events that hold the index terms Splunk
+# derives for it, which Splunk writes in the job's search.log as its "base lispy". The
+# prefilter reads them from a probe, the words after the macro as a search of their own
+# over a time range that holds no event, and requires them of the compact events the way
+# it requires a word.
+#
+# Every raw event the search returns holds each term, and its compact event expands to the
+# same text, so it holds each piece as a value or through its template. A term the
+# prefilter cannot read as a word, an indexed term (name::value), a NOT, an OR with any of
+# those, or no answer at all places no restriction.
 SPLUNK_MODE = "splunk"
 LISPY_LINE = re.compile(r"base lispy: (\[.*\])\s*$")
 LISPY_WORD = re.compile(r"^[^\s\"'\\()\[\]`]+$")
@@ -1409,23 +1410,23 @@ def dictionary_from_rows(rows, pieces=None):
 	return dictionary
 
 
-# The template dictionary read in part. Reading every record of the KV store for each search costs
-# seconds of search head CPU per search at hundreds of thousands of templates. The prefilter keeps its
-# answer for each piece in the collection tenx_dict_cache, and a later search for the same pieces reads
-# only the records Consume KV wrote in the hours since (stored_hour, an indexed field), adding them to
-# the kept answer. Why that is every template: a full read that starts at time S sees every record
-# readable at S; a record that became readable later was stamped with its hour before it was saved,
-# at most CACHE_LAG_SECONDS before it became readable, so its stored_hour is at least the hour of
-# S - CACHE_LAG_SECONDS, which is the first hour a later search reads again (through_hour). A record
-# written again (refreshed, replaced, marked hash-conflict) gets a new hour and is read again; a
-# template removed from the store stays in the kept answer, which can only select more events. A
-# record counted twice can only raise n past MAX_TEMPLATES, which narrows less. Every
-# CACHE_FULL_SECONDS, or when a piece has no kept answer, every record is read again, and so it is after
-# an install or an upgrade and after a load from the start of the index (cache_valid_from): records
-# restored into the store come back with the hours they had. The margin CACHE_LAG_SECONDS covers the
-# save of one chunk, the KV store's copy to the other members of a search head cluster and the
-# difference of their clocks together; a record that takes longer to become readable on a member is
-# missed there by the partial reads until the next full read.
+# The template dictionary read in part. Reading every record of the KV store costs seconds
+# of search head CPU per search at hundreds of thousands of templates, so the prefilter
+# keeps its answer for each piece in tenx_dict_cache. A later search for the same pieces
+# reads only the records Consume KV wrote in the hours since (stored_hour, an indexed
+# field) and adds them to the kept answer.
+#
+# A full read that starts at time S sees every record readable at S. A record readable
+# later was stamped with its hour at most CACHE_LAG_SECONDS before, so its stored_hour is
+# at least the hour of S - CACHE_LAG_SECONDS, the first hour a later search reads
+# (through_hour). A record written again gets a new hour, and a removed template stays in
+# the kept answer, which can only select more events.
+#
+# Every record is read again every CACHE_FULL_SECONDS, when a piece has no kept answer,
+# and after an install, an upgrade or a load from the start of the index
+# (cache_valid_from). CACHE_LAG_SECONDS covers one chunk's save, the KV store's copy to
+# the other members of a search head cluster and their clock difference; a record slower
+# than that on a member is missed there until the next full read.
 CACHE_PATH = "/servicesNS/nobody/tenx-for-splunk/storage/collections/data/tenx_dict_cache"
 STORED_HOUR = "stored_hour"
 # Longer than the Consume KV alert action may run (alert_actions.conf maxtime 10m), with what the clocks

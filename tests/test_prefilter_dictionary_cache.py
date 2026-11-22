@@ -1,8 +1,8 @@
 """
 The `tx` prefilter's template dictionary, read in part.
 
-Reading every record of the KV store for each search cost about 10 CPU-seconds of the search head per
-word search at 403,196 templates. The prefilter keeps its answer for each piece (tenx_dict_cache), and a
+Reading every record of the KV store for each search costs seconds of search head CPU per word search
+at hundreds of thousands of templates. The prefilter keeps its answer for each piece (tenx_dict_cache), and a
 later search for the same pieces reads only the records Consume KV wrote in the hours since
 (stored_hour), adding them to the kept answer; once a day, or for a piece without a kept answer, it reads
 every record again.

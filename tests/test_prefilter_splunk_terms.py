@@ -9,7 +9,7 @@ and so it holds each piece of the term as a value or through its template.
 
 What the prefilter cannot read with certainty places no restriction: an indexed term (name::value), a
 NOT, an OR with any such branch, a term with a quote, backslash, parenthesis or bracket in it, a lispy it
-cannot parse, a probe it cannot run (subsearch in the words). Then nothing is narrowed, as before.
+cannot parse, a probe it cannot run (subsearch in the words). Then nothing is narrowed.
 """
 import os
 
@@ -125,7 +125,7 @@ class TestReadingTheLispy:
 class TestTheNarrowing:
 
 	def test_a_field_comparison_narrows_by_its_index_terms(self):
-		# off before: a field comparison placed no restriction
+		# without Splunk's terms a field comparison places no restriction
 		assert as_words("EventCode=4625") is None
 		assert narrowed("EventCode=4625", "[ AND 4625 index::main ]") == "((TERM(4625)))"
 
