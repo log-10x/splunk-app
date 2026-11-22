@@ -1956,10 +1956,15 @@ def raw_history_probe(record, before):
 def word_index_probe(before):
 	"""
 	The tstats that finds, by index, host and source, compact events (`tenx-events`) in the search's range
-	that hold no word term. Every compact event starts with ~ and its template hash, which segmentation
-	indexes as a term starting with ~; a group with more events than events holding such a term was
-	indexed without words (SEGMENTATION = none on the compact sourcetype, its source or host), so a word
-	prefilter cannot find its events. Restricted to the indexes written before the macro (`before`).
+	indexed without words. Every compact event starts with ~ and its template hash, which segmentation
+	indexes as a term starting with ~; a group that has events and none holding such a term was indexed
+	without words (SEGMENTATION = none on the compact sourcetype, its source or host), so a word prefilter
+	cannot find its events. A group whose events are only partly without such a term is not one: an event
+	the sender passed whole (text that is not compact, beside compact ones) holds words but no term
+	starting with ~, and counted against every event of the group, three such events among 105,090
+	compact CloudTrail events made the group read whole (Splunk Enterprise 10.4.3). A group indexed partly
+	with words and partly without (the setting changed while it was being indexed) is therefore not
+	found. Restricted to the indexes written before the macro (`before`).
 	"""
 	quote = lambda v: '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
 	named = named_indexes(before)
@@ -1967,7 +1972,7 @@ def word_index_probe(before):
 	return ("| tstats count where %s`tenx-events` by index, host, source | eval tenx_w=0 | append [| tstats count "
 			"where %s`tenx-events` TERM(~*) by index, host, source | eval tenx_w=1] | stats sum(eval(if(tenx_w==0, "
 			"count, 0))) as tenx_all, sum(eval(if(tenx_w==1, count, 0))) as tenx_words by index, host, source "
-			"| where tenx_all > tenx_words" % (where, where))
+			"| where tenx_all > 0 AND tenx_words == 0" % (where, where))
 
 
 def word_index_branch(rows, most=200):
