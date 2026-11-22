@@ -1516,9 +1516,15 @@ def hour_of(t):
 	return int(t) // 3600
 
 
+# The form of the kept answers' clauses: an answer kept by a version that wrote other clauses (one run of the
+# hash, before hash_selector()) is under another key, so it is never read back, and the next search for the
+# piece reads every record again.
+CACHE_FORM = "s"
+
+
 def cache_key(piece):
 	"""The tenx_dict_cache key of a piece (a-z, 0-9 and '*', so '*' -> '-' is one to one)."""
-	return "p_" + piece.replace("*", "-")
+	return "p" + CACHE_FORM + "_" + piece.replace("*", "-")
 
 
 def cache_keys(pieces, formats=False):
