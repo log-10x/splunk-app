@@ -139,6 +139,9 @@ class TestWhatASearchReads:
 			plan.expression_fields('searchmatch("x=1")')
 		with pytest.raises(plan.Unknown):
 			plan.expression_fields('{x}')
+		# a JSON path in single quotes is a field name, braces included
+		assert plan.expression_fields("case(a=\"b\", 'requestParameters.items{}.name', true(), c)") >= {
+			'requestParameters.items{}.name', 'a', 'c'}
 
 
 # ---------------------------------------------------------------------------------------------------------
