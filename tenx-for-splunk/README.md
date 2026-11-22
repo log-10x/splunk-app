@@ -905,7 +905,7 @@ writes holds a folder with the package archive inside.
 
 | Tier | What to install |
 |---|---|
-| Search heads (through the deployer for a search head cluster) | the `_search_heads` package or the whole app, the add-ons of the original sourcetypes, and CIM |
+| Search heads (through the deployer for a search head cluster) | the `_search_heads` package or the whole app, and the add-ons of the original sourcetypes |
 | Indexers (through the cluster manager's bundle) | the `_indexers` package and the add-ons |
 | Heavy forwarders that parse the compact events | the `_indexers` package and the add-ons |
 | Universal Forwarders | nothing of 10x |
