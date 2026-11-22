@@ -157,14 +157,13 @@ file" below); it needs `--rules lookup`.
 Before the first event
 ----------------------
 A map's rules read whole events of the compact sourcetype as well as compact ones: the parsing settings copied from
-[tenx_encoded] (one event per line, no line merging), tenx_compact_st, and the original sourcetype (an index-time rule
-with several targets, the search-time rename line with one). Splunk applies the index-time ones while it indexes an
-event, so an event indexed before the map is installed keeps Splunk's default parsing (lines merged where a heavy
-forwarder reads the Receiver's output folder), the compact sourcetype with several targets, and no tenx_compact_st, so
-`tx` does not find it. None of these rules depends on the templates: gen without --records writes the map with them, an
-empty lookup file and the floor app, to install before the first event of the source. A later gen with the records
-writes the same rules, the template rows, and the search-time rules some templates need (a restored reserved name, a
-copy of an add-on rule); activate names any stanza the installed app lacks.
+[tenx_encoded], tenx_compact_st, and the original sourcetype. Splunk applies the index-time ones while it indexes an
+event, so an event indexed before the map is installed keeps Splunk's default parsing and the compact sourcetype, and
+`tx` does not find it.
+
+None of these rules depends on the templates, so gen without --records writes the map with them, an empty lookup file
+and the floor app, to install before the first event of the source. A later gen with the records writes the same rules,
+the template rows, and the search-time rules some templates need; activate names any stanza the installed app lacks.
 
 Standard library only.
 """

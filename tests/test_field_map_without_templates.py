@@ -1,12 +1,10 @@
 """
 gen without --records: a field map's rules before the first event of its source.
 
-Until a map is installed where its compact sourcetype is parsed, Splunk holds no stanza for that sourcetype, and the
-map's index-time rules never run on an event indexed before: such a whole event keeps Splunk's default parsing (a
-heavy forwarder that reads the Receiver's output folder merges its lines), keeps the compact sourcetype where the map
-stores events under the add-on's (several targets), and lacks tenx_compact_st, so `tx` does not find it. gen without
---records writes the map with no template, so it can be installed before the first event; a later gen with the
-records writes the same index-time rules and adds the template rows.
+An event indexed before its map is installed misses the map's index-time rules: it keeps Splunk's default parsing,
+keeps the compact sourcetype where the map stores events under the add-on's, and lacks tenx_compact_st, so `tx` does
+not find it. gen without --records writes the map with no template so that it can be installed first, and a later gen
+with the records writes the same index-time rules and adds the template rows.
 """
 import json
 import os
