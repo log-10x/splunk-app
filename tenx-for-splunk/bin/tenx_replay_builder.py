@@ -1547,14 +1547,10 @@ def uncovered_values(rows, covered):
 	return out
 
 
-# Splunk refuses a search whose pipeline holds more than 1,000 commands ("The pipeline size for this search
-# exceeds a search command limit : 1000"), counted at the top level: a foreach block counts once whatever it
-# holds, and a subsearch is a search of its own (Splunk Enterprise 10.4.3 and 9.4.15: 1,000 top-level commands
-# ran, 1,010 were refused; 600 with a foreach of 500 commands inside ran). It sets no limit on the length of a
-# macro or of the search a macro expands to: a macro of 400,152 characters, written through REST and read back
-# after a restart, and three chained macros of 454,221 characters together ran, on a search head over two
-# indexers as well. txf holds about 40 top-level commands of its own around the replay, so the replay keeps to
-# this many, which leaves room for the commands a search adds after txf.
+# Splunk refuses a search whose pipeline holds more than 1,000 top-level commands; a foreach block counts
+# once, and a subsearch is a search of its own. It sets no limit on the length of a macro or of its expansion.
+# txf holds about 40 top-level commands around the replay, so the replay keeps to this many and leaves room
+# for the commands a search adds after txf.
 REPLAY_MAX_COMMANDS = 900
 
 

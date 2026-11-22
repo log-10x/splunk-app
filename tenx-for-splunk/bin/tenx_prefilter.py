@@ -139,11 +139,10 @@ class TenxPrefilterCommand(GeneratingCommand):
 	def _record_checks(self, macro):
 		"""
 		Two warnings from tenxreplay's record of the original sourcetypes (tenx_replay.conf on disk, no
-		REST read): `txf` or txf(<sourcetype>) whose field replay leaves events of a covered sourcetype
-		without its rules (tenx_prefilter_parser.replay_left_out); and indexes that hold, in the search's
-		time range, raw events of the original sourcetypes of its compact events that the tenx-raw-events
-		macro does not name, which `tx` and `txf` leave out (one tstats, raw_history_probe). Nothing when no
-		compact event carries tenx_sourcetype, or when a check cannot run.
+		REST read). One for `txf` or txf(<sourcetype>) whose field replay leaves events of a covered
+		sourcetype without its rules (tenx_prefilter_parser.replay_left_out). One for indexes that hold raw
+		events of the search's original sourcetypes that tenx-raw-events does not name (raw_history_probe).
+		Nothing when no compact event carries tenx_sourcetype, or when a check cannot run.
 		"""
 		before = self.before[0] if getattr(self, "before", None) else ""
 		record = parser.replay_record_on_disk(apphome)

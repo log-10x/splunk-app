@@ -1,17 +1,14 @@
 """
-Two things a `tx` or `txf` search used to leave out with no message.
+A `tx` or `txf` search returns the raw events of the same sources, and the field replay covers the
+sourcetypes its macro leaves out.
 
-1. Raw events of the same sources. A source that sent raw events before the Receiver was installed has
-   them in the same indexes as its compact events; `tx` read `tenx-events` alone, so a search over both
-   periods returned the compact events only. `tx`, `txf` and txf(<sourcetype>) now read
-   ((`tenx-events`) OR (`tenx-raw-events`)), whose shipped definition selects no event, and the
-   prefilter warns when the indexes a search reads hold raw events of the original sourcetypes of its
-   compact events that the macro does not name (one tstats, from tenxreplay's record).
+1. Raw events of the same sources. `tx`, `txf` and txf(<sourcetype>) read
+   ((`tenx-events`) OR (`tenx-raw-events`)), whose shipped definition selects no event. The prefilter
+   warns when the indexes a search reads hold raw events of its original sourcetypes that the macro does
+   not name.
 2. Sourcetypes the field replay macro leaves out. Past replay_max_macro_chars `tenx-replay` holds the
-   busiest sourcetypes only; the others lost their unit as well (it became the no-op unit) and their
-   record, so txf(<sourcetype>) and the search rewrite gave their events none of the add-on's fields
-   either. Every covered sourcetype now keeps its unit and its record, the record marks what the macro
-   leaves out (left_out), the rewrite chains their units, and `txf` warns.
+   busiest sourcetypes only, while every covered sourcetype keeps its unit and its record. The record
+   marks what the macro leaves out (left_out), the rewrite chains their units, and `txf` warns.
 """
 import configparser
 import json
@@ -353,8 +350,7 @@ FAILED = {'messages': [{'type': 'ERROR', 'text': "Streamed search execute failed
 class TestTheLookupOnTheIndexers:
 	"""
 	For some minutes after an install or an upgrade, on a search head with search peers, the prefilter checks that
-	the template lookup runs on the indexers; while it does not, the search reads no indexer and says why, where it
-	failed with Splunk's lookup error and no rows.
+	the template lookup runs on the indexers; while it does not, the search reads no indexer and says why.
 	"""
 	def run(self, state, peers, probe):
 		with tempfile.TemporaryDirectory() as home:
@@ -369,7 +365,7 @@ class TestTheLookupOnTheIndexers:
 		assert pp.new_version({'version': '1.2.4', 'version_since': 1}, version, 10 ** 9)
 		assert pp.new_version({'version': version, 'version_since': 1000}, version, 1000 + pp.NEW_VERSION_SECONDS - 1)
 		assert not pp.new_version({'version': version, 'version_since': 1000}, version, 1000 + pp.NEW_VERSION_SECONDS)
-		# a record from before the field existed, of this version: not new
+		# a record of this version without the field: not new
 		assert not pp.new_version({'version': version}, version, 1000)
 
 	def test_lookup_failed(self):

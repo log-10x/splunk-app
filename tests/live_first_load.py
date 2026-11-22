@@ -5,8 +5,8 @@ template loads, against a running Splunk.
 
 Start it right after installing (or upgrading, then restarting) the app on a search head whose peers hold compact
 events (--index). Until the knowledge bundle that carries the app's template lookup reaches the indexers, a `tx`
-search there failed with Splunk's lookup error and no rows; the prefilter now keeps such a search on the search
-head and says so. Right after Splunk starts, until its KV store is ready, the lookup fails on the search head
+search there would fail with Splunk's lookup error; the prefilter keeps such a search on the search head and
+says so. Right after Splunk starts, until its KV store is ready, the lookup fails on the search head
 itself; the search still fails, and says why. Once the lookup is on the indexers, events whose template is stored
 but not yet there come back compact, marked tenx_expand_refused=no-template, for about a minute after each Consume
 KV run that stores templates. Every 5 seconds for --minutes it runs one `tx` search over --index and records the

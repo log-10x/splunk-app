@@ -1615,12 +1615,10 @@ def replay_left_out(record, macro, indexes):
 
 def raw_history_probe(record, before):
 	"""
-	The tstats that counts, by index and sourcetype, the events of the original sourcetypes in `record`
-	that are not compact, in the indexes their compact events were seen in and those written before the
-	macro (`before`), over the search's time range (with the earliest= and latest= written there), that
-	the tenx-raw-events macro does not name: raw events of the same sources, typically indexed before the
-	Receiver was installed, which `tx` and `txf` would leave out. None when there is nothing to count, or
-	when the search names a sourcetype before the macro (it chose the events it reads).
+	The tstats that counts, by index and sourcetype, the events of `record`'s original sourcetypes that are
+	not compact and that tenx-raw-events does not name. It reads the indexes their compact events were seen
+	in and those written before the macro (`before`), over the search's time range. None when there is
+	nothing to count, or when the search names a sourcetype before the macro.
 	"""
 	if not record or _specifiers(before, "sourcetype"):
 		return None
@@ -1655,12 +1653,11 @@ def raw_history_message(rows, macro):
 														 "holds" if len(ixs) == 1 else "hold", _names(sts)))
 
 
-# The minutes after an install or an upgrade. On a search head with separate indexers the app's template
-# lookup reaches them with the next knowledge bundle; until it has, every `tx` search failed there
-# (Splunk Enterprise 10.4.3, a fresh search head over two indexers: "Error in 'lookup' command: Could not
-# construct lookup 'tenx-dml-lookup' ... does not exist or is not available", no rows, for about a minute
-# after the install). For these minutes tenxprefilter runs LOOKUP_PROBE first, and when the lookup fails
-# on the indexers it keeps the search on the search head (ON_SEARCH_HEAD) and warns instead.
+# The minutes after an install or an upgrade. On a search head with separate indexers the
+# template lookup reaches them with the next knowledge bundle, and until then a `tx`
+# search fails on Splunk's lookup error. For these minutes tenxprefilter runs LOOKUP_PROBE
+# first and, when the lookup fails on the indexers, keeps the search on the search head
+# (ON_SEARCH_HEAD) and warns.
 NEW_VERSION_SECONDS = 900
 PEERS_PATH = "/services/search/distributed/peers?output_mode=json&count=0"
 LOOKUP_PROBE = ("search ((`tenx-events`) OR (`tenx-raw-events`)) | lookup tenx-dml-lookup _key AS tenx_hash OUTPUT _key AS "
@@ -1687,10 +1684,10 @@ def new_version(state, version, now):
 		return False
 
 
-# What says the template lookup is not on the indexers: Splunk's error naming tenx-dml-lookup as one it cannot
-# construct or find (the message measured above). Any other error of the probe is not this one: an add-on's
-# automatic lookup that fails on the probe's events, or the KV store starting on the search head. The search
-# then runs as it would and shows its own error.
+# Splunk's error naming tenx-dml-lookup as a lookup it cannot construct or find says the
+# template lookup is not on the indexers. Any other error of the probe, such as an
+# add-on's automatic lookup failing or the KV store starting, is not this one, and the
+# search runs as it would.
 LOOKUP_NAME = "tenx-dml-lookup"
 LOOKUP_MISSING = ("could not construct lookup", "does not exist or is not available")
 
@@ -1706,9 +1703,8 @@ def lookup_failed(result):
 	return None
 
 
-# Right after Splunk starts, until its KV store is ready, the read of the Consume KV record answers HTTP 503 "KV Store
-# is initializing", and the template lookup of every `tx` search fails on the search head ("Could not create KvStore
-# External command based lookup 'tenx-dml-lookup' ... KV Store initializing", FATAL; Splunk Enterprise 10.4.3, a few
-# seconds after a restart). The search still fails; this says why.
+# Right after Splunk starts, until its KV store is ready, the read of the Consume KV
+# record answers HTTP 503 "KV Store is initializing" and the template lookup of every `tx`
+# search fails. The search still fails; this says why.
 KV_STARTING = "KV Store is initializing"
 KV_NOT_READY = "tx: the KV store is still starting, so the template lookup cannot run yet; retry in a moment."

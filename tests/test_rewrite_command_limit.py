@@ -1,13 +1,11 @@
 """
 The search rewrite (`| tx`, `| tenxsearch`, the dashboard hook, compiled alerts) chains the units of the
 sourcetypes recorded for the indexes a search names (compose_units()). Splunk refuses a search whose
-pipeline holds more than 1,000 top-level commands, and nothing held the chain to that: on an estate whose
-units together pass it, every such search was refused. A unit's command count is now in its
-tenx_replay.conf stanza, and a chain past REPLAY_MAX_COMMANDS, or one the record cannot size, runs
+pipeline holds more than 1,000 top-level commands, so a unit's command count is kept in its
+tenx_replay.conf stanza. A chain past REPLAY_MAX_COMMANDS, or one the record cannot size, runs
 `tenx-replay`, which keeps to its limits.
 
-The rewrite reads the record through tenx_util.get_replay_coverage, which handed it `indexes` and `unit`
-only, so the `left_out` a stanza recorded never reached it either.
+The rewrite reads the record, `left_out` included, through tenx_util.get_replay_coverage.
 """
 import json
 import subprocess
