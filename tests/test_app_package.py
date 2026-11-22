@@ -57,7 +57,9 @@ class TestDashboardsFindCompactEvents:
 		# A compact event is marked extracted (_kv) before expansion; without dropping the
 		# mark, extract does nothing and every field=value term on key=value text returns 0.
 		tx = conf('macros.conf').get('tx', 'definition')
-		assert '| `tenx-inflate` | `tenx-whole-hide` | fields - _kv | extract |' in tx
+		assert '| `tenx-inflate` | `tenx-whole-hide` | fields - _kv | `tenx-extract` |' in tx
+		# shipped, the extraction is plain `extract`; tenxreplay writes the indexed fields around it
+		assert conf('macros.conf').get('tenx-extract', 'definition') == 'extract'
 		# spath on non-JSON text invents fields, and on JSON doubles what extract finds.
 		assert 'spath' not in tx
 
