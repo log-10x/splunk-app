@@ -143,7 +143,7 @@ class TestNeverNarrowerThanEveryRecord:
 		# h1 refreshed later with new text, stamped with its new hour
 		hours = p.cache_hours(kept, pieces, False, NOW, 0)
 		merged, _ = p.cache_merge(kept, self.answer(pieces, [("h1", "jsmith logged in")]), set(), pieces, False)
-		assert str(p.hour_of(NOW)) in hours and merged["jsmith"] == (1, ["TERM(~h1)"])
+		assert str(p.hour_of(NOW)) in hours and merged["jsmith"] == (1, [p.hash_selector("h1")])
 
 	def test_past_the_template_limit_only_the_count_is_kept(self):
 		d = {"error": (p.MAX_TEMPLATES + 1, ["TERM(~a)"]), "door": (2, ["TERM(~b)", "TERM(~c)"])}

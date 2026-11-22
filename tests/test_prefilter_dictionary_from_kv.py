@@ -55,7 +55,16 @@ def run_dictionary(search, templates):
 			segs = pat.sub(" ", segs)
 		segs = segs.split(" ")
 		cand = [x for x in segs if len(x) >= 2 and re.search(r"[A-Za-z0-9]", x)]
-		h = "TERM(%s)" % (max(cand, key=lambda x: "%03d" % len(x) + x) if cand else segs[0])
+		best = max(cand, key=lambda x: "%03d" % len(x) + x) if cand else segs[0]
+		cand = list(dict.fromkeys(cand))
+		pre = dml_hash.split("*", 1)[0]
+		sel = (['"~%s"' % pre] if pre else []) + ["TERM(%s)" % x for x in cand]
+		if "*" not in dml_hash:
+			h = '"~%s"' % dml_hash
+		elif sel:
+			h = sel[0] if len(sel) == 1 else "(%s)" % " ".join(sel)
+		else:
+			h = "TERM(%s)" % best
 		for i, rx in marks:
 			if rx.search(t):
 				row["n%d" % i] = row.get("n%d" % i, 0) + 1
@@ -111,10 +120,10 @@ class TestWordInTemplateTextWithManyTemplates:
 			search = p.dictionary_search({"jsmith"})
 			d = p.dictionary_from_rows(run_dictionary(search, kv), {"jsmith"})
 			assert d["jsmith"][0] == n, n
-			assert len(d["jsmith"][1]) == len(set(p.hash_term(h) for h, _ in kv[:n])), n
+			assert d["jsmith"][1] == sorted(set(p.hash_selector(h) for h, _ in kv[:n])), n
 			clause = p.prefilter(p.Parser(p.tokenize("jsmith")).parse(), d)
 			if n <= p.MAX_TEMPLATES:
-				assert clause.count("TERM(") == len(d["jsmith"][1]) + 1, n
+				assert clause == "((TERM(jsmith) OR %s))" % " OR ".join(d["jsmith"][1]), n
 			else:
 				# past MAX_TEMPLATES the word places no restriction: every compact event is expanded
 				assert clause is None, n
