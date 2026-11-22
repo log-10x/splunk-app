@@ -84,6 +84,8 @@ follows `tx` on the expanded text. The prefilter only selects which compact even
 so it may select more than the search keeps, never fewer.
 """
 import fnmatch
+import hashlib
+import json
 import re
 import time
 import urllib.parse
@@ -1514,6 +1516,16 @@ def hour_of(t):
 	return int(t) // 3600
 
 
+# The template store itself, for the read that tells whether Consume KV wrote any record in some hours.
+DML_PATH = "/servicesNS/nobody/tenx-for-splunk/storage/collections/data/tenx_dml"
+
+
+def written_in_path(hours):
+	"""The KV store read of at most one key of the records stored in `hours` (stored_hour values)."""
+	query = json.dumps({STORED_HOUR: {"$in": [str(h) for h in hours]}})
+	return DML_PATH + "?output_mode=json&limit=1&fields=_key&query=" + urllib.parse.quote(query, safe="")
+
+
 # The form of the kept answers' clauses: an answer kept by a version that wrote other clauses (one run of the
 # hash, before hash_selector()) is under another key, so it is never read back, and the next search for the
 # piece reads every record again.
@@ -2024,6 +2036,37 @@ def word_index_probe(before):
 			"| where tenx_all > 0 AND tenx_words == 0" % (where, where))
 
 
+RAW_EVENTS_NAME = "tenx-raw-events"
+
+
+def usable_definition(content):
+	"""
+	A search macro's definition (its conf stanza `content`) that can stand as search terms in the prefilter's
+	text, which Splunk does not expand further, or None: an eval macro, a macro call, a subsearch or a pipe
+	inside it, or terms this module cannot parse.
+	"""
+	if str((content or {}).get("iseval", "0")).strip().lower() in ("1", "t", "true", "y", "yes"):
+		return None
+	text = str((content or {}).get("definition") or "").strip()
+	if not text or any(c in text for c in "`[]|"):
+		return None
+	try:
+		Parser(tokenize(text)).parse()
+	except Unparsed:
+		return None
+	return text
+
+
+def without_words_branch(prefilter, raw_events):
+	"""
+	The prefilter ORed with every compact event that holds no term starting with ~: indexed without words
+	(SEGMENTATION = none on the compact sourcetype, its source or host), or sent whole. Splunk answers the
+	NOT from its index terms. The raw events that tenx-raw-events names (`raw_events`) stay with the
+	prefilter's terms.
+	"""
+	return "(%s OR (NOT TERM(~*) NOT (%s)))" % (prefilter, raw_events)
+
+
 def word_index_branch(rows, most=200):
 	"""The OR branch that reads every compact event of the groups word_index_probe found (by index alone past `most`)."""
 	quote = lambda v: '"' + str(v).replace("\\", "\\\\").replace('"', '\\"') + '"'
@@ -2031,6 +2074,41 @@ def word_index_branch(rows, most=200):
 		return " OR ".join("index=%s" % quote(i) for i in sorted(set(r.get("index", "") for r in rows)))
 	return " OR ".join("(index=%s host=%s source=%s)" % (quote(r.get("index", "")), quote(r.get("host", "")),
 														   quote(r.get("source", ""))) for r in rows)
+
+
+# The raw events check only decides a warning, never which events a search returns, so its answer is kept for
+# CHECK_SECONDS and used again by searches with the same check over the same time range, each end taken to that
+# step. A kept answer can show a warning up to that long after the events it names were indexed or left the range.
+CHECK_SECONDS = 900
+
+
+def check_record(probe, earliest, latest, rows, now):
+	"""The tenx_dict_cache record that keeps a check's answer `rows` (check_rows() reads it back)."""
+	return {"_key": check_key(probe), "range": _check_range(earliest, latest), "rows": json.dumps(rows), "at": int(now)}
+
+
+def check_key(probe):
+	return "c_" + hashlib.md5(probe.encode("utf-8")).hexdigest()
+
+
+def _check_range(earliest, latest):
+	def step(t):
+		try:
+			return str(int(float(t)) // CHECK_SECONDS)
+		except (TypeError, ValueError):
+			return str(t or "")
+	return step(earliest) + "-" + step(latest)
+
+
+def check_rows(record, earliest, latest, now):
+	"""The rows a kept check record holds for this time range, or None when it is missing, stale or of another range."""
+	try:
+		if record.get("range") != _check_range(earliest, latest) or not 0 <= now - float(record["at"]) < CHECK_SECONDS:
+			return None
+		rows = json.loads(record["rows"])
+		return rows if isinstance(rows, list) else None
+	except (AttributeError, KeyError, TypeError, ValueError):
+		return None
 
 
 def raw_history_message(rows, macro):

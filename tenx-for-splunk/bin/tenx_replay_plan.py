@@ -47,6 +47,10 @@ MARK = "tenx_ndm"
 SHARED = 0
 
 TXF = "`txf`"
+# The owner of a rule part from [default] or a source:: or host:: stanza: every original sourcetype.
+ANY_SOURCETYPE = "*"
+# The tenx_replay.conf stanza of the compact indexes in which no event carried tenx_sourcetype.
+NOCARRIER = "tenx:nocarrier"
 # Field names Splunk computes from every other field (event types, their tags).
 EVERY_FIELD = re.compile(r"^(eventtype|tag|tag::.*)$", re.I)
 NAME = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.:@-]*$")
@@ -113,17 +117,18 @@ def _outside_quotes(text):
 def expression_fields(expr):
 	"""
 	Every field an eval expression can read, taken widely: each name outside double-quoted strings
-	(function names and keywords included, which only widens it) and each 'single-quoted' name. Unknown
-	for searchmatch(), which reads fields named inside a string, and for braces (a field named by a value).
+	(function names and keywords included, which only widens it) and each 'single-quoted' name, braces
+	included ('items{}.name' is a JSON path). Unknown for searchmatch(), which reads fields named inside
+	a string, and for braces outside quotes (a field named by a value).
 	"""
 	text = str(expr or "")
 	if re.search(r"searchmatch\s*\(", text, re.I):
 		raise Unknown("searchmatch")
 	bare = _outside_quotes(text)
-	if "{" in bare or "}" in bare:
-		raise Unknown("a field named by a value")
 	found = set(re.findall(r"'([^']*)'", bare))
 	bare = re.sub(r"'[^']*'", " ", bare)
+	if "{" in bare or "}" in bare:
+		raise Unknown("a field named by a value")
 	found.update(IDENT.findall(bare))
 	return found
 
@@ -479,8 +484,8 @@ def needed_fields(search, parser):
 		return None
 
 
-# What a search that runs `txf(<sourcetype>)` once stores when it reads no event type and no tag
-# (tags_skipped()): the field the tenx-replay-tags macro tests before it runs `typer` and `tags`.
+# What a search that runs `txf` or `txf(<sourcetype>)` once stores when it reads no event type and no tag
+# (needed_fields(), tags_skipped()): the field tenx-replay-tags tests before it runs `typer` and `tags`.
 NOTAGS = PREFIX + "notags"
 TXF_UNIT = re.compile(r"^`txf\([^`()]*\)`$")
 
@@ -529,19 +534,32 @@ def _needed(search, parser, unit=False):
 	return reads
 
 
-def closure(rules, needed):
+def _share(rule, present):
+	"""(fields written, fields read) of the parts of `rule` that apply to the original sourcetypes `present`."""
+	parts = rule[4] if len(rule) > 4 else None
+	if present is None or parts is None:
+		return rule[1], rule[2]
+	mine = [p for p in parts if p[0] == ANY_SOURCETYPE or any(st in present for st in p[0])]
+	return [w for p in mine for w in p[1]], [r for p in mine for r in p[2]]
+
+
+def closure(rules, needed, present=None):
 	"""
 	The ids of the rules to run for `needed` (field names): every rule that writes a needed field, and,
 	again, every rule that writes a field those rules read, until nothing is added; SHARED when one of
 	them needs the source:: and host:: stanza tests. Names compare without case (only widening). None
-	when a rule to run reads fields that cannot be listed ('*'). `rules`: [[id, writes, reads, shared]].
+	when a rule to run reads fields that cannot be listed ('*'). `rules`: [[id, writes, reads, shared,
+	parts]]. With `present` (original sourcetypes), only the parts of a rule that apply to them count.
 	"""
 	need = set(f.lower() for f in needed)
 	chosen = set()
+	shares = dict((r[0], _share(r, present)) for r in rules)
 	changed = True
 	while changed:
 		changed = False
-		for rid, writes, reads, shared in rules:
+		for rule in rules:
+			rid, shared = rule[0], rule[3]
+			writes, reads = shares[rid]
 			if rid in chosen or not any(w.lower() in need for w in writes):
 				continue
 			if "*" in reads:
@@ -572,10 +590,20 @@ def read_table(entry):
 			return None
 		out = []
 		for r in rules:
-			rid, writes, reads, shared = r
+			rid, writes, reads, shared = r[:4]
 			if not isinstance(rid, int) or not all(isinstance(x, str) for x in list(writes) + list(reads)):
 				return None
-			out.append((rid, list(writes), list(reads), bool(shared)))
+			if len(r) == 4:
+				out.append((rid, list(writes), list(reads), bool(shared)))
+				continue
+			parts = []
+			for owner, pw, pr in r[4]:
+				if owner != ANY_SOURCETYPE and not (isinstance(owner, list) and all(isinstance(x, str) for x in owner)):
+					return None
+				if not all(isinstance(x, str) for x in list(pw) + list(pr)):
+					return None
+				parts.append((owner, list(pw), list(pr)))
+			out.append((rid, list(writes), list(reads), bool(shared), parts))
 		return generation, out
 	except (ValueError, TypeError, AttributeError):
 		return None
@@ -586,12 +614,87 @@ def read_table(entry):
 MAX_SHARE = 0.6
 
 
-def plan_value(table, needed):
+def plan_value(table, needed, present=None):
 	"""The value stored on the job (custom.tenx_replay_plan), or None for the whole replay."""
 	if table is None or needed is None:
 		return None
 	generation, rules = table
-	ids = closure(rules, needed)
+	ids = closure(rules, needed, present)
 	if ids is None or len([i for i in ids if i != SHARED]) > MAX_SHARE * max(len(rules), 1):
 		return None
 	return flags(generation, ids)
+
+
+def _index_rx(pattern):
+	return re.compile("^" + ".*".join(re.escape(p) for p in pattern.lower().split("*")) + "$")
+
+
+def _listed(value):
+	"""A tenx_replay.conf index list as a set of lower-case names, or None for '*'."""
+	value = str(value or "").strip()
+	if value == "*":
+		return None
+	return set(v.strip().lower() for v in value.split(",") if v.strip())
+
+
+def bounding_indexes(before, parser):
+	"""
+	Index values that every event a search reads before its macro is in (wildcards kept), or None when the
+	terms before it do not bound the index: a term under NOT or OR, a branch without an index, anything
+	that does not parse.
+	"""
+	try:
+		tree = parser.Parser(parser.tokenize(before or "")).parse()
+	except parser.Unparsed:
+		return None
+
+	def bound(node):
+		kind = node[0]
+		if kind == "field" and str(node[1]).lower() == "index" and node[2] in ("=", "::") and node[3]:
+			return [node[3]]
+		if kind == "in" and str(node[1]).lower() == "index" and node[2] and all(node[2]):
+			return list(node[2])
+		if kind == "and":
+			for child in node[1]:
+				got = bound(child)
+				if got:
+					return got
+			return None
+		if kind == "or":
+			out = []
+			for child in node[1]:
+				got = bound(child)
+				if not got:
+					return None
+				out.extend(got)
+			return out
+		return None
+	return bound(tree)
+
+
+def searched_sourcetypes(stanzas, indexes):
+	"""
+	The original sourcetypes whose compact events the indexes a search names can hold, from tenxreplay's
+	record (tenx_replay.conf `stanzas`), or None for any. The record is read as the search rewrite reads
+	it (tenx_replay_builder.rewrite_replay): None when no index is named, or when a named index (or
+	wildcard) is in neither the record nor its list of indexes without carried sourcetypes.
+	"""
+	names = [str(i).lower() for i in (indexes or []) if str(i)]
+	if not names:
+		return None
+	record = dict((st, kv) for st, kv in (stanzas or {}).items() if st and st != "default" and not st.startswith("tenx:"))
+	known = set()
+	for kv in record.values():
+		known |= _listed(kv.get("indexes")) or set()
+	none = (_listed((stanzas.get(NOCARRIER) or {}).get("indexes")) or set()) - known
+	for n in names:
+		rx = _index_rx(n)
+		if not any(rx.match(k) for k in known | none):
+			return None
+	rxs = [_index_rx(n) for n in names]
+	present = set()
+	for st, kv in record.items():
+		listed = _listed(kv.get("indexes"))
+		if not listed or any(r.match(ix) for ix in listed for r in rxs):
+			present.add(st)
+	return present

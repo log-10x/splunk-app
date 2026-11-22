@@ -258,7 +258,7 @@ class Model(object):
 		self.lookups = lookups or {}
 		self.macros = macros or {}
 		# What the step before the replay of `txf` reads back from the job (macros.conf [tenx-replay-plan]):
-		# the fields of a stored replay plan, or tenx_ndnoplan when none was stored.
+		# the fields of a stored replay plan, or tenx_ndnoplan when none was stored, and no word marks.
 		self.plan = plan or 'tenx_ndnoplan'
 
 	def run(self, pipeline, events):
@@ -270,7 +270,9 @@ class Model(object):
 	def expand(self, text):
 		for _ in range(5):
 			new = re.sub(r'`([^`]+)`', lambda m: WILD_STEP if m.group(1) == 'tenx-wild' else (
-				'fillnull value=1 tenx_ndnone ' + self.plan if m.group(1) == 'tenx-replay-plan' else self.macros[m.group(1)]), text)
+				'fields - tenx_wild' if m.group(1) == 'tenx-wild-planned' else (
+				'fillnull value=- ' + self.plan + ' tenx_ndnone tenx_wild' if m.group(1) == 'tenx-replay-plan'
+				else self.macros[m.group(1)])), text)
 			if new == text:
 				return text
 			text = new

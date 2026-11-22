@@ -165,8 +165,9 @@ class TenxPrefilterCommand(GeneratingCommand):
 		REST read): `txf` or txf(<sourcetype>) whose field replay leaves events of a covered sourcetype
 		without its rules (tenx_prefilter_parser.replay_left_out); and indexes that hold, in the search's
 		time range, raw events of the original sourcetypes of its compact events that the tenx-raw-events
-		macro does not name, which `tx` and `txf` leave out (one tstats, raw_history_probe). Nothing when no
-		compact event carries tenx_sourcetype, or when a check cannot run.
+		macro does not name, which `tx` and `txf` leave out (one tstats, raw_history_probe, whose answer is
+		kept in tenx_dict_cache: check_rows). Nothing when no compact event carries tenx_sourcetype, or when
+		a check cannot run.
 		"""
 		before = self.before[0] if getattr(self, "before", None) else ""
 		record = parser.replay_record_on_disk(apphome)
@@ -179,15 +180,27 @@ class TenxPrefilterCommand(GeneratingCommand):
 		if probe is None:
 			return
 		info = self._metadata.searchinfo
+		earliest, latest = str(info.earliest_time or "0"), str(info.latest_time or "now")
 		try:
-			result = self._rest(
-				"/servicesNS/%s/%s/search/jobs" % (urllib.parse.quote(info.username), APP_NAME),
-				{"search": probe, "exec_mode": "oneshot", "output_mode": "json", "count": "0",
-				 "earliest_time": str(info.earliest_time or "0"), "latest_time": str(info.latest_time or "now")})
-		except Exception as e:
-			self.logger.warning("tx: the raw events check failed: %s", e)
-			return
-		rows = [r for r in result.get("results", []) if str(r.get("count", "0")) not in ("0", "")]
+			kept = self._kv(parser.CACHE_PATH + "/" + parser.check_key(probe) + "?output_mode=json")
+		except Exception:
+			kept = None
+		rows = parser.check_rows(kept, earliest, latest, time.time())
+		if rows is None:
+			try:
+				result = self._rest(
+					"/servicesNS/%s/%s/search/jobs" % (urllib.parse.quote(info.username), APP_NAME),
+					{"search": probe, "exec_mode": "oneshot", "output_mode": "json", "count": "0",
+					 "earliest_time": earliest, "latest_time": latest})
+			except Exception as e:
+				self.logger.warning("tx: the raw events check failed: %s", e)
+				return
+			rows = [r for r in result.get("results", []) if str(r.get("count", "0")) not in ("0", "")]
+			try:
+				self._kv(parser.CACHE_PATH + "/batch_save?output_mode=json",
+						 [parser.check_record(probe, earliest, latest, rows, time.time())])
+			except Exception as e:
+				self.logger.info("tx: the raw events check was not kept: %s", e)
 		if rows:
 			self.write_warning(parser.raw_history_message(rows, macro))
 
@@ -241,12 +254,28 @@ class TenxPrefilterCommand(GeneratingCommand):
 		names = [n.strip() for n in str(entry.get("fields_not_in_text", "") or "").split(",") if n.strip()]
 		return parser.text_field_predicate(names)
 
+	def _raw_events(self):
+		"""The definition of the tenx-raw-events macro as this search expands it, when the prefilter's text can hold it."""
+		info = self._metadata.searchinfo
+		app = getattr(self, "parent_app", None) or APP_NAME
+		try:
+			entry = self._rest("/servicesNS/%s/%s/configs/conf-macros/%s?output_mode=json" % (
+				urllib.parse.quote(info.username, safe=""), urllib.parse.quote(app, safe=""), parser.RAW_EVENTS_NAME))
+			return parser.usable_definition(entry["entry"][0]["content"])
+		except Exception as e:
+			self.logger.info("tx: the raw events macro could not be read: %s", e)
+			return None
+
 	def _without_words(self, prefilter):
 		"""
-		The prefilter, with an OR branch that reads every compact event of the index, host and source groups
-		indexed without words (word_index_probe), which the prefilter's terms cannot find. Every compact event
-		in range is expanded when the check cannot run.
+		The prefilter, with an OR branch that reads the compact events indexed without words, which its terms
+		cannot find: every one that holds no term starting with ~ (without_words_branch). When the definition of
+		tenx-raw-events cannot be read, the groups of such events are found by one tstats (word_index_probe), and
+		every compact event in range is expanded when that check cannot run either.
 		"""
+		raw = self._raw_events()
+		if raw is not None:
+			return parser.without_words_branch(prefilter, raw)
 		before = self.before[0] if getattr(self, "before", None) else ""
 		try:
 			info = self._metadata.searchinfo
@@ -267,9 +296,10 @@ class TenxPrefilterCommand(GeneratingCommand):
 		"""
 		For a search running plain `txf` once: which rules of the field replay it reads, as the fields the
 		replay step puts on its events (tenx_replay_plan.plan_value), from the rule table tenxreplay wrote
-		with the macro ([tenx:plan] in tenx_replay.conf, read from disk). None, and the whole replay runs,
-		when that cannot be told (tenx_replay_plan.needed_fields), when Splunk keeps the search's events
-		(statusBuckets above 0, verbose mode: every field of them is shown), or when there is no table.
+		with the macro ([tenx:plan] in tenx_replay.conf, read from disk), and NOTAGS; NOTAGS alone, and the
+		whole replay runs, when no table or rule set applies. None, and the whole replay runs with event
+		types and tags, when what the search reads cannot be told (tenx_replay_plan.needed_fields) or when
+		Splunk keeps the search's events (statusBuckets above 0, verbose mode: every field is shown).
 		"""
 		try:
 			job = getattr(self, "job", None) or {}
@@ -284,7 +314,11 @@ class TenxPrefilterCommand(GeneratingCommand):
 			if needed is None:
 				return None
 			stanzas = parser.conf_stanzas([os.path.join(apphome, d, "tenx_replay.conf") for d in ("default", "local")])
-			return replay_plan.plan_value(replay_plan.read_table(stanzas.get(PLAN_STANZA) or {}), needed)
+			before = self.before[0] if getattr(self, "before", None) else None
+			present = replay_plan.searched_sourcetypes(stanzas, replay_plan.bounding_indexes(before, parser))
+			value = replay_plan.plan_value(replay_plan.read_table(stanzas.get(PLAN_STANZA) or {}), needed, present)
+			# needed_fields() is None for a search that reads an event type or a tag
+			return replay_plan.NOTAGS if value is None else value + " " + replay_plan.NOTAGS
 		except Exception as e:
 			self.logger.info("tx: no replay plan: %s", e)
 			return None
@@ -385,12 +419,21 @@ class TenxPrefilterCommand(GeneratingCommand):
 		with urllib.request.urlopen(request, context=context, timeout=60) as response:
 			return json.loads(response.read().decode() or "null")
 
+	def _written_in(self, hours):
+		"""Whether the template store holds a record stored in `hours`; True when that cannot be read."""
+		try:
+			return bool(self._kv(parser.written_in_path(hours)))
+		except Exception as e:
+			self.logger.info("tx: the recent template records could not be counted: %s", e)
+			return True
+
 	def _dictionary(self, pieces, formats):
 		"""
 		(the template dictionary of `pieces`, the stored timestamp formats or None), as
 		tenx_prefilter_parser.dictionary_search() answers them over every record. With an earlier answer
 		for every piece in tenx_dict_cache (cache_hours), only the records written in the hours since are
-		read and added to it (cache_merge); otherwise every record is read and the answer is kept. A
+		read and added to it (cache_merge), and no search runs when the store holds none; otherwise every
+		record is read and the answer is kept. A
 		cache that cannot be read or written only means every record is read. Raises when the template
 		lookup fails or reports cut rows.
 		"""
@@ -404,6 +447,8 @@ class TenxPrefilterCommand(GeneratingCommand):
 			entries = {}
 		hours = parser.cache_hours(entries, pieces, formats, started,
 								   parser.cache_valid_from(getattr(self, "store_state", None)))
+		if hours is not None and not self._written_in(hours):
+			return parser.cache_merge(entries, {}, set(), pieces, formats)
 		result = self._rest(
 			"/servicesNS/%s/%s/search/jobs" % (urllib.parse.quote(self._metadata.searchinfo.username), APP_NAME),
 			{"search": parser.dictionary_search(pieces, formats=formats, hours=hours), "exec_mode": "oneshot", "output_mode": "json",

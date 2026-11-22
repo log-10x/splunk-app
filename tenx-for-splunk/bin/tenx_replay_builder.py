@@ -643,17 +643,26 @@ class Selection(object):
 	The rules of the `tenx-replay` macro that a `txf` search can leave out (tenx_replay_plan.py): each
 	alias, calculated field and lookup class, and the source:: and host:: stanza tests, runs inside a
 	guard that passes when tenx_ndall exists or when the plan on the event names its id. `rules` is the
-	table tenxprefilter reads: [id, fields written, fields read ('*': not known), needs the stanza tests].
+	table tenxprefilter reads: [id, fields written, fields read ('*': not known), needs the stanza tests,
+	parts]. Each part is one stanza's share of the rule: [the original sourcetypes it applies to ('*' for
+	[default], source:: and host::), fields written, fields read].
 	The guards carry GEN until build() replaces it with the macro's generation.
 	"""
 
-	def __init__(self):
+	def __init__(self, owners=None):
 		self.rules = []
+		self.owners = owners or {}
 
-	def add(self, writes, reads, shared):
+	def add(self, writes, reads, shared, parts=()):
 		rid = len(self.rules) + 1
-		self.rules.append([rid, sorted(set(writes)), sorted(set(reads)), bool(shared)])
+		self.rules.append([rid, sorted(set(writes)), sorted(set(reads)), bool(shared),
+						   [[self.owner(s), sorted(set(w)), sorted(set(r))] for s, w, r in parts]])
 		return rid
+
+	def owner(self, stanza):
+		if stanza.kind != 'sourcetype':
+			return plan.ANY_SOURCETYPE
+		return sorted(self.owners.get(stanza.name) or [stanza.name])
 
 	@staticmethod
 	def guard(rid, body):
@@ -754,9 +763,10 @@ def _rules(chosen, flags, lookup_fields, warnings, stats, rejected=None, bad_loo
 			got = [(i, st, pairs) for k, i, st, pairs in parsed if k == key]
 			if got:
 				winners = ' '.join(_winner(aliases[key], i, cond) for i, _, _ in got)
-				alias_id[key] = sel.add([a for _, _, pairs in got for _, _, a in pairs],
-										[o for _, _, pairs in got for o, _, _ in pairs] +
-										[a for _, _, pairs in got for _, m, a in pairs if m == 'ASNEW'], tested(winners))
+				parts = [(st, [a for _, _, a in pairs], [o for o, _, _ in pairs] + [a for _, m, a in pairs if m == 'ASNEW'])
+						 for _, st, pairs in got]
+				alias_id[key] = sel.add([a for _, w, _ in parts for a in w], [r for _, _, rs in parts for r in rs],
+										tested(winners), parts)
 	if single:
 		# Each alias written once, from a field no alias writes: one assignment where its stanza wins.
 		by_home = dict((h, []) for h in homes)
@@ -815,7 +825,7 @@ def _rules(chosen, flags, lookup_fields, warnings, stats, rejected=None, bad_loo
 		# A candidate whose expression cannot be pasted is written as "leave the field as it
 		# is": it still hides the lower-precedence candidates, as an empty EVAL- in a local
 		# props.conf hides the shipped one.
-		cases, written, mine, read_fields = [], 0, [], set()
+		cases, written, mine, read_fields, parts = [], 0, [], set(), []
 		for stanza, expr in cands:
 			try:
 				check_expression(expr)
@@ -827,6 +837,7 @@ def _rules(chosen, flags, lookup_fields, warnings, stats, rejected=None, bad_loo
 				continue
 			mine.append((_home(stanza, flags), 'tenx_rc%d=if(%s, (%s), null())' % (n, cond(stanza), expr)))
 			read_fields |= _expression_reads(expr)
+			parts.append((stanza, [name], _expression_reads(expr)))
 			rules.append({'key': key, 'stanza': stanza.name, 'test': 'eval tenx_dry_run=(%s)' % expr})
 			cases.append('%s, tenx_rc%d' % (cond(stanza), n))
 			stat(stanza)['calculated'] += 1
@@ -840,7 +851,7 @@ def _rules(chosen, flags, lookup_fields, warnings, stats, rejected=None, bad_loo
 					reads[home].append(read)
 				writes.append(write)
 			else:
-				rid = sel.add([name], read_fields, tested(write))
+				rid = sel.add([name], read_fields, tested(write), parts)
 				for home in homes:
 					here = [r for h, r in mine if h == home]
 					if here:
@@ -861,7 +872,7 @@ def _rules(chosen, flags, lookup_fields, warnings, stats, rejected=None, bad_loo
 	n, used = 0, False
 	for key in sorted(lookups):
 		cands = lookups[key]
-		steps_of_key, writes_of_key, reads_of_key, tests_of_key = [], set(), set(), False
+		steps_of_key, writes_of_key, reads_of_key, tests_of_key, parts = [], set(), set(), False, []
 		for i, (stanza, value) in enumerate(cands):
 			try:
 				table, inputs, mode, outputs = parse_lookup(value)
@@ -916,6 +927,7 @@ def _rules(chosen, flags, lookup_fields, warnings, stats, rejected=None, bad_loo
 			reads_of_key.update(evt for _, evt in inputs)
 			if mode == 'OUTPUTNEW':
 				reads_of_key.update(produced)
+			parts.append((stanza, produced, [evt for _, evt in inputs] + (list(produced) if mode == 'OUTPUTNEW' else [])))
 			tests_of_key = tests_of_key or tested(w)
 			rules.append({'key': key, 'stanza': stanza.name, 'test': 'eval %s | lookup %s %s%s' % (
 				', '.join('tenx_ri%d_%d="tenx_dry_run"' % (n, k) for k in range(len(inputs))), lookup_name(table), args, out)})
@@ -927,7 +939,7 @@ def _rules(chosen, flags, lookup_fields, warnings, stats, rejected=None, bad_loo
 			if sel is None:
 				items.extend((home, step) for home, mine in steps_of_key for step in mine)
 			else:
-				rid = sel.add(writes_of_key, reads_of_key, tests_of_key)
+				rid = sel.add(writes_of_key, reads_of_key, tests_of_key, parts)
 				items.extend((home, sel.guard(rid, mine)) for home, mine in steps_of_key)
 	if used:
 		items.append((ANY, 'fields - tenx_ri*, tenx_ro*, tenx_rl*'))
@@ -1255,7 +1267,11 @@ def build(stanzas, present, lookup_fields=None, keep_fields=(), all_shared=True,
 	keep_rx = '^(%s)$' % '|'.join(list(KEEP_PATTERNS) + [re.escape(f) for f in names])
 
 	steps = replay.steps
-	sel = Selection() if select else None
+	owners = {}
+	for st in originals:
+		for e in effective[st]:
+			owners.setdefault(e, []).append(st)
+	sel = Selection(owners) if select else None
 	if sel is not None:
 		# The whole replay, unless the plan txf put on the events was made for this very macro.
 		steps.append('eval %s=if(isnull(%s%s), 1, null())' % (plan.ALL, plan.MARK, GEN))
@@ -1344,7 +1360,7 @@ def build(stanzas, present, lookup_fields=None, keep_fields=(), all_shared=True,
 	replay.warnings[:] = sorted(set(replay.warnings))
 
 	if with_tags:
-		steps.append(tags_block() if sel is None else every_rule([tags_block()]))
+		steps.append(tags_block() if sel is None else every_rule(list(TAGS_STEPS)))
 	steps.append(block(AS_READ, ['eval %s=if(isnotnull(%s) AND isnotnull(%s), 1, %s)' % (AS_IS, HIDE, AS_READ, AS_IS)]))
 	# tenx_rst and AS_IS stay: the search rewrite reads them after the macro. Callers remove them.
 	steps.append('fields - tenx_go*')
@@ -1361,6 +1377,24 @@ def generation(steps, rules):
 	return hashlib.md5((' | '.join(steps) + json.dumps(rules, sort_keys=True)).encode('utf-8')).hexdigest()[:8]
 
 
+def plan_switch(on, off):
+	"""
+	A subsearch that gives a command the argument `off` when the running search's plan holds
+	tenx_replay_plan.NOTAGS (it reads no event type and no tag), and `on` otherwise. Splunk fixes a
+	search's commands before any subsearch runs, so the plan can change their arguments only.
+	"""
+	return ('[| makeresults | addinfo | eval p=replace(info_sid, "^subsearch_(.+)_\\d+\\.\\d+$", "\\1") | where '
+			'p!=info_sid AND NOT match(p, "^nested_") | map maxsearches=1 search="| rest /services/search/jobs/$p$ '
+			'splunk_server=local | fields custom.tenx_replay_plan" | appendpipe [stats count | where count=0] | eval '
+			'search=if(match(\'custom.tenx_replay_plan\', "^tenx_nd[A-Za-z0-9_ ]+$") AND match(\'custom.tenx_replay_plan\', '
+			'"(^| )%s( |$)"), "%s", "%s") | fields search]' % (plan.NOTAGS, off, on))
+
+
+# The event type typer is given when the plan closes the tags step. No event type has this name, so typer loads
+# none; otherwise it loads every event type when the search starts, whether or not it runs on an event.
+NO_EVENT_TYPE = 'tenx_no_event_type'
+
+
 def tags_block():
 	"""
 	Event types and tags, recomputed on the replayed events (tenx_rst set); in a chunk that also
@@ -1370,7 +1404,7 @@ def tags_block():
 	return block(ANY, [
 		'eval tenx_rk_et=if(isnull(%s), eventtype, null()), tenx_rk_tag=if(isnull(%s), tag, null())' % (RST, RST),
 		'foreach tag::* [eval "tenx_rk_<<FIELD>>"=if(isnull(%s), \'<<FIELD>>\', null())]' % RST,
-		'typer',
+		'typer ' + plan_switch('', 'eventtypes=' + NO_EVENT_TYPE),
 		'tags',
 		# Inside a foreach body, tags writes each tag::<field> but not the combined tag field
 		# (measured: 0 events had tag inside the block, 786 with the same steps outside it), so
@@ -1384,12 +1418,10 @@ def tags_block():
 
 # The shipped `tenx-replay-tags` macro (default/macros.conf; a test keeps the two equal): event
 # types and tags of every replayed event, once, after the units of a search (txf(<sourcetype>),
-# the search rewrite). It does nothing on a chunk without a replayed event.
+# the search rewrite). It does nothing on a chunk without a replayed event, or on events that carry
+# tenx_ndnotags (tenx_replay_plan.NOTAGS, put there by tenx-replay-plan).
 TAGS_MACRO = 'tenx-replay-tags'
-# A txf(<sourcetype>) search that reads no event type and no tag carries tenx_ndnotags (the prefilter's plan,
-# tenx_replay_plan.NOTAGS, put on its events by tenx-replay-plan), and the step leaves them out. The search
-# rewrite never sets it.
-TAGS_STEPS = ('eval %s=if(isnotnull(%s) AND isnull(tenx_ndnotags),1,null())' % (ANY, RST), tags_block(), 'fields - %s' % ANY)
+TAGS_STEPS = ('eval %s=if(isnotnull(%s) AND isnull(%s),1,null())' % (ANY, RST, plan.NOTAGS), tags_block(), 'fields - %s' % ANY)
 
 
 NARROWING_STANZA = 'tenx:narrowing'
@@ -1621,11 +1653,13 @@ WILD_STEP = ' | `tenx-wild`'
 # What `tx`, `txf` and txf(<sourcetype>) read (macros.conf [tenx-raw-events]): the compact events, and
 # the raw events of the same sources that the deployment names there, which are returned as they are.
 EVENTS = '((`tenx-events`) OR (`tenx-raw-events`))'
+# The same step in `txf` and txf(<sourcetype>), whose tenx-replay-plan has put the marks on the events already.
+WILD_AFTER_PLAN = ' | `tenx-wild-planned`'
 TXF_ONE_UNIT = ('"' + EVENTS + ' [| tenxprefilter] | eval tenx_compact_raw=_raw, tenx_passed=if(match(_raw, \\"^~\\") OR '
 				'isnotnull(tenx_sourcetype), null(), 1) | `tenx-inflate` | fields - _kv | '
 				'`tenx-mapped-hide` | `tenx-whole-hide` | `tenx-replay-u" . substr(md5("$st$"), 1, 12) . "` | `tenx-replay-plan` | `tenx-replay-tags` | '
 				'`tenx-whole-restore` | `tenx-mapped-restore` | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars, tenx_nd* | '
-				'eval tenx_expand_refused=if(len(tenx_expand_refused)>0, tenx_expand_refused, null())' + WILD_STEP + ' | search *"')
+				'eval tenx_expand_refused=if(len(tenx_expand_refused)>0, tenx_expand_refused, null())' + WILD_AFTER_PLAN + ' | search *"')
 TXF_ONE = 'txf(1)'
 TXF_ONE_NAME = 'match(st, "^[A-Za-z0-9_.:/-]+$")'
 # Splunk prints it after "Encountered the following error while validating macro 'txf(<st>)': " and
@@ -1878,10 +1912,10 @@ def no_op_unit():
 	return build([], [], only=True)
 
 
-def compose_units(sourcetypes):
+def compose_units(sourcetypes, tags=True):
 	"""
 	The search rewrite's replay for some original sourcetypes: their units in turn, then
-	`tenx-replay-tags`. A unit sets tenx_rst on its own events and clears it on every other, so
+	`tenx-replay-tags` unless `tags` is False. A unit sets tenx_rst on its own events and clears it on every other, so
 	the value an earlier unit set is kept in tenx_rprev across the next and put back after it;
 	while tenx_rst is clear, an event is left alone by every step of a unit, and is hidden from
 	its extract by tenx_hide_others (which only the rewrite sets).
@@ -1892,8 +1926,13 @@ def compose_units(sourcetypes):
 		parts += ['eval tenx_rprev=%s' % RST, '`%s`' % unit_macro(st), 'eval %s=coalesce(%s, tenx_rprev)' % (RST, RST)]
 	if len(sts) > 1:
 		parts.append('fields - tenx_rprev')
-	parts.append('`%s`' % TAGS_MACRO)
+	if tags:
+		parts.append('`%s`' % TAGS_MACRO)
 	return ' | '.join(parts)
+
+
+# The search rewrite's `tenx-replay` for a search that reads no event type and no tag: its tags step closed.
+FULL_WITHOUT_TAGS = 'eval %s=1 | %s | fields - %s' % (plan.NOTAGS, FULL, plan.NOTAGS)
 
 
 def chained_commands(counts):
@@ -1915,7 +1954,7 @@ def _index_regex(pattern):
 	return re.compile('^' + '.*'.join(re.escape(p) for p in pattern.lower().split('*')) + '$')
 
 
-def rewrite_replay(covered, indexes):
+def rewrite_replay(covered, indexes, tags=True):
 	"""
 	The replay steps for the search rewrite, or None for none, which leaves the rewrite without
 	any replay step.
@@ -1924,6 +1963,7 @@ def rewrite_replay(covered, indexes):
 	          when tenx_replay.conf could not be read.
 	indexes   the index values the search names (TenxSearchAstNode.get_passing_specifiers():
 	          [] for none, None when it cannot tell, wildcards allowed).
+	tags      False for a search that reads no event type and no tag: no tags step runs.
 
 	Unreadable: `tenx-replay`, which replays whatever the install has (and is the shipped
 	extract alone where nothing carries tenx_sourcetype). No covered sourcetype: none. No index
@@ -1940,6 +1980,14 @@ def rewrite_replay(covered, indexes):
 	no replay, can. So an index the record does not know never gets less than `tenx-replay`, on an
 	install where any compact event carries tenx_sourcetype.
 	"""
+	replay = _rewrite_replay(covered, indexes, tags)
+	if tags or replay is None:
+		return replay
+	return FULL_WITHOUT_TAGS if replay == FULL else replay
+
+
+def _rewrite_replay(covered, indexes, tags):
+	"""rewrite_replay() without the steps of a search that reads no event type and no tag."""
 	if covered is None:
 		return FULL
 	sts = sorted(st for st in covered if usable_sourcetype(st))
@@ -1989,7 +2037,7 @@ def rewrite_replay(covered, indexes):
 	counts = [_recorded_commands(covered[st] if isinstance(covered[st], dict) else {}) for st in chosen]
 	if None in counts or chained_commands(counts) > REPLAY_MAX_COMMANDS:
 		return FULL
-	return compose_units(chosen)
+	return compose_units(chosen, tags)
 
 
 # Settings of the field replay in tenx_config.conf [config]; see README/tenx_config.conf.spec.

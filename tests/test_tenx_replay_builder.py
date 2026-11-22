@@ -195,9 +195,9 @@ class TestBuild:
 		alias = first(lambda s: 'tenx_ra0_0=' in s)
 		calc = first(lambda s: 'tenx_rc0=' in s)
 		lookup = first(lambda s: s.startswith('lookup '))
-		typer = first(lambda s: s == 'typer')
+		typer = first(lambda s: s.split(' ', 1)[0] == 'typer')
 		assert clear < retype < extract < alias < calc < lookup < typer
-		assert steps[typer + 1] == 'tags'
+		assert typer < first(lambda s: s == 'tags')
 
 	def test_lookups_run_in_ascii_order_of_their_class(self):
 		steps = flat(build(DEMO, PRESENT, LOOKUPS).steps)

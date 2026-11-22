@@ -135,7 +135,7 @@ class TestTheRawEventsProbe:
 COMMAND = r'''
 import json, os, sys, types, tempfile, shutil
 
-root, home, record, before, macro, rows = sys.argv[1:7]
+root, home, record, before, macro, rows, kept = sys.argv[1:8]
 os.makedirs(os.path.join(home, 'var', 'log', 'splunk'), exist_ok=True)
 os.environ['SPLUNK_HOME'] = home
 splunk = types.ModuleType('splunk')
@@ -159,23 +159,30 @@ cmd = tenx_prefilter.TenxPrefilterCommand()
 cmd.before = (before, macro)
 cmd._metadata = types.SimpleNamespace(searchinfo=types.SimpleNamespace(
 	username='u', splunkd_uri='https://127.0.0.1:8089', session_key='k', earliest_time='0', latest_time='now'))
-searches, warnings = [], []
+searches, warnings, saved = [], [], []
 def rest(path, data=None, answer=True):
 	searches.append(data['search'])
 	return {'results': json.loads(rows)}
-cmd._rest = rest
+def kv(path, records=None):
+	if records is not None:
+		saved.extend(records)
+		return []
+	if kept == 'none':
+		raise OSError('HTTP Error 404')
+	return json.loads(kept)
+cmd._rest, cmd._kv = rest, kv
 cmd.write_warning = warnings.append
 cmd._record_checks(macro)
 shutil.rmtree(app)
-print(json.dumps({'searches': searches, 'warnings': warnings}))
+print(json.dumps({'searches': searches, 'warnings': warnings, 'saved': saved}))
 '''
 
 
 class TestTheCommand:
-	def run(self, record, before, rows, macro='`tx`'):
+	def run(self, record, before, rows, macro='`tx`', kept='none'):
 		with tempfile.TemporaryDirectory() as home:
 			proc = subprocess.run([sys.executable, '-c', COMMAND, ROOT, home, json.dumps(record), before, macro,
-								   json.dumps(rows)], capture_output=True, text=True, timeout=60)
+								   json.dumps(rows), kept], capture_output=True, text=True, timeout=60)
 		assert proc.returncode == 0, proc.stderr[-3000:]
 		return json.loads(proc.stdout.strip().splitlines()[-1])
 
@@ -186,7 +193,32 @@ class TestTheCommand:
 
 	def test_none_found_or_nothing_recorded_is_no_warning(self):
 		assert self.run(RECORD, 'index=web', [{'index': 'web', 'sourcetype': 'x', 'count': '0'}])['warnings'] == []
-		assert self.run({}, 'index=web', []) == {'searches': [], 'warnings': []}
+		assert self.run({}, 'index=web', []) == {'searches': [], 'warnings': [], 'saved': []}
+
+	def test_the_answer_is_kept_and_used_again_for_the_same_range(self):
+		rows = [{'index': 'web', 'sourcetype': 'access_combined', 'count': '9'}]
+		out = self.run(RECORD, 'index=web', rows)
+		probe = pp.raw_history_probe(RECORD, 'index=web')
+		assert len(out['saved']) == 1 and out['saved'][0]['_key'] == pp.check_key(probe)
+		again = self.run(RECORD, 'index=web', [], kept=json.dumps(out['saved'][0]))
+		assert again['searches'] == [] and again['warnings'] == out['warnings'] and again['saved'] == []
+
+	def test_a_kept_answer_is_used_only_while_fresh_and_for_its_range(self):
+		import time
+		probe = pp.raw_history_probe(RECORD, 'index=web')
+		rows = [{'index': 'web', 'sourcetype': 'access_combined', 'count': '9'}]
+		now = time.time()
+		record = pp.check_record(probe, '0', 'now', rows, now)
+		assert pp.check_rows(record, '0', 'now', now + pp.CHECK_SECONDS - 1) == rows
+		assert pp.check_rows(record, '0', 'now', now + pp.CHECK_SECONDS) is None
+		assert pp.check_rows(record, '0', 'now', now - 5) is None
+		assert pp.check_rows(record, '900', 'now', now) is None
+		step = pp.CHECK_SECONDS
+		record = pp.check_record(probe, str(100 * step + 1), str(200 * step + 2), rows, now)
+		assert pp.check_rows(record, str(100 * step + step - 1), str(200 * step), now) == rows
+		assert pp.check_rows(record, str(101 * step), str(200 * step), now) is None
+		for bad in (None, {}, {'range': record['range'], 'at': 'x', 'rows': '[]'}, dict(record, rows='{')):
+			assert pp.check_rows(bad, str(100 * step + 1), str(200 * step + 2), now) is None
 
 	def test_txf_also_names_what_its_replay_leaves_out(self):
 		out = self.run(RECORD, 'index=fw', [], macro='`txf`')
