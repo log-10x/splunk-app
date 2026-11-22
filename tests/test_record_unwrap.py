@@ -16,8 +16,6 @@ import re
 
 import pytest
 
-import tenx_field_map as fm
-
 APP = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'tenx-for-splunk'))
 STANZA = 'source::/opt/tenx/compact/events/...'
 CLASS = 'TRANSFORMS-00_tenx_unwrap'
@@ -136,13 +134,11 @@ class TestWhereTheRuleRuns:
 		assert props.get('tenx_encoded', 'TRANSFORMS-tenx_time') == 'tenx-event-time'
 		assert [k for k, _ in props.items('tenx_encoded') if k.startswith('TRANSFORMS-')] == ['TRANSFORMS-tenx_time']
 
-	def test_the_class_sorts_before_event_time_and_every_field_map(self):
+	def test_the_class_sorts_before_event_time(self):
 		# The TRANSFORMS- classes of the source and sourcetype stanzas that match an event run in the order of their
-		# names: on Splunk Enterprise 10.4.3 the unwrap (class 00_...) ran before tenx-event-time and before the
-		# FortiGate field map's rule on every event (tests/live_hf_monitor/).
-		classes = ['tenx_time'] + [t.get('transforms_class', fm.sanitize(t['sourcetype'])) for t in fm.TARGETS.values()]
-		assert 'tenx_fgt' in classes and 'tenx_win' in classes
-		assert sorted(classes + [CLASS[len('TRANSFORMS-'):]])[0] == '00_tenx_unwrap'
+		# names: on Splunk Enterprise 10.4.3 the unwrap (class 00_...) ran before tenx-event-time on every event
+		# (tests/live_hf_monitor/).
+		assert sorted(['tenx_time', CLASS[len('TRANSFORMS-'):]])[0] == '00_tenx_unwrap'
 
 
 class TestTheRuleText:

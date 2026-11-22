@@ -101,9 +101,6 @@ import re
 import tenx_replay_plan as plan
 
 CARRIER_FIELD = 'tenx_sourcetype'
-# Written by every transform of a field map (tenx_field_map.py MARK_FIELD); tenx-mapped-hide keeps
-# an event that carries it out of the replay.
-MAPPED_FIELD = 'tenx_mapped'
 RST = 'tenx_rst'
 COMPACT_RAW = 'tenx_compact_raw'
 
@@ -127,8 +124,7 @@ PLACEHOLDER = 'tenx_hidden'
 # Events that arrive whole: the sender passed the line through as it was (log10x-format S4.1: a
 # line that does not begin with "~" is not encoded), so tenx-inflate leaves its text as it is and
 # Splunk has already read that text under the event's sourcetype. Two cases, by that sourcetype:
-# AS_READ   it is the sourcetype a raw event of the original sourcetype is searched under (a
-#           field map renames its compact sourcetype to the original, rename = in props.conf):
+# AS_READ   it is the sourcetype a raw event of the original sourcetype is searched under:
 #           Splunk has applied exactly the original's search-time rules, so the event is left as
 #           Splunk read it, and kept out of the replay's `extract`, which would add every field a
 #           transform with MV_ADD extracts a second time (Splunk Enterprise 10.4.3, Windows
@@ -1199,9 +1195,8 @@ def build(stanzas, present, lookup_fields=None, keep_fields=(), all_shared=True,
 	               kept on the events of the sourcetypes whose compact events carry it, and cleared
 	               on the events of the others present (see clearing_steps()); a sourcetype missing
 	               from it keeps every name listed for any. Indexed fields are
-	               set per event by whoever sent it, so one sourcetype's (a field map writing app
-	               as an indexed field on FortiGate events) say nothing about another's (app set
-	               when a Windows compact event is read).
+	               set per event by whoever sent it, so one sourcetype's say nothing about
+	               another's.
 	only           replay only the events whose original sourcetype is in `present`; every other
 	               event is left as `tx` leaves it (a unit, see build_unit()).
 	seen           {'sources': ..., 'hosts': ...} recorded for the sourcetype (see coverage()):
@@ -1657,8 +1652,8 @@ EVENTS = '((`tenx-events`) OR (`tenx-raw-events`))'
 WILD_AFTER_PLAN = ' | `tenx-wild-planned`'
 TXF_ONE_UNIT = ('"' + EVENTS + ' [| tenxprefilter] | eval tenx_compact_raw=_raw, tenx_passed=if(match(_raw, \\"^~\\") OR '
 				'isnotnull(tenx_sourcetype), null(), 1) | `tenx-inflate` | fields - _kv | '
-				'`tenx-mapped-hide` | `tenx-whole-hide` | `tenx-replay-u" . substr(md5("$st$"), 1, 12) . "` | `tenx-replay-plan` | `tenx-replay-tags` | '
-				'`tenx-whole-restore` | `tenx-mapped-restore` | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars, tenx_nd* | '
+				'`tenx-whole-hide` | `tenx-replay-u" . substr(md5("$st$"), 1, 12) . "` | `tenx-replay-plan` | `tenx-replay-tags` | '
+				'`tenx-whole-restore` | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars, tenx_nd* | '
 				'eval tenx_expand_refused=if(len(tenx_expand_refused)>0, tenx_expand_refused, null())' + WILD_AFTER_PLAN + ' | search *"')
 TXF_ONE = 'txf(1)'
 TXF_ONE_NAME = 'match(st, "^[A-Za-z0-9_.:/-]+$")'

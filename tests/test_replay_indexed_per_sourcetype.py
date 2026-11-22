@@ -1,12 +1,9 @@
 """
 Which indexed fields the clearing step of the field replay keeps, run through the SPL model
 (tests/support/spl_model.py). Indexed fields are set per event by whoever sent it, so the list is
-kept per original sourcetype (build() keep_by_sourcetype): a field map that writes `app` as an
+kept per original sourcetype (build() keep_by_sourcetype): a sender that writes `app` as an
 indexed field on FortiGate events is no reason to keep the `app` that Splunk set on a Windows
-compact event when it read the compact text (Splunk Enterprise 10.4.3, 662 Windows Security
-events with FortiGate field map sourcetypes named in tenx-events: 142 events kept
-app=win:unknown where raw has win:remote, 177 of 183 fields equal to raw; 180 with the list per
-sourcetype).
+compact event when it read the compact text.
 
 The stand-in for Splunk's extract adds each value it finds to a field that already exists, as
 measured on Splunk Enterprise 10.4.3 for an extraction with MV_ADD.
@@ -77,8 +74,7 @@ PRESENT = [('win', 'XmlWinEventLog:Security', 'dc01'), ('fgt', 'fgt.log', 'fw1')
 
 def model(full, units=None):
 	conf = macros_conf()
-	macros = dict((n, conf.get(n, 'definition')) for n in ('tenx-mapped-hide', 'tenx-mapped-restore', 'tenx-whole-hide',
-														  'tenx-whole-restore'))
+	macros = dict((n, conf.get(n, 'definition')) for n in ('tenx-whole-hide', 'tenx-whole-restore'))
 	macros.update({'tenx-inflate': 'inflatemodel', 'tenx-replay': full, 'tenx-replay-tags': ' | '.join(b.TAGS_STEPS)})
 	macros.update(units or {})
 	return Model(commands={'extract': extract, 'typer': typer, 'tags': lambda e, _: None,
@@ -205,7 +201,7 @@ def test_the_command_counts_indexed_fields_per_original_sourcetype():
 	every, declared, by_st = out['got']
 	# app, env, rare and srcip are indexed somewhere (the prefilter's list); declared is fields.conf INDEXED = true
 	assert every == ['app', 'declared', 'env', 'rare', 'srcip'] and declared == ['declared']
-	# per sourcetype, over the events the replay works on: no field-map event (tenx_mapped)
+	# per sourcetype, over the events the replay works on
 	assert by_st == {'fgt': ['env', 'rare', 'srcip'], 'win': ['env']}
 	assert out['searches'][0] == 'search `tenx-events` | head 1000 | fieldsummary | fields field'
 	assert out['searches'][1] == '| tstats max(_time) as t where `tenx-events` by index host source sourcetype'
@@ -216,4 +212,4 @@ def test_the_command_counts_indexed_fields_per_original_sourcetype():
 		'earliest=1590998401 latest=1590998402)) | dedup index host source sourcetype | fieldsummary | fields field')
 	funcs = 'dc("app") as f0, dc("env") as f1, dc("rare") as f2, dc("srcip") as f3'
 	assert out['searches'][3] == '| tstats %s where `tenx-events`' % funcs
-	assert out['searches'][4] == '| tstats %s where `tenx-events` NOT tenx_mapped=* by tenx_sourcetype' % funcs
+	assert out['searches'][4] == '| tstats %s where `tenx-events` by tenx_sourcetype' % funcs

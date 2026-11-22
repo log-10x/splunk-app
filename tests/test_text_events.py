@@ -7,17 +7,14 @@ so the first character decides: every rule that reads a compact event requires t
 - the search-time extraction gives a text line no tenx_hash, so no part of its text is looked up as a hash;
 - tenx-inflate reads values only from a line that starts with "~", and leaves a text line unmarked;
 - tenx-event-time leaves a text line at the time it arrived with (test_event_time.py);
-- the dashboard counts text events as one row of their own and no template;
-- the field map's offline verify counts text lines as events equal to raw ones.
+- the dashboard counts text events as one row of their own and no template.
 """
 import configparser
-import io
 import os
 import re
 
 import pytest
 
-import tenx_field_map as fm
 from support.spl_model import Model, visible
 
 APP = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'tenx-for-splunk'))
@@ -93,25 +90,3 @@ class TestTheDashboard:
 		text = self.text()
 		assert text.count('| eval hash=coalesce(hash, "(sent as text)")') == 2
 		assert text.count('| where isnotnull(hash)') == 1
-
-
-class TestTheFieldMapVerify:
-	def test_split_compact_reads_compact_lines_only(self):
-		assert fm.split_compact('~h1,a,b') == ('h1', ['a', 'b'])
-		assert fm.split_compact('h1,a,b') == (None, [])
-
-	def test_verify_counts_lines_sent_as_text(self, tmp_path):
-		# one template "$ user=$ action=$" with a timestamp, two compact lines and two lines sent as text
-		t = fm.Template(key='hk', written_hash='hk', parts=['__TENX_TS__ user=', ' action='], part_0='', terminator='',
-						timestamp_format='%H:%M:%S', expand_unsafe='', pattern='')
-		f = fm.FieldMap({'hk': t}, fm.KeyValueReader(), 'p')
-		raw = ['10:00:01 user=alice action=login', '10:00:02 user=bob action=logout', '10:00:03 user=carol action=login',
-			   '10:00:04 user=dave action=logout']
-		(tmp_path / 'raw.log').write_text('\n'.join(raw) + '\n')
-		(tmp_path / 'encoded.log').write_text('\n'.join([raw[0], raw[1], '~hk,1762768803000,carol,login',
-														 '~hk,1762768804000,dave,logout']) + '\n')
-		out = io.StringIO()
-		result = fm.verify({'hk': t}, f, str(tmp_path / 'encoded.log'), str(tmp_path / 'raw.log'), out=out)
-		assert result['lines_sent_as_text'] == 2 and result['sent_as_text_equal_raw'] == 2
-		assert result['expanded_equal_raw'] == 2 and result['lines_without_template'] == 0
-		assert 'equal to a raw event: 2 of 2' in out.getvalue()

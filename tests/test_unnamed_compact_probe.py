@@ -72,7 +72,7 @@ class TestTheOriginalSourcetype:
 
 	def test_probed_for_compact_events_carrying_it(self):
 		assert sb.compact_probe(result('index=df sourcetype=df:kv error'), make_config())[0] == (
-			'| tstats count where (index=df) (sourcetype=tenx_encoded) NOT tenx_mapped=* (tenx_sourcetype=df:kv) '
+			'| tstats count where (index=df) (sourcetype=tenx_encoded) (tenx_sourcetype=df:kv) '
 			'by index, sourcetype, tenx_sourcetype')
 
 	def test_not_probed(self):
@@ -82,7 +82,7 @@ class TestTheOriginalSourcetype:
 
 	def test_a_wildcard_that_misses_the_compact_sourcetype_is_probed(self):
 		assert sb.original_sourcetype_probe(result('index=df sourcetype=df:* error'), make_config()) == (
-			'| tstats count where (index=df) (sourcetype=tenx_encoded) NOT tenx_mapped=* (tenx_sourcetype=df:*) '
+			'| tstats count where (index=df) (sourcetype=tenx_encoded) (tenx_sourcetype=df:*) '
 			'by index, sourcetype, tenx_sourcetype')
 
 	def test_the_message(self):
@@ -135,11 +135,11 @@ class TestTheMacroPath:
 	def test_the_probe_and_message(self):
 		import tenx_prefilter_parser as pp
 		assert pp.original_sourcetype_probe(['df:kv'], ['df']) == (
-			'| tstats count where (index="df") `tenx-events` NOT tenx_mapped=* (tenx_sourcetype="df:kv") '
+			'| tstats count where (index="df") `tenx-events` (tenx_sourcetype="df:kv") '
 			'NOT (sourcetype="df:kv") by tenx_sourcetype')
 		# events the search's own sourcetype term selects (the compact sourcetype, for tenx*) are not counted
 		assert pp.original_sourcetype_probe(['tenx*', 'df:kv'], []) == (
-			'| tstats count where `tenx-events` NOT tenx_mapped=* (tenx_sourcetype="df:kv" OR tenx_sourcetype="tenx*") '
+			'| tstats count where `tenx-events` (tenx_sourcetype="df:kv" OR tenx_sourcetype="tenx*") '
 			'NOT (sourcetype="df:kv" OR sourcetype="tenx*") by tenx_sourcetype')
 		assert pp.original_sourcetype_probe([], ['df']) is None
 		assert pp.original_sourcetype_message([{'tenx_sourcetype': 'df:kv', 'count': '3'}], '`tx`') == (

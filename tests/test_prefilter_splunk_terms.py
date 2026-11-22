@@ -165,8 +165,8 @@ class TestTheNarrowing:
 		assert narrowed("year=2023", "[ AND 2023 ]") is None
 
 	def test_an_indexed_alternative_keeps_the_narrowing_of_the_terms(self):
-		# the compact event holding the terms stays selected, and one carrying the indexed field (a field map,
-		# fields sent with the event) is selected by it
+		# the compact event holding the terms stays selected, and one carrying the indexed field (fields sent
+		# with the event) is selected by it
 		got = narrowed("user=kerberos", "[ AND [ OR user::kerberos kerberos ] ]")
 		assert got == "((user::kerberos OR ((TERM(kerberos) OR TERM(~k1)))))"
 		# a branch that places no restriction leaves the whole OR without one

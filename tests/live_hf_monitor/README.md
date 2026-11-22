@@ -9,7 +9,7 @@ A separate search head searches the indexer.
 
 ```sh
 export W=<work folder> PKG=<tenx-for-splunk package> SAMPLES=<samples folder> ADDONS=<add-ons folder>
-for phase in build config "pass t" clean maps "pass m" drill clean report; do tests/live_hf_monitor/rig.sh $phase; done
+for phase in build config "pass t" clean drill clean report; do tests/live_hf_monitor/rig.sh $phase; done
 tests/live_hf_monitor/rig.sh down
 ```
 
@@ -28,12 +28,7 @@ Every check prints one line, PASS or FAIL, collected in `$W/res/summary.txt`:
   folder's files and lines, and the files the heavy forwarder has finished;
 - keys: every event's text, `_time` to the microsecond, host, source and index, raw against compact
   through `tx`, on four hosts and three sources;
-- fields: `txf` fields against raw, Windows and FortiGate (pass t), and through the Windows field map
-  (pass m);
-- activate and check of both field maps through the heavy forwarder's management port, without
-  `--probe-hec`;
-- data models through the field maps on the heavy forwarder: Authentication, Change and Endpoint
-  Processes on Windows, Network_Traffic on FortiGate, raw against compact row for row;
+- fields: `txf` fields against raw, Windows and FortiGate;
 - drill: a FortiGate file grows while its Receiver is stopped (`OUT` seconds, 300 by default); every
   event arrives once;
 - clean-up: the job the README prints deletes only files the heavy forwarder has finished, and no
