@@ -1,15 +1,13 @@
 """
-Field narrowing from Splunk's own index terms (tenx_config.conf field_narrowing = splunk; the default is false).
+Field narrowing from Splunk's own index terms (tenx_config.conf field_narrowing = splunk; off by default).
 
-A field comparison after `tx` or `txf` narrows the compact events by the index terms Splunk requires of
-raw events for that comparison (its base lispy, read from a probe job's search.log). Each term is
-required exactly as the same text written as a word after the macro, so the guarantees of word search
-carry over: every raw event the search returns holds each term, its compact event expands to that text,
-and so it holds each piece of the term as a value or through its template.
+A field comparison after `tx` or `txf` narrows the compact events by the index terms Splunk requires of raw
+events for it, read from a probe job's search.log. Each term is required as the same text written as a word,
+so the guarantees of word search carry over.
 
-What the prefilter cannot read with certainty places no restriction: an indexed term (name::value) on its
-own or of a default field, a NOT, an OR with any such branch, a term with a quote, backslash, parenthesis or bracket in it, a lispy it
-cannot parse, a probe it cannot run (subsearch in the words). Then nothing is narrowed, as before.
+What the prefilter cannot read with certainty narrows nothing: an indexed term on its own or of a default
+field, a NOT, an OR with such a branch, or a term with a quote, backslash, parenthesis or bracket. So does a
+lispy it cannot parse, or a probe it cannot run (a subsearch in the words).
 """
 import os
 
@@ -167,8 +165,8 @@ class TestTheNarrowing:
 		assert narrowed("year=2023", "[ AND 2023 ]") is None
 
 	def test_an_indexed_alternative_keeps_the_narrowing_of_the_terms(self):
-		# the compact event holding the terms is selected as before; one carrying the indexed field (a field
-		# map, fields sent with the event) is selected by it
+		# the compact event holding the terms stays selected, and one carrying the indexed field (a field map,
+		# fields sent with the event) is selected by it
 		got = narrowed("user=kerberos", "[ AND [ OR user::kerberos kerberos ] ]")
 		assert got == "((user::kerberos OR ((TERM(kerberos) OR TERM(~k1)))))"
 		# a branch that places no restriction leaves the whole OR without one
