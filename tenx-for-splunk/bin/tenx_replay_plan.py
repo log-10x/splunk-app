@@ -479,10 +479,31 @@ def needed_fields(search, parser):
 		return None
 
 
-def _needed(search, parser):
+# What a search that runs `txf(<sourcetype>)` once stores when it reads no event type and no tag
+# (tags_skipped()): the field the tenx-replay-tags macro tests before it runs `typer` and `tags`.
+NOTAGS = PREFIX + "notags"
+TXF_UNIT = re.compile(r"^`txf\([^`()]*\)`$")
+
+
+def tags_skipped(search, parser):
+	"""
+	True when a search that runs `txf(<sourcetype>)` once reads no event type and no tag after it, as
+	needed_fields() tells for plain `txf` (the same rules: a transforming command it reads up to, no
+	wildcard field name, no subsearch or other macro, no command this module does not read). The
+	sourcetype's unit then runs whole, and only the event types and tags step is left out. False when
+	that cannot be told.
+	"""
+	try:
+		_needed(search or "", parser, unit=True)
+		return True
+	except Unknown:
+		return False
+
+
+def _needed(search, parser, unit=False):
 	call = parser.macro_call(search)
-	if call is None or call[1] != TXF or parser.macro_calls(search) != 1:
-		raise Unknown("not one plain txf")
+	if call is None or parser.macro_calls(search) != 1 or not (call[1] == TXF if not unit else TXF_UNIT.match(call[1])):
+		raise Unknown("not one plain txf" if not unit else "not one txf(<sourcetype>)")
 	before, rest = call[0], search[len(call[0]) + len(call[1]):]
 	plain = _outside_quotes(before)
 	if any(c in plain for c in "|[]`") or "`" in _outside_quotes(rest):

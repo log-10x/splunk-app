@@ -6,7 +6,7 @@ TERM(<template hash>)). Indexed without words, a compact event holds none of the
 0 events where the raw search returned 38,204 (Splunk Enterprise 10.4.3, BOTS v1 FortiGate, 100,000 events).
 Every compact event starts with ~ and its template hash, which segmentation indexes as a term starting with
 ~; one tstats per search counts, by index, host and source, the compact events and those holding such a
-term, and the groups where they differ are read whole (ORed into the prefilter). The words are then matched
+term, and the groups that have events and none holding one are read whole (ORed into the prefilter). The words are then matched
 after expansion. When the check cannot run, every compact event in range is read.
 """
 import json
@@ -27,7 +27,19 @@ class TestTheCheck:
 		probe = p.word_index_probe('index=fw sourcetype::tenx_encoded ')
 		assert probe.startswith('| tstats count where (index="fw") `tenx-events` by index, host, source')
 		assert '`tenx-events` TERM(~*) by index, host, source' in probe
-		assert probe.endswith('| where tenx_all > tenx_words')
+		assert probe.endswith('| where tenx_all > 0 AND tenx_words == 0')
+
+	def test_events_sent_whole_do_not_make_a_group_read_whole(self):
+		# the probe's own where clause, applied to the per-group sums
+		where = p.word_index_probe('').rsplit('| where ', 1)[1].replace(' AND ', ' and ').replace(' OR ', ' or ')
+
+		def flagged(all_, words):
+			return eval(where, {}, {'tenx_all': all_, 'tenx_words': words})
+		# CloudTrail through the Receiver: 105,090 compact events and 3 sent whole, every one segmented
+		assert not flagged(105093, 105090)
+		# indexed without words: no event holds a term starting with ~
+		assert flagged(105093, 0)
+		assert not flagged(0, 0)
 
 	def test_every_index_when_none_is_named(self):
 		assert p.word_index_probe('').startswith('| tstats count where `tenx-events` by index')

@@ -94,8 +94,10 @@ class TestWhenToReadEverything:
 		assert p.cache_hours(bad, {"jsmith"}, False, NOW, 0) is None
 
 	def test_keys(self):
-		assert p.cache_key("valkey*") == "p_valkey-" and p.cache_key("*key") == "p_-key"
-		assert p.cache_keys({"b", "a"}, True) == ["p_a", "p_b", "formats"]
+		assert p.cache_key("valkey*") == "ps_valkey-" and p.cache_key("*key") == "ps_-key"
+		assert p.cache_keys({"b", "a"}, True) == ["ps_a", "ps_b", "formats"]
+		# an answer kept under the key of the clauses before hash_selector() is never read back
+		assert "p_a" not in p.cache_keys({"a"}, True)
 
 
 class TestNeverNarrowerThanEveryRecord:
@@ -143,12 +145,12 @@ class TestNeverNarrowerThanEveryRecord:
 		# h1 refreshed later with new text, stamped with its new hour
 		hours = p.cache_hours(kept, pieces, False, NOW, 0)
 		merged, _ = p.cache_merge(kept, self.answer(pieces, [("h1", "jsmith logged in")]), set(), pieces, False)
-		assert str(p.hour_of(NOW)) in hours and merged["jsmith"] == (1, ["TERM(~h1)"])
+		assert str(p.hour_of(NOW)) in hours and merged["jsmith"] == (1, [p.hash_selector("h1")])
 
 	def test_past_the_template_limit_only_the_count_is_kept(self):
 		d = {"error": (p.MAX_TEMPLATES + 1, ["TERM(~a)"]), "door": (2, ["TERM(~b)", "TERM(~c)"])}
 		rec = entries_of(p.cache_records(d, set(), {"error", "door"}, False, NOW))
-		assert rec["p_error"]["hs"] == [] and rec["p_error"]["n"] == p.MAX_TEMPLATES + 1
+		assert rec["ps_error"]["hs"] == [] and rec["ps_error"]["n"] == p.MAX_TEMPLATES + 1
 		merged, _ = p.cache_merge(rec, {}, set(), {"error", "door"}, False)
 		assert merged["error"][0] > p.MAX_TEMPLATES and merged["door"] == (2, ["TERM(~b)", "TERM(~c)"])
 		assert p.prefilter(("text", "error"), merged) is None

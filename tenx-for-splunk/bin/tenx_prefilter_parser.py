@@ -22,7 +22,8 @@ own search text, and this module
 3. builds the prefilter. A word or phrase is cut into pieces at the characters Splunk breaks
    indexed text at (SEGMENT_BREAKERS, the same set the search rewrite uses) and at white space;
    each piece must appear in the compact event as a value (TERM(piece)) or be carried by the
-   event's template (TERM(<token of the template's hash>)). A piece is not used when a rendered
+   event's template (the template's hash_selector(): the phrase "~<hash>", or for a hash holding a
+   '*' the text before it and every run of the hash). A piece is not used when a rendered
    timestamp could print text it matches (any run of digits, month and day names, 14t10, and any
    wildcard that can match such text: 2026*, nov*, *t10; see timestamp_could_print()), when it
    holds a character outside a-z and 0-9, when a wildcard sits between two of its characters
@@ -1340,6 +1341,47 @@ def prefilter(node, dictionary, text_field=None, digits=frozenset()):
 HASH_SEGMENT = re.compile(r"[^ !;<>{}|&?+\[\]*,()'\"]+")
 
 
+def hash_runs(dml_hash):
+	"""
+	The runs of '~<hash>' that TERM() finds both from the index alone and beside a field comparison
+	(hash_term's rules: at least two characters holding a letter or a digit, not between two '*'), in
+	order and each once.
+	"""
+	text = "~" + dml_hash
+	runs = [(m.group(0), m.start(), m.end()) for m in HASH_SEGMENT.finditer(text)]
+	return list(dict.fromkeys(run for run, start, end in runs
+							  if not (text[start - 1:start] == "*" and text[end:end + 1] == "*")
+							  and len(run) >= 2 and re.search(r"[A-Za-z0-9]", run)))
+
+
+def hash_selector(dml_hash):
+	"""
+	The clause that selects the compact events of one template in the prefilter. A hash without a '*':
+	the phrase "~<hash>". A hash holding one ('*' is a wildcard even inside quotes): the phrase of the
+	text before its first '*' and every run of hash_runs(), all required; TERM(hash_term()) when it has
+	neither.
+
+	One run of the hash alone is not specific. The base-84 alphabet of the hash (log10x format spec
+	S5.5) holds 14 major breakers and 8 minor ones, so a hash is cut into runs of a few characters, and
+	a short run is a term of many other templates' events. A hash with no run of two characters holding
+	a letter or a digit was selected by its first run, often "~" alone, which Splunk indexes for every
+	compact event whose hash starts with a breaker or with '-' (a negative value). Measured on Splunk
+	Enterprise 10.4.3 over CloudTrail (5,895 templates, 105,093 compact events): the word AccessDenied,
+	carried by 1,078 templates, selected 82,713 compact events, 80,277 of them through the one
+	template selected by TERM(~), against 6,399 events of the 1,078 templates. Splunk's index finds a
+	phrase by the terms in it and then checks the phrase in the event's text, so "~<hash>" keeps the
+	events of that template (and of a hash that differs only in letter case: the search after the
+	expansion removes those).
+	"""
+	if "*" not in dml_hash:
+		return '"~%s"' % dml_hash
+	prefix = dml_hash.split("*", 1)[0]
+	parts = (['"~%s"' % prefix] if prefix else []) + ["TERM(%s)" % run for run in hash_runs(dml_hash)]
+	if not parts:
+		return "TERM(%s)" % hash_term(dml_hash)
+	return parts[0] if len(parts) == 1 else "(%s)" % " ".join(parts)
+
+
 def hash_term(dml_hash):
 	"""
 	The term that selects the compact events of a template, as TERM(<term>): one run of
@@ -1417,8 +1459,11 @@ def dictionary_search(pieces, formats=False, hours=None):
 		' | eval segs=split(replace(replace(replace("~" . dml_hash, "--|%[0-9A-Fa-f]{2}", " "),'
 		' "(?<=\\*)[^ !;<>{}|&?+\\[\\]*,()\'\\"]+(?=\\*)", " "), "[ !;<>{}|&?+\\[\\]*,()\'\\"]", " "), " ")'
 		' | eval cand=mvfilter(len(segs) >= 2 AND match(segs, "[\\p{L}\\p{N}]"))'
-		' | eval best=substr(mvindex(mvsort(mvmap(cand, printf("%03d", len(cand)) . cand)), -1), 4)'
-		' | eval h="TERM(" . coalesce(best, mvindex(segs, 0)) . ")"'
+		' | eval best=substr(mvindex(mvsort(mvmap(cand, printf("%03d", len(cand)) . cand)), -1), 4), cand=mvdedup(cand),'
+		' tenx_pre=replace(dml_hash, "\\*[\\s\\S]*$", "")'
+		' | eval tenx_sel=mvappend(if(len(tenx_pre) > 0, "\\"~" . tenx_pre . "\\"", null()), mvmap(cand, "TERM(" . cand . ")"))'
+		' | eval h=case(NOT match(dml_hash, "\\*"), "\\"~" . dml_hash . "\\"", mvcount(tenx_sel) > 1, "(" . mvjoin(tenx_sel, " ") . ")",'
+		' mvcount(tenx_sel) == 1, tenx_sel, true(), "TERM(" . coalesce(best, mvindex(segs, 0)) . ")")'
 		' | stats ' + counts + (', values(tenx_fk) as tenx_formats' if formats else '')
 	)
 
@@ -1471,9 +1516,15 @@ def hour_of(t):
 	return int(t) // 3600
 
 
+# The form of the kept answers' clauses: an answer kept by a version that wrote other clauses (one run of the
+# hash, before hash_selector()) is under another key, so it is never read back, and the next search for the
+# piece reads every record again.
+CACHE_FORM = "s"
+
+
 def cache_key(piece):
 	"""The tenx_dict_cache key of a piece (a-z, 0-9 and '*', so '*' -> '-' is one to one)."""
-	return "p_" + piece.replace("*", "-")
+	return "p" + CACHE_FORM + "_" + piece.replace("*", "-")
 
 
 def cache_keys(pieces, formats=False):
@@ -1956,10 +2007,15 @@ def raw_history_probe(record, before):
 def word_index_probe(before):
 	"""
 	The tstats that finds, by index, host and source, compact events (`tenx-events`) in the search's range
-	that hold no word term. Every compact event starts with ~ and its template hash, which segmentation
-	indexes as a term starting with ~; a group with more events than events holding such a term was
-	indexed without words (SEGMENTATION = none on the compact sourcetype, its source or host), so a word
-	prefilter cannot find its events. Restricted to the indexes written before the macro (`before`).
+	indexed without words. Every compact event starts with ~ and its template hash, which segmentation
+	indexes as a term starting with ~; a group that has events and none holding such a term was indexed
+	without words (SEGMENTATION = none on the compact sourcetype, its source or host), so a word prefilter
+	cannot find its events. A group whose events are only partly without such a term is not one: an event
+	the sender passed whole (text that is not compact, beside compact ones) holds words but no term
+	starting with ~, and counted against every event of the group, three such events among 105,090
+	compact CloudTrail events made the group read whole (Splunk Enterprise 10.4.3). A group indexed partly
+	with words and partly without (the setting changed while it was being indexed) is therefore not
+	found. Restricted to the indexes written before the macro (`before`).
 	"""
 	quote = lambda v: '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
 	named = named_indexes(before)
@@ -1967,7 +2023,7 @@ def word_index_probe(before):
 	return ("| tstats count where %s`tenx-events` by index, host, source | eval tenx_w=0 | append [| tstats count "
 			"where %s`tenx-events` TERM(~*) by index, host, source | eval tenx_w=1] | stats sum(eval(if(tenx_w==0, "
 			"count, 0))) as tenx_all, sum(eval(if(tenx_w==1, count, 0))) as tenx_words by index, host, source "
-			"| where tenx_all > tenx_words" % (where, where))
+			"| where tenx_all > 0 AND tenx_words == 0" % (where, where))
 
 
 def word_index_branch(rows, most=200):
