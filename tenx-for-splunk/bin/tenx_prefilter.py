@@ -55,13 +55,7 @@ text.
 """
 import json
 import os
-import re
-import ssl
 import sys
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
 
 
 APP_NAME = 'tenx-for-splunk'
@@ -70,7 +64,19 @@ apphome = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.append(os.path.join(apphome, 'bin'))
 sys.path.append(os.path.join(apphome, 'lib'))
 
-from splunklib.searchcommands import dispatch, Configuration, GeneratingCommand
+import tenx_chunked
+
+# Two of the three starts of this command per search only ask for its settings; they end here, before the imports below.
+INFO = tenx_chunked.answer_getinfo() if __name__ == "__main__" else None
+if __name__ == "__main__" and INFO is None:
+	sys.exit(0)
+
+import re
+import ssl
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 
 import tenx_prefilter_parser as parser
 import tenx_replay_plan as replay_plan
@@ -89,6 +95,19 @@ SUBSEARCH_SID = re.compile(r"^subsearch_(.+)_\d+\.\d+$")
 UNREAD = object()
 
 
+_tls_context = None
+
+
+def tls_context():
+	"""The TLS context of every request to splunkd: the certificate is not checked, so no CA store is loaded."""
+	global _tls_context
+	if _tls_context is None:
+		_tls_context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+		_tls_context.check_hostname = False
+		_tls_context.verify_mode = ssl.CERT_NONE
+	return _tls_context
+
+
 def dictionary_failed(result):
 	"""
 	The first message of a oneshot answer that means its rows cannot be trusted as complete: an
@@ -103,21 +122,17 @@ def dictionary_failed(result):
 	return None
 
 
-@Configuration()
-class TenxPrefilterCommand(GeneratingCommand):
+class TenxPrefilterCommand(tenx_chunked.GeneratingCommand):
 
 	def _rest(self, path, data=None, answer=True, method=None):
 		"""splunkd REST as the searching user: the JSON answer, its text (answer="text"), or None."""
 		info = self._metadata.searchinfo
-		context = ssl.create_default_context()
-		context.check_hostname = False
-		context.verify_mode = ssl.CERT_NONE
 		request = urllib.request.Request(
 			info.splunkd_uri + path,
 			data=urllib.parse.urlencode(data).encode() if data else None,
 			method=method or ("POST" if data else "GET"),
 			headers={"Authorization": "Splunk " + info.session_key})
-		with urllib.request.urlopen(request, context=context, timeout=60) as response:
+		with urllib.request.urlopen(request, context=tls_context(), timeout=60) as response:
 			body = response.read().decode("utf-8", "replace")
 			return body if answer == "text" else json.loads(body) if answer else None
 
@@ -409,14 +424,11 @@ class TenxPrefilterCommand(GeneratingCommand):
 	def _kv(self, path, records=None):
 		"""The prefilter's KV store reads and writes as the searching user: JSON in, JSON out."""
 		info = self._metadata.searchinfo
-		context = ssl.create_default_context()
-		context.check_hostname = False
-		context.verify_mode = ssl.CERT_NONE
 		request = urllib.request.Request(
 			info.splunkd_uri + path, data=json.dumps(records).encode() if records is not None else None,
 			method="POST" if records is not None else "GET",
 			headers={"Authorization": "Splunk " + info.session_key, "Content-Type": "application/json"})
-		with urllib.request.urlopen(request, context=context, timeout=60) as response:
+		with urllib.request.urlopen(request, context=tls_context(), timeout=60) as response:
 			return json.loads(response.read().decode() or "null")
 
 	def _written_in(self, hours):
@@ -532,4 +544,5 @@ class TenxPrefilterCommand(GeneratingCommand):
 		yield {"search": prefilter if prefilter == EVERY_EVENT else self._without_words(prefilter)}
 
 
-dispatch(TenxPrefilterCommand, sys.argv, sys.stdin, sys.stdout, __name__)
+if __name__ == "__main__":
+	tenx_chunked.run(TenxPrefilterCommand, INFO)
