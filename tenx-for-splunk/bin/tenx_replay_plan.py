@@ -483,8 +483,8 @@ def needed_fields(search, parser):
 		return None
 
 
-# What a search that runs `txf(<sourcetype>)` once stores when it reads no event type and no tag
-# (tags_skipped()): the field the tenx-replay-tags macro tests before it runs `typer` and `tags`.
+# What a search that runs `txf` or `txf(<sourcetype>)` once stores when it reads no event type and no tag
+# (needed_fields(), tags_skipped()): the field tenx-replay-tags tests before it runs `typer` and `tags`.
 NOTAGS = PREFIX + "notags"
 TXF_UNIT = re.compile(r"^`txf\([^`()]*\)`$")
 

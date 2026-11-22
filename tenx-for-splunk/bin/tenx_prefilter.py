@@ -296,9 +296,10 @@ class TenxPrefilterCommand(GeneratingCommand):
 		"""
 		For a search running plain `txf` once: which rules of the field replay it reads, as the fields the
 		replay step puts on its events (tenx_replay_plan.plan_value), from the rule table tenxreplay wrote
-		with the macro ([tenx:plan] in tenx_replay.conf, read from disk). None, and the whole replay runs,
-		when that cannot be told (tenx_replay_plan.needed_fields), when Splunk keeps the search's events
-		(statusBuckets above 0, verbose mode: every field of them is shown), or when there is no table.
+		with the macro ([tenx:plan] in tenx_replay.conf, read from disk), and NOTAGS; NOTAGS alone, and the
+		whole replay runs, when no table or rule set applies. None, and the whole replay runs with event
+		types and tags, when what the search reads cannot be told (tenx_replay_plan.needed_fields) or when
+		Splunk keeps the search's events (statusBuckets above 0, verbose mode: every field is shown).
 		"""
 		try:
 			job = getattr(self, "job", None) or {}
@@ -315,7 +316,9 @@ class TenxPrefilterCommand(GeneratingCommand):
 			stanzas = parser.conf_stanzas([os.path.join(apphome, d, "tenx_replay.conf") for d in ("default", "local")])
 			before = self.before[0] if getattr(self, "before", None) else None
 			present = replay_plan.searched_sourcetypes(stanzas, replay_plan.bounding_indexes(before, parser))
-			return replay_plan.plan_value(replay_plan.read_table(stanzas.get(PLAN_STANZA) or {}), needed, present)
+			value = replay_plan.plan_value(replay_plan.read_table(stanzas.get(PLAN_STANZA) or {}), needed, present)
+			# needed_fields() is None for a search that reads an event type or a tag
+			return replay_plan.NOTAGS if value is None else value + " " + replay_plan.NOTAGS
 		except Exception as e:
 			self.logger.info("tx: no replay plan: %s", e)
 			return None

@@ -1360,7 +1360,7 @@ def build(stanzas, present, lookup_fields=None, keep_fields=(), all_shared=True,
 	replay.warnings[:] = sorted(set(replay.warnings))
 
 	if with_tags:
-		steps.append(tags_block() if sel is None else every_rule([tags_block()]))
+		steps.append(tags_block() if sel is None else every_rule(list(TAGS_STEPS)))
 	steps.append(block(AS_READ, ['eval %s=if(isnotnull(%s) AND isnotnull(%s), 1, %s)' % (AS_IS, HIDE, AS_READ, AS_IS)]))
 	# tenx_rst and AS_IS stay: the search rewrite reads them after the macro. Callers remove them.
 	steps.append('fields - tenx_go*')
@@ -1377,6 +1377,24 @@ def generation(steps, rules):
 	return hashlib.md5((' | '.join(steps) + json.dumps(rules, sort_keys=True)).encode('utf-8')).hexdigest()[:8]
 
 
+def plan_switch(on, off):
+	"""
+	A subsearch that gives a command the argument `off` when the running search's plan holds
+	tenx_replay_plan.NOTAGS (it reads no event type and no tag), and `on` otherwise. Splunk fixes a
+	search's commands before any subsearch runs, so the plan can change their arguments only.
+	"""
+	return ('[| makeresults | addinfo | eval p=replace(info_sid, "^subsearch_(.+)_\\d+\\.\\d+$", "\\1") | where '
+			'p!=info_sid AND NOT match(p, "^nested_") | map maxsearches=1 search="| rest /services/search/jobs/$p$ '
+			'splunk_server=local | fields custom.tenx_replay_plan" | appendpipe [stats count | where count=0] | eval '
+			'search=if(match(\'custom.tenx_replay_plan\', "^tenx_nd[A-Za-z0-9_ ]+$") AND match(\'custom.tenx_replay_plan\', '
+			'"(^| )%s( |$)"), "%s", "%s") | fields search]' % (plan.NOTAGS, off, on))
+
+
+# The event type typer is given when the plan closes the tags step. No event type has this name, so typer loads
+# none; otherwise it loads every event type when the search starts, whether or not it runs on an event.
+NO_EVENT_TYPE = 'tenx_no_event_type'
+
+
 def tags_block():
 	"""
 	Event types and tags, recomputed on the replayed events (tenx_rst set); in a chunk that also
@@ -1386,7 +1404,7 @@ def tags_block():
 	return block(ANY, [
 		'eval tenx_rk_et=if(isnull(%s), eventtype, null()), tenx_rk_tag=if(isnull(%s), tag, null())' % (RST, RST),
 		'foreach tag::* [eval "tenx_rk_<<FIELD>>"=if(isnull(%s), \'<<FIELD>>\', null())]' % RST,
-		'typer',
+		'typer ' + plan_switch('', 'eventtypes=' + NO_EVENT_TYPE),
 		'tags',
 		# Inside a foreach body, tags writes each tag::<field> but not the combined tag field
 		# (measured: 0 events had tag inside the block, 786 with the same steps outside it), so
@@ -1400,12 +1418,10 @@ def tags_block():
 
 # The shipped `tenx-replay-tags` macro (default/macros.conf; a test keeps the two equal): event
 # types and tags of every replayed event, once, after the units of a search (txf(<sourcetype>),
-# the search rewrite). It does nothing on a chunk without a replayed event.
+# the search rewrite). It does nothing on a chunk without a replayed event, or on events that carry
+# tenx_ndnotags (tenx_replay_plan.NOTAGS, put there by tenx-replay-plan).
 TAGS_MACRO = 'tenx-replay-tags'
-# A txf(<sourcetype>) search that reads no event type and no tag carries tenx_ndnotags (the prefilter's plan,
-# tenx_replay_plan.NOTAGS, put on its events by tenx-replay-plan), and the step leaves them out. The search
-# rewrite never sets it.
-TAGS_STEPS = ('eval %s=if(isnotnull(%s) AND isnull(tenx_ndnotags),1,null())' % (ANY, RST), tags_block(), 'fields - %s' % ANY)
+TAGS_STEPS = ('eval %s=if(isnotnull(%s) AND isnull(%s),1,null())' % (ANY, RST, plan.NOTAGS), tags_block(), 'fields - %s' % ANY)
 
 
 NARROWING_STANZA = 'tenx:narrowing'
@@ -1894,10 +1910,10 @@ def no_op_unit():
 	return build([], [], only=True)
 
 
-def compose_units(sourcetypes):
+def compose_units(sourcetypes, tags=True):
 	"""
 	The search rewrite's replay for some original sourcetypes: their units in turn, then
-	`tenx-replay-tags`. A unit sets tenx_rst on its own events and clears it on every other, so
+	`tenx-replay-tags` unless `tags` is False. A unit sets tenx_rst on its own events and clears it on every other, so
 	the value an earlier unit set is kept in tenx_rprev across the next and put back after it;
 	while tenx_rst is clear, an event is left alone by every step of a unit, and is hidden from
 	its extract by tenx_hide_others (which only the rewrite sets).
@@ -1908,8 +1924,13 @@ def compose_units(sourcetypes):
 		parts += ['eval tenx_rprev=%s' % RST, '`%s`' % unit_macro(st), 'eval %s=coalesce(%s, tenx_rprev)' % (RST, RST)]
 	if len(sts) > 1:
 		parts.append('fields - tenx_rprev')
-	parts.append('`%s`' % TAGS_MACRO)
+	if tags:
+		parts.append('`%s`' % TAGS_MACRO)
 	return ' | '.join(parts)
+
+
+# The search rewrite's `tenx-replay` for a search that reads no event type and no tag: its tags step closed.
+FULL_WITHOUT_TAGS = 'eval %s=1 | %s | fields - %s' % (plan.NOTAGS, FULL, plan.NOTAGS)
 
 
 def chained_commands(counts):
@@ -1931,7 +1952,7 @@ def _index_regex(pattern):
 	return re.compile('^' + '.*'.join(re.escape(p) for p in pattern.lower().split('*')) + '$')
 
 
-def rewrite_replay(covered, indexes):
+def rewrite_replay(covered, indexes, tags=True):
 	"""
 	The replay steps for the search rewrite, or None for none, which leaves the rewrite without
 	any replay step.
@@ -1940,6 +1961,7 @@ def rewrite_replay(covered, indexes):
 	          when tenx_replay.conf could not be read.
 	indexes   the index values the search names (TenxSearchAstNode.get_passing_specifiers():
 	          [] for none, None when it cannot tell, wildcards allowed).
+	tags      False for a search that reads no event type and no tag: no tags step runs.
 
 	Unreadable: `tenx-replay`, which replays whatever the install has (and is the shipped
 	extract alone where nothing carries tenx_sourcetype). No covered sourcetype: none. No index
@@ -1956,6 +1978,14 @@ def rewrite_replay(covered, indexes):
 	no replay, can. So an index the record does not know never gets less than `tenx-replay`, on an
 	install where any compact event carries tenx_sourcetype.
 	"""
+	replay = _rewrite_replay(covered, indexes, tags)
+	if tags or replay is None:
+		return replay
+	return FULL_WITHOUT_TAGS if replay == FULL else replay
+
+
+def _rewrite_replay(covered, indexes, tags):
+	"""rewrite_replay() without the steps of a search that reads no event type and no tag."""
 	if covered is None:
 		return FULL
 	sts = sorted(st for st in covered if usable_sourcetype(st))
@@ -2005,7 +2035,7 @@ def rewrite_replay(covered, indexes):
 	counts = [_recorded_commands(covered[st] if isinstance(covered[st], dict) else {}) for st in chosen]
 	if None in counts or chained_commands(counts) > REPLAY_MAX_COMMANDS:
 		return FULL
-	return compose_units(chosen)
+	return compose_units(chosen, tags)
 
 
 # Settings of the field replay in tenx_config.conf [config]; see README/tenx_config.conf.spec.

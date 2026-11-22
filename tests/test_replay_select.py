@@ -366,11 +366,11 @@ class TestTheModel:
 				assert g.get('ftnt_action') == w.get('ftnt_action')
 
 	def test_units_and_the_unselected_macro_carry_no_guard(self):
-		assert 'tenx_nd' not in b.build(STANZAS, PRESENT, LOOKUPS).spl()
+		assert 'foreach tenx_nd' not in b.build(STANZAS, PRESENT, LOOKUPS).spl()
 		assert b.build(STANZAS, PRESENT, LOOKUPS).selection is None
 		cov = b.coverage([('fw:traffic', '/var/fw/a.log', 'fw-1', 5, 'fw')])
 		units = b.build_units(STANZAS, cov, ['fw:traffic'], LOOKUPS)
-		assert 'tenx_nd' not in units['fw:traffic'].spl()
+		assert 'tenx_nd' not in units['fw:traffic'].spl() and 'typer' not in units['fw:traffic'].spl()
 
 	def test_commands_at_the_top_level_grow_by_two(self):
 		plain, guarded = b.build(STANZAS, PRESENT, LOOKUPS).spl(), selected().spl()
@@ -496,7 +496,7 @@ def store(search, job=None, table=PLAN_TABLE, fail=False):
 class TestThePrefilterStoresThePlan:
 	def test_a_search_that_reads_one_field(self):
 		out = store('search index=fw `txf` dest_ip=10.0.0.1 | stats count')
-		assert out['stored'] == [{'custom.tenx_replay_plan': 'tenx_ndm0a1b2c3d tenx_nd0a1b2c3d_1_'}]
+		assert out['stored'] == [{'custom.tenx_replay_plan': 'tenx_ndm0a1b2c3d tenx_nd0a1b2c3d_1_ tenx_ndnotags'}]
 		assert out['warnings'] == []
 
 	def test_with_a_word_plan_in_one_request(self):
@@ -516,8 +516,9 @@ class TestThePrefilterStoresThePlan:
 		assert store('search index=fw `txf` dest_ip=10.0.0.1 | stats count', job)['stored'] == []
 
 	@pytest.mark.parametrize('table', [{}, {'tenx:plan': {'generation': 'x', 'rules': '[]'}}])
-	def test_none_without_a_table(self, table):
-		assert store('search index=fw `txf` dest_ip=10.0.0.1 | stats count', table=table)['stored'] == []
+	def test_without_a_table_only_event_types_and_tags_are_left_out(self, table):
+		stored = store('search index=fw `txf` dest_ip=10.0.0.1 | stats count', table=table)['stored']
+		assert stored == [{'custom.tenx_replay_plan': plan.NOTAGS}]
 
 	@pytest.mark.parametrize('search', ['search index=fw `txf` dest_ip=10.0.0.1',
 										'search index=fw `tx` dest_ip=10.0.0.1 | stats count',
@@ -565,13 +566,13 @@ class TestThePlanClosesOverTheSearchedSourcetypes:
 
 	def test_the_prefilter_stores_the_plan_of_those_sourcetypes(self):
 		out = store('search index=ct `txf` dest=a | stats count', table=RECORDED)
-		assert out['stored'] == [{'custom.tenx_replay_plan': 'tenx_ndm0a1b2c3d tenx_nd0a1b2c3d_1_3_'}]
+		assert out['stored'] == [{'custom.tenx_replay_plan': 'tenx_ndm0a1b2c3d tenx_nd0a1b2c3d_1_3_ tenx_ndnotags'}]
 
 	@pytest.mark.parametrize('search', ['search index=ct OR host=x `txf` dest=a | stats count',
 										'search index=other `txf` dest=a | stats count',
 										'search index=ct OR index=win `txf` dest=a | stats count'])
 	def test_the_whole_replay_where_another_sourcetype_can_be_read(self, search):
-		assert store(search, table=RECORDED)['stored'] == []
+		assert store(search, table=RECORDED)['stored'] == [{'custom.tenx_replay_plan': plan.NOTAGS}]
 
 
 class TestTxfOfASourcetypeLeavesOutTagsNoOneReads:
@@ -617,6 +618,26 @@ class TestTxfOfASourcetypeLeavesOutTagsNoOneReads:
 			if os.path.basename(f) in ('tenx_replay_plan.py', 'tenx_replay_builder.py'):
 				continue
 			assert 'ndnotags' not in open(f).read(), f
+
+	def test_the_plan_gives_typer_its_event_types(self):
+		assert 'typer ' + b.plan_switch('', 'eventtypes=tenx_no_event_type') in macros().get('tenx-replay-tags', 'definition')
+		switch = b.plan_switch('ON', 'OFF')
+		# the same read of the plan as tenx-replay-plan, and the flag only when the plan is field names
+		plan_step = macros().get('tenx-replay-plan', 'definition')
+		assert switch[:switch.index('| fields custom.tenx_replay_plan')] in plan_step
+		test = re.search(r'eval search=if\((.*), "OFF", "ON"\)', switch).group(1)
+		assert test == ('match(\'custom.tenx_replay_plan\', "^tenx_nd[A-Za-z0-9_ ]+$") AND '
+						'match(\'custom.tenx_replay_plan\', "(^| )tenx_ndnotags( |$)")')
+		for value, off_ in (('tenx_ndnotags', True), ('tenx_ndm0a1b2c3d tenx_nd0a1b2c3d_1_ tenx_ndnotags', True),
+							('tenx_ndm0a1b2c3d tenx_nd0a1b2c3d_1_', False), ('tenx_ndnotagsx', False),
+							('tenx_ndnotags | delete', False), ('', False)):
+			got = bool(re.match(r"^tenx_nd[A-Za-z0-9_ ]+$", value)) and bool(re.search(r"(^| )tenx_ndnotags( |$)", value))
+			assert got == off_, value
+
+	def test_the_tags_step_of_plain_txf_is_closed_the_same_way(self):
+		assert plan.NOTAGS == 'tenx_ndnotags'
+		spl = selected().spl()
+		assert 'foreach tenx_ndall* fieldstr="@@TENXN@@" matchstr="@@TENXO@@" [' + ' | '.join(b.TAGS_STEPS) + ']' in spl
 
 
 def macros():
@@ -725,3 +746,33 @@ class TestSourceAndHostTestsInOnePattern:
 		assert seen == []
 		model.run(b.build(STANZAS, PRESENT, LOOKUPS).spl(), [replayed('fw:traffic', source='/var/fw/a.log')])
 		assert len(seen) == 1
+
+
+# ---------------------------------------------------------------------------------------------------------
+# The search rewrite leaves out event types and tags a compiled search does not read
+# ---------------------------------------------------------------------------------------------------------
+
+class TestTheRewriteLeavesOutTagsNoOneReads:
+	COVERED = {'aws:cloudtrail': {'indexes': 'ct', 'unit': b.unit_macro('aws:cloudtrail'), b.COMMANDS_KEY: '17'},
+			   'k8s:container:json': {'indexes': 'otel', 'unit': b.unit_macro('k8s:container:json'), b.COMMANDS_KEY: '13'}}
+
+	def test_the_replay_of_a_search_that_reads_no_tag(self):
+		unit = '`%s`' % b.unit_macro('aws:cloudtrail')
+		assert b.rewrite_replay(self.COVERED, ['ct']) == unit + ' | `tenx-replay-tags`'
+		assert b.rewrite_replay(self.COVERED, ['ct'], tags=False) == unit
+		assert b.rewrite_replay(self.COVERED, None, tags=False) == (
+			'eval tenx_ndnotags=1 | `tenx-replay` | fields - tenx_ndnotags')
+		assert b.rewrite_replay({}, ['ct'], tags=False) is None
+
+	@pytest.mark.parametrize('leading, rest, unread', [
+		('index=ct sourcetype=tenx_encoded eventName=DeletePolicy', ['rename user_name as user', 'stats count by dest user'], True),
+		('index=ct sourcetype=tenx_encoded tag=authentication', ['stats count'], False),
+		('index=ct sourcetype=tenx_encoded', ['stats count by eventtype'], False),
+		('index=ct sourcetype=tenx_encoded', ['stats values(*) as *'], False),
+		('index=ct sourcetype=tenx_encoded eventName=ConsoleLogin', [], False),
+		('index=ct sourcetype=tenx_encoded x', ['`some_macro`', 'stats count'], False)])
+	def test_what_the_search_reads(self, leading, rest, unread):
+		import tenx_search_builder as sb
+		commands = [sb.TenxSplCommand({'command': c.split(' ', 1)[0], 'rawargs': c.split(' ', 1)[1] if ' ' in c else ''}, {})
+					for c in rest]
+		assert sb.tags_unread({'command': 'search', 'rawargs': leading}, commands) is unread
