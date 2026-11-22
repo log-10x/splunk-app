@@ -117,17 +117,18 @@ def _outside_quotes(text):
 def expression_fields(expr):
 	"""
 	Every field an eval expression can read, taken widely: each name outside double-quoted strings
-	(function names and keywords included, which only widens it) and each 'single-quoted' name. Unknown
-	for searchmatch(), which reads fields named inside a string, and for braces (a field named by a value).
+	(function names and keywords included, which only widens it) and each 'single-quoted' name, braces
+	included ('items{}.name' is a JSON path). Unknown for searchmatch(), which reads fields named inside
+	a string, and for braces outside quotes (a field named by a value).
 	"""
 	text = str(expr or "")
 	if re.search(r"searchmatch\s*\(", text, re.I):
 		raise Unknown("searchmatch")
 	bare = _outside_quotes(text)
-	if "{" in bare or "}" in bare:
-		raise Unknown("a field named by a value")
 	found = set(re.findall(r"'([^']*)'", bare))
 	bare = re.sub(r"'[^']*'", " ", bare)
+	if "{" in bare or "}" in bare:
+		raise Unknown("a field named by a value")
 	found.update(IDENT.findall(bare))
 	return found
 
