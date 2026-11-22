@@ -507,15 +507,19 @@ class TenxReplayCommand(GeneratingCommand):
 		if definition != replay.spl():
 			self._rest(self._ns('configs/conf-macros/%s' % urllib.parse.quote(MACRO, safe='')), {'definition': replay.spl()})
 			changed.append(MACRO)
-		for st, info in replay.per_sourcetype.items():
+		infos = self._recorded_infos(replay, units or {}, failed)
+		for st, info in infos.items():
 			seen = cov.get(st)
 			want = {'computed_fields': ','.join(info['computed']), 'aliased_fields': ','.join(info['aliased']),
 					'masked_at_index_time': ', '.join(info.get('masking', [])),
 					'sources': builder.listed_value(seen['sources']) if seen else builder.sources_value(info['sources']),
-					'last_seen': str(last_seen[st])}
+					'last_seen': str(last_seen[st]), builder.LEFT_OUT_KEY: self._left_out(st, replay, units or {})}
 			if seen:
 				want.update(hosts=builder.listed_value(seen['hosts']), indexes=builder.listed_value(seen['indexes']),
 							unit='' if st in failed else builder.unit_macro(st))
+				# The unit's size, which keeps the search rewrite's chain of units within Splunk's command limit.
+				want[builder.COMMANDS_KEY] = ('' if st in failed or st not in (units or {}) else
+											  str(builder.top_level_commands(units[st].spl())))
 			have = existing.get(st)
 			if have is None:
 				self._rest(self._ns('configs/conf-%s' % CONF), dict(want, name=st))
@@ -524,7 +528,8 @@ class TenxReplayCommand(GeneratingCommand):
 			elif any(have.get(k, '') != v for k, v in want.items()):
 				self._rest(self._ns('configs/conf-%s/%s' % (CONF, urllib.parse.quote(st, safe=''))), want)
 				changed.append(st)
-				if any(k in want and have.get(k, '') != want[k] for k in ('indexes', 'unit')):
+				if any(k in want and have.get(k, '') != want[k] for k in ('indexes', 'unit', builder.LEFT_OUT_KEY,
+																		  builder.COMMANDS_KEY)):
 					self.rewrite_changed.append(st)
 		if nocarrier is not None:
 			moved = self._write_nocarrier(existing.get(builder.NOCARRIER_STANZA), nocarrier)
@@ -547,12 +552,31 @@ class TenxReplayCommand(GeneratingCommand):
 				{'fields_not_in_text': want})
 			changed.append(builder.NARROWING_STANZA)
 		for st in existing:
-			if st not in replay.per_sourcetype and st not in ('default', builder.NARROWING_STANZA, builder.RETIRED_STANZA,
+			if st not in infos and st not in ('default', builder.NARROWING_STANZA, builder.RETIRED_STANZA,
 															  builder.NOCARRIER_STANZA):
 				self._rest(self._ns('configs/conf-%s/%s' % (CONF, urllib.parse.quote(st, safe=''))), method='DELETE')
 				changed.append('-' + st)
 				self.rewrite_changed.append('-' + st)
 		return changed
+
+	@staticmethod
+	def _recorded_infos(replay, units, failed=()):
+		"""
+		{original sourcetype: what its tenx_replay.conf stanza records} for every sourcetype the macro
+		replays or that has a unit (or a unit that did not run): the macro's own entry where it has one,
+		else the unit's.
+		"""
+		infos = dict((st, info) for st in units for s, info in units[st].per_sourcetype.items() if s == st)
+		for st in failed:
+			infos.setdefault(st, {'stanzas': [], 'aliases': 0, 'calculated': 0, 'lookups': 0, 'computed': [], 'aliased': [],
+								  'masking': [], 'sources': [], 'warnings': ['its unit does not run']})
+		infos.update(replay.per_sourcetype)
+		return infos
+
+	@staticmethod
+	def _left_out(st, replay, units):
+		"""The LEFT_OUT_KEY value of `st` (tenx_replay_builder.left_out_value)."""
+		return builder.left_out_value(st in replay.per_sourcetype, getattr(units.get(st), 'replays_nothing', False))
 
 	def _recompile_alerts(self):
 		"""
@@ -658,22 +682,25 @@ class TenxReplayCommand(GeneratingCommand):
 		last_seen = builder.last_seen_of(present, covered, now)
 		replay = builder.build_capped(stanzas, present, lookups, keep, settings, last_seen, transforms=transforms,
 									  keep_by_sourcetype=keep_by_st)
+		# Every covered sourcetype gets a unit, including those replay_max_macro_chars leaves out of the
+		# macro: their units are what txf(<sourcetype>) and the search rewrite replay them with.
+		unit_sts = builder.unit_sourcetypes(present, last_seen, settings)
 		units, failed = {}, set()
-		if replay.per_sourcetype:
+		if unit_sts:
 			# Check every rule against this Splunk before writing, so one rule it cannot run
 			# is left out (and named in the log) instead of failing every `tx` search.
 			try:
 				bad_lookups = self._lookup_problems()
 				replay = builder.build_capped(stanzas, present, lookups, keep, settings, last_seen,
 											  bad_lookups=bad_lookups, transforms=transforms, keep_by_sourcetype=keep_by_st)
-				units = builder.build_units(stanzas, cov, replay.per_sourcetype, lookups, keep, settings,
+				units = builder.build_units(stanzas, cov, unit_sts, lookups, keep, settings,
 											bad_lookups=bad_lookups, transforms=transforms, keep_by_sourcetype=keep_by_st)
 				rejected = builder.failing_rules(builder.all_rules(replay, units), self._dry_run)
 				if rejected:
 					replay = builder.build_capped(stanzas, present, lookups, keep, settings, last_seen,
 												  rejected=rejected, bad_lookups=bad_lookups, transforms=transforms,
 												  keep_by_sourcetype=keep_by_st)
-					units = builder.build_units(stanzas, cov, replay.per_sourcetype, lookups, keep, settings,
+					units = builder.build_units(stanzas, cov, unit_sts, lookups, keep, settings,
 												rejected=rejected, bad_lookups=bad_lookups, transforms=transforms,
 												keep_by_sourcetype=keep_by_st)
 				error = self._dry_run(builder.macro_dry_run(replay))
@@ -725,7 +752,7 @@ class TenxReplayCommand(GeneratingCommand):
 		events = {}
 		for st, _, _, count in present:
 			events[st] = events.get(st, 0) + count
-		for st, info in sorted(replay.per_sourcetype.items()):
+		for st, info in sorted(self._recorded_infos(replay, units, failed).items()):
 			row = {
 				'sourcetype': st,
 				'compact_events': events.get(st, 0),
@@ -745,12 +772,13 @@ class TenxReplayCommand(GeneratingCommand):
 				'indexes': builder.listed_value(cov.get(st, {}).get('indexes', set())),
 				'written': 'yes' if written else ('no change' if self.apply else 'dry run'),
 				'recompile_dispatched': 'yes' if self.dispatched else 'no',
+				'left_out': self._left_out(st, replay, units),
 			}
 			if not self.apply:
 				row['definition'] = replay.spl()
 				row['unit_definition'] = units[st].spl() if st in units else ''
 			yield row
-		if not replay.per_sourcetype:
+		if not self._recorded_infos(replay, units, failed):
 			yield {'sourcetype': '', 'compact_events': 0,
 				   'warnings': ['no compact event in this time range carries %s' % builder.CARRIER_FIELD],
 				   'written': 'yes' if written else 'no change', 'recompile_dispatched': 'yes' if self.dispatched else 'no'}

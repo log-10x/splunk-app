@@ -1520,3 +1520,192 @@ def store_warning(state, now):
 	if status == "loading":
 		return ("tx: Consume KV is still storing templates%s; events that use them stay compact until it has." % after)
 	return None
+
+
+# The record tenxreplay keeps of the original sourcetypes (tenx_replay.conf: one stanza per original
+# sourcetype, with the indexes its compact events were seen in, and LEFT_OUT_KEY), read from the
+# app's own conf files on disk, so the checks below make no REST call to read it.
+RECORD_KEYS = ("indexes", "left_out")
+RAW_EVENTS_MACRO = "`tenx-raw-events`"
+SAFE_TIME = re.compile(r"^[-+@0-9A-Za-z:/.]+$")
+
+
+def conf_stanzas(paths):
+	"""{stanza: {key: value}} of the .conf files `paths`, a later file overriding an earlier one, read from
+	disk; {} when none can be read. Lines are `key = value`; `#` starts a comment line."""
+	out = {}
+	for path in paths:
+		try:
+			with open(path, encoding="utf-8") as f:
+				lines = f.read().splitlines()
+		except (OSError, UnicodeDecodeError):
+			continue
+		current = None
+		for line in lines:
+			text = line.strip()
+			if not text or text.startswith("#"):
+				continue
+			if text.startswith("[") and text.endswith("]"):
+				current = text[1:-1].strip()
+				out.setdefault(current, {})
+			elif current is not None and "=" in text:
+				k, v = text.split("=", 1)
+				out[current][k.strip()] = v.strip()
+	return out
+
+
+def replay_record_on_disk(apphome):
+	"""
+	{original sourcetype: {'indexes': ..., 'left_out': ...}} from tenx_replay.conf on disk (default, then
+	local), without [default] and the tenx:* stanzas. Empty when nothing is recorded: then no compact
+	event carries tenx_sourcetype (or tenxreplay has not run), and the checks below have nothing to go on.
+	"""
+	import os
+	stanzas = conf_stanzas([os.path.join(apphome, d, "tenx_replay.conf") for d in ("default", "local")])
+	return dict((st, dict((k, kv.get(k, "")) for k in RECORD_KEYS)) for st, kv in stanzas.items()
+				if st and st != "default" and not st.startswith("tenx:"))
+
+
+def _listed(value):
+	"""The indexes a record lists: a set of lower-case names, or None for * (any index)."""
+	value = str(value or "").strip()
+	if value == "*":
+		return None
+	return set(v.strip().lower() for v in value.split(",") if v.strip())
+
+
+def _in_indexes(listed, named):
+	"""Whether an index the record lists (`listed`, see _listed) can be one the search names (`named`,
+	wildcards allowed; none named: every index)."""
+	if not named or listed is None:
+		return True
+	return any(fnmatch.fnmatchcase(ix, n.lower()) for ix in listed for n in named)
+
+
+def _names(values, n=3):
+	values = sorted(values)
+	if len(values) <= n:
+		return values[0] if len(values) == 1 else ", ".join(values[:-1]) + " and " + values[-1]
+	return ", ".join(values[:n]) + " and %d more" % (len(values) - n)
+
+
+def replay_left_out(record, macro, indexes):
+	"""
+	The warning of `txf` or txf(<sourcetype>) whose field replay leaves events of a covered sourcetype
+	without its rules, or None. `txf`: the `tenx-replay` macro holds the busiest sourcetypes that fit in
+	replay_max_macro_chars, and the record marks the others left_out=txf; only those recorded in the
+	indexes the search names count. txf(<sourcetype>): that sourcetype's unit is over the same size and
+	replays nothing (left_out has unit). Either way such events get only the fields in their text.
+	"""
+	name = (macro or "").strip("`")
+	if name == "txf":
+		left = [st for st, kv in record.items() if "txf" in str(kv.get("left_out") or "").split(",")
+				and _in_indexes(_listed(kv.get("indexes")), indexes)]
+		if left:
+			return ("txf: the field replay of txf leaves out %s (over replay_max_macro_chars), so %s events get only "
+					"the fields in their text; txf(<sourcetype>) gives them all their fields."
+					% (_names(left), "their" if len(left) > 1 else "its"))
+	elif name.startswith("txf(") and name.endswith(")"):
+		st = name[4:-1].strip()
+		if "unit" in str((record.get(st) or {}).get("left_out") or "").split(","):
+			return ("txf(%s): this sourcetype's field replay is over replay_max_macro_chars and replays nothing, so its "
+					"events get only the fields in their text." % st)
+	return None
+
+
+def raw_history_probe(record, before):
+	"""
+	The tstats that counts, by index and sourcetype, the events of `record`'s original sourcetypes that are
+	not compact and that tenx-raw-events does not name. It reads the indexes their compact events were seen
+	in and those written before the macro (`before`), over the search's time range. None when there is
+	nothing to count, or when the search names a sourcetype before the macro.
+	"""
+	if not record or _specifiers(before, "sourcetype"):
+		return None
+	quote = lambda v: '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
+	named = named_indexes(before)
+	pairs = []
+	for st, kv in sorted(record.items()):
+		listed = _listed(kv.get("indexes"))
+		if not _in_indexes(listed, named):
+			continue
+		ixs = sorted(listed or [])
+		pairs.append("(sourcetype=%s%s)" % (quote(st), (" (%s)" % " OR ".join("index=%s" % quote(i) for i in ixs)) if ixs else ""))
+	if not pairs:
+		return None
+	times = " ".join("%s=%s" % (k, v) for k in ("earliest", "latest") for v in _specifiers(before, k)[:1] if SAFE_TIME.match(v))
+	where = "(%s) " % " OR ".join("index=%s" % quote(i) for i in sorted(named)) if named else ""
+	return "| tstats count where %s%s(%s) NOT tenx_sourcetype=* NOT tenx_mapped=* NOT (%s) by index, sourcetype" % (
+		times + " " if times else "", where, " OR ".join(pairs), RAW_EVENTS_MACRO)
+
+
+def raw_history_message(rows, macro):
+	"""
+	The warning of a `tx` or `txf` search whose indexes hold, in its time range, events of the original
+	sourcetypes of its compact events that are not compact (`rows` of raw_history_probe). Splunk keeps the
+	first 256 characters of a search command's message.
+	"""
+	name = (macro or "`tx`").strip("`").split("(")[0]
+	sts = set(r.get("sourcetype", "") for r in rows if r.get("sourcetype"))
+	ixs = set(r.get("index", "") for r in rows if r.get("index"))
+	return ("%s: %s %s also %s events of %s that are not compact, and this search leaves them out. To return them too, "
+			"name them in the tenx-raw-events macro." % (name, "index" if len(ixs) == 1 else "indexes", _names(ixs, 2),
+														 "holds" if len(ixs) == 1 else "hold", _names(sts)))
+
+
+# The minutes after an install or an upgrade. On a search head with separate indexers the app's template
+# lookup reaches them with the next knowledge bundle; until it has, every `tx` search failed there
+# (Splunk Enterprise 10.4.3, a fresh search head over two indexers: "Error in 'lookup' command: Could not
+# construct lookup 'tenx-dml-lookup' ... does not exist or is not available", no rows, for about a minute
+# after the install). For these minutes tenxprefilter runs LOOKUP_PROBE first, and when the lookup fails
+# on the indexers it keeps the search on the search head (ON_SEARCH_HEAD) and warns instead.
+NEW_VERSION_SECONDS = 900
+PEERS_PATH = "/services/search/distributed/peers?output_mode=json&count=0"
+LOOKUP_PROBE = ("search ((`tenx-events`) OR (`tenx-raw-events`)) | lookup tenx-dml-lookup _key AS tenx_hash OUTPUT _key AS "
+				"tenx_probe | head 1 | fields tenx_probe")
+ON_SEARCH_HEAD = "splunk_server=local"
+NOT_ON_INDEXERS = ("tx: the app's template lookup has not reached the indexers yet; Splunk sends it with the next "
+				   "knowledge bundle, about a minute after the app is installed or upgraded. No event was read: retry "
+				   "in a minute.")
+
+
+def new_version(state, version, now):
+	"""
+	Whether the app may still be on its way to the indexers: the Consume KV record (`state`, None when
+	there is none yet) is absent, was written by another version than `version` (this one, from
+	app.conf), or says this version's first run started less than NEW_VERSION_SECONDS ago.
+	"""
+	if not isinstance(state, dict) or not state:
+		return True
+	if version and str(state.get("version") or "") != version:
+		return True
+	try:
+		return now - float(state.get("version_since")) < NEW_VERSION_SECONDS
+	except (TypeError, ValueError):
+		return False
+
+
+# What says the template lookup is not on the indexers: Splunk's error naming tenx-dml-lookup as one it cannot
+# construct or find (the message measured above). Any other error of the probe is not this one: an add-on's
+# automatic lookup that fails on the probe's events, or the KV store starting on the search head. The search
+# then runs as it would and shows its own error.
+LOOKUP_NAME = "tenx-dml-lookup"
+LOOKUP_MISSING = ("could not construct lookup", "does not exist or is not available")
+
+
+def lookup_failed(result):
+	"""The text of an error of LOOKUP_PROBE's answer that says the template lookup cannot run on the indexers
+	(LOOKUP_NAME with one of LOOKUP_MISSING), or None."""
+	for message in (result or {}).get("messages", []) or []:
+		kind, text = str(message.get("type", "")).upper(), str(message.get("text", ""))
+		low = text.lower()
+		if kind in ("ERROR", "FATAL") and LOOKUP_NAME in low and any(m in low for m in LOOKUP_MISSING):
+			return text[:300]
+	return None
+
+
+# Right after Splunk starts, until its KV store is ready, the read of the Consume KV
+# record answers HTTP 503 "KV Store is initializing" and the template lookup of every `tx`
+# search fails. The search still fails; this says why.
+KV_STARTING = "KV Store is initializing"
+KV_NOT_READY = "tx: the KV store is still starting, so the template lookup cannot run yet; retry in a moment."

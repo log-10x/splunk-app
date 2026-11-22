@@ -1,7 +1,7 @@
 """
 tenxprefilter: the prefilter of the `tx` macro, built once per search.
 
-`tx` expands to `tenx-events` [| tenxprefilter] | `tenx-inflate` | ... | search *, and the words
+`tx` expands to ((`tenx-events`) OR (`tenx-raw-events`)) [| tenxprefilter] | `tenx-inflate` | ... | search *, and the words
 written after `tx` become the arguments of that last search. This command runs in the
 subsearch: it reads the running job's own search text through the REST API, parses the words
 after `tx` (tenx_prefilter_parser), asks the KV store of templates which templates carry each
@@ -26,6 +26,15 @@ find each such word as the index does (tenx_prefilter_parser.wild_marks), and th
 such word replaced by its mark. `tx` and `txf` read them back in the step before their final
 search (macros.conf [tenx-wild]).
 
+It also warns, from the record tenxreplay keeps of the original sourcetypes (tenx_replay.conf), when
+the search reads compact events whose original sourcetype the field replay of `txf` leaves out, and
+when its indexes hold raw events of those sourcetypes, in its time range, that the tenx-raw-events
+macro does not name (`tx` and `txf` then leave them out).
+
+In the minutes after an install or an upgrade, on a search head with search peers, it first checks that
+the template lookup runs on the indexers; until the knowledge bundle that carries it has reached them it
+keeps the search on the search head and says so, where the search otherwise failed with a lookup error.
+
 Every `tx` and `txf` of a search runs this command and reads the same search text. When the text
 holds more than one, the words after the first would choose the compact events of every other one
 (the second arm of a multisearch or union kept too few events), so this command then selects every
@@ -38,6 +47,7 @@ import re
 import ssl
 import sys
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 
@@ -126,6 +136,37 @@ class TenxPrefilterCommand(GeneratingCommand):
 			return None, macro
 		return [r for r in result.get("results", []) if str(r.get("count", "0")) not in ("0", "")], macro
 
+	def _record_checks(self, macro):
+		"""
+		Two warnings from tenxreplay's record of the original sourcetypes (tenx_replay.conf on disk, no
+		REST read). One for `txf` or txf(<sourcetype>) whose field replay leaves events of a covered
+		sourcetype without its rules (tenx_prefilter_parser.replay_left_out). One for indexes that hold raw
+		events of the search's original sourcetypes that tenx-raw-events does not name (raw_history_probe).
+		Nothing when no compact event carries tenx_sourcetype, or when a check cannot run.
+		"""
+		before = self.before[0] if getattr(self, "before", None) else ""
+		record = parser.replay_record_on_disk(apphome)
+		if not record:
+			return
+		note = parser.replay_left_out(record, macro, parser.named_indexes(before))
+		if note:
+			self.write_warning(note)
+		probe = parser.raw_history_probe(record, before)
+		if probe is None:
+			return
+		info = self._metadata.searchinfo
+		try:
+			result = self._rest(
+				"/servicesNS/%s/%s/search/jobs" % (urllib.parse.quote(info.username), APP_NAME),
+				{"search": probe, "exec_mode": "oneshot", "output_mode": "json", "count": "0",
+				 "earliest_time": str(info.earliest_time or "0"), "latest_time": str(info.latest_time or "now")})
+		except Exception as e:
+			self.logger.warning("tx: the raw events check failed: %s", e)
+			return
+		rows = [r for r in result.get("results", []) if str(r.get("count", "0")) not in ("0", "")]
+		if rows:
+			self.write_warning(parser.raw_history_message(rows, macro))
+
 	def _text_field(self):
 		"""
 		Which field comparisons may narrow, or None for none: then no field comparison restricts
@@ -168,17 +209,58 @@ class TenxPrefilterCommand(GeneratingCommand):
 		"""
 		Warns when the template store can lack templates the events need: Consume KV failed, is
 		still loading, or has not run for fifteen minutes (tenx_prefilter_parser.store_warning).
-		One read of one KV record; nothing when it cannot be read.
+		One read of one KV record; nothing when it cannot be read. In the minutes after an install or
+		an upgrade (no record yet, or a new one), also checks that the template lookup runs on the
+		indexers (_lookup_check). Returns False when it does not: the search then reads no indexer.
 		"""
 		try:
-			note = parser.store_warning(self._rest(parser.STORE_STATE_PATH), time.time())
+			state = self._rest(parser.STORE_STATE_PATH)
+		except urllib.error.HTTPError as e:
+			state = None if e.code == 404 else False
+			if e.code == 503 and parser.KV_STARTING in (e.read().decode("utf-8", "replace") or ""):
+				self.write_warning(parser.KV_NOT_READY)
 		except Exception:
-			return
-		if note:
-			self.write_warning(note)
+			state = False
+		if state is not False:
+			note = parser.store_warning(state, time.time())
+			if note:
+				self.write_warning(note)
+			version = parser.conf_setting([os.path.join(apphome, "default", "app.conf")], "launcher", "version")
+			if parser.new_version(state, version, time.time()):
+				return self._lookup_check()
+		return True
+
+	def _lookup_check(self):
+		"""
+		False when this search head has search peers and the template lookup cannot run on them yet
+		(LOOKUP_PROBE, one small search: tenx_prefilter_parser.lookup_failed), with the warning
+		NOT_ON_INDEXERS; True otherwise, and whenever the check cannot run.
+		"""
+		try:
+			if not self._rest(parser.PEERS_PATH).get("entry"):
+				return True
+			info = self._metadata.searchinfo
+			try:
+				result = self._rest(
+					"/servicesNS/%s/%s/search/jobs" % (urllib.parse.quote(info.username), APP_NAME),
+					{"search": parser.LOOKUP_PROBE, "exec_mode": "oneshot", "output_mode": "json", "count": "0",
+					 "earliest_time": str(info.earliest_time or "0"), "latest_time": str(info.latest_time or "now")})
+			except urllib.error.HTTPError as e:
+				result = json.loads(e.read().decode() or "{}")
+		except Exception as e:
+			self.logger.warning("tx: the lookup check failed: %s", e)
+			return True
+		failed = parser.lookup_failed(result)
+		if failed is None:
+			return True
+		self.logger.warning("tx: the template lookup does not run on the indexers yet: %s", failed)
+		self.write_warning(parser.NOT_ON_INDEXERS)
+		return False
 
 	def generate(self):
-		self._store_check()
+		if not self._store_check():
+			yield {"search": parser.ON_SEARCH_HEAD}
+			return
 		try:
 			text = self._search_text()
 		except Exception as e:
@@ -207,6 +289,7 @@ class TenxPrefilterCommand(GeneratingCommand):
 		rows, macro = self._original_sourcetype_rows(tree)
 		if rows:
 			self.error_exit(RuntimeError("original sourcetype"), parser.original_sourcetype_message(rows, macro))
+		self._record_checks(macro)
 		if several:
 			self.write_warning("tx: this search holds more than one tx or txf; every compact event in range is expanded.")
 			yield {"search": EVERY_EVENT}
