@@ -141,6 +141,7 @@ Usage
     tenx_field_map.py gen --records <kv_rows.json | templates.json> [--records ...]
         --target windows-security | windows-security-classic | fortigate | <target.json> [--sourcetype ...] [--rename ...]
         [--addon <add-on dir>] --out <app dir>
+    tenx_field_map.py gen --rules lookup --target ... --out <app dir>        (no --records: before the first event)
     tenx_field_map.py verify --records ... --target ... --encoded <encoded.log> --raw <raw.log>
     tenx_field_map.py gen --rules lookup ... --cap-file <compact cap file> [--splunkd <management URL> --probe-index <index>]
     tenx_field_map.py activate --app <app dir> --cap-file <compact cap file> --splunkd <management URL> --probe-index <index>
@@ -152,6 +153,17 @@ on its own, with no reload and no restart, for streams that are already sending 
 below). `--cap-file` keeps the Receiver's compact cap file to the templates whose row Splunk was seen to
 apply, so an event goes compact only once its fields can be written (see "The engine's compact cap
 file" below); it needs `--rules lookup`.
+
+Before the first event
+----------------------
+A map's rules read whole events of the compact sourcetype as well as compact ones: the parsing settings copied from
+[tenx_encoded], tenx_compact_st, and the original sourcetype. Splunk applies the index-time ones while it indexes an
+event, so an event indexed before the map is installed keeps Splunk's default parsing and the compact sourcetype, and
+`tx` does not find it.
+
+None of these rules depends on the templates, so gen without --records writes the map with them, an empty lookup file
+and the floor app, to install before the first event of the source. A later gen with the records writes the same rules,
+the template rows, and the search-time rules some templates need; activate names any stanza the installed app lacks.
 
 Standard library only.
 """
@@ -4735,7 +4747,7 @@ def _build(args):
 		'leave_out': None if args.leave_out is None else [f for f in args.leave_out.split(',') if f],
 	}
 	target = load_target(args.target, overrides)
-	templates, refused = merge_templates([load_templates(p) for p in args.records])
+	templates, refused = merge_templates([load_templates(p) for p in args.records or ()])
 	keep = None
 	if args.only_hashes_in:
 		keep = set()
@@ -4824,8 +4836,10 @@ def build_parser():
 
 	for mode in ('gen', 'verify'):
 		p = sub.add_parser(mode)
-		p.add_argument('--records', action='append', required=True,
-			help='KV store export (JSON array) or templates.json; repeat to merge')
+		p.add_argument('--records', action='append', required=mode == 'verify',
+			help='KV store export (JSON array) or templates.json; repeat to merge' + ('' if mode == 'verify' else
+				'. Without it, gen writes the map with no template, to install before the first event of the compact '
+				'sourcetype (see "Before the first event")'))
 		p.add_argument('--only-hashes-in', action='append',
 			help='keep only the templates named in this templates.json or KV export')
 		p.add_argument('--target', help='built-in target (%s) or a JSON file' % ', '.join(sorted(TARGETS)))
@@ -5085,6 +5099,9 @@ def _main(args):
 	if args.rules == RULES_LOOKUP and args.floor == 'on':
 		sys.stdout.write('floor app: %s; install it on every instance that parses the compact events\n'
 			% floor_dir(args.out))
+	if not args.records:
+		sys.stdout.write('no templates: install the map before the first event of %s; run gen again with --records once '
+			'its templates are stored\n' % target['sourcetype'])
 	if cap is not None:
 		sys.stdout.write('compact cap: %s\n' % json.dumps(cap))
 		if args.splunkd:
