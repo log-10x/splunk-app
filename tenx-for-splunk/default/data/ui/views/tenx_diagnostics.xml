@@ -140,6 +140,7 @@
         <search>
           <query>`tenx-events`
 | head 5
+| eval tenx_hash=if(isnull(tenx_hash) AND match(_raw, "^~[^,]"), nullif(trim(replace(_raw, "^~([^,]+)[\s\S]*$", "\1")), ""), tenx_hash)
 | table _raw, tenx_hash, tenx_var_0, tenx_vars</query>
           <earliest>1</earliest>
           <latest></latest>
@@ -224,6 +225,7 @@
         <search>
           <query>`tenx-events`
 | head 5
+| eval tenx_hash=if(isnull(tenx_hash) AND match(_raw, "^~[^,]"), nullif(trim(replace(_raw, "^~([^,]+)[\s\S]*$", "\1")), ""), tenx_hash)
 | lookup tenx-dml-lookup _key as tenx_hash OUTPUT pattern
 | eval has_template=if(isnull(pattern), "NO", "YES")
 | table tenx_hash, has_template, pattern</query>

@@ -86,6 +86,8 @@ import tenx_replay_builder as builder
 tenx_util.setup_logger('tenx_replay_command', logging.INFO)
 
 MACRO = 'tenx-replay'
+# The extraction `tx` runs (macros.conf [tenx-extract]).
+TX_EXTRACT = 'tenx-extract'
 CONF = 'tenx_replay'
 # default/savedsearches.conf: rewrites every managed compiled alert whose compiled text changed.
 RECOMPILE_SEARCH = 'Recompile Compiled Alerts'
@@ -509,8 +511,20 @@ class TenxReplayCommand(GeneratingCommand):
 			return []
 		return [builder.PLAN_STANZA]
 
+	def _write_tx_extract(self, definition):
+		"""Writes tenx-extract when its definition changed and it runs cleanly here; returns the names written."""
+		current = self._rest(self._ns('configs/conf-macros/%s' % urllib.parse.quote(TX_EXTRACT, safe='')))
+		if current.get('entry', [{}])[0].get('content', {}).get('definition') == definition:
+			return []
+		error = self._dry_run('| makeresults | eval _raw="x" | %s | stats count' % definition)
+		if error:
+			self.logger.warning("tenxreplay: the %s macro does not run (%s); the previous one is kept", TX_EXTRACT, error)
+			return []
+		self._rest(self._ns('configs/conf-macros/%s' % urllib.parse.quote(TX_EXTRACT, safe='')), {'definition': definition})
+		return [TX_EXTRACT]
+
 	def _write(self, replay, not_in_text, last_seen, narrowing, units=None, cov=None, failed=(), now=None,
-			   settings=None, nocarrier=None):
+			   settings=None, nocarrier=None, tx_extract=None):
 		try:
 			existing = dict((e['name'], e.get('content', {})) for e in
 				self._rest(self._ns('configs/conf-%s?count=0' % CONF)).get('entry', []))
@@ -530,6 +544,8 @@ class TenxReplayCommand(GeneratingCommand):
 			self._rest(self._ns('configs/conf-macros/%s' % urllib.parse.quote(MACRO, safe='')), {'definition': replay.spl()})
 			changed.append(MACRO)
 		changed += self._write_plan(existing.get(builder.PLAN_STANZA), replay.selection)
+		if tx_extract is not None:
+			changed += self._write_tx_extract(tx_extract)
 		infos = self._recorded_infos(replay, units or {}, failed)
 		for st, info in infos.items():
 			seen = cov.get(st)
@@ -764,7 +780,7 @@ class TenxReplayCommand(GeneratingCommand):
 		if self.apply:
 			try:
 				written = self._write(replay, not_in_text, last_seen, builder.narrowing_wanted(config, replay), units, cov,
-									  failed, now, settings, nocarrier)
+									  failed, now, settings, nocarrier, builder.tx_extract(keep_all))
 			except Exception as e:
 				self.logger.exception("tenxreplay: writing the macro failed")
 				self._recompile_alerts()

@@ -145,7 +145,7 @@ WHOLE = 'tenx_gow'
 AS_IS = 'tenx_asis'
 
 
-def extract_steps(as_read=False):
+def extract_steps(as_read=False, indexed=()):
 	"""
 	`extract`, with the events that are not replayed hidden from it when the caller set HIDE.
 	In `txf` (no HIDE) this is the plain `extract` that `tx` runs after `fields - _kv`.
@@ -153,21 +153,68 @@ def extract_steps(as_read=False):
 	as_read: also hide the events marked AS_READ (whole events Splunk read under the sourcetype
 	whose rules they need) when HIDE is not set; with HIDE they are hidden already, as events
 	that are not replayed.
+
+	indexed: indexed fields of the compact events, held aside on the replayed events around
+	`extract` (held_steps()).
 	"""
+	hold, restore = held_steps(indexed, 'isnotnull(%s)' % RST)
+	if hold:
+		hold, restore = [block(ANY, hold)], [block(ANY, restore)]
 	held = ('tenx_hk_raw', '_raw'), ('tenx_hk_st', 'sourcetype'), ('tenx_hk_src', 'source'), ('tenx_hk_host', 'host')
 	hide = ['eval ' + ', '.join('%s=if(isnull(%s), %s, null())' % (h, RST, f) for h, f in held),
 			'eval _raw=if(isnull(%s), "", _raw), ' % RST + ', '.join(
 				'%s=if(isnull(%s), "%s", %s)' % (f, RST, PLACEHOLDER, f) for _, f in held[1:])]
 	unhide = ['eval ' + ', '.join('%s=coalesce(%s, %s)' % (f, h, f) for h, f in held), 'fields - tenx_hk_*']
 	if not as_read:
-		return [block(HIDE, hide), 'extract', block(HIDE, unhide)]
+		return [block(HIDE, hide)] + hold + ['extract'] + restore + [block(HIDE, unhide)]
 	cond = 'isnotnull(%s) AND isnull(%s)' % (AS_READ, HIDE)
 	kept = ('tenx_hx_raw', '_raw'), ('tenx_hx_st', 'sourcetype'), ('tenx_hx_src', 'source'), ('tenx_hx_host', 'host')
 	hide_read = ['eval ' + ', '.join('%s=if(%s, %s, null())' % (h, cond, f) for h, f in kept),
 				 'eval _raw=if(%s, "", _raw), ' % cond + ', '.join(
 					 '%s=if(%s, "%s", %s)' % (f, cond, PLACEHOLDER, f) for _, f in kept[1:])]
 	unhide_read = ['eval ' + ', '.join('%s=coalesce(%s, %s)' % (f, h, f) for h, f in kept), 'fields - tenx_hx_*']
-	return [block(HIDE, hide), block(AS_READ, hide_read), 'extract', block(AS_READ, unhide_read), block(HIDE, unhide)]
+	return ([block(HIDE, hide), block(AS_READ, hide_read)] + hold + ['extract'] + restore
+			+ [block(AS_READ, unhide_read), block(HIDE, unhide)])
+
+
+# The working fields of held_steps(): the flag of the events it holds fields on, and one copy per field.
+HELD = 'tenx_ih'
+# The events `tx` expands (macros.conf [tenx-extract]): not passed whole, and with a template applied.
+TX_EXPANDED = 'isnull(tenx_passed) AND coalesce(tenx_expand_refused, "")==""'
+
+
+def held_steps(names, cond):
+	"""
+	(steps before an `extract`, steps after it) that hold the fields `names` aside on the events `cond`
+	selects and put each back where `extract` set nothing. Splunk adds an extracted value to an indexed
+	field of the same name, so a field both indexed and in the text would otherwise hold its value twice.
+	A name eval cannot write is not held.
+	"""
+	hold, restore = [], []
+	for name in sorted(set(names)):
+		try:
+			lhs, ref = field_lhs(name), field_ref(name)
+		except ReplayError:
+			continue
+		copy = '%s_%d' % (HELD, len(restore))
+		hold += ['%s=if(isnotnull(%s), %s, null())' % (copy, HELD, ref), '%s=if(isnotnull(%s), null(), %s)' % (lhs, HELD, ref)]
+		restore.append('%s=coalesce(%s, %s)' % (lhs, ref, copy))
+	if not restore:
+		return [], []
+	return (['eval %s=if(%s, 1, null()), %s' % (HELD, cond, ', '.join(hold))],
+			['eval ' + ', '.join(restore), 'fields - %s*' % HELD])
+
+
+def held_names(names):
+	"""The names of `names` that held_steps() holds: none of Splunk's default fields or the kept patterns."""
+	keep = re.compile('^(%s)$' % '|'.join(KEEP_PATTERNS))
+	return sorted(n for n in set(names) if n not in DEFAULT_KEEP and not keep.match(n) and safe_text(n))
+
+
+def tx_extract(names):
+	"""The definition of tenx-extract (macros.conf) for the indexed fields `names` of the compact events."""
+	hold, restore = held_steps(held_names(names), TX_EXPANDED)
+	return ' | '.join(hold + ['extract'] + restore)
 
 
 ALIAS_KEY = re.compile(r'^FIELDALIAS-(.+)$')
@@ -1260,6 +1307,7 @@ def build(stanzas, present, lookup_fields=None, keep_fields=(), all_shared=True,
 		for name in set().union(*by_st.values()) - everywhere:
 			cleared_on[name] = sorted(st for st in originals if name not in by_st[st])
 	keep_rx = '^(%s)$' % '|'.join(list(KEEP_PATTERNS) + [re.escape(f) for f in names])
+	indexed = held_names(names + list(cleared_on))
 
 	steps = replay.steps
 	owners = {}
@@ -1302,7 +1350,7 @@ def build(stanzas, present, lookup_fields=None, keep_fields=(), all_shared=True,
 											cleared_on=cleared_on) + [
 		'eval sourcetype=coalesce(%s, sourcetype)' % RST,
 		'eval _kv=if(isnotnull(%s), null(), _kv)' % RST]))
-	steps.extend(extract_steps(as_read=True))
+	steps.extend(extract_steps(as_read=True, indexed=indexed))
 
 	stats = {}
 	steps.extend(_rules(chosen, flags, lookup_fields, replay.warnings, stats, rejected, bad_lookups, replay.rules, sel))
