@@ -656,17 +656,23 @@ class TestTheMacros:
 		unit = macros().get('txf(1)', 'definition')
 		assert '. "` | `tenx-replay-plan` | `tenx-replay-tags` |' in unit and 'tenx_vars, tenx_nd* |' in unit
 		assert 'AND isnull(tenx_ndnotags)' in macros().get('tenx-replay-tags', 'definition')
+		# the plan step puts the word marks on the events, so both read them without a step of their own
+		assert d.endswith(' | `tenx-wild-planned` | search *') and unit.endswith(' | `tenx-wild-planned` | search *"')
 
 	def test_the_plan_step_reads_the_stored_field_as_tenx_wild_reads_its_marks(self):
 		d = macros().get('tenx-replay-plan', 'definition')
 		wild = macros().get('tenx-wild', 'definition')
 		# a field is always named: with no name, fillnull would fill every field of every event
-		assert d.startswith('fillnull value=1 tenx_ndnone [| makeresults | addinfo | eval p=')
+		assert d.startswith('fillnull [| makeresults | addinfo | eval p=') and d.endswith('] tenx_ndnone tenx_wild')
 		head = wild[wild.index('[| makeresults'):wild.index('| fields custom.tenx_wild_marks')]
-		assert head in d and '| fields custom.tenx_replay_plan" | appendpipe [stats count | where count=0] |' in d
-		# only field names go into fillnull; anything else is the whole replay
-		assert ('eval search=if(match(\'custom.tenx_replay_plan\', "^tenx_nd[A-Za-z0-9_ ]+$"), '
-				'\'custom.tenx_replay_plan\', "tenx_ndnoplan")') in d
+		assert head in d and ('| fields custom.tenx_replay_plan custom.tenx_wild_marks" | appendpipe [stats count | '
+							  'where count=0] |') in d
+		# the marks as tenx-wild reads them; only field names go into fillnull, anything else is the whole replay
+		assert ('eval search="value=\\"" . coalesce(\'custom.tenx_wild_marks\', "-") . "\\" " . if(match('
+				'\'custom.tenx_replay_plan\', "^tenx_nd[A-Za-z0-9_ ]+$"), \'custom.tenx_replay_plan\', "tenx_ndnoplan")') in d
+		assert ('eval search="value=\\"" . coalesce(\'custom.tenx_wild_marks\', "-") . "\\""') in wild
+		planned = macros().get('tenx-wild-planned', 'definition')
+		assert wild.endswith('] tenx_wild | ' + planned)
 		import re
 		for value, ok in (('tenx_ndm0a1b2c3d tenx_nd0a1b2c3d_1_', True), ('value=x tenx_ndm1', False), ('', False),
 						  ('tenx_ndm1 | delete', False), ('tenx_nd1 [x]', False)):
@@ -676,9 +682,9 @@ class TestTheMacros:
 		# Splunk refuses the search ("Field 'tenx_ndnone' cannot be specified multiple times"): with no plan
 		# stored, every txf search failed in a first build (Splunk Enterprise 10.4.3)
 		d = macros().get('tenx-replay-plan', 'definition')
-		literal = d[len('fillnull value=1 '):d.index(' [')].split()
+		literal = d[d.rindex(']') + 1:].split()
 		default = d[d.rindex('"tenx_nd'):].split('"')[1]
-		assert literal == ['tenx_ndnone'] and default not in literal
+		assert literal == ['tenx_ndnone', 'tenx_wild'] and default not in literal
 		for generation, ids in (('0a1b2c3d', {1}), ('00000000', set())):
 			assert not set(plan.flags(generation, ids).split()) & set(literal)
 		model = Model(commands={'extract': extract, 'typer': lambda e, _: None, 'tags': lambda e, _: None},
@@ -696,10 +702,11 @@ class TestTheMacros:
 		replay = selected()
 		model = Model(commands={'extract': extract, 'typer': lambda e, _: None, 'tags': lambda e, _: None},
 					  lookups=TABLES, macros={'tenx-replay': replay.spl()})
-		out = [visible(e) for e in model.run('`tenx-replay-plan` | `tenx-replay` | fields - tenx_nd*', events())]
+		tail = '`tenx-replay-plan` | `tenx-replay` | fields - tenx_nd* | `tenx-wild-planned`'
+		out = [visible(e) for e in model.run(tail, events())]
 		assert out == run(replay)
 		model.plan = plan.flags(replay.selection[0], plan.closure(replay.selection[1], {'dest_ip'}))
-		out = [visible(e) for e in model.run('`tenx-replay-plan` | `tenx-replay` | fields - tenx_nd*', events())]
+		out = [visible(e) for e in model.run(tail, events())]
 		assert out[0]['dest_ip'] == '10.0.0.1' and 'ftnt_action' not in out[0]
 
 
