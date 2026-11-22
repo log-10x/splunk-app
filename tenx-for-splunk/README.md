@@ -880,11 +880,12 @@ time terms before it, every other term after it.
 | not classified | A macro the tool cannot expand, `map`, `savedsearch`, a subsearch that writes search terms, a dashboard token without a default, or a shape not measured |
 | not affected | Reads none of the moved data |
 
-Searches of the moved data need `tx` or `txf`, except searches that count by index, host and
-source. Data models and their accelerations read the fields of the original sourcetype, which a
-compact event does not carry. `tstats` reads the indexed sourcetype, which stays the compact one,
-so `tstats` by or on the original sourcetype counts no compact event; `tenx_sourcetype` holds the
-original. Use `where (sourcetype=XmlWinEventLog OR tenx_sourcetype=XmlWinEventLog)`.
+Searches of compact events need `tx` or `txf`, except searches that count by index, host and
+source. Data models and their accelerations read the original sourcetype's fields. A compact event
+does not carry them, so data models do not count it. `tstats` reads the indexed sourcetype, which
+on a compact event stays the compact one. A `tstats` search by or on the original sourcetype
+therefore counts no compact events. The original sourcetype is in `tenx_sourcetype`, for example
+`where (sourcetype=XmlWinEventLog OR tenx_sourcetype=XmlWinEventLog)`.
 
 Checked on Splunk Enterprise 10.4.3 with the Windows add-on 12.0.0, the AWS add-on 8.3.1, the
 FortiGate add-on 1.6.10 and CIM 8.8.0, on 117 saved searches, 18 of them ESCU detections, and two

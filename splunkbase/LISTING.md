@@ -77,7 +77,7 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 >
 > - The `txf` macro, written where `tx` goes, gives each expanded event the search-time fields
 >   of its original sourcetype: the add-on's extractions, aliases, lookups, event types and tags.
-> - `txf` is checked on Windows Security, AWS CloudTrail and FortiGate events with their add-ons,
+> - `txf` is tested on Windows Security, AWS CloudTrail and FortiGate events with their add-ons,
 >   against the same events indexed raw.
 > - The search report, `bin/tenx_search_report.py`, lists which saved searches, alerts and
 >   dashboard panels of a search head run unchanged after a source moves to compact events, and

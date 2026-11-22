@@ -96,10 +96,11 @@ README = {
 		'events they differ from the raw event\'s.',
 	'xml_profile': '`txf` gives the add-on\'s search-time fields, so three fields that depend on that indexing '
 		'(`xmlns`, `vendor_privilege`, `privilege_id`) are not on expanded events.',
-	'data_models': 'Data models and their accelerations read the fields of the original sourcetype, which a compact '
-		'event does not carry.',
-	'tstats_sourcetype': '`tstats` reads the indexed sourcetype, which stays the compact one, so `tstats` by or on the '
-		'original sourcetype counts no compact event; `tenx_sourcetype` holds the original. Use '
+	'data_models': 'Data models and their accelerations read the original sourcetype\'s fields. A compact event '
+		'does not carry them, so data models do not count it.',
+	'tstats_sourcetype': '`tstats` reads the indexed sourcetype, which on a compact event stays the compact one. A '
+		'`tstats` search by or on the original sourcetype therefore counts no compact events. The original '
+		'sourcetype is in `tenx_sourcetype`, for example '
 		'`where (sourcetype=XmlWinEventLog OR tenx_sourcetype=XmlWinEventLog)`.',
 	'ct_time': 'A compact event\'s `_time` is the first timestamp the Receiver found in the line. In a CloudTrail record '
 		'that can be `userIdentity.sessionContext.attributes.creationDate`, which comes before `eventTime`.',
