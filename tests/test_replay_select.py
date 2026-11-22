@@ -182,6 +182,26 @@ class TestClosure:
 		assert not fnmatch.fnmatchcase('tenx_ndm0a1b2c3d', 'tenx_nd0a1b2c3d*_3_*')
 		assert not fnmatch.fnmatchcase('tenx_nd99999999_3_', 'tenx_nd0a1b2c3d*_3_*')
 
+	def test_only_the_parts_of_the_searched_sourcetypes_count(self):
+		table = [[1, ['dest'], ['host_a', 'Computer'], False, [[['aws:cloudtrail'], ['dest'], ['host_a']],
+															   [['XmlWinEventLog'], ['dest'], ['Computer']]]],
+				 [2, ['Computer'], ['*'], False, [[['XmlWinEventLog'], ['Computer'], ['*']]]],
+				 [3, ['host_a'], ['h'], False, [['*', ['host_a'], ['h']]]],
+				 [4, ['src'], ['srcip'], False, [[['XmlWinEventLog'], ['src'], ['srcip']]]]]
+		assert plan.closure(table, {'dest'}) is None
+		assert plan.closure(table, {'dest'}, {'aws:cloudtrail'}) == {1, 3}
+		assert plan.closure(table, {'src'}, {'aws:cloudtrail'}) == set()
+		assert plan.closure(table, {'dest'}, {'aws:cloudtrail', 'XmlWinEventLog'}) is None
+		# a rule without parts counts whole
+		assert plan.closure([r[:4] for r in table], {'dest'}, {'aws:cloudtrail'}) is None
+
+	def test_the_parts_read_back(self):
+		rules = [[1, ['a'], ['b'], False, [['*', ['a'], ['b']], [['st1', 'st2'], ['a'], []]]]]
+		entry = {'generation': '0a1b2c3d', 'rules': json.dumps(rules)}
+		assert plan.read_table(entry) == ('0a1b2c3d', [(1, ['a'], ['b'], False, [('*', ['a'], ['b']), (['st1', 'st2'], ['a'], [])])])
+		for bad in ([[1, ['a'], ['b'], False, [['x', ['a'], ['b']]]]], [[1, ['a'], ['b'], False, [[[1], ['a'], ['b']]]]]):
+			assert plan.read_table({'generation': '0a1b2c3d', 'rules': json.dumps(bad)}) is None
+
 	def test_the_table_as_written_and_read(self):
 		entry = {'generation': '0a1b2c3d', 'rules': json.dumps(TABLE)}
 		assert plan.read_table(entry) == ('0a1b2c3d', [tuple(r[:3]) + (r[3],) for r in TABLE])
@@ -264,7 +284,7 @@ def selected():
 
 
 def outputs(table):
-	return sorted(set(f for _, writes, _, _ in table for f in writes))
+	return sorted(set(f for rule in table for f in rule[1]))
 
 
 class TestTheModel:
@@ -317,13 +337,33 @@ class TestTheModel:
 
 	def test_the_table_lists_each_rule_once_with_what_it_reads(self):
 		generation, table = selected().selection
-		by_writes = dict((tuple(w), (r, s)) for _, w, r, s in table)
+		by_writes = dict((tuple(w), (r, s)) for _, w, r, s, _ in table)
 		assert by_writes[('action',)] == (['ftnt_action'], True)   # the host:: stanza's candidate is tested
 		assert set(by_writes[('ftnt_action',)][0]) >= {'utmaction', 'vendor_action', 'vendor_status'}
 		assert by_writes[('dest_zone',)][0] == ['dest_ip', 'dest_zone']   # OUTPUTNEW reads its output
 		assert by_writes[('src_ip',)][1] is True
 		assert outputs(table) == ['action', 'd', 'dest_ip', 'dest_port', 'dest_zone', 'dvc', 'ftnt_action', 'h',
 								  'proto', 'src_ip', 'src_kind', 'src_port', 'tcp_flag', 'vendor_action', 'vendor_status']
+
+	def test_each_part_names_the_sourcetypes_its_stanza_applies_to(self):
+		generation, table = selected().selection
+		by_writes = dict((tuple(w), parts) for _, w, _, _, parts in table)
+		assert sorted(o for o, _, _ in by_writes[('ftnt_action',)]) == [['fw:traffic'], ['fw:utm']]
+		traffic = [r for o, _, r in by_writes[('ftnt_action',)] if o == ['fw:traffic']][0]
+		assert set(traffic) >= {'utmaction', 'vendor_action', 'vendor_status'}
+		assert ['*', ['action'], ['ftnt_action']] in by_writes[('action',)]
+		assert by_writes[('d',)] == [['*', ['d'], []]]
+
+	def test_a_plan_for_one_sourcetype_replays_as_the_whole_replay_on_its_events(self):
+		replay = selected()
+		generation, table = replay.selection
+		ids = plan.closure(table, {'ftnt_action'}, {'fw:utm'})
+		assert ids is not None and ids != plan.closure(table, {'ftnt_action'})
+		got = run(replay, plan.flags(generation, ids))
+		whole = run(replay)
+		for g, w in zip(got, whole):
+			if g.get('tenx_sourcetype') == 'fw:utm':
+				assert g.get('ftnt_action') == w.get('ftnt_action')
 
 	def test_units_and_the_unselected_macro_carry_no_guard(self):
 		assert 'tenx_nd' not in b.build(STANZAS, PRESENT, LOOKUPS).spl()
@@ -485,6 +525,53 @@ class TestThePrefilterStoresThePlan:
 										'search index=fw `txf` tag=network | stats count'])
 	def test_none_when_the_search_cannot_be_read(self, search):
 		assert store(search)['stored'] == []
+
+
+PARTS_TABLE = [[1, ['dest'], ['host_a', 'Computer'], False, [[['aws:cloudtrail'], ['dest'], ['host_a']],
+															  [['XmlWinEventLog'], ['dest'], ['Computer']]]],
+			   [2, ['Computer'], ['*'], False, [[['XmlWinEventLog'], ['Computer'], ['*']]]],
+			   [3, ['host_a'], ['h'], False, [['*', ['host_a'], ['h']]]],
+			   [4, ['src'], ['s'], False, [[['XmlWinEventLog'], ['src'], ['s']]]],
+			   [5, ['x'], ['y'], False, [[['XmlWinEventLog'], ['x'], ['y']]]]]
+RECORDED = {'tenx:plan': {'generation': '0a1b2c3d', 'rules': json.dumps(PARTS_TABLE)},
+			'aws:cloudtrail': {'indexes': 'ct'}, 'XmlWinEventLog': {'indexes': 'win'}, 'tenx:nocarrier': {'indexes': 'app'}}
+
+
+class TestThePlanClosesOverTheSearchedSourcetypes:
+	"""
+	A rule of the replay can come from several add-ons' stanzas. Closed over every stanza, a field one
+	sourcetype computes plainly can lead to another add-on's rule that reads fields that cannot be listed,
+	and the whole replay runs. The plan counts only the stanzas of the sourcetypes tenxreplay recorded in the
+	indexes the search is bound to.
+	"""
+
+	def test_the_indexes_a_search_is_bound_to(self):
+		assert plan.bounding_indexes('index=ct ', p) == ['ct']
+		assert plan.bounding_indexes('index=ct OR index=win ', p) == ['ct', 'win']
+		assert plan.bounding_indexes('earliest=-1h (index=ct OR index=w*) sourcetype=x ', p) == ['ct', 'w*']
+		assert plan.bounding_indexes('index IN (ct, win) ', p) == ['ct', 'win']
+		for before in ('index=ct OR host=h ', 'NOT index=ct ', 'host=h ', '', '"unclosed '):
+			assert plan.bounding_indexes(before, p) is None, before
+
+	def test_the_sourcetypes_recorded_for_them(self):
+		assert plan.searched_sourcetypes(RECORDED, ['ct']) == {'aws:cloudtrail'}
+		assert plan.searched_sourcetypes(RECORDED, ['CT', 'app']) == {'aws:cloudtrail'}
+		assert plan.searched_sourcetypes(RECORDED, ['app']) == set()
+		assert plan.searched_sourcetypes(RECORDED, ['*']) == {'aws:cloudtrail', 'XmlWinEventLog'}
+		# an index the record does not know may hold any sourcetype
+		for indexes in (None, [], ['other'], ['ct', 'other'], ['o*']):
+			assert plan.searched_sourcetypes(RECORDED, indexes) is None, indexes
+		assert plan.searched_sourcetypes(dict(RECORDED, x={'indexes': '*'}), ['ct']) == {'aws:cloudtrail', 'x'}
+
+	def test_the_prefilter_stores_the_plan_of_those_sourcetypes(self):
+		out = store('search index=ct `txf` dest=a | stats count', table=RECORDED)
+		assert out['stored'] == [{'custom.tenx_replay_plan': 'tenx_ndm0a1b2c3d tenx_nd0a1b2c3d_1_3_'}]
+
+	@pytest.mark.parametrize('search', ['search index=ct OR host=x `txf` dest=a | stats count',
+										'search index=other `txf` dest=a | stats count',
+										'search index=ct OR index=win `txf` dest=a | stats count'])
+	def test_the_whole_replay_where_another_sourcetype_can_be_read(self, search):
+		assert store(search, table=RECORDED)['stored'] == []
 
 
 class TestTxfOfASourcetypeLeavesOutTagsNoOneReads:

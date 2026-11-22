@@ -284,7 +284,9 @@ class TenxPrefilterCommand(GeneratingCommand):
 			if needed is None:
 				return None
 			stanzas = parser.conf_stanzas([os.path.join(apphome, d, "tenx_replay.conf") for d in ("default", "local")])
-			return replay_plan.plan_value(replay_plan.read_table(stanzas.get(PLAN_STANZA) or {}), needed)
+			before = self.before[0] if getattr(self, "before", None) else None
+			present = replay_plan.searched_sourcetypes(stanzas, replay_plan.bounding_indexes(before, parser))
+			return replay_plan.plan_value(replay_plan.read_table(stanzas.get(PLAN_STANZA) or {}), needed, present)
 		except Exception as e:
 			self.logger.info("tx: no replay plan: %s", e)
 			return None
