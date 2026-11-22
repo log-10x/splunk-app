@@ -200,10 +200,9 @@ class TenxReplayCommand(GeneratingCommand):
 		INDEXED = true, and the fields of a sample of compact events (_sample_fields) that tstats can
 		count over all compact events. The replay's clearing step keeps the second on every replayed event and the
 		third per original sourcetype (builder.build keep_by_sourcetype), counted over the events the
-		replay works on: those carrying tenx_sourcetype and not indexed with a field map (tenx_mapped,
-		which tenx-mapped-hide keeps out of the replay). An indexed field one sender writes for one
-		sourcetype (a field map's app on FortiGate events) is then no reason to keep the field of the
-		same name that Splunk set on another sourcetype's compact events when it read them.
+		replay works on, those carrying tenx_sourcetype. An indexed field one sender writes for one
+		sourcetype is then no reason to keep the field of the same name that Splunk set on another
+		sourcetype's compact events when it read them.
 		"""
 		declared = set()
 		for entry in self._rest(self._ns('configs/conf-fields?count=0')).get('entry', []):
@@ -218,8 +217,8 @@ class TenxReplayCommand(GeneratingCommand):
 			counts = self._oneshot('| tstats %s where %s' % (funcs, self._events()), earliest, latest)
 			row = counts[0] if counts else {}
 			names.update(c for n, c in enumerate(candidates) if str(row.get('f%d' % n, '0')) not in ('0', ''))
-			for row in self._oneshot('| tstats %s where %s NOT %s=* by %s' % (
-					funcs, self._events(), builder.MAPPED_FIELD, builder.CARRIER_FIELD), earliest, latest):
+			for row in self._oneshot('| tstats %s where %s by %s' % (
+					funcs, self._events(), builder.CARRIER_FIELD), earliest, latest):
 				st = row.get(builder.CARRIER_FIELD)
 				if st:
 					by_sourcetype.setdefault(st, set()).update(

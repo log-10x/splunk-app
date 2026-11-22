@@ -3,8 +3,8 @@ Events that arrive whole (text that does not begin with "~", log10x-format S4.1)
 field replay of `txf`, run through the SPL model (tests/support/spl_model.py). Splunk has read
 such an event's own text under the sourcetype it was indexed with, so:
 
-* read under the sourcetype whose rules it needs (a field map renames its compact sourcetype to
-  the original): Splunk applied exactly those rules, and the event is left as read. Replayed, its
+* read under the sourcetype whose rules it needs: Splunk applied exactly those rules, and the
+  event is left as read. Replayed, its
   extract added every field a second time (Splunk Enterprise 10.4.3, Windows Security XML: 570
   of 662 whole events, EventID ["4670", "4670"], 95 of 183 fields differed from raw);
 * read under the compact sourcetype (tenx_encoded): the fields come from that sourcetype's
@@ -25,10 +25,10 @@ import tenx_search_builder as sb
 
 
 def whole_win():
-	"""A Windows event that arrived whole through a field map: its compact sourcetype is renamed to
-	the original, so Splunk read it with exactly that sourcetype's rules."""
+	"""A Windows event that arrived whole under its original sourcetype, so Splunk read it with
+	exactly that sourcetype's rules."""
 	return {'_raw': '<Event>4670</Event>', 'sourcetype': 'win', 'source': 'XmlWinEventLog:Security', 'host': 'dc01',
-			'tenx_sourcetype': 'win', 'tenx_compact_st': 'tenx_w', 'EventID': '4670', 'LogonType': '2',
+			'tenx_sourcetype': 'win', 'EventID': '4670', 'LogonType': '2',
 			'app': 'win:local', 'k': 'win', 'eventtype': 'et_win', 'tag::eventtype': ['a'],
 			'__by_st': {'win': {'EventID': '4670', 'LogonType': '2'}}}
 

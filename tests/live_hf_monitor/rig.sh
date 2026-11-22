@@ -4,7 +4,7 @@
 #
 #   tests/live_hf_monitor/rig.sh <phase> [...]
 #
-#   phases, in order: build, config, pass t, clean, maps, pass m, drill, clean, report; down removes everything
+#   phases, in order: build, config, pass t, clean, drill, clean, report; down removes everything
 #
 # Environment:
 #   W        work folder on the Docker host (required): secret/, data/, opt/tenx/, apps/, res/
@@ -57,11 +57,11 @@ mkapp(){ local d=$W/apps/$1; mkdir -p "$d/local" "$d/metadata"; printf '[install
 # samples: <host>|<file>|<sourcetype>|<source>|<index suffix>
 SAMPLES_SET=("dc1|win662.log|XmlWinEventLog|XmlWinEventLog:Security|win" "fs2|win4663.log|XmlWinEventLog|XmlWinEventLog:Security|win2"
   "fwa|fgt100k.log|fgt_log|/var/log/fortigate/fwa.log|fgt" "fwb|fgt239.log|fgt_log|/var/log/fortigate/fwb.log|fgt2")
-INDEXES=$(for p in t m d; do for s in win win2 fgt fgt2; do printf 'hfm_%s_%s hfm_%sr_%s ' $p $s $p $s; done; done; echo hfm_fallback tenx_dml tenx_probe)
+INDEXES=$(for p in t d; do for s in win win2 fgt fgt2; do printf 'hfm_%s_%s hfm_%sr_%s ' $p $s $p $s; done; done; echo hfm_fallback tenx_dml)
 
 build(){
   mkdir -p "$W/secret" "$W/data" "$W/apps" "$W/opt/tenx/rfs" "$W/opt/tenx/compact/events" "$W/opt/tenx/compact/templates" \
-    "$W/opt/tenx/state" "$W/opt/tenx/receiver"; chmod 700 "$W/secret"
+    "$W/opt/tenx/state"; chmod 700 "$W/secret"
   [ -s "$W/secret/admin.pw" ] || ( umask 077; python3 -c 'import secrets,string; a=string.ascii_letters+string.digits; print("Hm"+"".join(secrets.choice(a) for _ in range(20))+"!4")' > "$W/secret/admin.pw" )
   chmod 777 "$W/opt/tenx" "$W/opt/tenx/rfs" "$W/opt/tenx/compact" "$W/opt/tenx/compact/events" "$W/opt/tenx/compact/templates" "$W/opt/tenx/state"
   docker network inspect $NET >/dev/null 2>&1 || docker network create --subnet $SUB.0/24 $NET >/dev/null
@@ -90,10 +90,9 @@ config(){
   # indexer: indexes only
   mkapp hfm_idx; mkindexes $INDEXES > "$A/hfm_idx/local/indexes.conf"; printf '[splunktcp://9997]\ndisabled = 0\n' > "$A/hfm_idx/local/inputs.conf"
   cp_app $P-idx "$A/hfm_idx" hfm_idx
-  # search head: the whole app, add-ons, CIM; tenx-events reads the compact sourcetypes
+  # search head: the whole app, add-ons, CIM
   cp_app $P-sh "$A/pkg/tenx-for-splunk" tenx-for-splunk
   for a in Splunk_TA_windows Splunk_TA_fortinet_fortigate Splunk_SA_CIM; do cp_app $P-sh "$ADDONS/$a" $a; done
-  docker exec -u splunk $P-sh sh -c 'mkdir -p /opt/splunk/etc/apps/tenx-for-splunk/local && printf "[tenx-events]\ndefinition = index=* (sourcetype::tenx_encoded OR tenx_compact_st::tenx_win OR tenx_compact_st::tenx_fgt)\n" > /opt/splunk/etc/apps/tenx-for-splunk/local/macros.conf'
   # heavy forwarder: the _indexers package, the add-ons, and hfm_hf: rig parsing of the sample files, the route, the
   # file destination, tcpout, the compact folders' monitors
   cp_app $P-hf "$IXAPP" tenx-for-splunk
@@ -139,7 +138,7 @@ batchTimeout = 5
 fs.timeBeforeClosingFileSecs = 30
 X
   { printf '[splunktcp://9997]\ndisabled = 0\n'
-    for d in t-wxml:tenx_encoded t-fgt:tenx_encoded m-wxml:tenx_win m-fgt:tenx_fgt d-fgt:tenx_encoded; do
+    for d in t-wxml:tenx_encoded t-fgt:tenx_encoded d-fgt:tenx_encoded; do
       mkdir -p "$W/opt/tenx/compact/events/${d%%:*}"; chmod 777 "$W/opt/tenx/compact/events/${d%%:*}"
       printf '\n[monitor:///opt/tenx/compact/events/%s]\nsourcetype = %s\nindex = hfm_fallback\ncrcSalt = <SOURCE>\ndisabled = 0\n' "${d%%:*}" "${d#*:}"; done
     printf '\n[monitor:///opt/tenx/compact/templates]\nsourcetype = tenx_dml_raw_json\nindex = tenx_dml\ncrcSalt = <SOURCE>\ndisabled = 0\n'; } > "$L/inputs.conf"
@@ -150,15 +149,14 @@ X
   cp_app $P-uf "$A/hfm_uf" hfm_uf
   for c in $P-idx $P-hf $P-sh; do restart $c; done; sp $P-uf restart >/dev/null 2>&1; log "$P-uf restarted"
   for c in $P-sh $P-hf; do P_=$(pw) docker exec -u splunk -e P_ $c sh -c '/opt/splunk/bin/splunk add search-server https://'$IDX':8089 -auth "admin:$P_" -remoteUsername admin -remotePassword "$P_"' 2>&1 | grep -v WARNING; done
-  rest $P-hf POST /services/data/indexes -d name=tenx_probe -o /dev/null -w "tenx_probe on the heavy forwarder: %{http_code}\n"
   for c in $P-hf $P-sh; do echo "$c add-on inputs enabled: $(sp $c btool inputs list --debug | grep -E 'Splunk_TA_|Splunk_SA_CIM' | grep -cE 'disabled *= *(0|false)')"; done
   sp $P-hf btool props list 'source::/opt/tenx/compact/events/...' | head -3
   log config done
 }
 
-# Fluent Bit (two processes) and one Receiver per source, for a pass; mode opt (receiverOptimize) or map (cap files)
+# Fluent Bit (two processes) and one Receiver per source, for a pass
 fluent(){
-  local pass=$1 mode=$2 C=$W/fb/$1; mkdir -p "$C/in" "$C/back" "$W/opt/tenx/state/$pass"; chmod -R a+rX "$W/fb"; chmod 777 "$W/opt/tenx/state/$pass"
+  local pass=$1 C=$W/fb/$1; mkdir -p "$C/in" "$C/back" "$W/opt/tenx/state/$pass"; chmod -R a+rX "$W/fb"; chmod 777 "$W/opt/tenx/state/$pass"
   printf '[PARSER]\n    Name    json\n    Format  json\n' > "$C/in/parsers.conf"
   tail_in(){ local name=$1 path=$2 port=$3; printf '\n[INPUT]\n    Name               tail\n    Path               %s\n    Tag                rfs.%s.*\n    Parser             json\n    Read_from_Head     true\n    Refresh_Interval   1\n    Buffer_Chunk_Size  64k\n    Buffer_Max_Size    4M\n    DB                 /opt/tenx/state/%s/tail_%s.db\n    Mem_Buf_Limit      16MB\n    storage.type       filesystem\n\n[OUTPUT]\n    Name         forward\n    Match        rfs.%s.*\n    Host         127.0.0.1\n    Port         %s\n    Retry_Limit  False\n' "$path" "$name" "$pass" "$name" "$name" "$port"; }
   { printf '[SERVICE]\n    Flush                      1\n    Parsers_File               /fluent-bit/etc/parsers.conf\n    HTTP_Server                On\n    HTTP_Port                  2020\n    storage.path               /opt/tenx/state/%s/storage-in\n    storage.sync               normal\n    storage.backlog.mem_limit  16M\n' "$pass"
@@ -173,19 +171,11 @@ fluent(){
   fluent_down
   docker run -d --name $P-fbback --hostname $P-fbback --network $NET --ip $FBIP --cpus=1 -m 1g -v "$C/back:/fluent-bit/etc:ro" \
     -v "$W/opt/tenx/state:/opt/tenx/state" -v "$W/opt/tenx/compact:/opt/tenx/compact" "$FB" >/dev/null && log "fbback up ($pass)"
-  local ARGS="@run/input/forwarder/fluentbit @apps/receiver" R=$W/opt/tenx/receiver n port
+  local ARGS="@run/input/forwarder/fluentbit @apps/receiver" n port
   for nm in wxml:24224 fgt:24226; do n=${nm%:*}; port=${nm#*:}; [ "$pass" = d ] && [ $n = wxml ] && continue
-    if [ "$mode" = opt ]; then
-      docker run -d --name $P-rx-$n --network container:$P-fbback --cpus=1.5 -m 4g ${RXENV:-} "$RX" $ARGS receiverOptimize true varMaxRecurIndexes 0 \
-        timestampZone UTC timestampMaxPerObject 1 groupJoinLines false fluentbitInputPort $port fluentbitOutputHost 127.0.0.1 \
-        fluentbitOutputPort 24225 fluentbitInputMessageField event >/dev/null
-    else
-      docker run -d --name $P-rx-$n --network container:$P-fbback --cpus=1.5 -m 4g \
-        -v "$R/compact-config.yaml:/etc/tenx/config/pipelines/run/receive/compact/config.yaml:ro" -v "$R/$n:/opt/tenx/receiver/$n" ${RXENV:-} "$RX" $ARGS \
-        varMaxRecurIndexes 0 timestampZone UTC timestampMaxPerObject 1 groupJoinLines false fluentbitInputPort $port \
-        fluentbitOutputHost 127.0.0.1 fluentbitOutputPort 24225 fluentbitInputMessageField event \
-        compactReceiverLookupFile /opt/tenx/receiver/$n/compact-cap.csv >/dev/null
-    fi && log "rx-$n up ($mode)"; done
+    docker run -d --name $P-rx-$n --network container:$P-fbback --cpus=1.5 -m 4g ${RXENV:-} "$RX" $ARGS receiverOptimize true varMaxRecurIndexes 0 \
+      timestampZone UTC timestampMaxPerObject 1 groupJoinLines false fluentbitInputPort $port fluentbitOutputHost 127.0.0.1 \
+      fluentbitOutputPort 24225 fluentbitInputMessageField event >/dev/null && log "rx-$n up"; done
   sleep 8
   docker run -d --name $P-fbin --network container:$P-fbback --cpus=1 -m 1g -v "$C/in:/fluent-bit/etc:ro" -v "$W/opt/tenx/state:/opt/tenx/state" \
     -v "$W/opt/tenx/rfs:/opt/tenx/rfs:ro" "$FB" >/dev/null && log "fbin up ($pass)"
@@ -250,7 +240,7 @@ hops(){ local p=$1
 expanded(){ local p=$1 n; for i in $(seq 1 40); do n=$(n1 "search index=hfm_${p}_* \`tx\` | where like(_raw, \"~%\") | stats count")
     [ "${n:-0}" = 0 ] && { log "pass $p: tx leaves no event compact"; return 0; }; log "pass $p: $n events still compact after tx"; sleep 15; done; return 1; }
 
-pass_t(){ fluent t opt; uf_pass t; settle t; hops t; kv_load; check_t; }
+pass_t(){ fluent t; uf_pass t; settle t; hops t; kv_load; check_t; }
 check_t(){ expanded t
   spq "| tenxreplay" > "$W/res/replay_t.csv"
   for s in win win2 fgt fgt2; do keys t $s tx; done
@@ -258,63 +248,9 @@ check_t(){ expanded t
   python3 "$HERE/fields.py" "$W" $SH t_fgt _rawmd5,host "search index=hfm_tr_fgt | eval _rawmd5=md5(_raw)" "search index=hfm_t_fgt \`txf\` | eval _rawmd5=md5(_raw)" 0 +10y
 }
 
-maps(){ local T=$W/apps/pkg/tenx-for-splunk/bin/tenx_field_map.py R=$W/opt/tenx/receiver F=$W/fm
-  mkdir -p "$F" "$R/wxml" "$R/fgt"; rm -rf "$F"/kv_*.json "$F"/fm_*
-  [ -f "$R/compact-config.yaml" ] || { docker create --name $P-cfg "$RX" >/dev/null; docker cp $P-cfg:/etc/tenx/config/pipelines/run/receive/compact/config.yaml "$R/compact-config.shipped.yaml"; docker rm -f $P-cfg >/dev/null
-    sed -e 's/^\(  fieldNames:\)$/\1 [templateHash]/' -e '/^    - \$=yield TenXEnv.get("symbolMessageField")$/d' "$R/compact-config.shipped.yaml" > "$R/compact-config.yaml"; }
-  for n in wxml fgt; do printf 'pattern_hash,value\n' > "$R/$n/compact-cap.csv"; rm -f "$R/$n/compact-cap.csv.pending"; done; chmod -R a+rwX "$R"
-  local n=0; while :; do rest $P-sh GET "/servicesNS/nobody/tenx-for-splunk/storage/collections/data/tenx_dml?output_mode=json&limit=2000&skip=$((n*2000))" > "$F/kv_$n.json"
-    grep -q '"_key"' "$F/kv_$n.json" || { rm "$F/kv_$n.json"; break; }; n=$((n+1)); done
-  local RECS; RECS=$(for f in "$F"/kv_*.json; do printf -- '--records %s ' "$f"; done)
-  ( cd "$F" && python3 -I "$T" gen $RECS --target windows-security --rules lookup --addon "$ADDONS/Splunk_TA_windows" --leave-out SystemTime,EventRecordID \
-      --app-name fm_win --cap-file "$R/wxml/compact-cap.csv" --out fm_win > "$W/res/gen_win.txt" 2>&1
-    python3 -I "$T" gen $RECS --target fortigate --rules lookup --leave-out time --app-name fm_fgt --cap-file "$R/fgt/compact-cap.csv" --out fm_fgt > "$W/res/gen_fgt.txt" 2>&1 )
-  grep -q '^REPORT-tenx_fgt_hash_vars' <(sed -n '/^\[tenx_fgt\]/,/^\[/p' "$F/fm_fgt/default/props.conf") && echo "fm_fgt: [tenx_fgt] holds the hash extraction"
-  for m in fm_win fm_fgt; do cp_app $P-hf "$F/$m" $m; cp_app $P-hf "$F/${m}_floor" ${m}_floor; cp_app $P-sh "$F/$m" $m; done
-  restart $P-hf; restart $P-sh
-  export TENX_SPLUNKD_AUTH="admin:$(pw)"
-  for m in win:wxml fgt:fgt; do python3 -I "$T" activate --app "$F/fm_${m%:*}" --cap-file "$R/${m#*:}/compact-cap.csv" --splunkd https://$HF:8089 \
-      --probe-index tenx_probe --tls-verify off > "$W/res/activate_${m%:*}.txt" 2>&1; local rc=$?
-    local cap; cap=$(($(wc -l < "$R/${m#*:}/compact-cap.csv")-1)); [ $rc = 0 ] && [ "$cap" -gt 0 ] && r=PASS || r=FAIL
-    ok $r "activate fm_${m%:*} through the heavy forwarder's management port, no --probe-hec: rc $rc, $cap templates listed ($(tail -1 "$W/res/activate_${m%:*}.txt" | cut -c1-120))"; done
-  unset TENX_SPLUNKD_AUTH
-}
-
-dmodel(){ local p=$1 s=$2 dm=$3 by=$4 a b
-  q(){ spq "| tstats summariesonly=false fillnull_value=NULL count from datamodel=$dm where index=$1 by $by" | tail -n +2 | sort; }
-  a=$(q hfm_${p}r_$s); b=$(q hfm_${p}_$s); local rows ev; rows=$(printf '%s\n' "$a" | grep -c .); ev=$(printf '%s\n' "$a" | awk -F, '{s+=$NF} END{print s+0}')
-  [ "$rows" -gt 0 ] && [ "$a" = "$b" ] && r=PASS || r=FAIL
-  ok $r "data model pass $p $s $dm by $by: raw $rows rows / $ev events, compact $(printf '%s\n' "$b" | grep -c .) rows, identical $( [ "$a" = "$b" ] && echo yes || echo no)"; }
-
-pass_m(){ sudo -n find "$W/opt/tenx/rfs" -name '*.ndjson' -delete; fluent m map; uf_pass m; settle m; hops m; check_m; }
-check_m(){ expanded m
-  spq "| tenxreplay" > "$W/res/replay_m.csv"
-  for s in win win2 fgt fgt2; do keys m $s tx; done
-  # allowed: the field map limits the app's README lists for Windows XML (block fields not written, --leave-out SystemTime
-  # and the add-on's event_time read from it, line breaks written as spaces, "-" for privilege_id and vendor_privilege)
-  python3 "$HERE/fields.py" "$W" $SH m_win _rawmd5,host "search index=hfm_mr_win | eval _rawmd5=md5(_raw)" "search index=hfm_m_win \`txf\` | eval _rawmd5=md5(_raw)" 0 +10y \
-    EventData_Xml,System_Props_Xml,SystemTime,event_time,PrivilegeList,UserAccountControl,privilege_id,vendor_privilege
-  dmodel m win Authentication "Authentication.action Authentication.app Authentication.user Authentication.src Authentication.dest"
-  dmodel m win Change.All_Changes "All_Changes.action All_Changes.object_category All_Changes.user All_Changes.object"
-  dmodel m win Endpoint.Processes "Processes.process_name Processes.user Processes.dest"
-  dmodel m fgt Network_Traffic "All_Traffic.action All_Traffic.src All_Traffic.dest All_Traffic.dest_port All_Traffic.transport"
-  dmodel m fgt Network_Traffic "All_Traffic.app All_Traffic.src_zone All_Traffic.dest_zone All_Traffic.bytes_in All_Traffic.bytes_out"
-  dmodel m fgt2 Network_Traffic "All_Traffic.action All_Traffic.src All_Traffic.dest All_Traffic.dest_port All_Traffic.transport"
-  local left; left=$(n1 "search index=hfm_m_fgt2 \`tx\` | where isnotnull(tenx_expand_refused) OR like(_raw, \"~%\") | stats count")
-  [ "${left:-0}" = 0 ] && r=PASS || r=FAIL; ok $r "pass m fgt2: events left compact or refused after tx: ${left:-0}"
-  export TENX_SPLUNKD_AUTH="admin:$(pw)"
-  python3 -I "$W/apps/pkg/tenx-for-splunk/bin/tenx_field_map.py" check --app "$W/fm/fm_fgt" --cap-file "$W/opt/tenx/receiver/fgt/compact-cap.csv" \
-    --splunkd https://$HF:8089 --probe-index tenx_probe --tls-verify off --timeout 20 --poll 5 > "$W/res/check_fgt.txt" 2>&1; local rc=$?; unset TENX_SPLUNKD_AUTH
-  # rc 1 with only no_match events (a value holding a control character, a README limit) still proves the map: check
-  # names them and leaves the list as it is
-  local nm; nm=$(grep -c 'no_match' "$W/res/check_fgt.txt")
-  grep -q 'all indexed with their fields' "$W/res/check_fgt.txt" && { [ $rc = 0 ] || { [ $rc = 1 ] && [ "$nm" -gt 0 ] && ! grep -qE 'bad_row|no_table|no_row|emptied' "$W/res/check_fgt.txt"; }; } && r=PASS || r=FAIL
-  ok $r "check fm_fgt through the heavy forwarder's management port: rc $rc; $(head -1 "$W/res/check_fgt.txt" | cut -c1-100); $(grep -o '[0-9]* compact events of tenx_fgt were indexed without their fields[^:]*' "$W/res/check_fgt.txt")"
-}
-
 # Receiver stop: a FortiGate file grows at RATE lines/s on the forwarder; the Receiver stops for OUT seconds
 drill(){ local N=${N:-30000} RATE=${RATE:-200} OUT=${OUT:-300} L=$W/res/drill.log f=$W/apps/hfm_uf/local/inputs.conf
-  sudo -n find "$W/opt/tenx/rfs" -name '*.ndjson' -delete; fluent d opt; : > "$L"
+  sudo -n find "$W/opt/tenx/rfs" -name '*.ndjson' -delete; fluent d; : > "$L"
   for arm in r x; do mkdir -p "$W/data/d/$arm/fwd"; done; : > "$W/data/d/live.log"; ln -f "$W/data/d/live.log" "$W/data/d/r/fwd/live.log"; ln -f "$W/data/d/live.log" "$W/data/d/x/fwd/live.log"
   for arm in r x; do [ $arm = r ] && ix=hfm_dr_fgt || ix=hfm_d_fgt
     printf '[monitor:///data/d/%s/fwd/live.log]\nindex = %s\nsourcetype = fgt_log\nhost = hfm-fwd\nsource = /var/log/fortigate/fwd.log\ncrcSalt = <SOURCE>\ndisabled = 0\n\n' $arm $ix >> "$f"; done
@@ -355,7 +291,7 @@ report(){ local written indexed; written=$(( $(awk '{s+=$1} END{print s+0}' "$W/
 down(){ fluent_down; for c in $P-uf $P-hf $P-sh $P-idx; do docker rm -f -v $c >/dev/null 2>&1; done; docker network rm $NET >/dev/null 2>&1; log down; }
 
 case "${1:-}" in
-  build) build;; config) config;; pass) case "${2:-}" in t) pass_t;; m) pass_m;; esac;; check) case "${2:-}" in t) check_t;; m) check_m;; esac;;
-  maps) maps;; drill) drill;; clean) clean;;
+  build) build;; config) config;; pass) case "${2:-}" in t) pass_t;; esac;; check) case "${2:-}" in t) check_t;; esac;;
+  drill) drill;; clean) clean;;
   report) report;; down) down;; *) sed -n 2,40p "$0";;
 esac

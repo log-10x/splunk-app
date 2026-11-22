@@ -1534,7 +1534,6 @@ def original_sourcetype_probe(build_result, tenx_config):
 	compact event is indexed as the compact sourcetype and carries its original sourcetype in the
 	indexed field tenx_sourcetype, so `| tx index=x sourcetype=df:kv error` (not rewritten: df:kv is
 	not a compact sourcetype) matches none of them (Splunk Enterprise 10.4.3: 0 against 10,000 raw).
-	Field-mapped events (tenx_mapped) are left out: their sourcetype is renamed to the original.
 	A wildcard is probed too (sourcetype=df:*) unless it matches a compact sourcetype (tenx*, *).
 	"""
 	if build_result is None or build_result.engaged or not build_result.sourcetypes:
@@ -1552,7 +1551,7 @@ def original_sourcetype_probe(build_result, tenx_config):
 		where = '(%s) ' % ' OR '.join('index=%s' % _spl_value(i) for i in sorted(set(build_result.indexes)))
 	else:
 		where = ''
-	return ('| tstats count where %s(%s) NOT tenx_mapped=* (%s) by index, sourcetype, tenx_sourcetype' % (
+	return ('| tstats count where %s(%s) (%s) by index, sourcetype, tenx_sourcetype' % (
 		where, ' OR '.join('sourcetype=%s' % _spl_value(t) for t in compact),
 		' OR '.join('tenx_sourcetype=%s' % _spl_value(t) for t in named)))
 

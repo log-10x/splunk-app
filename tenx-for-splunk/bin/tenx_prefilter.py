@@ -139,7 +139,7 @@ class TenxPrefilterCommand(GeneratingCommand):
 
 	def _original_sourcetype_rows(self, tree):
 		"""
-		Compact events (not field-mapped) whose original sourcetype the search names where it can
+		Compact events whose original sourcetype the search names where it can
 		match none of them: before `tx` or `txf`, or after `tx`. None when it names none, or when the
 		check could not run.
 		"""

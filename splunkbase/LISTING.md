@@ -77,14 +77,11 @@ The app name must match `[ui] label` in `default/app.conf` exactly.
 >
 > - The `txf` macro, written where `tx` goes, gives each expanded event the search-time fields
 >   of its original sourcetype: the add-on's extractions, aliases, lookups, event types and tags.
-> - The field map tool, `bin/tenx_field_map.py`, generates an app that writes those fields as
->   indexed fields while compact events are indexed, so data models, their accelerations and
->   detections read them without `tx`.
-> - Both are checked on Windows Security, AWS CloudTrail and FortiGate events with their
->   add-ons, against the same events indexed raw.
+> - `txf` is checked on Windows Security, AWS CloudTrail and FortiGate events with their add-ons,
+>   against the same events indexed raw.
 > - The search report, `bin/tenx_search_report.py`, lists which saved searches, alerts and
->   dashboard panels of a search head run unchanged after a source moves to compact events, with
->   or without a field map, and which need `tx`, `txf` or a field map.
+>   dashboard panels of a search head run unchanged after a source moves to compact events, and
+>   which need `tx` or `txf`.
 >
 > **Speed**, on one laptop running Splunk 10.4.3: a `tx` search over 157,228 compact events
 > returns in about 1.5 to 4 seconds, where the same search over the raw lines takes under a

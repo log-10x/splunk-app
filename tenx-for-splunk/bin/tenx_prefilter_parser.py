@@ -308,7 +308,7 @@ def named_indexes(before):
 
 def original_sourcetype_probe(sourcetypes, indexes):
 	"""
-	The tstats that finds compact events (not field-mapped) whose original sourcetype
+	The tstats that finds compact events whose original sourcetype
 	(tenx_sourcetype) is one of `sourcetypes` while their indexed sourcetype is none of them, in
 	`indexes` (all the user searches when none), or None. Those are the events such a search
 	misses; a value that also selects the compact sourcetype (tenx_encoded, tenx*) finds none.
@@ -317,7 +317,7 @@ def original_sourcetype_probe(sourcetypes, indexes):
 		return None
 	quote = lambda v: '"' + v.replace("\\", "\\\\").replace('"', '\\"') + '"'
 	where = "(%s) " % " OR ".join("index=%s" % quote(i) for i in sorted(indexes)) if indexes else ""
-	return "| tstats count where %s`tenx-events` NOT tenx_mapped=* (%s) NOT (%s) by tenx_sourcetype" % (
+	return "| tstats count where %s`tenx-events` (%s) NOT (%s) by tenx_sourcetype" % (
 		where, " OR ".join("tenx_sourcetype=%s" % quote(v) for v in sorted(sourcetypes)),
 		" OR ".join("sourcetype=%s" % quote(v) for v in sorted(sourcetypes)))
 
@@ -849,8 +849,8 @@ def lispy_tree(lispy):
 	An indexed term (name::value) restricts only as a branch of an OR beside a branch that does: Splunk
 	writes [ OR dstip::10.1.2.3 [ AND 10 1 2 3 ] ] for dstip=10.1.2.3 by default (limits.conf
 	always_include_indexedfield_lispy = true), and a raw event it returns holds either the indexed field or
-	the terms; its compact event holds the same terms, or carries the same indexed field (a field map, fields
-	sent with the event). Required on its own, or in an OR of indexed terms only, it places no restriction (a
+	the terms; its compact event holds the same terms, or carries the same indexed field (fields sent with the
+	event). Required on its own, or in an OR of indexed terms only, it places no restriction (a
 	compact event can get the field at search time instead), nor does one on a default field (sourcetype,
 	source, host, index: a compact event has its own). None when the text is not a lispy this reads (then no
 	narrowing at all).
@@ -2010,7 +2010,7 @@ def raw_history_probe(record, before):
 		return None
 	times = " ".join("%s=%s" % (k, v) for k in ("earliest", "latest") for v in _specifiers(before, k)[:1] if SAFE_TIME.match(v))
 	where = "(%s) " % " OR ".join("index=%s" % quote(i) for i in sorted(named)) if named else ""
-	return "| tstats count where %s%s(%s) NOT tenx_sourcetype=* NOT tenx_mapped=* NOT (%s) by index, sourcetype" % (
+	return "| tstats count where %s%s(%s) NOT tenx_sourcetype=* NOT (%s) by index, sourcetype" % (
 		times + " " if times else "", where, " OR ".join(pairs), RAW_EVENTS_MACRO)
 
 

@@ -103,8 +103,8 @@ class TestTheRawEventsProbe:
 	def test_the_recorded_pairs_in_the_indexes_and_time_written_before_the_macro(self):
 		assert pp.raw_history_probe(RECORD, 'index=web earliest=-90d') == (
 			'| tstats count where earliest=-90d (index="web") ((sourcetype="access_combined" (index="web" OR '
-			'index="web_old")) OR (sourcetype="fortigate_log")) NOT tenx_sourcetype=* NOT tenx_mapped=* NOT '
-			'(`tenx-raw-events`) by index, sourcetype')
+			'index="web_old")) OR (sourcetype="fortigate_log")) NOT tenx_sourcetype=* NOT (`tenx-raw-events`) by '
+			'index, sourcetype')
 
 	def test_no_index_named_is_every_recorded_pair(self):
 		probe = pp.raw_history_probe(RECORD, '')
