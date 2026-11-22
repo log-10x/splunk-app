@@ -1656,15 +1656,12 @@ def raw_history_message(rows, macro):
 														 "holds" if len(ixs) == 1 else "hold", _names(sts)))
 
 
-# The minutes after an install or an upgrade. On a search head with separate indexers the app's template
-# lookup reaches them with the next knowledge bundle; until it has, every `tx` search failed there
-# (Splunk Enterprise 10.4.3, a fresh search head over two indexers: "Error in 'lookup' command: Could not
-# construct lookup 'tenx-dml-lookup' ... does not exist or is not available", no rows, for about a minute
-# after the install). On another fresh search head over the same indexers the search process on each
-# indexer exited instead (splunkd.log: "caught exception", exit code 111), and the search head said only
-# "Search results might be incomplete: the search process on the peer:[...] ended prematurely", no rows,
-# for about a minute. For these minutes tenxprefilter runs LOOKUP_PROBE first, and when it fails on the
-# indexers either way it keeps the search on the search head (ON_SEARCH_HEAD) and warns instead.
+# The minutes after an install or an upgrade. On a search head with separate indexers the
+# template lookup reaches them with the next knowledge bundle, and until then a `tx`
+# search there fails: on Splunk's lookup error, or because the search process on each
+# indexer ends prematurely. For these minutes tenxprefilter runs LOOKUP_PROBE first and,
+# when it fails on the indexers either way, keeps the search on the search head
+# (ON_SEARCH_HEAD) and warns.
 NEW_VERSION_SECONDS = 900
 PEERS_PATH = "/services/search/distributed/peers?output_mode=json&count=0"
 LOOKUP_PROBE = ("search ((`tenx-events`) OR (`tenx-raw-events`)) | lookup tenx-dml-lookup _key AS tenx_hash OUTPUT _key AS "
@@ -1691,11 +1688,10 @@ def new_version(state, version, now):
 		return False
 
 
-# What says the template lookup is not on the indexers: one of the two answers measured above. Splunk's error
-# naming tenx-dml-lookup as a lookup it cannot construct or find, or its message that the search process on a peer
-# ended prematurely. Any other error of the probe is not this one: an add-on's automatic lookup that fails on the
-# probe's events, or the KV store starting on the search head. The search then runs as it would and shows its own
-# error.
+# Splunk's error naming tenx-dml-lookup as a lookup it cannot construct or find, or its
+# message that the search process on a peer ended prematurely, says the template lookup is
+# not on the indexers. Any other error of the probe, such as an add-on's automatic lookup
+# failing or the KV store starting, is not this one, and the search runs as it would.
 LOOKUP_NAME = "tenx-dml-lookup"
 LOOKUP_MISSING = ("could not construct lookup", "does not exist or is not available")
 PEER_PROCESS = "search process on the peer"

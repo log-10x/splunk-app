@@ -376,7 +376,7 @@ class TestTheLookupOnTheIndexers:
 		assert pp.lookup_failed(FAILED).startswith("Streamed search execute failed")
 		assert pp.lookup_failed({'messages': [{'type': 'WARN', 'text': 'lookup slow'}]}) is None
 		assert pp.lookup_failed({'results': [{'tenx_probe': 'x'}]}) is None
-		# the search process on each indexer exited before the bundle was usable (Splunk Enterprise 10.4.3)
+		# the search process on each indexer exits before the bundle is usable
 		peer = ('Search results might be incomplete: the search process on the peer:[rg-idx1,rg-idx2]  ended prematurely. '
 				'Check the peer log, such as $SPLUNK_HOME/var/log/splunk/splunkd.log and as well as the search.log for '
 				'the particular search.')

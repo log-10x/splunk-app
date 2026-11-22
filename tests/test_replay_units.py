@@ -106,7 +106,7 @@ VALUES_STEP = 'eval tenx_vars=if(match(_raw, "^~?[^,]+,[^,]+,[\\s\\S]"), replace
 
 
 # The comment over the inflate macros on events sent as their own text, and the leading "~" those macros require
-# where e12ec4e had it optional (test_text_events.py).
+# (test_text_events.py).
 TEXT_EVENTS_NOTE = '# Events sent as text. A line that does not start with ~ is an event the Receiver sent as its own'
 
 

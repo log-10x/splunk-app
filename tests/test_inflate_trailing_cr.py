@@ -1,11 +1,10 @@
 """
 The CR of a CR LF line end at the very end of an expanded event.
 
-An engine that reads a CR LF line end as one line break, and keeps the CR in the template so that the event
-is written back with its own line end, gives the expansion of such an event a CR as its last character: in the
-template's last part, or at the end of its last value. Splunk's raw event of the same line has none: its line
-breaking removes the CR LF. With that CR, a field rule ending in `$` fails and `.*` captures it. Both inflate
-macros drop exactly one CR at the very end of the expanded text, and no CR inside it.
+An engine that keeps the CR of a CR LF line end in the template gives the expansion of such an event a final
+CR, in the template's last part or at the end of its last value. Splunk's raw event of the same line has none,
+so a field rule ending in `$` fails and `.*` captures the CR. Both inflate macros drop exactly one CR at the
+very end of the expanded text, and no CR inside it.
 
 The step is run here with Python's re, as test_inflate_values_from_raw runs the macros' other regular
 expressions; the text it reads is what expand() there builds from the records tenx_dml_builder makes.
