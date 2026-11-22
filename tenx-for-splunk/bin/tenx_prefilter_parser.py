@@ -737,16 +737,15 @@ def narrowing_on(config):
 
 # Field narrowing from Splunk's own index terms (tenx_config.conf field_narrowing = splunk; off by default).
 #
-# A field comparison on raw events reads only the events that hold the index terms Splunk
-# derives for it, which Splunk writes in the job's search.log as its "base lispy". The
-# prefilter reads them from a probe, the words after the macro as a search of their own
-# over a time range that holds no event, and requires them of the compact events the way
-# it requires a word.
-#
-# Every raw event the search returns holds each term, and its compact event expands to the
-# same text, so it holds each piece as a value or through its template. A term the
-# prefilter cannot read as a word, an indexed term (name::value), a NOT, an OR with any of
-# those, or no answer at all places no restriction.
+# A field comparison on raw events reads only the events that hold the index terms Splunk derives
+# for it: Splunk expands the field's aliases, event types and tags, and leaves out a value it cannot
+# expect in the text. It writes those terms in the job's search.log as its "base lispy". The
+# prefilter asks for them with a probe: the words after the macro as a search of their own, over a
+# time range that holds no event, and requires the same terms of the compact events the way it
+# requires a word (pieces, template dictionary). Every raw event the search returns holds each of
+# those terms; its compact event expands to the same text, so it holds each piece as a value or
+# through its template, and it is selected. A term the prefilter cannot read as a word, an indexed
+# term (name::value), a NOT, an OR with any of those, or no answer at all, place no restriction.
 SPLUNK_MODE = "splunk"
 LISPY_LINE = re.compile(r"base lispy: (\[.*\])\s*$")
 LISPY_WORD = re.compile(r"^[^\s\"'\\()\[\]`]+$")

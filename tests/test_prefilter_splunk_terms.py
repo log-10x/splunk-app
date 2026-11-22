@@ -9,7 +9,7 @@ and so it holds each piece of the term as a value or through its template.
 
 What the prefilter cannot read with certainty places no restriction: an indexed term (name::value), a
 NOT, an OR with any such branch, a term with a quote, backslash, parenthesis or bracket in it, a lispy it
-cannot parse, a probe it cannot run (subsearch in the words). Then nothing is narrowed.
+cannot parse, a probe it cannot run (subsearch in the words). Then nothing is narrowed, as before.
 """
 import os
 
