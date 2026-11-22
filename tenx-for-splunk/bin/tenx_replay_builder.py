@@ -1653,11 +1653,13 @@ WILD_STEP = ' | `tenx-wild`'
 # What `tx`, `txf` and txf(<sourcetype>) read (macros.conf [tenx-raw-events]): the compact events, and
 # the raw events of the same sources that the deployment names there, which are returned as they are.
 EVENTS = '((`tenx-events`) OR (`tenx-raw-events`))'
+# The same step in `txf` and txf(<sourcetype>), whose tenx-replay-plan has put the marks on the events already.
+WILD_AFTER_PLAN = ' | `tenx-wild-planned`'
 TXF_ONE_UNIT = ('"' + EVENTS + ' [| tenxprefilter] | eval tenx_compact_raw=_raw, tenx_passed=if(match(_raw, \\"^~\\") OR '
 				'isnotnull(tenx_sourcetype), null(), 1) | `tenx-inflate` | fields - _kv | '
 				'`tenx-mapped-hide` | `tenx-whole-hide` | `tenx-replay-u" . substr(md5("$st$"), 1, 12) . "` | `tenx-replay-plan` | `tenx-replay-tags` | '
 				'`tenx-whole-restore` | `tenx-mapped-restore` | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars, tenx_nd* | '
-				'eval tenx_expand_refused=if(len(tenx_expand_refused)>0, tenx_expand_refused, null())' + WILD_STEP + ' | search *"')
+				'eval tenx_expand_refused=if(len(tenx_expand_refused)>0, tenx_expand_refused, null())' + WILD_AFTER_PLAN + ' | search *"')
 TXF_ONE = 'txf(1)'
 TXF_ONE_NAME = 'match(st, "^[A-Za-z0-9_.:/-]+$")'
 # Splunk prints it after "Encountered the following error while validating macro 'txf(<st>)': " and

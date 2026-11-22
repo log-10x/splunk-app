@@ -240,20 +240,20 @@ class TestTxIsTheShippedMacro:
 		head = ('((`tenx-events`) OR (`tenx-raw-events`)) [| tenxprefilter] | eval tenx_compact_raw=_raw, %s | `tenx-inflate` | fields - _kv | '
 				'`tenx-mapped-hide` | `tenx-whole-hide` | ')
 		tail = (' | `tenx-whole-restore` | `tenx-mapped-restore` | fields - tenx_compact_raw, tenx_rst, tenx_hash, '
-				'tenx_var_0, tenx_vars' + REFUSED_STEP + b.WILD_STEP + ' | search *')
+				'tenx_var_0, tenx_vars' + REFUSED_STEP + b.WILD_AFTER_PLAN + ' | search *')
+		tail = tail.replace('tenx_var_0, tenx_vars', 'tenx_var_0, tenx_vars, tenx_nd*')
 		# plain txf reads its replay plan right before the replay, and removes the plan's fields after it
-		assert conf.get('txf', 'definition') == head % mark + '`tenx-replay-plan` | `tenx-replay`' + tail.replace(
-			'tenx_var_0, tenx_vars', 'tenx_var_0, tenx_vars, tenx_nd*')
+		assert conf.get('txf', 'definition') == head % mark + '`tenx-replay-plan` | `tenx-replay`' + tail
 		# Splunk Enterprise 10.4.3 refuses a colon in a macro name, so txf(1) computes the unit's
 		# name with md5() in eval; on 10.4.3, md5 in eval equals hashlib's for the five names tried
 		assert conf.get('txf(1)', 'iseval') == '1'
 		assert conf.get('txf(1)', 'definition') == b.TXF_ONE_UNIT == (
 			'"' + head % mark.replace('"', '\\"') + '`tenx-replay-u" . substr(md5("$st$"), 1, 12) . "` | `tenx-replay-plan` | `tenx-replay-tags`'
-			+ tail.replace('tenx_var_0, tenx_vars', 'tenx_var_0, tenx_vars, tenx_nd*') + '"')
+			+ tail + '"')
 		assert without_guard(conf.get('txf', 'definition')) == (
 			'((`tenx-events`) OR (`tenx-raw-events`)) [| tenxprefilter] | eval tenx_compact_raw=_raw | `tenx-inflate` | fields - _kv | '
 			'`tenx-replay-plan` | `tenx-replay` | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars, tenx_nd*'
-			+ REFUSED_STEP + b.WILD_STEP + ' | search *')
+			+ REFUSED_STEP + b.WILD_AFTER_PLAN + ' | search *')
 		assert conf.get('txf(1)', 'args') == 'st'
 		# shipped, the validation names no unit; tenxreplay writes the units it has written into it
 		assert conf.get('txf(1)', 'validation') == b.txf_one_validation([]) == (
@@ -1127,6 +1127,6 @@ class TestTheWholeGuard:
 
 	def test_txf_marks_only_whole_events_without_their_original_sourcetype(self):
 		d = macros().get('txf', 'definition')
-		mark = d.split(' | ')[1]
+		mark = [step for step in d.split(' | ') if 'tenx_passed=' in step][0]
 		got = self.run(mark, [self.whole(), self.whole(tenx_sourcetype='aws:cloudtrail'), self.compact()])
 		assert [e.get('tenx_passed') for e in got] == [1, None, None]

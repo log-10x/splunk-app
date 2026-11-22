@@ -292,5 +292,9 @@ class TestTheMacroStep:
 		import configparser
 		conf = configparser.RawConfigParser(strict=False)
 		conf.read(os.path.join(APP, 'default', 'macros.conf'))
-		for name in ('tx', 'txf', 'txf(1)'):
-			assert conf.get(name, 'definition').rstrip('"').endswith(' | `tenx-wild` | search *'), name
+		assert conf.get('tx', 'definition').endswith(' | `tenx-wild` | search *')
+		# txf and txf(<sourcetype>) put the marks on the events in their plan step (tenx-replay-plan)
+		for name in ('txf', 'txf(1)'):
+			assert conf.get(name, 'definition').rstrip('"').endswith(' | `tenx-wild-planned` | search *'), name
+		wild, planned = conf.get('tenx-wild', 'definition'), conf.get('tenx-wild-planned', 'definition')
+		assert wild.endswith('] tenx_wild | ' + planned)
