@@ -238,6 +238,10 @@ def kv(path, records=None):
 	calls.append(['kv', path, records])
 	if cached == 'fail':
 		raise RuntimeError('403')
+	if '/collections/data/tenx_dml?' in path:
+		if os.environ.get('TENX_DML') == 'fail':
+			raise RuntimeError('503')
+		return json.loads(os.environ.get('TENX_DML', '[{"_key": "h"}]'))
 	return json.loads(cached) if records is None else []
 def rest(path, data=None, answer=True, method=None):
 	calls.append(['search', data['search']])
@@ -252,11 +256,12 @@ print(json.dumps({'dictionary': d, 'formats': f, 'calls': calls}))
 
 class TestTheCommand:
 
-	def run(self, cached, rows, state={'version_since': NOW - 3600}):
+	def run(self, cached, rows, state={'version_since': NOW - 3600}, dml=None):
+		env = dict(os.environ, **({'TENX_DML': dml} if dml is not None else {}))
 		with tempfile.TemporaryDirectory() as home:
 			proc = subprocess.run([sys.executable, '-c', COMMAND, ROOT, home, cached, json.dumps(rows), str(NOW),
 								   json.dumps(state)],
-								  capture_output=True, text=True, timeout=60)
+								  capture_output=True, text=True, timeout=60, env=env)
 		assert proc.returncode == 0, proc.stderr[-3000:]
 		return json.loads(proc.stdout.strip().splitlines()[-1])
 
@@ -272,11 +277,30 @@ class TestTheCommand:
 	def test_a_kept_answer_reads_the_hours_since(self):
 		kept = p.cache_records({'jsmith': (2, ['TERM(~a)', 'TERM(~b)'])}, {'00|%H:%M:%S'}, {'jsmith'}, True, NOW - 600)
 		out = self.run(json.dumps(kept), [{"n0": "1", "hs0": "TERM(~c)", "tenx_formats": "11|%Y"}])
-		assert len(out['calls']) == 2
+		assert len(out['calls']) == 3
 		hours = p.cache_hours(entries_of(kept), {'jsmith'}, True, NOW, NOW - 3600)
-		assert out['calls'][1][1] == p.dictionary_search({'jsmith'}, formats=True, hours=hours)
+		assert out['calls'][1][1] == p.written_in_path(hours)
+		assert out['calls'][2][1] == p.dictionary_search({'jsmith'}, formats=True, hours=hours)
 		assert out['dictionary'] == {'jsmith': [3, ['TERM(~a)', 'TERM(~b)', 'TERM(~c)']]}
 		assert sorted(map(tuple, out['formats'])) == [('%H:%M:%S', False, False), ('%Y', True, True)]
+
+	def test_no_record_stored_since_runs_no_search(self):
+		kept = p.cache_records({'jsmith': (2, ['TERM(~a)', 'TERM(~b)'])}, {'00|%H:%M:%S'}, {'jsmith'}, True, NOW - 600)
+		out = self.run(json.dumps(kept), [{"n0": "9", "hs0": "TERM(~z)"}], dml='[]')
+		assert [c[0] for c in out['calls']] == ['kv', 'kv']
+		assert out['dictionary'] == {'jsmith': [2, ['TERM(~a)', 'TERM(~b)']]}
+		assert out['formats'] == [['%H:%M:%S', False, False]]
+		# a store it cannot read counts as one with records: the hours are searched
+		out = self.run(json.dumps(kept), [{"n0": "1", "hs0": "TERM(~c)"}], dml='fail')
+		assert out['calls'][-1][0] == 'search' and out['dictionary'] == {'jsmith': [3, ['TERM(~a)', 'TERM(~b)', 'TERM(~c)']]}
+
+	def test_the_read_of_records_stored_in_the_hours(self):
+		path = p.written_in_path(['500000', '500001'])
+		assert path.startswith('/servicesNS/nobody/tenx-for-splunk/storage/collections/data/tenx_dml?')
+		query = dict(x.split('=', 1) for x in path.split('?', 1)[1].split('&'))
+		assert query['limit'] == '1' and query['fields'] == '_key'
+		import urllib.parse
+		assert json.loads(urllib.parse.unquote(query['query'])) == {'stored_hour': {'$in': ['500000', '500001']}}
 
 	def test_a_kept_answer_from_before_a_reload_is_not_used(self):
 		kept = p.cache_records({'jsmith': (2, ['TERM(~a)', 'TERM(~b)'])}, {'00|%H:%M:%S'}, {'jsmith'}, True, NOW - 600)

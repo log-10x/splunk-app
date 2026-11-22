@@ -53,7 +53,7 @@ class TestTheCheck:
 
 GENERATE = r"""
 import json, os, sys, types
-root, home, answer = sys.argv[1:4]
+root, home, answer, macro = sys.argv[1:5]
 os.makedirs(os.path.join(home, 'var', 'log', 'splunk'), exist_ok=True)
 os.environ['SPLUNK_HOME'] = home
 splunk = types.ModuleType('splunk')
@@ -74,6 +74,11 @@ checks, warnings = [], []
 def rest(path, data=None, answer_=True, method=None):
 	if path.startswith('/services/search/jobs/1794937815.59') and not data:
 		return {'entry': [{'content': {'search': 'search index=fw `tx` kerberos | stats count'}}]}
+	if '/configs/conf-macros/tenx-raw-events' in path:
+		checks.append(path)
+		if macro == 'none':
+			raise OSError('HTTP Error 404')
+		return {'entry': [{'content': json.loads(macro)}]}
 	if data and 'TERM(~*)' in data.get('search', ''):
 		checks.append(data['search'])
 		if answer == 'fail':
@@ -91,18 +96,35 @@ print(json.dumps({'rows': rows, 'checks': len(checks), 'warnings': warnings}))
 """
 
 
-def generate(answer):
+def generate(answer, macro='none'):
 	with tempfile.TemporaryDirectory() as home:
-		proc = subprocess.run([sys.executable, '-c', GENERATE, ROOT, home, answer], capture_output=True, text=True,
+		proc = subprocess.run([sys.executable, '-c', GENERATE, ROOT, home, answer, macro], capture_output=True, text=True,
 							  timeout=60)
 	assert proc.returncode == 0, proc.stderr[-3000:]
 	return json.loads(proc.stdout.strip().splitlines()[-1])
 
 
 class TestThePrefilter:
+	def test_events_without_words_are_read_by_a_not_of_their_hash_term(self):
+		shipped = json.dumps({'definition': 'sourcetype::tenx_no_raw_events'})
+		out = generate('fail', shipped)
+		assert out['checks'] == 1 and out['warnings'] == []
+		assert out['rows'] == [{'search': '(((TERM(kerberos) OR TERM(~h_kerberos))) OR (NOT TERM(~*) NOT (sourcetype::tenx_no_raw_events)))'}]
+		named = json.dumps({'definition': 'index=web (sourcetype::access_combined OR sourcetype::fw)'})
+		assert generate('fail', named)['rows'][0]['search'].endswith(
+			'OR (NOT TERM(~*) NOT (index=web (sourcetype::access_combined OR sourcetype::fw))))')
+
+	@pytest.mark.parametrize('content', [{'definition': '`other`'}, {'definition': 'x', 'iseval': '1'},
+										 {'definition': 'index=a [| inputlookup x]'}, {'definition': ''},
+										 {'definition': '(unbalanced'}, {}])
+	def test_a_definition_that_cannot_stand_in_the_text_falls_back_to_the_check(self, content):
+		assert p.usable_definition(content) is None
+		out = generate('[]', json.dumps(content))
+		assert out['rows'] == [{'search': '((TERM(kerberos) OR TERM(~h_kerberos)))'}] and out['checks'] == 2
+
 	def test_every_group_holds_words(self):
 		out = generate('[]')
-		assert out['checks'] == 1 and out['warnings'] == []
+		assert out['checks'] == 2 and out['warnings'] == []
 		assert out['rows'] == [{'search': '((TERM(kerberos) OR TERM(~h_kerberos)))'}]
 
 	def test_a_group_without_words_is_read_whole(self):
