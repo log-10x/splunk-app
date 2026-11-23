@@ -14,7 +14,6 @@ import tenx_replay_builder as b
 APP = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'tenx-for-splunk'))
 WINDOWS = 'source::XmlWinEventLog:Security'
 STREAM = 'source::stream:*'
-TRANSFORM = 'tenx-computer-as-dest'
 
 
 def conf(name, strict=False):
@@ -31,10 +30,8 @@ def meta():
 
 
 class TestTheStanzas:
-	def test_windows_xml_security_sets_dest_from_computer(self):
-		assert dict(conf('props.conf').items(WINDOWS)) == {'REPORT-tenx_dest': TRANSFORM}
-		assert dict(conf('transforms.conf').items(TRANSFORM)) == \
-			{'SOURCE_KEY': 'Computer', 'REGEX': '^(.+)$', 'FORMAT': 'dest::$1'}
+	def test_windows_xml_security_aliases_computer_as_dest(self):
+		assert dict(conf('props.conf').items(WINDOWS)) == {'FIELDALIAS-tenx_dest': 'Computer ASNEW dest'}
 
 	def test_stream_aliases_src_and_dest(self):
 		assert dict(conf('props.conf').items(STREAM)) == \
@@ -44,30 +41,18 @@ class TestTheStanzas:
 	def test_each_file_reads_without_a_repeated_stanza_or_setting(self, name):
 		assert conf(name, strict=True).sections()
 
-	def test_the_transform_writes_the_whole_value_to_dest(self):
-		transform = dict(conf('transforms.conf').items(TRANSFORM))
-		regex = re.compile(transform['REGEX'])
-		assert regex.groups == 1 and re.findall(r'\$(\d+)', transform['FORMAT']) == ['1']
-		assert b.transform_outputs(transform) == {'dest'}
-		for value in ('WIN-DC01.corp.example.com', 'host 2', 'a'):
-			assert regex.match(value).group(1) == value
-		assert regex.match('') is None
+	def test_the_aliases_read_as_asnew_pairs(self):
+		props = conf('props.conf')
+		assert b.parse_aliases(props.get(WINDOWS, 'FIELDALIAS-tenx_dest')) == [('Computer', 'ASNEW', 'dest')]
+		assert b.parse_aliases(props.get(STREAM, 'FIELDALIAS-tenx_src_dest')) == [('src_ip', 'ASNEW', 'src'), ('dest_ip', 'ASNEW', 'dest')]
 
-	def test_the_alias_reads_as_two_asnew_pairs(self):
-		value = conf('props.conf').get(STREAM, 'FIELDALIAS-tenx_src_dest')
-		assert b.parse_aliases(value) == [('src_ip', 'ASNEW', 'src'), ('dest_ip', 'ASNEW', 'dest')]
-
-	def test_both_are_search_time_only(self):
+	def test_both_set_their_fields_by_alias_alone(self):
+		# Splunk looks up the value of a search for an alias also as the source field's indexed value, which a compact
+		# event carries; a value an extraction gives is looked up only as words of the event text.
 		props = conf('props.conf')
 		for stanza in (WINDOWS, STREAM):
-			assert all(k.startswith(('REPORT-', 'FIELDALIAS-')) for k in props.options(stanza)), stanza
-		assert not set(conf('transforms.conf').options(TRANSFORM)) & {'INGEST_EVAL', 'DEST_KEY', 'WRITE_META'}
-
-	def test_the_report_class_sorts_after_the_windows_add_ons_dest_and_xml_classes(self):
-		# The Windows add-on's classes that extract Computer from the XML or write dest, on the same events.
-		addon = ['0xml_block_extract', '0xml_kv_extract', '0dest_for_windows_security_4798',
-				 '0dest_for_windows_security_from_xml', 'dest_for_windows_security']
-		assert sorted(addon + ['tenx_dest'])[-1] == 'tenx_dest'
+			assert all(k.startswith('FIELDALIAS-') for k in props.options(stanza)), stanza
+		assert not [s for s in conf('transforms.conf').sections() if 'dest' in s or 'src' in s]
 
 
 class TestTheSourcesTheyApplyTo:
@@ -98,12 +83,11 @@ class TestSharedLikeTheOtherSearchTimeSettings:
 
 	def test_no_entry_of_their_own_changes_that(self):
 		entries = re.findall(r'^\[((?:props|transforms)/[^\]]*)\]', meta(), re.M)
-		assert entries and not [e for e in entries if re.search(r'XmlWinEventLog|stream|computer-as-dest', e, re.I)]
+		assert entries and not [e for e in entries if re.search(r'XmlWinEventLog|stream', e, re.I)]
 
 	def test_the_replay_counts_dest_and_src_as_fields_not_in_the_text(self):
 		# The search rewrite then does not narrow a comparison on them by the compact text, where their values need not be.
-		props, transforms = conf('props.conf'), conf('transforms.conf')
+		props = conf('props.conf')
 		stanzas = [b.Stanza(s, dict(props.items(s))) for s in (WINDOWS, STREAM)]
-		found = b.fields_not_in_text(stanzas, {TRANSFORM: dict(transforms.items(TRANSFORM))},
-									 keep_fields=('Computer', 'src_ip', 'dest_ip'))
+		found = b.fields_not_in_text(stanzas, {}, keep_fields=('Computer', 'src_ip', 'dest_ip'))
 		assert {'dest', 'src'} <= set(found)
