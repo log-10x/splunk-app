@@ -116,6 +116,13 @@ COUNTED_PER_SEARCH = 400
 ALL_TIME = ('0', None)
 
 
+def json_path(path):
+	"""`path` with output_mode=json in its query once; splunkd refuses a request that names it twice."""
+	if re.search(r'[?&]output_mode=', path):
+		return path
+	return path + ('&' if '?' in path else '?') + 'output_mode=json'
+
+
 def shared_with_everyone(acl):
 	"""Whether a macro listing's acl shares it with every app and lets every role read it."""
 	acl = acl or {}
@@ -146,9 +153,8 @@ class TenxReplayCommand(GeneratingCommand):
 		context = ssl.create_default_context()
 		context.check_hostname = False
 		context.verify_mode = ssl.CERT_NONE
-		sep = '&' if '?' in path else '?'
 		request = urllib.request.Request(
-			info.splunkd_uri + path + sep + 'output_mode=json',
+			info.splunkd_uri + json_path(path),
 			data=urllib.parse.urlencode(data).encode() if data is not None else None,
 			method=method or ('POST' if data is not None else 'GET'),
 			headers={'Authorization': 'Splunk ' + info.session_key})

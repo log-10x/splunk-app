@@ -375,3 +375,70 @@ def test_a_rebuild_samples_only_what_is_new():
 	assert pair['samples'] == ['index=sy tenx_sourcetype::XmlWinEventLog']
 	# a sample older than the rebuild's window is taken again
 	assert len(week['samples']) == 4
+
+
+# The rebuild through its own requests: every URL it builds is answered as splunkd answers it, refused when it
+# names a query key twice (splunkd 10.4.3: "Must provide one value for output mode (got 2).").
+THROUGH_REQUESTS = r'''
+import io, time, urllib.error, urllib.request
+
+repeated = []
+
+class Response(io.BytesIO):
+	def __enter__(self):
+		return self
+
+	def __exit__(self, *a):
+		return False
+
+def urlopen(request, context=None, timeout=None):
+	url = urllib.parse.urlsplit(request.full_url)
+	keys = [k for k, _ in urllib.parse.parse_qsl(url.query, keep_blank_values=True)]
+	if len(keys) != len(set(keys)):
+		repeated.append(url.path)
+		raise urllib.error.HTTPError(request.full_url, 400, 'Must provide one value for output mode (got 2).', {}, None)
+	data = dict(urllib.parse.parse_qsl(request.data.decode())) if request.data else None
+	method = 'DELETE' if request.get_method() == 'DELETE' else None
+	return Response(json.dumps(fake.rest(url.path + ('?' + url.query if url.query else ''), data, method)).encode())
+
+urllib.request.urlopen = urlopen
+
+def rebuild():
+	cmd = tenxreplay.TenxReplayCommand()
+	cmd._metadata = types.SimpleNamespace(searchinfo=types.SimpleNamespace(
+		username='splunk-system-user', splunkd_uri='https://127.0.0.1:8089', session_key='key',
+		earliest_time='-7d', latest_time='now'))
+	cmd._apply, cmd._only_new, cmd._lookback = True, False, '-7d'
+	warnings = []
+	cmd.logger.warning = lambda *a: warnings.append(a[0] % a[1:] if len(a) > 1 else a[0])
+	fake.searches, fake.writes = [], []
+	list(cmd.generate())
+	return {'samples': len([s for s, _ in fake.searches if 'dedup tenx_th' in s]), 'warnings': warnings}
+
+fake = FakeSplunk([('XmlWinEventLog', 'XmlWinEventLog:Security', 'dc1', 5, 'wx', True),
+				   ('linux:audit', '/var/log/audit/audit.log', 'h1', 3, 'au', True)])
+out = {'first': rebuild(), 'quiet': rebuild()}
+fake.stored = [{'pattern_hash': 'h new', 'stored_hour': str(int(time.time()) // 3600)}]
+out['template'] = rebuild()
+out['repeated'] = sorted(set(repeated))
+print(json.dumps(out))
+'''
+
+
+class TestTheRebuildsOwnRequests:
+	ran = {}
+
+	def out(self):
+		from test_replay_coverage_record import child_run
+		if not self.ran:
+			self.ran.update(child_run(THROUGH_REQUESTS))
+		return self.ran
+
+	def test_no_request_names_a_query_key_twice(self):
+		assert self.out()['repeated'] == []
+
+	def test_a_run_with_nothing_new_reads_the_store_and_samples_nothing(self):
+		out = self.out()
+		assert out['first']['samples'] == 3
+		assert out['quiet'] == {'samples': 0, 'warnings': []}
+		assert out['template']['samples'] == 1
