@@ -128,7 +128,7 @@ MONITOR = {'host': 'hf1', 'source': '/opt/tenx/compact/events/win/tenx.rfs.win.x
 class TestWhereTheRuleRuns:
 	def test_only_the_compact_folder_runs_it(self):
 		props = conf('props.conf')
-		assert props.get(STANZA, CLASS) == RULE
+		assert props.get(STANZA, CLASS) == 'tenx-relay-line, ' + RULE
 		users = [(s, k) for s in props.sections() for k, v in props.items(s) if RULE in v]
 		assert users == [(STANZA, CLASS)]
 
@@ -136,7 +136,7 @@ class TestWhereTheRuleRuns:
 		# Fluent Bit writes the template records beside events/, and the heavy forwarder reads them as tenx_dml_raw_json.
 		assert STANZA.endswith('/events/...')
 
-	def test_compact_events_sent_to_hec_or_read_by_a_universal_forwarder_are_not_touched(self):
+	def test_compact_events_outside_the_folder_are_not_touched(self):
 		props = conf('props.conf')
 		assert props.get('tenx_encoded', 'TRANSFORMS-tenx_time') == 'tenx-event-time'
 		assert [k for k, _ in props.items('tenx_encoded') if k.startswith('TRANSFORMS-')] == ['TRANSFORMS-tenx_time']
@@ -191,6 +191,15 @@ class TestTheRuleOnLines:
 	def test_a_line_without_an_event_keeps_its_text_and_is_marked(self, raw):
 		e = run(raw, **MONITOR)
 		assert e['_raw'] == raw and e['tenx_unwrap'] == 'failed'
+
+	def test_a_line_without_a_sourcetype_keeps_the_one_the_event_has(self):
+		# A Universal Forwarder's _meta = tenx_sourcetype::<st>; := with null() would remove it.
+		line = dict(LINE)
+		del line['sourcetype']
+		e = run(json.dumps(line), tenx_sourcetype='aws:cloudtrail', **MONITOR)
+		assert e['tenx_sourcetype'] == 'aws:cloudtrail'
+		e = run(json.dumps(LINE), tenx_sourcetype='aws:cloudtrail', **MONITOR)
+		assert e['tenx_sourcetype'] == 'XmlWinEventLog'
 
 	def test_a_line_without_meta_leaves_the_indexed_fields_alone(self):
 		e = run(json.dumps(LINE), **MONITOR)

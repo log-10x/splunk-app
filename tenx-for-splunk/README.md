@@ -388,14 +388,15 @@ under, after any rename the add-on makes while it parses them. To limit the rule
 the line in a `[source::<source>]` or `[host::<host>]` stanza in place of `[tenx_encoded]`.
 
 Turn it on only for sources whose Receiver attaches the fields that the add-on's event types and models
-read; without them, an event can count in a model with those fields empty. Compact files a Universal
-Forwarder reads carry no attached fields, so leave those sources out.
+read; without them, an event can count in a model with those fields empty. A Universal Forwarder's
+compact files carry attached fields only as relay lines (see "Universal Forwarder Relay Lines"), so
+leave out sources whose files hold the compact text alone.
 
 `tx`, `txf` and the dashboards find these events by `tenx_sourcetype` and expand them as before. A field
 the Receiver attached and the expanded text also holds keeps the extracted values alone, once the
-"Rebuild Field Replay" saved searches have run. Behind a heavy forwarder, the Receiver attaches the
-fields with `compactFieldsForm text`, `compactFieldsKey meta` and `compactFieldsSeparator ::`, and
-`[tenx-record-unwrap]` adds them to the event's indexed fields.
+"Rebuild Field Replay" saved searches have run. On the file routes, behind a heavy forwarder or a
+Universal Forwarder, the Receiver attaches the fields with `compactFieldsForm text`, `compactFieldsKey
+meta` and `compactFieldsSeparator ::`, and `[tenx-record-unwrap]` adds them to the event's indexed fields.
 
 ### Raw Events from Before the Receiver
 
@@ -982,7 +983,7 @@ For another folder, add a stanza for it to `local/props.conf` of the app on the 
 
 ```
 [source::<folder>/events/...]
-TRANSFORMS-00_tenx_unwrap = tenx-record-unwrap
+TRANSFORMS-00_tenx_unwrap = tenx-relay-line, tenx-record-unwrap
 ```
 
 Every compact event keeps the `_time` the heavy forwarder gave the raw event: the rule marks it
@@ -1007,6 +1008,30 @@ These limits apply to this arrangement:
   schedule, whose wait between tries grows, so their compact events can arrive minutes after the
   Receiver is back.
 - Fields a rule of the heavy forwarder's own writes with `WRITE_META` are not on the compact events.
+
+### Universal Forwarder Relay Lines
+
+Where a Universal Forwarder reads the Receiver's compact events from files, each line can carry the
+fields the Receiver attaches and the event's time. Fluent Bit writes the file with `Format out_file`,
+so a line is the record the Receiver returned, after its tag and time:
+
+```
+tenx.app.logs: [1794013200.448351000, {"event":"~...","meta":"user::\"bob\""}]
+```
+
+On the files under `/opt/tenx/compact/events/`, the instance that parses the events runs
+`[tenx-relay-line]` and then `[tenx-record-unwrap]`. That instance is an indexer, or the heavy
+forwarder the Universal Forwarder sends to. The event gets the line's time, marked `tenx_time=sender`,
+and the record's `meta` text as indexed fields. The compact text becomes `_raw`, so only it is counted
+against the licence. Files in another folder take the stanza shown above.
+
+The record holds the compact text under `event`: Fluent Bit's tail input takes `Key event`, and the
+Receiver `fluentbitInputMessageField event`. The Receiver writes the fields with `compactFieldsForm
+text`, `compactFieldsKey meta` and `compactFieldsSeparator ::`. A `sourcetype` key in the record sets
+`tenx_sourcetype`; without one, the event keeps the `tenx_sourcetype` of the monitor stanza's `_meta`.
+
+Install the `_indexers` package on the parsing instance before Fluent Bit writes this format. Without
+it, the whole line is indexed and counted against the licence, and nothing expands.
 
 ## Getting Started
 
