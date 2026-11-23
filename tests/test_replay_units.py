@@ -1014,7 +1014,7 @@ class TestTheRewriteReadsTheCoverage:
 		import tenx_util
 		got = tenx_util.get_replay_coverage(self.service({'XmlWinEventLog': {'indexes': 'wineventlog', 'sources': 'x'},
 														 'demo:kv': {}}))
-		empty = {'left_out': '', 'commands': ''}
+		empty = {'left_out': '', 'commands': '', 'renamed': ''}
 		assert got == {'XmlWinEventLog': dict(empty, indexes='wineventlog', unit=''), 'demo:kv': dict(empty, indexes='', unit='')}
 		# JSON-safe: the search handler logs the config with json.dumps
 		json.dumps(got)

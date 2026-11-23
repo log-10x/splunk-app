@@ -36,7 +36,8 @@ the alias tenx-replay-st-<sourcetype>; the validation of txf(1), which lets txf(
 for a sourcetype that has a unit and stops it with a message for one that has none; one tenx_replay.conf stanza
 per original sourcetype listing the fields a calculated field or a lookup produces and the
 sources, hosts and indexes recorded (the search rewrite reads `indexes` to pick the units a search
-needs); the stanza [tenx:narrowing]: every field whose value some props stanza takes from
+needs), with `renamed = 1` once compact events are indexed under that sourcetype (the search rewrite then
+expands a search that names it); the stanza [tenx:narrowing]: every field whose value some props stanza takes from
 somewhere other than the event's text, which the prefilter must not narrow on (see
 tenx_prefilter_parser.py), written whatever field_narrowing says so that the setting takes effect
 however it is changed; and the stanza [tenx:plan]: the macro's rule table, from which the prefilter
@@ -91,9 +92,11 @@ TX_EXTRACT = 'tenx-extract'
 CONF = 'tenx_replay'
 # default/savedsearches.conf: rewrites every managed compiled alert whose compiled text changed.
 RECOMPILE_SEARCH = 'Recompile Compiled Alerts'
-SAMPLE_EVENTS = 1000
+SAMPLE_EVENTS = 100000
 # Senders (index, host, source, sourcetype) per search that reads the most recent event of each.
 SENDERS_PER_SEARCH = 200
+# Field names per tstats that counts which of them the compact events carry.
+COUNTED_PER_SEARCH = 400
 # Every event date: from the epoch, with no end (an end of 'now' leaves out events dated ahead).
 ALL_TIME = ('0', None)
 
@@ -193,14 +196,15 @@ class TenxReplayCommand(GeneratingCommand):
 		return dict((e['name'], e.get('content', {})) for e in
 			self._rest(self._ns('configs/conf-transforms?count=0')).get('entry', []))
 
-	def _indexed_fields(self, earliest, latest):
+	def _indexed_fields(self, earliest, latest, named=()):
 		"""
 		(every indexed field name of the compact events, the names declared indexed,
 		{original sourcetype: the indexed fields of its compact events}).
 
 		The first is what the prefilter must not narrow on (builder.fields_not_in_text): fields.conf
-		INDEXED = true, and the fields of a sample of compact events (_sample_fields) that tstats can
-		count over all compact events. The replay's clearing step keeps the second on every replayed event and the
+		INDEXED = true, and the names that tstats can count over all compact events among those of a sample
+		of compact events (_sample_fields), those tenx-extract holds already, and `named`. The replay's
+		clearing step keeps the second on every replayed event and the
 		third per original sourcetype (builder.build keep_by_sourcetype), counted over the events the
 		replay works on, those carrying tenx_sourcetype. An indexed field one sender writes for one
 		sourcetype is then no reason to keep the field of the same name that Splunk set on another
@@ -212,36 +216,45 @@ class TenxReplayCommand(GeneratingCommand):
 				declared.add(entry['name'])
 		names = set(declared)
 		by_sourcetype = {}
-		candidates = sorted(self._sample_fields(earliest, latest) - set(builder.DEFAULT_KEEP))
-		candidates = [c for c in candidates if not c.startswith(('_', 'tenx_', 'date_')) and '"' not in c]
-		if candidates:
-			funcs = ', '.join('dc("%s") as f%d' % (c, n) for n, c in enumerate(candidates))
+		# A name tenx-extract holds already stays while tstats still counts it, so a field of a template a later
+		# sample misses is not dropped.
+		sampled = (self._sample_fields(earliest, latest) | set(named)
+				   | set(builder.tx_extract_names(self._tx_extract_definition())))
+		candidates = sorted(sampled - set(builder.DEFAULT_KEEP) - set(builder.SPLUNK_COMPUTED))
+		candidates = [c for c in candidates if not c.startswith(('_', 'tenx_', 'date_')) and '"' not in c
+					  and '\\' not in c and builder.safe_text(c)]
+		for at in range(0, len(candidates), COUNTED_PER_SEARCH):
+			chunk = candidates[at:at + COUNTED_PER_SEARCH]
+			funcs = ', '.join('dc("%s") as f%d' % (c, n) for n, c in enumerate(chunk))
 			counts = self._oneshot('| tstats %s where %s' % (funcs, self._events()), earliest, latest)
 			row = counts[0] if counts else {}
-			names.update(c for n, c in enumerate(candidates) if str(row.get('f%d' % n, '0')) not in ('0', ''))
+			names.update(c for n, c in enumerate(chunk) if str(row.get('f%d' % n, '0')) not in ('0', ''))
 			for row in self._oneshot('| tstats %s where %s by %s' % (
 					funcs, self._events(), builder.CARRIER_FIELD), earliest, latest):
 				st = row.get(builder.CARRIER_FIELD)
 				if st:
 					by_sourcetype.setdefault(st, set()).update(
-						c for n, c in enumerate(candidates) if str(row.get('f%d' % n, '0')) not in ('0', ''))
+						c for n, c in enumerate(chunk) if str(row.get('f%d' % n, '0')) not in ('0', ''))
 
 		def usable(found):
 			# Splunk's own fields.conf lists its default fields; those are kept anyway.
-			return sorted(n for n in found if n not in builder.DEFAULT_KEEP and '*' not in n and '::' not in n
-						  and not n.startswith(('_', 'tenx_', 'date_')))
+			return sorted(n for n in found if n not in builder.DEFAULT_KEEP and n not in builder.SPLUNK_COMPUTED
+						  and '*' not in n and '::' not in n and not n.startswith(('_', 'tenx_', 'date_')))
 		return usable(names), usable(declared), dict((st, usable(found)) for st, found in by_sourcetype.items())
 
 	def _sample_fields(self, earliest, latest):
 		"""
-		The field names of a sample of the compact events: the SAMPLE_EVENTS most recent, and the most
-		recent event of each index, host, source and sourcetype, so a sender whose events are not among
-		the most recent still brings the indexed fields it writes (an event_field of one Fluent Bit, a
-		_meta of one forwarder). A field that only older events of a sender carry is not in it; fields.conf
+		The field names of a sample of the compact events: one event of each template and sender among the
+		SAMPLE_EVENTS most recent, since the fields a reader attaches follow the event's structure, and the
+		most recent event of each index, host, source and sourcetype, so a sender whose events are not among
+		the most recent still brings the indexed fields it writes (an event_field of one Fluent Bit, a _meta
+		of one forwarder). A field that only older events of a sender carry is not in it; fields.conf
 		INDEXED = true names such a field.
 		"""
-		found = set(r.get('field') for r in self._oneshot('search %s | head %d | fieldsummary | fields field' % (
-			self._events(), SAMPLE_EVENTS), earliest, latest))
+		found = set(r.get('field') for r in self._oneshot(
+			'search %s | head %d | eval tenx_th=if(match(_raw, "^~[^,]"), replace(_raw, "^~([^,]+)[\\s\\S]*$", "\\1"), "-") '
+			'| dedup tenx_th index host source sourcetype | fieldsummary | fields field' % (
+				self._events(), SAMPLE_EVENTS), earliest, latest))
 		clauses = []
 		for r in self._oneshot('| tstats max(_time) as t where %s by index host source sourcetype' % self._events(),
 							   earliest, latest):
@@ -305,6 +318,13 @@ class TenxReplayCommand(GeneratingCommand):
 			self._events(all_time), where, builder.CARRIER_FIELD), earliest, latest)
 		return [(r[builder.CARRIER_FIELD], r.get('source', ''), r.get('host', ''), int(r.get('count', 0) or 0),
 				 r.get('index', '')) for r in rows if r.get(builder.CARRIER_FIELD)]
+
+	def _renamed(self, earliest, latest):
+		"""The original sourcetypes that compact events in the time range are indexed under."""
+		rows = self._oneshot('| tstats count where %s by %s, sourcetype' % (self._events(), builder.CARRIER_FIELD),
+							 earliest, latest)
+		return sorted(set(r[builder.CARRIER_FIELD] for r in rows
+						  if r.get(builder.CARRIER_FIELD) and r.get(builder.CARRIER_FIELD) == r.get('sourcetype')))
 
 	def _config(self):
 		"""tenx_config.conf [config]: the replay limits and field_narrowing. Unreadable: the defaults."""
@@ -511,10 +531,17 @@ class TenxReplayCommand(GeneratingCommand):
 			return []
 		return [builder.PLAN_STANZA]
 
+	def _tx_extract_definition(self):
+		"""The definition of tenx-extract as written now; None when it cannot be read."""
+		try:
+			current = self._rest(self._ns('configs/conf-macros/%s' % urllib.parse.quote(TX_EXTRACT, safe='')))
+		except (OSError, ValueError):
+			return None
+		return current.get('entry', [{}])[0].get('content', {}).get('definition')
+
 	def _write_tx_extract(self, definition):
 		"""Writes tenx-extract when its definition changed and it runs cleanly here; returns the names written."""
-		current = self._rest(self._ns('configs/conf-macros/%s' % urllib.parse.quote(TX_EXTRACT, safe='')))
-		if current.get('entry', [{}])[0].get('content', {}).get('definition') == definition:
+		if self._tx_extract_definition() == definition:
 			return []
 		error = self._dry_run('| makeresults | eval _raw="x" | %s | stats count' % definition)
 		if error:
@@ -524,7 +551,7 @@ class TenxReplayCommand(GeneratingCommand):
 		return [TX_EXTRACT]
 
 	def _write(self, replay, not_in_text, last_seen, narrowing, units=None, cov=None, failed=(), now=None,
-			   settings=None, nocarrier=None, tx_extract=None):
+			   settings=None, nocarrier=None, tx_extract=None, renamed=()):
 		try:
 			existing = dict((e['name'], e.get('content', {})) for e in
 				self._rest(self._ns('configs/conf-%s?count=0' % CONF)).get('entry', []))
@@ -560,15 +587,19 @@ class TenxReplayCommand(GeneratingCommand):
 				want[builder.COMMANDS_KEY] = ('' if st in failed or st not in (units or {}) else
 											  str(builder.top_level_commands(units[st].spl())))
 			have = existing.get(st)
+			# Kept once set: the events indexed under the sourcetype stay searchable after this time range.
+			if st in renamed or (have or {}).get(builder.RENAMED_KEY) == '1':
+				want[builder.RENAMED_KEY] = '1'
 			if have is None:
 				self._rest(self._ns('configs/conf-%s' % CONF), dict(want, name=st))
 				changed.append(st)
 				self.rewrite_changed.append(st)
 			elif any(have.get(k, '') != v for k, v in want.items()):
+				moved = any(k in want and have.get(k, '') != want[k] for k in ('indexes', 'unit', builder.LEFT_OUT_KEY,
+																			   builder.COMMANDS_KEY, builder.RENAMED_KEY))
 				self._rest(self._ns('configs/conf-%s/%s' % (CONF, urllib.parse.quote(st, safe=''))), want)
 				changed.append(st)
-				if any(k in want and have.get(k, '') != want[k] for k in ('indexes', 'unit', builder.LEFT_OUT_KEY,
-																		  builder.COMMANDS_KEY)):
+				if moved:
 					self.rewrite_changed.append(st)
 		if nocarrier is not None:
 			moved = self._write_nocarrier(existing.get(builder.NOCARRIER_STANZA), nocarrier)
@@ -711,9 +742,12 @@ class TenxReplayCommand(GeneratingCommand):
 			nocarrier = builder.nocarrier_value(self._compact_indexes(earliest, latest), carrier_ix)
 			stanzas = self._stanzas()
 			lookups = self._lookup_fields()
-			keep_all, keep, keep_by_st = self._indexed_fields(earliest, latest)
-			not_raw = self._indexed_value_false()
 			transforms = self._transforms()
+			named = builder.rule_field_names(stanzas, [p[0] for p in present if builder.usable_sourcetype(p[0])],
+											 transforms, lookups)
+			keep_all, keep, keep_by_st = self._indexed_fields(earliest, latest, named)
+			not_raw = self._indexed_value_false()
+			renamed = self._renamed(earliest, latest)
 		except Exception as e:
 			self.logger.exception("tenxreplay: reading the configuration failed")
 			self.error_exit(e, "tenxreplay: could not read the instance's configuration (%s); nothing was written." % e)
@@ -776,11 +810,14 @@ class TenxReplayCommand(GeneratingCommand):
 				self.logger.warning("tenxreplay: original sourcetype %s is masked at index time (%s); its compact events "
 									"hold those values unmasked", st, ', '.join(info['masking']))
 		not_in_text = builder.fields_not_in_text(stanzas, transforms, lookups, keep_all, not_raw)
+		computed = set()
+		for info in self._recorded_infos(replay, units, failed).values():
+			computed.update(info.get('computed', ()), info.get('aliased', ()))
 		written = []
 		if self.apply:
 			try:
 				written = self._write(replay, not_in_text, last_seen, builder.narrowing_wanted(config, replay), units, cov,
-									  failed, now, settings, nocarrier, builder.tx_extract(keep_all))
+									  failed, now, settings, nocarrier, builder.tx_extract(keep_all, computed), renamed)
 			except Exception as e:
 				self.logger.exception("tenxreplay: writing the macro failed")
 				self._recompile_alerts()

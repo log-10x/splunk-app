@@ -181,6 +181,12 @@ def extract_steps(as_read=False, indexed=()):
 HELD = 'tenx_ih'
 # The events `tx` expands (macros.conf [tenx-extract]): not passed whole, and with a template applied.
 TX_EXPANDED = 'isnull(tenx_passed) AND coalesce(tenx_expand_refused, "")==""'
+# tx_extract(): the flag of the expanded events Splunk read under their original sourcetype, and the prefix
+# of the copies that are put back in place of what `extract` finds.
+AS_ORIGINAL = 'tenx_io'
+KEPT = 'tenx_ic'
+# Splunk's own fields, which typer and tags compute: never kept or held as indexed fields.
+SPLUNK_COMPUTED = ('eventtype', 'tag')
 
 
 def held_steps(names, cond):
@@ -206,15 +212,73 @@ def held_steps(names, cond):
 
 
 def held_names(names):
-	"""The names of `names` that held_steps() holds: none of Splunk's default fields or the kept patterns."""
+	"""The names of `names` that held_steps() holds: none of Splunk's default or computed fields or the kept patterns."""
 	keep = re.compile('^(%s)$' % '|'.join(KEEP_PATTERNS))
-	return sorted(n for n in set(names) if n not in DEFAULT_KEEP and not keep.match(n) and safe_text(n))
+	return sorted(n for n in set(names) if n not in DEFAULT_KEEP and n not in SPLUNK_COMPUTED
+				  and not keep.match(n) and safe_text(n))
 
 
-def tx_extract(names):
-	"""The definition of tenx-extract (macros.conf) for the indexed fields `names` of the compact events."""
-	hold, restore = held_steps(held_names(names), TX_EXPANDED)
-	return ' | '.join(hold + ['extract'] + restore)
+def _holds(names, copies, null):
+	"""
+	The steps that run the assignments `copies` and then `null` for each of `names`, written with <<FIELD>>:
+	one foreach over the plain names (a third of the text of one eval assignment each), one eval for the rest.
+	A name eval cannot write is left out.
+	"""
+	listed, parts = [], []
+	for name in names:
+		try:
+			field_lhs(name), field_ref(name)
+		except ReplayError:
+			continue
+		if PLAIN_NAME.match(name):
+			listed.append(name)
+		else:
+			parts += [a.replace('<<FIELD>>', name) for a in copies + [null]]
+	steps = []
+	if listed:
+		steps.append('foreach %s [eval %s]' % (' '.join(listed), ', '.join(copies + [null])))
+	if parts:
+		steps.append('eval ' + ', '.join(parts))
+	return steps
+
+
+def tx_extract(names, computed=()):
+	"""
+	The definition of tenx-extract (macros.conf): `extract` with the indexed fields `names` held aside on each
+	event `tx` expands. A held field takes the values `extract` finds and keeps its own where it finds none.
+	A field of `computed` on an event Splunk read under its original sourcetype keeps its own value: that
+	sourcetype's calculated field, lookup or alias set it from the indexed fields, as on the raw event.
+	"""
+	held = held_names(names)
+	first = sorted(set(held) & set(computed))
+	plain = sorted(set(held) - set(first))
+	copy = '"%s_<<FIELD>>"=if(%s, \'<<FIELD>>\', null())'
+	null = '"<<FIELD>>"=if(isnotnull(%s), null(), \'<<FIELD>>\')' % HELD
+	hold = _holds(plain, [copy % (HELD, 'isnotnull(%s)' % HELD)], null)
+	hold += _holds(first, [copy % (KEPT, 'isnotnull(%s)' % AS_ORIGINAL),
+						   copy % (HELD, 'isnotnull(%s) AND isnull(%s)' % (HELD, AS_ORIGINAL))], null)
+	if not hold:
+		return 'extract'
+	flags = 'eval %s=if(%s, 1, null())' % (HELD, TX_EXPANDED)
+	restore = ['foreach %s_* [eval "<<MATCHSTR>>"=coalesce(\'<<MATCHSTR>>\', \'<<FIELD>>\')]' % HELD]
+	drop = 'fields - %s*' % HELD
+	if first:
+		flags += ', %s=if(isnotnull(%s) AND sourcetype==mvindex(%s,0), 1, null())' % (AS_ORIGINAL, HELD, CARRIER_FIELD)
+		restore.append('foreach %s_* [eval "<<MATCHSTR>>"=coalesce(\'<<FIELD>>\', \'<<MATCHSTR>>\')]' % KEPT)
+		drop += ', %s_*, %s' % (KEPT, AS_ORIGINAL)
+	return ' | '.join([flags] + hold + ['extract'] + restore + [drop])
+
+
+TX_HELD = re.compile(r'"%s_([^"<]+)"=if\(|foreach ([A-Za-z0-9_.:@ -]+?) \[eval "(?:%s|%s)_<<FIELD>>"=' % (
+	'(?:%s|%s)' % (HELD, KEPT), HELD, KEPT))
+
+
+def tx_extract_names(definition):
+	"""The fields a definition written by tx_extract() holds aside; none for any other text."""
+	names = set()
+	for one, listed in TX_HELD.findall(definition or ''):
+		names.update([one] if one else listed.split())
+	return sorted(names)
 
 
 ALIAS_KEY = re.compile(r'^FIELDALIAS-(.+)$')
@@ -1046,6 +1110,44 @@ def read_time_names(stanzas, transforms=None, lookup_fields=None):
 	return names, dynamic
 
 
+def rule_field_names(stanzas, sourcetypes, transforms=None, lookup_fields=None):
+	"""
+	Every field name the search-time rules of `sourcetypes` (and of every [default], source:: and host::
+	stanza) name: what their extractions, aliases, calculated fields and lookups write, and what the
+	aliases, calculated fields and lookups read. Read widely, so it holds some names that are no field.
+	"""
+	transforms = transforms or {}
+	_, effective, _ = effective_sourcetypes(stanzas, transforms, sorted(set(sourcetypes)))
+	wanted = set(sourcetypes) | set(e for es in effective.values() for e in es)
+	names = set()
+	for stanza in stanzas:
+		if stanza.kind == 'sourcetype' and stanza.name not in wanted:
+			continue
+		for key, value in stanza.settings.items():
+			value = str(value or '')
+			if key.startswith('EXTRACT-'):
+				m = EXTRACT_IN.match(value)
+				names.update(NAMED_GROUP.findall(m.group(1) if m else value))
+			elif key.startswith('REPORT-'):
+				for t in [n.strip() for n in value.split(',') if n.strip()]:
+					names.update(transform_outputs(transforms.get(t) or {}))
+		for key, value in stanza.rules.items():
+			try:
+				if ALIAS_KEY.match(key):
+					names.update(n for orig, _, alias in parse_aliases(value) for n in (orig, alias))
+				elif EVAL_KEY.match(key):
+					names.add(EVAL_KEY.match(key).group(1))
+					names.update(_expression_reads(value))
+				elif LOOKUP_KEY.match(key):
+					table, inputs, mode, outputs = parse_lookup(value)
+					names.update(evt for _, evt in inputs + outputs)
+					if not mode:
+						names.update((lookup_fields or {}).get(table) or ())
+			except ReplayError:
+				continue
+	return set(n for n in names if n != '*' and not n.startswith(('_KEY_', '_VAL_')))
+
+
 def clearing_steps(names, keep_rx, warnings, compact=False, cleared_on=None):
 	"""
 	The steps that remove from a replayed event the fields Splunk set when it read the compact
@@ -1291,14 +1393,14 @@ def build(stanzas, present, lookup_fields=None, keep_fields=(), all_shared=True,
 	sourcetypes = sorted(set(p[0] for p in eff_present))
 	flags = dict((st, 'tenx_go%dz' % (n + 1)) for n, st in enumerate(sourcetypes))
 
-	keep_fields = [f for f in keep_fields if safe_text(f)]
+	keep_fields = [f for f in keep_fields if safe_text(f) and f not in SPLUNK_COMPUTED]
 	names = list(DEFAULT_KEEP) + [f for f in keep_fields if f not in DEFAULT_KEEP]
 	cleared_on = {}
 	if keep_by_sourcetype is not None:
 		# A sourcetype with no entry was not counted (no compact event of it in the time range the
 		# caller looked at): it keeps every name that any counted sourcetype keeps, as when one
 		# list served every sourcetype.
-		known = dict((st, set(f for f in keep_by_sourcetype[st] if safe_text(f)))
+		known = dict((st, set(f for f in keep_by_sourcetype[st] if safe_text(f) and f not in SPLUNK_COMPUTED))
 					 for st in originals if keep_by_sourcetype.get(st) is not None)
 		union = set().union(*known.values()) if known else set()
 		by_st = dict((st, known.get(st, union)) for st in originals)
@@ -1445,7 +1547,10 @@ def tags_block():
 	with a replayed event (the block of tenx_go0z).
 	"""
 	return block(ANY, [
-		'eval tenx_rk_et=if(isnull(%s), eventtype, null()), tenx_rk_tag=if(isnull(%s), tag, null())' % (RST, RST),
+		# A replayed event's eventtype is cleared first, so that an eventtype key of its text is not kept beside
+		# the event types typer finds; on a raw event the event types replace it.
+		'eval tenx_rk_et=if(isnull(%s), eventtype, null()), tenx_rk_tag=if(isnull(%s), tag, null()), '
+		'eventtype=if(isnull(%s), eventtype, null())' % (RST, RST, RST),
 		'foreach tag::* [eval "tenx_rk_<<FIELD>>"=if(isnull(%s), \'<<FIELD>>\', null())]' % RST,
 		'typer ' + plan_switch('', 'eventtypes=' + NO_EVENT_TYPE),
 		'tags',
@@ -1882,6 +1987,10 @@ LEFT_OUT_KEY = 'left_out'
 # The tenx_replay.conf key that holds the top-level commands of a sourcetype's unit, for rewrite_replay() to
 # keep a chain of units within REPLAY_MAX_COMMANDS.
 COMMANDS_KEY = 'commands'
+
+# The tenx_replay.conf key that is 1 once compact events of the sourcetype are indexed under it (transforms.conf
+# [tenx-original-sourcetype]): the search rewrite then expands the events a search names it for.
+RENAMED_KEY = 'renamed'
 
 
 def left_out_value(in_macro, replays_nothing):
