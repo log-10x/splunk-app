@@ -340,7 +340,7 @@ class TestSubsecond:
 
 
 STORE_CHILD = r'''
-import io, json, os, sys, types, urllib.error
+import json, os, sys, types
 
 root, home, state, peers, probe = sys.argv[1:6]
 os.makedirs(os.path.join(home, 'var', 'log', 'splunk'), exist_ok=True)
@@ -364,10 +364,10 @@ def rest(path, data=None, answer=True):
 	calls.append(path.split('?')[0] if data is None else data['search'][:14])
 	if path == tenx_prefilter.parser.STORE_STATE_PATH:
 		if state == 'absent':
-			raise urllib.error.HTTPError(path, 404, 'Not Found', {}, io.BytesIO(b'{}'))
+			raise tenx_prefilter.HTTPError(404, b'{}')
 		if state == 'starting':
-			raise urllib.error.HTTPError(path, 503, 'Service Unavailable', {}, io.BytesIO(
-				b'{"messages":[{"type":"ERROR","text":"KV Store is initializing. Please try again later."}]}'))
+			raise tenx_prefilter.HTTPError(503,
+				b'{"messages":[{"type":"ERROR","text":"KV Store is initializing. Please try again later."}]}')
 		return json.loads(state)
 	if path == tenx_prefilter.parser.PEERS_PATH:
 		return {'entry': [{'name': 'idx1'}] * int(peers)}
