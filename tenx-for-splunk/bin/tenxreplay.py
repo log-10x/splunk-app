@@ -98,6 +98,8 @@ SAMPLE_EVENTS = 100000
 # An original sourcetype written as an indexed-field term (tenx_sourcetype::<name>), and an index name written in a search.
 SOURCETYPE_TERM = re.compile(r'^[A-Za-z0-9_.:/-]+$')
 INDEX_NAME = re.compile(r'^[A-Za-z0-9_-]+$')
+# What a walklex row without a field name is given, so such rows are seen.
+NO_NAME = 'tenx_no_name'
 # Senders (index, host, source, sourcetype) per search that reads the most recent event of each.
 SENDERS_PER_SEARCH = 200
 # Field names per tstats that counts which of them the compact events carry.
@@ -258,12 +260,17 @@ class TenxReplayCommand(GeneratingCommand):
 		if not named:
 			return set()
 		try:
-			rows = self._oneshot('| walklex type=field %s | stats count by term | fields term' % ' '.join(
-				'index=%s' % ix for ix in named), earliest, latest)
+			rows = self._oneshot('| walklex type=field %s | fillnull value=%s field | stats count by field | fields field' % (
+				' '.join('index=%s' % ix for ix in named), NO_NAME), earliest, latest)
 		except Exception as e:
 			self.logger.warning("tenxreplay: walklex did not run (%s); the indexed field names come from the sample alone", e)
 			return set()
-		return set(r.get('term') for r in rows if r.get('term'))
+		# walklex writes each name with a space before it.
+		names = set(str(r.get('field') or '').strip() for r in rows) - {'', NO_NAME}
+		if rows and not names:
+			self.logger.warning("tenxreplay: walklex returned rows without a field name; the indexed field names come "
+								"from the sample alone")
+		return names
 
 	def _sample_fields(self, earliest, latest, groups=()):
 		"""

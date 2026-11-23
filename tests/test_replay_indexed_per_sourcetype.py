@@ -246,7 +246,10 @@ def answer(walklex):
 		if s.startswith('| walklex'):
 			if not walklex:
 				raise urllib.error.HTTPError(path, 400, 'Unknown search command', {}, None)
-			return {'results': [{'term': t} for t in ('SidHistory', 'NewSd', 'host', 'raw_only')]}
+			if walklex == 'unnamed':
+				return {'results': [{'field': 'tenx_no_name', 'count': '3'}]}
+			# each name with a space before it, as Splunk 10.4.3 writes them
+			return {'results': [{'field': ' ' + t} for t in ('SidHistory', 'NewSd', 'host', 'raw_only')]}
 		if 'dedup tenx_th' in s:
 			part = s.split('`tenx-events` ', 1)[1].split(' | head', 1)[0]
 			return {'results': [{'field': f} for f in SAMPLED[part]]}
@@ -263,15 +266,17 @@ def answer(walklex):
 
 import re
 out = {}
-for walklex in (True, False):
+for walklex in (True, False, 'unnamed'):
 	cmd = tenxreplay.TenxReplayCommand()
 	cmd._rest, searches = answer(walklex)
+	warnings = []
+	cmd.logger.warning = lambda *a: warnings.append(a[0] % a[1:] if len(a) > 1 else a[0])
 	cmd._metadata = types.SimpleNamespace(searchinfo=types.SimpleNamespace(
 		username='splunk-system-user', splunkd_uri='https://127.0.0.1:8089', session_key='key'))
 	got = cmd._indexed_fields('0', None, (), groups=[('XmlWinEventLog', 'wx'), ('XmlWinEventLog', 'sy'),
 													 ('linux:audit', 'au'), ('odd name', 'wx')],
 							  indexes={'wx': 10, 'sy': 20, 'au': 5, 'bad index': 1})
-	out[str(walklex)] = {'got': got, 'searches': searches}
+	out[str(walklex)] = {'got': got, 'searches': searches, 'warnings': warnings}
 print(json.dumps(out))
 '''
 
@@ -291,7 +296,9 @@ class TestTheNamesOfEveryOriginalSourcetype:
 		# SidHistory and NewSd are only in the lexicon; raw_only is there and no compact event carries it
 		assert every == ['Image', 'NewSd', 'SidHistory', 'TargetLogonId', 'exit', 'k8s_ns']
 		assert by_st == {'XmlWinEventLog': ['Image', 'NewSd', 'SidHistory', 'TargetLogonId'], 'linux:audit': ['exit']}
-		assert out['searches'][0] == '| walklex type=field index=au index=sy index=wx | stats count by term | fields term'
+		assert out['searches'][0] == ('| walklex type=field index=au index=sy index=wx | fillnull value=tenx_no_name field '
+									  '| stats count by field | fields field')
+		assert out['warnings'] == []
 		# one sample per original sourcetype and index, and one for every other compact event
 		sample = ('search `tenx-events` %s | head 100000 | eval tenx_th=if(match(_raw, "^~[^,]"), '
 				  'replace(_raw, "^~([^,]+)[\\s\\S]*$", "\\1"), "-") | dedup tenx_th index host source sourcetype '
@@ -300,6 +307,11 @@ class TestTheNamesOfEveryOriginalSourcetype:
 			'index=sy tenx_sourcetype::XmlWinEventLog', 'index=wx tenx_sourcetype::XmlWinEventLog',
 			'index=au tenx_sourcetype::linux:audit', 'NOT ((index=sy tenx_sourcetype::XmlWinEventLog) OR '
 			'(index=wx tenx_sourcetype::XmlWinEventLog) OR (index=au tenx_sourcetype::linux:audit))')]
+
+	def test_rows_without_a_name_are_reported(self):
+		out = every_source()['unnamed']
+		assert out['got'][0] == ['Image', 'TargetLogonId', 'exit', 'k8s_ns']
+		assert [w for w in out['warnings'] if 'walklex returned rows without a field name' in w]
 
 	def test_without_walklex_the_samples_still_count(self):
 		every, _, by_st = every_source()['False']['got']
@@ -318,7 +330,8 @@ print(json.dumps([s for s, _ in fake.searches if s.startswith('| walklex') or 'd
 def test_the_rebuild_reads_the_names_of_each_sourcetype_and_index():
 	from test_replay_coverage_record import child_run
 	searches = child_run(FROM_THE_REBUILD)
-	assert searches[0] == '| walklex type=field index=au index=wx | stats count by term | fields term'
+	assert searches[0] == ('| walklex type=field index=au index=wx | fillnull value=tenx_no_name field | stats count by field '
+						   '| fields field')
 	assert [s.split(' | head')[0] for s in searches[1:]] == [
 		'search `tenx-events` index=wx tenx_sourcetype::XmlWinEventLog',
 		'search `tenx-events` index=au tenx_sourcetype::linux:audit',
