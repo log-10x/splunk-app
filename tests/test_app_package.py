@@ -247,8 +247,9 @@ class TestScheduledRecompile:
 
 	def test_the_field_replay_is_rebuilt_on_a_schedule(self):
 		saved = conf('savedsearches.conf')
-		# by index time, over every event date: events dated a year ago or ahead are found when indexed
-		assert saved.get('Rebuild Field Replay', 'search').strip() == '| tenxreplay by_index_time=true'
+		# by index time, over every event date: events dated a year ago or ahead are found when indexed; the hourly
+		# run rebuilds only when something it reads changed
+		assert saved.get('Rebuild Field Replay', 'search').strip() == '| tenxreplay by_index_time=true skip_unchanged=true'
 		assert saved.get('Rebuild Field Replay When New', 'search').strip() == '| tenxreplay only_new=true by_index_time=true'
 		assert saved.get('Rebuild Field Replay', 'enableSched') == '1'
 		assert conf('commands.conf').get('tenxreplay', 'filename') == 'tenxreplay.py'
