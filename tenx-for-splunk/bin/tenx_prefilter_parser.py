@@ -2318,3 +2318,88 @@ def lookup_failed(result):
 # seconds after a restart). The search still fails; this says why.
 KV_STARTING = "KV Store is initializing"
 KV_NOT_READY = "tx: the KV store is still starting, so the template lookup cannot run yet; retry in a moment."
+
+
+# A candidate is certain when its template's own text proves the words after `tx`: each word or phrase stands in
+# the template's text with a breaker or an end of the text on each side, so the search after the expansion keeps
+# the event whatever its values and its rendered timestamp. A skeleton is the text tenx-inflate makes with SLOT in
+# place of every value and of the timestamp, a character that is neither a breaker nor a letter or digit.
+SLOT = "\x00"
+BREAKER_SET = frozenset(MAJOR_CHARS + MINOR_CHARS)
+PROVABLE_TEXT = re.compile(r"^[A-Za-z0-9]+(?: [A-Za-z0-9]+)*$")
+RAW_VALUES = re.compile(r"^~[^,]+,[^,]+,[\s\S]")
+RAW_FIRST = re.compile(r"^~[^,]+,([^,]+)")
+
+
+def provable(node):
+	"""Whether a template's text can prove the parsed words `node`: no words, or AND and OR of words and phrases of ASCII letters and digits."""
+	if node[0] == "true":
+		return True
+	if node[0] == "text":
+		return bool(PROVABLE_TEXT.match(node[1]))
+	if node[0] in ("and", "or"):
+		return all(provable(child) for child in node[1])
+	return False
+
+
+def skeleton(record, raw):
+	"""
+	tenx-inflate's text for the compact event `raw` and its template record, with SLOT for every value and for the
+	timestamp; None when the macro would leave the event compact or read its values otherwise.
+	"""
+	if not record or record.get("expand_unsafe") or record.get("pattern_terminator") is None:
+		return None
+	if not isinstance(raw, str) or not RAW_VALUES.match(raw) or not RAW_FIRST.match(raw):
+		return None
+	values = [v for v in re.sub(",,+", ",", raw[len(RAW_FIRST.match(raw).group(0)) + 1:]).strip(",").split(",") if v != ""]
+	parts = record.get("pattern_parts")
+	parts = [] if parts is None else [parts] if isinstance(parts, str) else list(parts)
+	zipped = "".join(part + SLOT for part in parts[:len(values)])
+	if (record.get("timestamp_format") or "") == "":
+		text = (record.get("part_0") or "") + SLOT + zipped + record["pattern_terminator"]
+	else:
+		text = (zipped + record["pattern_terminator"]).replace("__TENX_TS__", SLOT)
+	text = re.sub(r"\r(?![\s\S])", "", text)
+	return text or None
+
+
+def _ascii_lower(text):
+	return re.sub("[A-Z]", lambda m: m.group(0).lower(), text)
+
+
+def _stands(words, text):
+	"""Whether `words` stands in `text` with a breaker or an end of the text on each side."""
+	start = text.find(words)
+	while start >= 0:
+		end = start + len(words)
+		if (start == 0 or text[start - 1] in BREAKER_SET) and (end == len(text) or text[end] in BREAKER_SET):
+			return True
+		start = text.find(words, start + 1)
+	return False
+
+
+def proves(node, skeleton_text):
+	"""Whether the skeleton proves the parsed words `node` (provable() must hold). No words need no skeleton."""
+	if node[0] == "true":
+		return True
+	if node[0] == "text":
+		return _stands(_ascii_lower(node[1]), _ascii_lower(skeleton_text))
+	if node[0] == "and":
+		return all(proves(child, skeleton_text) for child in node[1])
+	if node[0] == "or":
+		return any(proves(child, skeleton_text) for child in node[1])
+	return False
+
+
+def needs_no_text(tree, reads, job):
+	"""
+	Whether a `tx` search's result is the same with its certain candidates left compact: its words are provable(),
+	the rest of the search reads no field but _time (`reads`, tenx_replay_plan.tx_reads()), and Splunk keeps none of
+	its events (statusBuckets 0, not verbose mode).
+	"""
+	request = (job or {}).get("request") or {}
+	if "statusBuckets" not in (job or {}) or float(job.get("statusBuckets") or 0) > 0:
+		return False
+	if str(request.get("adhoc_search_level", "") or "").lower() == "verbose":
+		return False
+	return reads is not None and set(reads) <= {"_time"} and provable(tree)

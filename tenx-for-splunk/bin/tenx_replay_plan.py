@@ -505,10 +505,21 @@ def tags_skipped(search, parser):
 		return False
 
 
-def _needed(search, parser, unit=False):
+def tx_reads(search, parser):
+	"""The fields a search that runs plain `tx` once reads after it, by the rules of needed_fields(); None when that cannot be told."""
+	try:
+		return _needed(search or "", parser, macro=TX)
+	except Unknown:
+		return None
+
+
+TX = "`tx`"
+
+
+def _needed(search, parser, unit=False, macro=TXF):
 	call = parser.macro_call(search)
-	if call is None or parser.macro_calls(search) != 1 or not (call[1] == TXF if not unit else TXF_UNIT.match(call[1])):
-		raise Unknown("not one plain txf" if not unit else "not one txf(<sourcetype>)")
+	if call is None or parser.macro_calls(search) != 1 or not (call[1] == macro if not unit else TXF_UNIT.match(call[1])):
+		raise Unknown("not one plain %s" % macro.strip("`") if not unit else "not one txf(<sourcetype>)")
 	before, rest = call[0], search[len(call[0]) + len(call[1]):]
 	plain = _outside_quotes(before)
 	if any(c in plain for c in "|[]`") or "`" in _outside_quotes(rest):
