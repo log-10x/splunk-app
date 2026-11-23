@@ -213,12 +213,15 @@ def held_restore():
 	"""
 	The step that puts back each field held_steps() or tx_extract() held aside: the values `extract` found, or
 	the held ones where it found none. Where it found the held values and no other, but more of them, the held
-	ones are put back, so that no value is counted twice.
+	ones are put back, so that no value is counted twice. The values are compared line by line, since
+	`extract` can join the values two rules find into one value with a line break between them.
 	"""
 	found, held = "'<<MATCHSTR>>'", "'<<FIELD>>'"
-	return ('foreach %s_* [eval "<<MATCHSTR>>"=if(isnull(%s) OR (mvcount(%s)<mvcount(%s) AND '
+	lines = 'split(mvjoin(%s, urldecode("%%0A")), urldecode("%%0A"))'
+	f, h = '%sf' % HELD, '%sh' % HELD
+	return ('foreach %s_* [eval %s=%s, %s=%s, "<<MATCHSTR>>"=if(isnull(%s) OR (mvcount(%s)<mvcount(%s) AND '
 			'mvcount(mvdedup(mvappend(%s, %s)))==mvcount(mvdedup(%s)) AND mvcount(mvdedup(%s))==mvcount(mvdedup(%s))), '
-			'%s, %s)]' % (HELD, found, held, found, found, held, held, found, held, held, found))
+			'%s, %s)]' % (HELD, f, lines % found, h, lines % held, found, h, f, f, h, h, f, h, held, found))
 
 
 def held_names(names):

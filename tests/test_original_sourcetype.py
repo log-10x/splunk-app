@@ -418,6 +418,27 @@ class TestAValueExtractFindsTwiceIsCountedOnce:
 		assert not [k for k in out[0] if k.startswith(b.HELD)]
 
 
+class TestAValueExtractJoinsIsAPlainValue:
+	"""`extract` can return the values two rules find as one value with a line break between them ("1\n1"):
+	the field comes back as the attached value, one plain value that a field=value term matches."""
+
+	def test_through_tx(self):
+		e = renamed(EventCode='1', __text={'srcip': '10.1.2.3', 'action': 'deny', 'EventCode': '1\n1'})
+		out = run_tx([e], b.tx_extract(ATTACHED + ['EventCode']))
+		assert out[0]['EventCode'] == '1'
+		assert not [k for k in out[0] if k.startswith(b.HELD)]
+
+	def test_through_txf(self):
+		e = txf_event(EventCode='1', __text={'srcip': '10.1.2.3', 'action': 'deny', 'EventCode': '1\n1'})
+		out = run_txf([e], {'fortigate_traffic': ['srcip', 'action', 'k8s_ns', 'EventCode']})
+		assert out[0]['EventCode'] == '1'
+
+	def test_a_value_of_several_lines_is_the_texts(self):
+		for held, found in (('a\nb', 'a\nb'), ('a', 'a\nb'), ('a\nb', 'a\nb\nc')):
+			e = renamed(EventCode=held, __text={'EventCode': found})
+			assert run_tx([e], b.tx_extract(ATTACHED + ['EventCode']))[0]['EventCode'] == found, (held, found)
+
+
 def appending_typer(event, _):
 	"""A typer that adds the event types it finds to an eventtype the event has already."""
 	found, have = 'et_%s' % event.get('sourcetype'), event.get('eventtype')

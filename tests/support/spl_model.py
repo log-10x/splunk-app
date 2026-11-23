@@ -4,7 +4,7 @@ an event rather than what its text looks like.
 
 It runs a list of events (dicts) through a pipeline string. It knows only what the replay macro,
 the `tx` macro and the search rewrite use: eval (if, case, coalesce, isnull, isnotnull, null,
-true, mvindex, mvcount, match, len, lower, substr, mvappend, mvjoin, mvdedup, mvsort; ==, !=, AND, OR, NOT), fields -, foreach,
+true, mvindex, mvcount, match, len, lower, substr, split, urldecode, mvappend, mvjoin, mvdedup, mvsort; ==, !=, AND, OR, NOT), fields -, foreach,
 rename (one literal name to another, on every event that has it), and stand-ins for extract, spath,
 lookup, typer and tags supplied by the test.
 
@@ -27,6 +27,7 @@ Modelled behaviour, as observed on Splunk Enterprise 10.4.3:
 """
 import fnmatch
 import re
+import urllib.parse
 
 
 class Unsupported(Exception):
@@ -214,6 +215,13 @@ def evaluate(node, event):
 		if name == 'mvcount':
 			v = vals[0]
 			return None if v is None else len(v) if isinstance(v, list) else 1
+		if name == 'split':
+			if vals[0] is None:
+				return None
+			parts = str(vals[0]).split(str(vals[1]))
+			return parts if len(parts) > 1 else parts[0]
+		if name == 'urldecode':
+			return None if vals[0] is None else urllib.parse.unquote(str(vals[0]))
 		if name == 'len':
 			return None if vals[0] is None else len(str(vals[0]))
 		if name == 'lower':
