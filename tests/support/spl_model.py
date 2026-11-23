@@ -4,7 +4,7 @@ an event rather than what its text looks like.
 
 It runs a list of events (dicts) through a pipeline string. It knows only what the replay macro,
 the `tx` macro and the search rewrite use: eval (if, case, coalesce, isnull, isnotnull, null,
-true, mvindex, match, len, lower, substr, mvappend, mvjoin, mvdedup, mvsort; ==, !=, AND, OR, NOT), fields -, foreach,
+true, mvindex, mvcount, match, len, lower, substr, mvappend, mvjoin, mvdedup, mvsort; ==, !=, AND, OR, NOT), fields -, foreach,
 rename (one literal name to another, on every event that has it), and stand-ins for extract, spath,
 lookup, typer and tags supplied by the test.
 
@@ -211,6 +211,9 @@ def evaluate(node, event):
 		if name == 'mvindex':
 			v = vals[0]
 			return v[vals[1]] if isinstance(v, list) else v
+		if name == 'mvcount':
+			v = vals[0]
+			return None if v is None else len(v) if isinstance(v, list) else 1
 		if name == 'len':
 			return None if vals[0] is None else len(str(vals[0]))
 		if name == 'lower':

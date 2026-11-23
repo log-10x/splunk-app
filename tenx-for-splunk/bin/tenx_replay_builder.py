@@ -177,7 +177,7 @@ def extract_steps(as_read=False, indexed=()):
 			+ [block(AS_READ, unhide_read), block(HIDE, unhide)])
 
 
-# The working fields of held_steps(): the flag of the events it holds fields on, and one copy per field.
+# The working fields of held_steps(): the flag of the events it holds fields on, and one copy per field (tenx_ih_<name>).
 HELD = 'tenx_ih'
 # The events `tx` expands (macros.conf [tenx-extract]): not passed whole, and with a template applied.
 TX_EXPANDED = 'isnull(tenx_passed) AND coalesce(tenx_expand_refused, "")==""'
@@ -192,23 +192,33 @@ SPLUNK_COMPUTED = ('eventtype', 'tag')
 def held_steps(names, cond):
 	"""
 	(steps before an `extract`, steps after it) that hold the fields `names` aside on the events `cond`
-	selects and put each back where `extract` set nothing. Splunk adds an extracted value to an indexed
-	field of the same name, so a field both indexed and in the text would otherwise hold its value twice.
+	selects and put each back as held_restore() says. Splunk adds an extracted value to an indexed field
+	of the same name, so a field both indexed and in the text would otherwise hold its value twice.
 	A name eval cannot write is not held.
 	"""
-	hold, restore = [], []
+	hold = []
 	for name in sorted(set(names)):
 		try:
-			lhs, ref = field_lhs(name), field_ref(name)
+			lhs, ref, copy = field_lhs(name), field_ref(name), field_lhs('%s_%s' % (HELD, name))
 		except ReplayError:
 			continue
-		copy = '%s_%d' % (HELD, len(restore))
 		hold += ['%s=if(isnotnull(%s), %s, null())' % (copy, HELD, ref), '%s=if(isnotnull(%s), null(), %s)' % (lhs, HELD, ref)]
-		restore.append('%s=coalesce(%s, %s)' % (lhs, ref, copy))
-	if not restore:
+	if not hold:
 		return [], []
 	return (['eval %s=if(%s, 1, null()), %s' % (HELD, cond, ', '.join(hold))],
-			['eval ' + ', '.join(restore), 'fields - %s*' % HELD])
+			[held_restore(), 'fields - %s*' % HELD])
+
+
+def held_restore():
+	"""
+	The step that puts back each field held_steps() or tx_extract() held aside: the values `extract` found, or
+	the held ones where it found none. Where it found the held values and no other, but more of them, the held
+	ones are put back, so that no value is counted twice.
+	"""
+	found, held = "'<<MATCHSTR>>'", "'<<FIELD>>'"
+	return ('foreach %s_* [eval "<<MATCHSTR>>"=if(isnull(%s) OR (mvcount(%s)<mvcount(%s) AND '
+			'mvcount(mvdedup(mvappend(%s, %s)))==mvcount(mvdedup(%s)) AND mvcount(mvdedup(%s))==mvcount(mvdedup(%s))), '
+			'%s, %s)]' % (HELD, found, held, found, found, held, held, found, held, held, found))
 
 
 def held_names(names):
@@ -245,7 +255,8 @@ def _holds(names, copies, null):
 def tx_extract(names, computed=()):
 	"""
 	The definition of tenx-extract (macros.conf): `extract` with the indexed fields `names` held aside on each
-	event `tx` expands. A held field takes the values `extract` finds and keeps its own where it finds none.
+	event `tx` expands. A held field takes the values `extract` finds and keeps its own where it finds none
+	(held_restore()).
 	A field of `computed` on an event Splunk read under its original sourcetype keeps its own value: that
 	sourcetype's calculated field, lookup or alias set it from the indexed fields, as on the raw event.
 	"""
@@ -260,7 +271,7 @@ def tx_extract(names, computed=()):
 	if not hold:
 		return 'extract'
 	flags = 'eval %s=if(%s, 1, null())' % (HELD, TX_EXPANDED)
-	restore = ['foreach %s_* [eval "<<MATCHSTR>>"=coalesce(\'<<MATCHSTR>>\', \'<<FIELD>>\')]' % HELD]
+	restore = [held_restore()]
 	drop = 'fields - %s*' % HELD
 	if first:
 		flags += ', %s=if(isnotnull(%s) AND sourcetype==mvindex(%s,0), 1, null())' % (AS_ORIGINAL, HELD, CARRIER_FIELD)

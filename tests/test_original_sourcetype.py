@@ -395,6 +395,29 @@ class TestTxHoldsEveryAttachedName:
 		assert all(out[0]['f%d' % n] == 'v%d' % n for n in range(60))
 
 
+class TestAValueExtractFindsTwiceIsCountedOnce:
+	"""Two rules of the event's sourcetype and source read the same field from the text, and `extract` adds a value
+	for each: the field the Receiver attached once comes back once."""
+
+	def test_through_tx(self):
+		e = renamed(EventCode='1', __text={'srcip': '10.1.2.3', 'action': 'deny', 'EventCode': ['1', '1']})
+		out = run_tx([e], b.tx_extract(ATTACHED + ['EventCode']))
+		assert (out[0]['EventCode'], out[0]['srcip']) == ('1', '10.1.2.3')
+		assert not [k for k in out[0] if k.startswith(b.HELD)]
+		# a value the attached ones lack, as many or fewer values, or none attached: what `extract` found
+		for held, found in (('1', ['1', '2']), ('1', ['2', '2']), (['1', '1'], '1'), (['1', '2'], ['2', '1']), (None, ['1', '1'])):
+			e = renamed(__text={'EventCode': found})
+			if held is not None:
+				e['EventCode'] = held
+			assert run_tx([e], b.tx_extract(ATTACHED + ['EventCode']))[0]['EventCode'] == found, (held, found)
+
+	def test_through_txf(self):
+		e = txf_event(EventCode='1', __text={'srcip': '10.1.2.3', 'action': 'deny', 'EventCode': ['1', '1']})
+		out = run_txf([e], {'fortigate_traffic': ['srcip', 'action', 'k8s_ns', 'EventCode']})
+		assert (out[0]['EventCode'], out[0]['srcip']) == ('1', '10.1.2.3')
+		assert not [k for k in out[0] if k.startswith(b.HELD)]
+
+
 def appending_typer(event, _):
 	"""A typer that adds the event types it finds to an eventtype the event has already."""
 	found, have = 'et_%s' % event.get('sourcetype'), event.get('eventtype')
