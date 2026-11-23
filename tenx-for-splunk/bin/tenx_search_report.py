@@ -17,12 +17,9 @@ says for each one what moving the named sourcetypes or indexes to compact events
 * not affected     it reads none of the moved data.
 
 Every verdict rests on a measured result or on a sentence of the README, and the reason says
-which. Measured on Splunk Enterprise 10.4.3 with the Windows add-on 12.0.0 and CIM 8.8.0, over
-8,311 Windows Security events indexed raw and compact with tenx_sourcetype: a search over compact
-events finds an event only where its words are values ("Kerberos": 0 of 21; "NULL SID": 0 of 107)
-and its original sourcetype not at all (`sourcetype=XmlWinEventLog`: 0 of 8,311); with `txf` in
-front, 21, 107 and 8,311; `stats` and `tstats` by index, host and source count compact events as
-raw ones.
+which. A search over compact events finds an event only where its words are values, and not by its
+original sourcetype; with `txf` in front it finds both. `stats` and `tstats` by index, host and
+source count compact events as raw ones.
 
 The edit printed for `tx` and `txf` puts the index, host, source and time terms written at the
 top level of the search before the macro and every other term after it, as the README's Usage

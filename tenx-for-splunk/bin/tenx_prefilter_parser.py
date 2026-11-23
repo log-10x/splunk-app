@@ -1365,13 +1365,10 @@ def hash_selector(dml_hash):
 	S5.5) holds 14 major breakers and 8 minor ones, so a hash is cut into runs of a few characters, and
 	a short run is a term of many other templates' events. A hash with no run of two characters holding
 	a letter or a digit was selected by its first run, often "~" alone, which Splunk indexes for every
-	compact event whose hash starts with a breaker or with '-' (a negative value). Measured on Splunk
-	Enterprise 10.4.3 over CloudTrail (5,895 templates, 105,093 compact events): the word AccessDenied,
-	carried by 1,078 templates, selected 82,713 compact events, 80,277 of them through the one
-	template selected by TERM(~), against 6,399 events of the 1,078 templates. Splunk's index finds a
-	phrase by the terms in it and then checks the phrase in the event's text, so "~<hash>" keeps the
-	events of that template (and of a hash that differs only in letter case: the search after the
-	expansion removes those).
+	compact event whose hash starts with a breaker or with '-' (a negative value), so selecting by that run
+	alone would read most compact events. Splunk's index finds a phrase by the terms in it and then checks the
+	phrase in the event's text, so "~<hash>" keeps the events of that template (and of a hash that differs
+	only in letter case: the search after the expansion removes those).
 	"""
 	if "*" not in dml_hash:
 		return '"~%s"' % dml_hash
