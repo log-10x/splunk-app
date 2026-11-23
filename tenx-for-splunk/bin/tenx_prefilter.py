@@ -71,12 +71,11 @@ INFO = tenx_chunked.answer_getinfo() if __name__ == "__main__" else None
 if __name__ == "__main__" and INFO is None:
 	sys.exit(0)
 
+import http.client
 import re
 import ssl
 import time
-import urllib.error
 import urllib.parse
-import urllib.request
 
 import tenx_prefilter_parser as parser
 import tenx_replay_plan as replay_plan
@@ -108,6 +107,56 @@ def tls_context():
 	return _tls_context
 
 
+class HTTPError(Exception):
+	"""An answer of splunkd with a status outside 2xx: the status in code, the body from read()."""
+
+	def __init__(self, code, body):
+		Exception.__init__(self, "HTTP Error %d" % code)
+		self.code, self._body = code, body
+
+	def read(self):
+		return self._body
+
+
+class Splunkd(object):
+	"""The requests of one run to splunkd, over one connection while splunkd keeps it open."""
+
+	def __init__(self, uri):
+		parts = urllib.parse.urlsplit(uri)
+		self.secure, self.host, self.port, self.base = parts.scheme == "https", parts.hostname, parts.port, parts.path.rstrip("/")
+		self.connection = None
+
+	def close(self):
+		if self.connection is not None:
+			self.connection.close()
+			self.connection = None
+
+	def request(self, method, path, body, headers):
+		"""The body of the answer. A kept connection that splunkd has closed is opened again once."""
+		for attempt in (1, 2):
+			kept = self.connection is not None
+			if not kept:
+				self.connection = (http.client.HTTPSConnection(self.host, self.port, timeout=60, context=tls_context())
+								   if self.secure else http.client.HTTPConnection(self.host, self.port, timeout=60))
+			try:
+				self.connection.request(method, self.base + path, body=body, headers=headers)
+				response = self.connection.getresponse()
+				data = response.read()
+			except (ConnectionError, http.client.BadStatusLine):
+				self.close()
+				if kept and attempt == 1:
+					continue
+				raise
+			except Exception:
+				self.close()
+				raise
+			if response.will_close:
+				self.close()
+			if not 200 <= response.status < 300:
+				raise HTTPError(response.status, data)
+			return data
+
+
 def dictionary_failed(result):
 	"""
 	The first message of a oneshot answer that means its rows cannot be trusted as complete: an
@@ -124,17 +173,19 @@ def dictionary_failed(result):
 
 class TenxPrefilterCommand(tenx_chunked.GeneratingCommand):
 
+	def _splunkd(self):
+		if getattr(self, "_connection", None) is None:
+			self._connection = Splunkd(self._metadata.searchinfo.splunkd_uri)
+		return self._connection
+
 	def _rest(self, path, data=None, answer=True, method=None):
 		"""splunkd REST as the searching user: the JSON answer, its text (answer="text"), or None."""
-		info = self._metadata.searchinfo
-		request = urllib.request.Request(
-			info.splunkd_uri + path,
-			data=urllib.parse.urlencode(data).encode() if data else None,
-			method=method or ("POST" if data else "GET"),
-			headers={"Authorization": "Splunk " + info.session_key})
-		with urllib.request.urlopen(request, context=tls_context(), timeout=60) as response:
-			body = response.read().decode("utf-8", "replace")
-			return body if answer == "text" else json.loads(body) if answer else None
+		headers = {"Authorization": "Splunk " + self._metadata.searchinfo.session_key}
+		if data:
+			headers["Content-Type"] = "application/x-www-form-urlencoded"
+		body = self._splunkd().request(method or ("POST" if data else "GET"), path,
+									   urllib.parse.urlencode(data).encode() if data else None, headers).decode("utf-8", "replace")
+		return body if answer == "text" else json.loads(body) if answer else None
 
 	def _search_text(self):
 		match = SUBSEARCH_SID.match(self._metadata.searchinfo.sid or "")
@@ -377,7 +428,7 @@ class TenxPrefilterCommand(tenx_chunked.GeneratingCommand):
 		"""
 		try:
 			state = self._rest(parser.STORE_STATE_PATH)
-		except urllib.error.HTTPError as e:
+		except HTTPError as e:
 			state = None if e.code == 404 else False
 			if e.code == 503 and parser.KV_STARTING in (e.read().decode("utf-8", "replace") or ""):
 				self.write_warning(parser.KV_NOT_READY)
@@ -409,7 +460,7 @@ class TenxPrefilterCommand(tenx_chunked.GeneratingCommand):
 					"/servicesNS/%s/%s/search/jobs" % (urllib.parse.quote(info.username), APP_NAME),
 					{"search": parser.LOOKUP_PROBE, "exec_mode": "oneshot", "output_mode": "json", "count": "0",
 					 "earliest_time": str(info.earliest_time or "0"), "latest_time": str(info.latest_time or "now")})
-			except urllib.error.HTTPError as e:
+			except HTTPError as e:
 				result = json.loads(e.read().decode() or "{}")
 		except Exception as e:
 			self.logger.warning("tx: the lookup check failed: %s", e)
@@ -423,13 +474,10 @@ class TenxPrefilterCommand(tenx_chunked.GeneratingCommand):
 
 	def _kv(self, path, records=None):
 		"""The prefilter's KV store reads and writes as the searching user: JSON in, JSON out."""
-		info = self._metadata.searchinfo
-		request = urllib.request.Request(
-			info.splunkd_uri + path, data=json.dumps(records).encode() if records is not None else None,
-			method="POST" if records is not None else "GET",
-			headers={"Authorization": "Splunk " + info.session_key, "Content-Type": "application/json"})
-		with urllib.request.urlopen(request, context=tls_context(), timeout=60) as response:
-			return json.loads(response.read().decode() or "null")
+		body = self._splunkd().request(
+			"POST" if records is not None else "GET", path, json.dumps(records).encode() if records is not None else None,
+			{"Authorization": "Splunk " + self._metadata.searchinfo.session_key, "Content-Type": "application/json"})
+		return json.loads(body.decode() or "null")
 
 	def _records_in(self, hours, pieces, formats):
 		"""
