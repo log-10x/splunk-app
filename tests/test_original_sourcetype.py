@@ -234,10 +234,12 @@ class TestTxCountsAnAttachedFieldOnce:
 
 	def test_only_fields_eval_can_write_and_none_of_splunks_own_are_held(self):
 		assert b.held_names(['host', 'source', 'sourcetype', 'index', 'linecount', 'punct', 'date_hour', '_time',
-							 'tenx_sourcetype', 'srcip', 'kubernetes.container_name', 'a{}.b', "it's"]) == [
-			'a{}.b', "it's", 'kubernetes.container_name', 'srcip']
-		text = b.tx_extract(['srcip', 'kubernetes.container_name', 'a{}.b', "it's"])
-		assert '"kubernetes.container_name"=if(' in text and 'a{}.b' not in text and "it's" not in text
+							 'tenx_sourcetype', 'eventtype', 'tag', 'srcip', 'kubernetes.container_name', 'a{}.b',
+							 "it's"]) == ['a{}.b', "it's", 'kubernetes.container_name', 'srcip']
+		text = b.tx_extract(['srcip', 'kubernetes.container_name', 'a{}.b', "it's", 'Account Name'])
+		assert 'foreach kubernetes.container_name srcip [eval ' in text
+		assert '"Account Name"=if(isnotnull(tenx_ih), null(), \'Account Name\')' in text
+		assert 'a{}.b' not in text and "it's" not in text
 
 	def test_without_indexed_fields_it_is_the_shipped_extraction(self):
 		assert b.tx_extract([]) == macro('tenx-extract') == 'extract'
@@ -336,3 +338,265 @@ def test_the_command_writes_the_extraction_once_and_only_when_it_runs():
 	assert out['again'] == []
 	assert out['refused'] == [] and out['kept'] == definition
 	assert out['runs'] == ['| makeresults | eval _raw="x" | %s | stats count' % d for d in (definition, 'extract')]
+
+
+# ---------------------------------------------------------------------------
+# After expansion, a field the original sourcetype computes keeps the value the search gave it, and every
+# other field the compact event carries holds the values of the expanded text once.
+# ---------------------------------------------------------------------------
+
+def computed_event(**more):
+	"""A renamed FortiGate event as the search read it: the add-on set action from the attached vendor value."""
+	return renamed(action='blocked', **more)
+
+
+class TestTxKeepsWhatTheSourcetypeComputed:
+	def test_a_computed_field_keeps_the_value_the_search_gave_it(self):
+		out = run_tx([computed_event()], b.tx_extract(ATTACHED, computed=['action', 'vendor_action']))
+		assert (out[0]['action'], out[0]['srcip']) == ('blocked', '10.1.2.3')
+		assert not [k for k in out[0] if k.startswith(('tenx_ih', 'tenx_ic', 'tenx_io'))]
+
+	def test_held_as_any_other_field_it_takes_the_vendor_value_of_the_text(self):
+		out = run_tx([computed_event()], b.tx_extract(ATTACHED))
+		assert out[0]['action'] == 'deny'
+
+	def test_without_a_value_before_it_takes_the_texts(self):
+		e = computed_event()
+		del e['action']
+		assert run_tx([e], b.tx_extract(ATTACHED, computed=['action']))[0]['action'] == 'deny'
+
+	def test_an_event_read_as_the_compact_sourcetype_takes_the_texts(self):
+		# no add-on rule ran when Splunk read it, so its value is the attached one
+		e = renamed(sourcetype='tenx_encoded', __text={'srcip': '10.1.2.3', 'action': 'deny-text'})
+		assert run_tx([e], b.tx_extract(ATTACHED, computed=['action']))[0]['action'] == 'deny-text'
+
+	def test_a_computed_field_no_compact_event_carries_is_not_held(self):
+		assert 'vendor_action' not in b.tx_extract(ATTACHED, computed=['vendor_action'])
+
+
+class TestTxHoldsEveryAttachedName:
+	NAMES = ['srcip', 'kubernetes.container_name', 'Account Name', 'action']
+
+	def test_the_names_a_definition_holds_are_read_back(self):
+		assert b.tx_extract_names(b.tx_extract(self.NAMES, computed=['action'])) == sorted(self.NAMES)
+		assert b.tx_extract_names(b.tx_extract(self.NAMES)) == sorted(self.NAMES)
+		assert b.tx_extract_names('extract') == [] and b.tx_extract_names(None) == []
+
+	def test_each_plain_name_costs_its_own_length(self):
+		names = ['Field%02d_name' % n for n in range(92)]
+		fixed = len(b.tx_extract(['a']))
+		assert len(b.tx_extract(names)) - fixed == sum(len(n) + 1 for n in names) - 2
+
+	def test_every_attached_name_comes_back_once(self):
+		attached = dict(('f%d' % n, 'v%d' % n) for n in range(60))
+		e = renamed(**attached)
+		e['__text'] = dict(attached, srcip='10.1.2.3', action='deny')
+		out = run_tx([e], b.tx_extract(list(attached) + ATTACHED))
+		assert all(out[0]['f%d' % n] == 'v%d' % n for n in range(60))
+
+
+def appending_typer(event, _):
+	"""A typer that adds the event types it finds to an eventtype the event has already."""
+	found, have = 'et_%s' % event.get('sourcetype'), event.get('eventtype')
+	event['eventtype'] = found if have is None else (have if isinstance(have, list) else [have]) + [found]
+
+
+def run_txf_typed(events, by_st, typer):
+	present = [('fortigate_traffic', 'fgt', 'fw1')]
+	full = b.build(STANZAS, present, LOOKUP_FIELDS, (), keep_by_sourcetype=by_st).spl()
+	m = replay_model(full)
+	m.commands['typer'] = typer
+	return [visible(e) for e in m.run(txf_steps('`tenx-replay`'), events)]
+
+
+class TestTxfEventTypesAreTheTypersAlone:
+	BY_ST = {'fortigate_traffic': ['srcip', 'action', 'eventtype']}
+
+	def utm(self):
+		# the vendor's eventtype key in the text, and the event types Splunk gave the compact event
+		e = txf_event(eventtype='et_compact')
+		e['__by_st']['fortigate_traffic']['eventtype'] = 'signature'
+		return e
+
+	def test_a_text_key_named_eventtype_is_not_an_event_type(self):
+		for typer in (appending_typer, None):
+			out = run_txf_typed([self.utm()], self.BY_ST, typer or replay_model('').commands['typer'])
+			assert out[0]['eventtype'] == 'et_fortigate_traffic', typer
+
+	def test_eventtype_and_tag_are_never_kept_as_indexed_fields(self):
+		full = b.build(STANZAS, [('fortigate_traffic', 'fgt', 'fw1')], LOOKUP_FIELDS, ('tag',),
+					   keep_by_sourcetype=self.BY_ST).spl()
+		assert "eventtype=if(isnotnull(tenx_rst), null(), 'eventtype')" in full
+		assert "tag=if(isnotnull(tenx_rst), null(), 'tag')" in full
+
+	def test_the_shipped_tags_macro_clears_it_before_typer(self):
+		d = macro('tenx-replay-tags')
+		assert d == ' | '.join(b.TAGS_STEPS)
+		assert d.index('eventtype=if(isnull(tenx_rst), eventtype, null())') < d.index('typer ')
+
+
+class TestTheRewriteExpandsRenamedEvents:
+	def service(self, replay):
+		class Stanza(object):
+			def __init__(self, name, content):
+				self.name, self.content = name, content
+
+		class Confs(object):
+			def __getitem__(self, name):
+				if name == 'tenx_config':
+					return {'config': Stanza('config', {})}
+				if name == 'props':
+					return [Stanza('tenx_encoded', {'REPORT-tenx': 'tenx-hash-vars-extraction'}),
+							Stanza('fortigate_traffic', {'EVAL-action': 'lower(action)'})]
+				if name == 'tenx_replay':
+					return [Stanza(n, c) for n, c in replay.items()]
+				raise KeyError(name)
+
+		class Service(object):
+			confs = Confs()
+		return Service()
+
+	def config(self):
+		import tenx_util
+		return tenx_util.get_tenx_config(service=self.service({
+			'fortigate_traffic': {'indexes': 'fgt', 'renamed': '1'}, 'XmlWinEventLog': {'indexes': 'win'},
+			'tenx:narrowing': {'fields_not_in_text': 'action'}}))
+
+	def test_a_sourcetype_compact_events_are_indexed_under_is_a_compact_sourcetype(self):
+		import tenx_util
+		config = self.config()
+		assert config['tenx_source_types'] == ['tenx_encoded', 'fortigate_traffic']
+		assert config[tenx_util.RENAMED_SOURCE_TYPES] == ['fortigate_traffic']
+
+	def build(self, search, config):
+		import tenx_search_builder
+		from support.local_search_manager import LocalSearchManager, CsvTemplateStore
+		config = dict(config, dml_source_type='tenx_dml_pure', timestamp_placeholder='__TENX_TS__',
+					  variable_separator='$')
+		manager = LocalSearchManager(CsvTemplateStore([('h_deny', 'action=deny policy $')]))
+		return tenx_search_builder.TenxSearchBuilder(server_connection=None, tenx_config=config,
+													 search_manager=manager).build(search)
+
+	def test_the_command_the_hook_and_alerts_expand_a_search_that_names_it(self):
+		config = self.config()
+		got = self.build('search index=fgt sourcetype=fortigate_traffic deny', config)
+		assert got.engaged and '`tenx-inflate`' in got.resolved
+		not_renamed = dict(config, tenx_source_types=['tenx_encoded'])
+		assert not self.build('search index=fgt sourcetype=fortigate_traffic deny', not_renamed).engaged
+
+	def test_a_search_that_names_no_sourcetype_is_refused_only_for_compact_events(self):
+		import tenx_search_builder
+		config = self.config()
+		got = self.build('search index=fgt deny', config)
+		probe = tenx_search_builder.unnamed_compact_probe(got, config)
+		assert probe == ('| tstats count where (index=fgt) (sourcetype=tenx_encoded OR '
+						 '(sourcetype=fortigate_traffic tenx_sourcetype=*)) by index, sourcetype, source')
+
+	def test_a_compiled_alert_that_names_it_is_flagged_when_passed_through(self):
+		import tenx_alert_compiler
+		assert tenx_alert_compiler._referenced_tenx_sources('index=fgt sourcetype=fortigate_traffic', self.config()) == [
+			'fortigate_traffic']
+
+
+RENAMED_SCENARIO = r'''
+class RenamedSplunk(FakeSplunk):
+	"""Compact events of app:kv indexed under app:kv while `renamed` is set; app:json's stay tenx_encoded."""
+	renamed = False
+	def rest(self, path, data=None, method=None):
+		if path.endswith('/search/jobs') and data['search'].endswith('by tenx_sourcetype, sourcetype'):
+			self.searches.append((data['search'], data.get('earliest_time')))
+			return {'results': [{'tenx_sourcetype': 'app:kv', 'sourcetype': 'app:kv' if self.renamed else 'tenx_encoded'},
+								{'tenx_sourcetype': 'app:json', 'sourcetype': 'tenx_encoded'}]}
+		if path.endswith('/search/jobs') and data['search'].startswith('| tstats dc('):
+			# the compact events of app:kv carry x and y
+			self.searches.append((data['search'], data.get('earliest_time')))
+			import re
+			counted = dict((f, '1' if n in ('x', 'y') else '0') for n, f in re.findall(r'dc\("([^"]+)"\) as (f\d+)', data['search']))
+			return {'results': [dict(counted, tenx_sourcetype='app:kv')]}
+		return FakeSplunk.rest(self, path, data, method)
+
+def flags():
+	return dict((k, v.get('renamed')) for k, v in sorted(fake.conf.items()) if k.startswith('app:'))
+
+out = {}
+fake = RenamedSplunk([('app:kv', '/var/app/a.log', 'web-1', 5, 'app', True),
+					  ('app:json', '/var/other/b.log', 'api-1', 3, 'shared', True)])
+run(fake)
+out['before'] = flags()
+# the fields app:kv's alias and calculated field name are counted with the sample
+out['named'] = [n for n in ('x', 'y', 'k') if any('dc("%s")' % n in s for s, _ in fake.searches)]
+out['tx_extract'] = fake.macros.get('tenx-extract')
+for step in ('renamed', 'kept'):
+	fake.renamed = step == 'renamed'
+	fake.dispatches = []
+	run(fake)
+	out[step] = (flags(), [d[0] for d in fake.dispatches])
+print(json.dumps(out))
+'''
+
+
+def test_the_rebuild_records_the_sourcetypes_compact_events_are_indexed_under():
+	from test_replay_coverage_record import child_run
+	out = child_run(RENAMED_SCENARIO)
+	assert out['before'] == {'app:json': None, 'app:kv': None}
+	assert out['named'] == ['x', 'y', 'k']
+	# y is the target of app:kv's alias: on an event read as app:kv it keeps the alias's value
+	assert out['tx_extract'] == b.tx_extract(['x', 'y'], computed=['k', 'y'])
+	assert 'foreach y [eval "tenx_ic_<<FIELD>>"' in out['tx_extract']
+	# recorded, and compiled alerts recompiled at once
+	assert out['renamed'] == [{'app:json': None, 'app:kv': '1'}, ['Recompile Compiled Alerts']]
+	# events indexed under it earlier stay searchable, so the record keeps it
+	assert out['kept'] == [{'app:json': None, 'app:kv': '1'}, []]
+
+
+class TestTheNamesTheRulesRead:
+	TRANSFORMS = {'fgt_kv': {'REGEX': r'(?<devid>FG\w+)', 'FIELDS': 'policyid'}}
+
+	def stanzas(self):
+		return [b.Stanza('default', {}, {}),
+				b.Stanza('fortigate_traffic', {'EVAL-action': 'case(action=="deny", "blocked")',
+											   'FIELDALIAS-src': 'srcip AS src', 'REPORT-kv': 'fgt_kv',
+											   'LOOKUP-app': 'fgt_apps app OUTPUT app_category'}, {}),
+				b.Stanza('source::fgt', {'EVAL-from_source': 'lower(vd)'}, {}),
+				b.Stanza('other', {'EVAL-zz': 'lower(yy)'}, {})]
+
+	def test_what_the_rules_of_the_sourcetype_read_and_write(self):
+		got = b.rule_field_names(self.stanzas(), ['fortigate_traffic'], self.TRANSFORMS, {})
+		assert {'action', 'srcip', 'src', 'devid', 'policyid', 'app', 'app_category', 'from_source', 'vd'} <= got
+		assert not {'zz', 'yy'} & got
+
+	def test_the_command_counts_them_with_the_sample(self):
+		with tempfile.TemporaryDirectory() as home:
+			proc = subprocess.run([sys.executable, '-c', NAMED_CHILD, ROOT, home], capture_output=True, text=True,
+								  timeout=60)
+		assert proc.returncode == 0, proc.stderr[-3000:]
+		every, _, by_st = json.loads(proc.stdout.strip().splitlines()[-1])
+		# policyid is named only by a rule and carried by the compact events; vd is named and not carried
+		assert every == ['policyid', 'srcip'] and by_st == {'fortigate_traffic': ['policyid', 'srcip']}
+
+
+NAMED_CHILD = CHILD.split('import tenxreplay')[0] + r'''
+import re
+import tenxreplay
+
+CARRIED = {'srcip', 'policyid'}
+
+def rest(path, data=None, method=None):
+	if 'conf-fields' in path:
+		return {'entry': []}
+	if path.endswith('/configs/conf-macros/tenx-extract'):
+		return {'entry': [{'content': {'definition': 'extract'}}]}
+	s = data['search']
+	if 'fieldsummary' in s:
+		return {'results': [{'field': 'srcip'}]}
+	if s.startswith('| tstats max(_time)'):
+		return {'results': []}
+	counted = dict((f, '1' if name in CARRIED else '0') for name, f in re.findall(r'dc\("([^"]+)"\) as (f\d+)', s))
+	return {'results': [dict(counted, tenx_sourcetype='fortigate_traffic')]}
+
+cmd = tenxreplay.TenxReplayCommand()
+cmd._rest = rest
+cmd._metadata = types.SimpleNamespace(searchinfo=types.SimpleNamespace(
+	username='splunk-system-user', splunkd_uri='https://127.0.0.1:8089', session_key='key'))
+print(json.dumps(cmd._indexed_fields('-7d', 'now', {'policyid', 'vd', 'if'})))
+'''

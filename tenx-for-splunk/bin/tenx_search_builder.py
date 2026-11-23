@@ -1600,8 +1600,11 @@ def unnamed_compact_probe(build_result, tenx_config):
 	sources = [t for t in (config.get('tenx_sources') or []) if t]
 	if not sourcetypes and not sources:
 		return None
-	compact = ' OR '.join(['sourcetype=%s' % _spl_value(t) for t in sourcetypes] +
-						  ['source=%s' % _spl_value(t) for t in sources])
+	# Raw events share an original sourcetype with the compact events indexed under it; only the latter carry
+	# tenx_sourcetype.
+	renamed = set(config.get(tenx_util.RENAMED_SOURCE_TYPES) or [])
+	compact = ' OR '.join([('(sourcetype=%s tenx_sourcetype=*)' if t in renamed else 'sourcetype=%s') % _spl_value(t)
+						   for t in sourcetypes] + ['source=%s' % _spl_value(t) for t in sources])
 	if build_result.indexes is None:
 		where = 'index=* '
 	elif build_result.indexes:
