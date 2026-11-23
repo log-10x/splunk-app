@@ -537,8 +537,7 @@ after the template load is run from the start of the index.
 and `| tenxsearch searchstring="..."` run a rewritten search and write every event out
 through Python, which is several times slower than the macro. They are kept so saved
 searches written with them keep working. The search they run must name the compact sourcetype,
-`sourcetype=tenx_encoded`. Without it the command stops and says so. `| tx` and `| tenxsearch`
-return a CR LF line end as LF; the `tx` and `txf` macros keep it.
+`sourcetype=tenx_encoded`. Without it the command stops and says so.
 
 **Search behavior.**
 
@@ -690,6 +689,11 @@ compact events to the compact index.
     event_sourcetype  tenx_dml_raw_json
     Retry_Limit       False
 
+[FILTER]
+    Name              modify
+    Match             tenx.src.app
+    Add               tenx_sourcetype <original sourcetype>
+
 [OUTPUT]
     Name              splunk
     Match             tenx.src.app
@@ -700,12 +704,13 @@ compact events to the compact index.
     event_index       <compact index>
     event_sourcetype  tenx_encoded
     event_key         $log
-    event_field       tenx_sourcetype <original sourcetype>
+    event_field       tenx_sourcetype $tenx_sourcetype
     Retry_Limit       False
 ```
 
-`event_field tenx_sourcetype` gives each event the sourcetype its raw events have, which `txf` reads
-and [Compact Events Under the Original Sourcetype](#compact-events-under-the-original-sourcetype) uses.
+The `modify` filter gives each record the sourcetype its raw events have, and
+`event_field tenx_sourcetype $tenx_sourcetype` sends it as an indexed field, which `txf` reads and
+[Compact Events Under the Original Sourcetype](#compact-events-under-the-original-sourcetype) uses.
 
 A multi-line source takes a multiline parser with `flush_timeout 30000` on its `tail` input, as the
 Windows sources below do. Every `rewrite_tag` filter takes `Emitter_Storage.type filesystem` and
