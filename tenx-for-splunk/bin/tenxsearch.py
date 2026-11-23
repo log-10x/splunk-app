@@ -91,6 +91,16 @@ MAX_WAIT_MS = 30 * 60 * 1000
 NESTED_AUTO_CANCEL_S = 30
 
 
+def as_written(result):
+	"""
+	The result with each CR LF of its values written as CR CR LF. Splunk reads back each CR LF in the values a
+	search command writes as LF and keeps every other CR, so the search reads the values as the event holds them.
+	"""
+	def one(value):
+		return value.replace('\r\n', '\r\r\n') if isinstance(value, str) else value
+	return dict((k, [one(x) for x in v] if isinstance(v, list) else one(v)) for k, v in result.items())
+
+
 class TenxSearchCommandBase(GeneratingCommand):
 	"""
 	Generating command which effectively returns the result of doing the given searchstring
@@ -352,7 +362,7 @@ class TenxSearchCommandBase(GeneratingCommand):
 					for field in regenerated_fields:
 						result.pop(field, None)
 
-					yield result
+					yield as_written(result)
 
 			finished = True
 
