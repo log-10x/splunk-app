@@ -21,8 +21,9 @@ configuration (see tenx_replay_builder.py for the rules and their order):
 2. the props stanzas this app can see, as merged by Splunk, and the [default] stanza;
 3. the lookup definitions this app can see, with their fields;
 4. the indexed fields of the compact events, which the replay keeps when it clears the fields
-   Splunk set on the unexpanded event (fields.conf INDEXED = true on every event, and the fields
-   of a sample of compact events that tstats can count, per original sourcetype).
+   Splunk set on the unexpanded event (fields.conf INDEXED = true on every event, and, per original
+   sourcetype, the fields tstats counts among the indexed field names of the indexes that hold compact
+   events and those of a sample of the compact events of each original sourcetype in each index).
 
 What the written replay already covers stays covered (see tenx_replay_builder.keep_covered and
 coverage), so a sourcetype that stopped sending keeps its replay for searches over its older
@@ -65,6 +66,7 @@ Logs to: $SPLUNK_HOME/var/log/splunk/tenx_replay_command.log
 import json
 import logging
 import os
+import re
 import ssl
 import sys
 import time
@@ -93,6 +95,9 @@ CONF = 'tenx_replay'
 # default/savedsearches.conf: rewrites every managed compiled alert whose compiled text changed.
 RECOMPILE_SEARCH = 'Recompile Compiled Alerts'
 SAMPLE_EVENTS = 100000
+# An original sourcetype written as an indexed-field term (tenx_sourcetype::<name>), and an index name written in a search.
+SOURCETYPE_TERM = re.compile(r'^[A-Za-z0-9_.:/-]+$')
+INDEX_NAME = re.compile(r'^[A-Za-z0-9_-]+$')
 # Senders (index, host, source, sourcetype) per search that reads the most recent event of each.
 SENDERS_PER_SEARCH = 200
 # Field names per tstats that counts which of them the compact events carry.
@@ -196,15 +201,16 @@ class TenxReplayCommand(GeneratingCommand):
 		return dict((e['name'], e.get('content', {})) for e in
 			self._rest(self._ns('configs/conf-transforms?count=0')).get('entry', []))
 
-	def _indexed_fields(self, earliest, latest, named=()):
+	def _indexed_fields(self, earliest, latest, named=(), groups=(), indexes=()):
 		"""
 		(every indexed field name of the compact events, the names declared indexed,
 		{original sourcetype: the indexed fields of its compact events}).
 
 		The first is what the prefilter must not narrow on (builder.fields_not_in_text): fields.conf
-		INDEXED = true, and the names that tstats can count over all compact events among those of a sample
-		of compact events (_sample_fields), those tenx-extract holds already, and `named`. The replay's
-		clearing step keeps the second on every replayed event and the
+		INDEXED = true, and the names that tstats can count over all compact events among the indexed field
+		names of the `indexes` that hold them (_lexicon_fields), those of a sample of the compact events of
+		each (original sourcetype, index) in `groups` (_sample_fields), those tenx-extract holds already, and
+		`named`. The replay's clearing step keeps the second on every replayed event and the
 		third per original sourcetype (builder.build keep_by_sourcetype), counted over the events the
 		replay works on, those carrying tenx_sourcetype. An indexed field one sender writes for one
 		sourcetype is then no reason to keep the field of the same name that Splunk set on another
@@ -218,8 +224,8 @@ class TenxReplayCommand(GeneratingCommand):
 		by_sourcetype = {}
 		# A name tenx-extract holds already stays while tstats still counts it, so a field of a template a later
 		# sample misses is not dropped.
-		sampled = (self._sample_fields(earliest, latest) | set(named)
-				   | set(builder.tx_extract_names(self._tx_extract_definition())))
+		sampled = (self._lexicon_fields(earliest, latest, indexes) | self._sample_fields(earliest, latest, groups)
+				   | set(named) | set(builder.tx_extract_names(self._tx_extract_definition())))
 		candidates = sorted(sampled - set(builder.DEFAULT_KEEP) - set(builder.SPLUNK_COMPUTED))
 		candidates = [c for c in candidates if not c.startswith(('_', 'tenx_', 'date_')) and '"' not in c
 					  and '\\' not in c and builder.safe_text(c)]
@@ -242,19 +248,41 @@ class TenxReplayCommand(GeneratingCommand):
 						  and '*' not in n and '::' not in n and not n.startswith(('_', 'tenx_', 'date_')))
 		return usable(names), usable(declared), dict((st, usable(found)) for st, found in by_sourcetype.items())
 
-	def _sample_fields(self, earliest, latest):
+	def _lexicon_fields(self, earliest, latest, indexes):
+		"""
+		The indexed field names in the lexicon of each bucket of `indexes` (walklex). Splunk reads the lexicon
+		only of a bucket with a merged lexicon or a single tsidx file, so most hot buckets are left out;
+		_sample_fields covers the newest events. Empty when walklex does not run here.
+		"""
+		named = [ix for ix in sorted(indexes) if INDEX_NAME.match(ix)]
+		if not named:
+			return set()
+		try:
+			rows = self._oneshot('| walklex type=field %s | stats count by term | fields term' % ' '.join(
+				'index=%s' % ix for ix in named), earliest, latest)
+		except Exception as e:
+			self.logger.warning("tenxreplay: walklex did not run (%s); the indexed field names come from the sample alone", e)
+			return set()
+		return set(r.get('term') for r in rows if r.get('term'))
+
+	def _sample_fields(self, earliest, latest, groups=()):
 		"""
 		The field names of a sample of the compact events: one event of each template and sender among the
-		SAMPLE_EVENTS most recent, since the fields a reader attaches follow the event's structure, and the
-		most recent event of each index, host, source and sourcetype, so a sender whose events are not among
-		the most recent still brings the indexed fields it writes (an event_field of one Fluent Bit, a _meta
-		of one forwarder). A field that only older events of a sender carry is not in it; fields.conf
-		INDEXED = true names such a field.
+		SAMPLE_EVENTS most recent of each (original sourcetype, index) in `groups`, and among the SAMPLE_EVENTS
+		most recent of every other compact event, since the fields a reader attaches follow the event's
+		structure; and the most recent event of each index, host, source and sourcetype, so a sender whose
+		events are not among the most recent still brings the indexed fields it writes (an event_field of one
+		Fluent Bit, a _meta of one forwarder).
 		"""
-		found = set(r.get('field') for r in self._oneshot(
-			'search %s | head %d | eval tenx_th=if(match(_raw, "^~[^,]"), replace(_raw, "^~([^,]+)[\\s\\S]*$", "\\1"), "-") '
-			'| dedup tenx_th index host source sourcetype | fieldsummary | fields field' % (
-				self._events(), SAMPLE_EVENTS), earliest, latest))
+		listed = sorted(set((st, ix) for st, ix in groups if SOURCETYPE_TERM.match(st) and INDEX_NAME.match(ix)))
+		parts = ['index=%s %s::%s' % (ix, builder.CARRIER_FIELD, st) for st, ix in listed]
+		parts.append('NOT (%s)' % ' OR '.join('(%s)' % t for t in parts) if parts else '')
+		found = set()
+		for part in parts:
+			found.update(r.get('field') for r in self._oneshot(
+				'search %s | head %d | eval tenx_th=if(match(_raw, "^~[^,]"), replace(_raw, "^~([^,]+)[\\s\\S]*$", "\\1"), "-") '
+				'| dedup tenx_th index host source sourcetype | fieldsummary | fields field' % (
+					' '.join(t for t in (self._events(), part) if t), SAMPLE_EVENTS), earliest, latest))
 		clauses = []
 		for r in self._oneshot('| tstats max(_time) as t where %s by index host source sourcetype' % self._events(),
 							   earliest, latest):
@@ -739,13 +767,15 @@ class TenxReplayCommand(GeneratingCommand):
 			for value in cov.values():
 				if value['indexes'] is not builder.ALL:
 					carrier_ix |= set(value['indexes'])
-			nocarrier = builder.nocarrier_value(self._compact_indexes(earliest, latest), carrier_ix)
+			compact_ix = self._compact_indexes(earliest, latest)
+			nocarrier = builder.nocarrier_value(compact_ix, carrier_ix)
 			stanzas = self._stanzas()
 			lookups = self._lookup_fields()
 			transforms = self._transforms()
 			named = builder.rule_field_names(stanzas, [p[0] for p in present if builder.usable_sourcetype(p[0])],
 											 transforms, lookups)
-			keep_all, keep, keep_by_st = self._indexed_fields(earliest, latest, named)
+			keep_all, keep, keep_by_st = self._indexed_fields(
+				earliest, latest, named, groups=[(r[0], r[4]) for r in rows if r[3]], indexes=compact_ix)
 			not_raw = self._indexed_value_false()
 			renamed = self._renamed(earliest, latest)
 		except Exception as e:

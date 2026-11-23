@@ -221,3 +221,105 @@ def test_the_command_counts_indexed_fields_per_original_sourcetype():
 	funcs = 'dc("app") as f0, dc("before") as f1, dc("env") as f2, dc("rare") as f3, dc("srcip") as f4'
 	assert out['searches'][3] == '| tstats %s where `tenx-events`' % funcs
 	assert out['searches'][4] == '| tstats %s where `tenx-events` by tenx_sourcetype' % funcs
+
+
+# The names of every original sourcetype in every index, whichever sends most: the newest compact events are all
+# of one source, the others' templates are older, and some of their names are only in the index's lexicon.
+EVERY_SOURCE = CHILD.split('cmd = tenxreplay.TenxReplayCommand()')[0] + r'''
+import urllib.error
+
+EVERY_OTHER = ('NOT ((index=sy tenx_sourcetype::XmlWinEventLog) OR (index=wx tenx_sourcetype::XmlWinEventLog) '
+			   'OR (index=au tenx_sourcetype::linux:audit))')
+SAMPLED = {'index=sy tenx_sourcetype::XmlWinEventLog': ['Image'], 'index=wx tenx_sourcetype::XmlWinEventLog': ['TargetLogonId'],
+		   'index=au tenx_sourcetype::linux:audit': ['exit'], EVERY_OTHER: ['k8s_ns']}
+CARRIED = {'XmlWinEventLog': {'SidHistory', 'NewSd', 'TargetLogonId', 'Image'}, 'linux:audit': {'exit'}, '': {'k8s_ns'}}
+
+def answer(walklex):
+	searches = []
+	def rest(path, data=None, method=None):
+		if 'conf-fields' in path:
+			return {'entry': []}
+		if path.endswith('/configs/conf-macros/tenx-extract'):
+			return {'entry': [{'content': {'definition': 'extract'}}]}
+		s = data['search']
+		searches.append(s)
+		if s.startswith('| walklex'):
+			if not walklex:
+				raise urllib.error.HTTPError(path, 400, 'Unknown search command', {}, None)
+			return {'results': [{'term': t} for t in ('SidHistory', 'NewSd', 'host', 'raw_only')]}
+		if 'dedup tenx_th' in s:
+			part = s.split('`tenx-events` ', 1)[1].split(' | head', 1)[0]
+			return {'results': [{'field': f} for f in SAMPLED[part]]}
+		if 'fieldsummary' in s or s.startswith('| tstats max(_time)'):
+			return {'results': []}
+		names = dict(re.findall(r'dc\("([^"]+)"\) as (f\d+)', s))
+		inverse = dict((f, n) for n, f in names.items())
+		def row(sts):
+			return dict((f, '1' if any(inverse[f] in CARRIED[st] for st in sts) else '0') for f in inverse)
+		if s.endswith('by tenx_sourcetype'):
+			return {'results': [dict(row([st]), tenx_sourcetype=st) for st in CARRIED if st]}
+		return {'results': [row(list(CARRIED))]}
+	return rest, searches
+
+import re
+out = {}
+for walklex in (True, False):
+	cmd = tenxreplay.TenxReplayCommand()
+	cmd._rest, searches = answer(walklex)
+	cmd._metadata = types.SimpleNamespace(searchinfo=types.SimpleNamespace(
+		username='splunk-system-user', splunkd_uri='https://127.0.0.1:8089', session_key='key'))
+	got = cmd._indexed_fields('0', None, (), groups=[('XmlWinEventLog', 'wx'), ('XmlWinEventLog', 'sy'),
+													 ('linux:audit', 'au'), ('odd name', 'wx')],
+							  indexes={'wx': 10, 'sy': 20, 'au': 5, 'bad index': 1})
+	out[str(walklex)] = {'got': got, 'searches': searches}
+print(json.dumps(out))
+'''
+
+
+def every_source():
+	with tempfile.TemporaryDirectory() as home:
+		proc = subprocess.run([sys.executable, '-c', EVERY_SOURCE, ROOT, home], capture_output=True, text=True,
+							  timeout=60)
+	assert proc.returncode == 0, proc.stderr[-3000:]
+	return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+class TestTheNamesOfEveryOriginalSourcetype:
+	def test_each_sourcetype_is_sampled_and_the_lexicon_read(self):
+		out = every_source()['True']
+		every, _, by_st = out['got']
+		# SidHistory and NewSd are only in the lexicon; raw_only is there and no compact event carries it
+		assert every == ['Image', 'NewSd', 'SidHistory', 'TargetLogonId', 'exit', 'k8s_ns']
+		assert by_st == {'XmlWinEventLog': ['Image', 'NewSd', 'SidHistory', 'TargetLogonId'], 'linux:audit': ['exit']}
+		assert out['searches'][0] == '| walklex type=field index=au index=sy index=wx | stats count by term | fields term'
+		# one sample per original sourcetype and index, and one for every other compact event
+		sample = ('search `tenx-events` %s | head 100000 | eval tenx_th=if(match(_raw, "^~[^,]"), '
+				  'replace(_raw, "^~([^,]+)[\\s\\S]*$", "\\1"), "-") | dedup tenx_th index host source sourcetype '
+				  '| fieldsummary | fields field')
+		assert out['searches'][1:5] == [sample % p for p in (
+			'index=sy tenx_sourcetype::XmlWinEventLog', 'index=wx tenx_sourcetype::XmlWinEventLog',
+			'index=au tenx_sourcetype::linux:audit', 'NOT ((index=sy tenx_sourcetype::XmlWinEventLog) OR '
+			'(index=wx tenx_sourcetype::XmlWinEventLog) OR (index=au tenx_sourcetype::linux:audit))')]
+
+	def test_without_walklex_the_samples_still_count(self):
+		every, _, by_st = every_source()['False']['got']
+		assert every == ['Image', 'TargetLogonId', 'exit', 'k8s_ns']
+		assert by_st == {'XmlWinEventLog': ['Image', 'TargetLogonId'], 'linux:audit': ['exit']}
+
+
+FROM_THE_REBUILD = r'''
+fake = FakeSplunk([('XmlWinEventLog', 'XmlWinEventLog:Security', 'dc1', 5, 'wx', True),
+				   ('linux:audit', '/var/log/audit/audit.log', 'h1', 3, 'au', True)])
+run(fake)
+print(json.dumps([s for s, _ in fake.searches if s.startswith('| walklex') or 'dedup tenx_th' in s]))
+'''
+
+
+def test_the_rebuild_reads_the_names_of_each_sourcetype_and_index():
+	from test_replay_coverage_record import child_run
+	searches = child_run(FROM_THE_REBUILD)
+	assert searches[0] == '| walklex type=field index=au index=wx | stats count by term | fields term'
+	assert [s.split(' | head')[0] for s in searches[1:]] == [
+		'search `tenx-events` index=wx tenx_sourcetype::XmlWinEventLog',
+		'search `tenx-events` index=au tenx_sourcetype::linux:audit',
+		'search `tenx-events` NOT ((index=wx tenx_sourcetype::XmlWinEventLog) OR (index=au tenx_sourcetype::linux:audit))']
