@@ -46,8 +46,10 @@ REFUSED_STEP = ' | eval tenx_expand_refused=if(len(tenx_expand_refused)>0, tenx_
 # [tx] now: the same, with the whole-event guard around `extract` and REFUSED_STEP before the final
 # search (see TestTxIsTheShippedMacro)
 TX_DEFINITION = ('((`tenx-events`) OR (`tenx-raw-events`)) [| tenxprefilter] | eval tenx_passed=if(match(_raw, "^~"), null(), 1) | `tenx-inflate` | '
-				 '`tenx-whole-hide` | fields - _kv | extract | `tenx-whole-restore` | '
+				 '`tenx-whole-hide` | fields - _kv | `tenx-extract` | `tenx-whole-restore` | '
 				 'fields - tenx_hash, tenx_var_0, tenx_vars' + REFUSED_STEP + b.WILD_STEP + ' | search *')
+# The macro `tx` calls in place of `extract`, shipped as `extract` (test_original_sourcetype.py).
+EXTRACT_CALL = '`tenx-extract`'
 # the whole-event guard with the marks that select its events
 GUARD_CALLS = (' | `tenx-whole-hide`', ' | `tenx-whole-restore`',
 			   ' | eval tenx_passed=if(match(_raw, "^~"), null(), 1)',
@@ -57,7 +59,7 @@ GUARD_CALLS = (' | `tenx-whole-hide`', ' | `tenx-whole-restore`',
 def without_guard(definition):
 	for call in GUARD_CALLS:
 		definition = definition.replace(call, '')
-	return definition
+	return definition.replace(EXTRACT_CALL, 'extract')
 
 
 # The empty-expansion guard of tenx-inflate and tenx-inflate-debug (test_inflate_one_row_no_silent_empty.py),
@@ -155,6 +157,34 @@ def without_split(text):
 	return '\n'.join(lines).replace(SPLIT_STEP, 'makemv delim="," tenx_vars')
 
 
+# The step of both inflate macros that reads the template hash from _raw, and the comment above them that says
+# why (test_original_sourcetype.py).
+HASH_NOTE = "# The template hash. Splunk's extraction gives tenx_hash only to an event of a sourcetype whose props carry"
+HASH_STEP = (' | eval tenx_hash=if(isnull(tenx_hash) AND match(_raw, "^~[^,]"), '
+			 'nullif(trim(replace(_raw, "^~([^,]+)[\\s\\S]*$", "\\1")), ""), tenx_hash)')
+
+
+def without_hash_step(text):
+	lines = text.split('\n')
+	if HASH_NOTE in lines:
+		start = lines.index(HASH_NOTE)
+		end = lines.index('#', start)
+		lines = lines[:start] + lines[end + 1:]
+	return '\n'.join(lines).replace(HASH_STEP, '')
+
+
+# tenx-events with the marker term, and the lines of its comment on it (test_original_sourcetype.py).
+MARKER_LINES = """# It also finds every event that carries the indexed field tenx_sourcetype, which is how an
+# event indexed under its original sourcetype (transforms.conf [tenx-original-sourcetype])
+# is found: tenx_sourcetype::* is looked up in the index terms, as sourcetype:: is.
+"""
+
+
+def without_marker(text):
+	return text.replace(MARKER_LINES, '').replace(' OR tenx_sourcetype::*)', ')').replace(
+		'definition = index=* (sourcetype::tenx_encoded)', 'definition = index=* sourcetype::tenx_encoded')
+
+
 def macros():
 	conf = configparser.RawConfigParser(strict=False)
 	conf.read(MACROS)
@@ -233,12 +263,12 @@ class TestTxIsTheShippedMacro:
 		# every other stanza shipped at e12ec4e is unchanged, its comments included; the two inflate
 		# macros differ by the empty-expansion guard (test_inflate_one_row_no_silent_empty.py), by the
 		# values read from _raw (test_inflate_values_from_raw.py), by the step that drops the last CR
-		# (test_inflate_trailing_cr.py), by the split of the values (test_inflate_values_from_raw.py) and by the
-		# sub-second step alone
+		# (test_inflate_trailing_cr.py), by the split of the values (test_inflate_values_from_raw.py), by the hash
+		# read from _raw (test_original_sourcetype.py) and by the sub-second step; tenx-events by its marker term
 		for name in shipped.sections():
 			if name != 'tx':
-				assert without_split(without_values_from_raw(without_empty_guard(without_subsecond(without_text_events(
-					without_trailing_cr(stanza_text(ours, name))))))) == (
+				assert without_marker(without_split(without_values_from_raw(without_empty_guard(without_subsecond(
+					without_text_events(without_trailing_cr(without_hash_step(stanza_text(ours, name))))))))) == (
 					stanza_text(base.stdout, name)), name
 
 	def test_tx_runs_no_replay(self):
@@ -822,8 +852,8 @@ class FakeSplunk(object):
 					self.macros[name] = data['definition']
 				self.writes.append(('macro~', name))
 				return {}
-			# txf(1) is shipped (default/macros.conf): its definition is the unit's
-			default = tenxreplay.builder.TXF_ONE_UNIT if name == 'txf(1)' else None
+			# txf(1) is shipped (default/macros.conf): its definition is the unit's; tenx-extract is shipped as extract
+			default = {'txf(1)': tenxreplay.builder.TXF_ONE_UNIT, 'tenx-extract': 'extract'}.get(name)
 			return {'entry': [{'name': name, 'content': {'definition': self.macros.get(name, default),
 														 'validation': self.validations.get(name)}}]}
 		raise AssertionError('unexpected REST call %s %s' % (path, data))
@@ -1046,7 +1076,8 @@ class TestTheWholeGuard:
 				e[k] = [e[k], v] if k in e else v
 		m = Model(commands={'extract': doubling_extract,
 							'inflatemodel': lambda e, _: e.__setitem__('_raw', e.get('__exp', e['_raw']))},
-				  macros=dict({'tenx-inflate': 'inflatemodel'}, **guard_macros()))
+				  macros=dict({'tenx-inflate': 'inflatemodel', 'tenx-extract': macros().get('tenx-extract', 'definition')},
+							  **guard_macros()))
 		return [visible(e) for e in m.run(steps, evs)]
 
 	@staticmethod

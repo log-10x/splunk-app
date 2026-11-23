@@ -356,18 +356,47 @@ This applies the field extraction that parses compact events into `tenx_hash`, `
 
 The app's Analytics and Diagnostics dashboards read the `tenx-events` macro, and every `tx`
 and `txf` search starts with it, so it limits what they read as well. Its default,
-`index=* sourcetype::tenx_encoded`, finds the app's sourcetype in every index that can be
-searched. Set it to the compact index, and add any custom sourcetype, under **Settings >
-Advanced search > Search macros**. Write each sourcetype in the indexed form `sourcetype::`:
+`index=* (sourcetype::tenx_encoded OR tenx_sourcetype::*)`, finds the app's sourcetype, and every
+event that carries `tenx_sourcetype`, in every index that can be searched. Set it to the compact
+index, and add any custom sourcetype, under **Settings > Advanced search > Search macros**. Write each sourcetype in the indexed form `sourcetype::`:
 beside the prefilter `tx` adds to this clause, Splunk dropped some events matched with
 `sourcetype=`:
 
 ```spl
-index=my_compact_index (sourcetype::tenx_encoded OR sourcetype::my_custom_sourcetype)
+index=my_compact_index (sourcetype::tenx_encoded OR sourcetype::my_custom_sourcetype OR tenx_sourcetype::*)
 ```
 
 Naming the index makes every panel faster. Raw events of the same sources, such as those
 indexed before the Receiver, are named in a second macro; see the next section.
+
+### Compact Events Under the Original Sourcetype
+
+An add-on keys its event types, tags and field rules on its sourcetype, so its data models do not read
+compact events indexed as `tenx_encoded`. Where the Receiver attaches the fields those models read
+(its `compactFields` option), the instances that parse the compact events can index each one under its
+original sourcetype instead. Add this line to a `local/props.conf` of the app on the indexers or the
+heavy forwarder that parse them:
+
+```
+[tenx_encoded]
+TRANSFORMS-tenx_type = tenx-original-sourcetype
+```
+
+An event that carries `tenx_sourcetype` is then indexed under its first value, once the rules of
+`tenx_encoded` have parsed it. Set `tenx_sourcetype` to the sourcetype the raw events are searched
+under, after any rename the add-on makes while it parses them. To limit the rule to some sources, put
+the line in a `[source::<source>]` or `[host::<host>]` stanza in place of `[tenx_encoded]`.
+
+Turn it on only for sources whose Receiver attaches the fields that the add-on's event types and models
+read; without them, an event can count in a model with those fields empty. A Universal Forwarder's
+compact files carry attached fields only as relay lines (see "Universal Forwarder Relay Lines"), so
+leave out sources whose files hold the compact text alone.
+
+`tx`, `txf` and the dashboards find these events by `tenx_sourcetype` and expand them as before. A field
+the Receiver attached and the expanded text also holds keeps the extracted values alone, once the
+"Rebuild Field Replay" saved searches have run. On the file routes, behind a heavy forwarder or a
+Universal Forwarder, the Receiver attaches the fields with `compactFieldsForm text`, `compactFieldsKey
+meta` and `compactFieldsSeparator ::`, and `[tenx-record-unwrap]` adds them to the event's indexed fields.
 
 ### Raw Events from Before the Receiver
 
@@ -671,8 +700,12 @@ compact events to the compact index.
     event_index       <compact index>
     event_sourcetype  tenx_encoded
     event_key         $log
+    event_field       tenx_sourcetype <original sourcetype>
     Retry_Limit       False
 ```
+
+`event_field tenx_sourcetype` gives each event the sourcetype its raw events have, which `txf` reads
+and [Compact Events Under the Original Sourcetype](#compact-events-under-the-original-sourcetype) uses.
 
 A multi-line source takes a multiline parser with `flush_timeout 30000` on its `tail` input, as the
 Windows sources below do. Every `rewrite_tag` filter takes `Emitter_Storage.type filesystem` and
@@ -885,7 +918,11 @@ source. Data models and their accelerations read the original sourcetype's field
 does not carry them, so data models do not count it. `tstats` reads the indexed sourcetype, which
 on a compact event stays the compact one. A `tstats` search by or on the original sourcetype
 therefore counts no compact events. The original sourcetype is in `tenx_sourcetype`, for example
-`where (sourcetype=XmlWinEventLog OR tenx_sourcetype=XmlWinEventLog)`.
+`where (sourcetype=XmlWinEventLog OR tenx_sourcetype=XmlWinEventLog)`. A compact event indexed under
+its original sourcetype, as
+[Compact Events Under the Original Sourcetype](#compact-events-under-the-original-sourcetype)
+describes, is read by `tstats` and the data models under that sourcetype, with the fields its
+Receiver attached.
 
 Checked on Splunk Enterprise 10.4.3 with the Windows add-on 12.0.0, the AWS add-on 8.3.1, the
 FortiGate add-on 1.6.10 and CIM 8.8.0, on 117 saved searches, 18 of them ESCU detections, and two
@@ -940,13 +977,13 @@ Collector or token is needed. The steps are in the Log10x documentation:
 
 The `_indexers` package holds the rule that reads those lines, `[tenx-record-unwrap]` in
 `transforms.conf`. It gives each event back the host, source, index and time its line holds, sets
-`tenx_sourcetype` to the original sourcetype, and makes the compact text the event. `props.conf` runs
-it on the files under `/opt/tenx/compact/events/`. For another folder, add a stanza for it to
-`local/props.conf` of the app on the heavy forwarder:
+`tenx_sourcetype` to the original sourcetype, adds the line's `meta` text to its indexed fields, and
+makes the compact text the event. `props.conf` runs it on the files under `/opt/tenx/compact/events/`.
+For another folder, add a stanza for it to `local/props.conf` of the app on the heavy forwarder:
 
 ```
 [source::<folder>/events/...]
-TRANSFORMS-00_tenx_unwrap = tenx-record-unwrap
+TRANSFORMS-00_tenx_unwrap = tenx-relay-line, tenx-record-unwrap
 ```
 
 Every compact event keeps the `_time` the heavy forwarder gave the raw event: the rule marks it
@@ -971,6 +1008,30 @@ These limits apply to this arrangement:
   schedule, whose wait between tries grows, so their compact events can arrive minutes after the
   Receiver is back.
 - Fields a rule of the heavy forwarder's own writes with `WRITE_META` are not on the compact events.
+
+### Universal Forwarder Relay Lines
+
+Where a Universal Forwarder reads the Receiver's compact events from files, each line can carry the
+fields the Receiver attaches and the event's time. Fluent Bit writes the file with `Format out_file`,
+so a line is the record the Receiver returned, after its tag and time:
+
+```
+tenx.app.logs: [1794013200.448351000, {"event":"~...","meta":"user::\"bob\""}]
+```
+
+On the files under `/opt/tenx/compact/events/`, the instance that parses the events runs
+`[tenx-relay-line]` and then `[tenx-record-unwrap]`. That instance is an indexer, or the heavy
+forwarder the Universal Forwarder sends to. The event gets the line's time, marked `tenx_time=sender`,
+and the record's `meta` text as indexed fields. The compact text becomes `_raw`, so only it is counted
+against the licence. Files in another folder take the stanza shown above.
+
+The record holds the compact text under `event`: Fluent Bit's tail input takes `Key event`, and the
+Receiver `fluentbitInputMessageField event`. The Receiver writes the fields with `compactFieldsForm
+text`, `compactFieldsKey meta` and `compactFieldsSeparator ::`. A `sourcetype` key in the record sets
+`tenx_sourcetype`; without one, the event keeps the `tenx_sourcetype` of the monitor stanza's `_meta`.
+
+Install the `_indexers` package on the parsing instance before Fluent Bit writes this format. Without
+it, the whole line is indexed and counted against the licence, and nothing expands.
 
 ## Getting Started
 

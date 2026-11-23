@@ -13,8 +13,8 @@
 
   2. WHERE THE COMPACT EVENTS ARE: every panel reads the `tenx-events` macro (macros.conf)
      - Set it to the index and sourcetype your compact events use; naming the index is faster
-     - The default, index=* sourcetype=tenx_encoded, finds the app's sourcetype in every
-       index the searcher can read
+     - The default, index=* (sourcetype::tenx_encoded OR tenx_sourcetype::*), finds the app's
+       sourcetype, and every event that carries tenx_sourcetype, in every index the searcher can read
 
   5. NO SEARCH REWRITE ON THIS VIEW: dashboard.js leaves it out, because these panels read
      the compact form on purpose (compact bytes, template hashes) and expand explicitly

@@ -5,7 +5,8 @@ The rule a heavy forwarder runs on the compact events it reads back from files (
 Fluent Bit's file output with Format plain writes each record the Receiver returns as one JSON object
 per line, with the keys the heavy forwarder's ingest actions file destination wrote: time, event, host,
 source, sourcetype, index. The rule gives the event back host, source, index and _time from the line,
-marks the time tenx_time=sender, writes the original sourcetype as tenx_sourcetype, and makes the
+marks the time tenx_time=sender, writes the original sourcetype as tenx_sourcetype, adds the line's
+"meta" text (the Receiver's compactFields in the text form) to the event's indexed fields, and makes the
 compact text _raw. What Splunk does with it was measured on Splunk Enterprise 10.4.3 (tests/live_hf_monitor/);
 these tests pin the text, and run it through a small model of the eval functions it uses.
 """
@@ -73,6 +74,10 @@ def assignments():
 def evaluate(expr, event):
 	"""The value of one expression of the rule on an event (a dict of fields), for the functions it uses."""
 	expr = expr.strip()
+	parts = split_top(expr, '.') if '" . "' in expr or ') . ' in expr else [expr]
+	if len(parts) > 1:
+		values = [evaluate(p, event) for p in parts]
+		return None if any(v is None for v in values) else ''.join(values)
 	if expr.startswith('"'):
 		return json.loads(expr)
 	m = re.match(r'^([a-z_]+)\((.*)\)$', expr, re.S)
@@ -85,6 +90,8 @@ def evaluate(expr, event):
 		cond = evaluate(args[0], event)
 		return evaluate(args[1], event) if cond else evaluate(args[2], event)
 	value = evaluate(args[0], event)
+	if name == 'coalesce':
+		return next((v for v in [value] + [evaluate(a, event) for a in args[1:]] if v is not None), None)
 	if name == 'isnull':
 		return value is None
 	if name == 'isnotnull':
@@ -121,7 +128,7 @@ MONITOR = {'host': 'hf1', 'source': '/opt/tenx/compact/events/win/tenx.rfs.win.x
 class TestWhereTheRuleRuns:
 	def test_only_the_compact_folder_runs_it(self):
 		props = conf('props.conf')
-		assert props.get(STANZA, CLASS) == RULE
+		assert props.get(STANZA, CLASS) == 'tenx-relay-line, ' + RULE
 		users = [(s, k) for s in props.sections() for k, v in props.items(s) if RULE in v]
 		assert users == [(STANZA, CLASS)]
 
@@ -129,7 +136,7 @@ class TestWhereTheRuleRuns:
 		# Fluent Bit writes the template records beside events/, and the heavy forwarder reads them as tenx_dml_raw_json.
 		assert STANZA.endswith('/events/...')
 
-	def test_compact_events_sent_to_hec_or_read_by_a_universal_forwarder_are_not_touched(self):
+	def test_compact_events_outside_the_folder_are_not_touched(self):
 		props = conf('props.conf')
 		assert props.get('tenx_encoded', 'TRANSFORMS-tenx_time') == 'tenx-event-time'
 		assert [k for k, _ in props.items('tenx_encoded') if k.startswith('TRANSFORMS-')] == ['TRANSFORMS-tenx_time']
@@ -144,11 +151,11 @@ class TestWhereTheRuleRuns:
 class TestTheRuleText:
 	def test_raw_is_replaced_last(self):
 		fields = [f for f, _, _ in assignments()]
-		assert fields == ['host', 'source', 'index', 'tenx_sourcetype', 'tenx_time', '_time', 'tenx_unwrap', '_raw']
+		assert fields == ['host', 'source', 'index', 'tenx_sourcetype', 'tenx_time', '_time', 'tenx_unwrap', '_meta', '_raw']
 
 	def test_metadata_is_set_and_the_rest_indexed(self):
 		ops = dict((f, op) for f, op, _ in assignments())
-		assert [f for f in ops if ops[f] == '='] == ['host', 'source', 'index', '_time', '_raw']
+		assert [f for f in ops if ops[f] == '='] == ['host', 'source', 'index', '_time', '_meta', '_raw']
 		assert [f for f in ops if ops[f] == ':='] == ['tenx_sourcetype', 'tenx_time', 'tenx_unwrap']
 
 	def test_the_time_keeps_its_fraction(self):
@@ -159,7 +166,7 @@ class TestTheRuleText:
 
 	def test_only_functions_index_time_eval_takes(self):
 		names = set(re.findall(r'([a-z_]+)\(', ingest_eval()))
-		assert names == {'if', 'isnotnull', 'isnull', 'json_extract', 'tonumber', 'tostring', 'null'}
+		assert names == {'if', 'isnotnull', 'isnull', 'json_extract', 'tonumber', 'tostring', 'null', 'coalesce'}
 
 
 class TestTheRuleOnLines:
@@ -184,3 +191,25 @@ class TestTheRuleOnLines:
 	def test_a_line_without_an_event_keeps_its_text_and_is_marked(self, raw):
 		e = run(raw, **MONITOR)
 		assert e['_raw'] == raw and e['tenx_unwrap'] == 'failed'
+
+	def test_a_line_without_a_sourcetype_keeps_the_one_the_event_has(self):
+		# A Universal Forwarder's _meta = tenx_sourcetype::<st>; := with null() would remove it.
+		line = dict(LINE)
+		del line['sourcetype']
+		e = run(json.dumps(line), tenx_sourcetype='aws:cloudtrail', **MONITOR)
+		assert e['tenx_sourcetype'] == 'aws:cloudtrail'
+		e = run(json.dumps(LINE), tenx_sourcetype='aws:cloudtrail', **MONITOR)
+		assert e['tenx_sourcetype'] == 'XmlWinEventLog'
+
+	def test_a_line_without_meta_leaves_the_indexed_fields_alone(self):
+		e = run(json.dumps(LINE), **MONITOR)
+		assert '_meta' not in e
+		e = run(json.dumps(LINE), _meta='tenx_sourcetype::XmlWinEventLog', **MONITOR)
+		assert e['_meta'] == 'tenx_sourcetype::XmlWinEventLog'
+
+	def test_the_meta_text_is_added_to_the_indexed_fields(self):
+		meta = 'EventCode::"4625" Account_Name::"a \\"b\\""'
+		e = run(json.dumps(dict(LINE, meta=meta)), **MONITOR)
+		assert e['_meta'] == ' ' + meta and e['_raw'] == LINE['event']
+		e = run(json.dumps(dict(LINE, meta=meta)), _meta='host::x', **MONITOR)
+		assert e['_meta'] == 'host::x ' + meta
