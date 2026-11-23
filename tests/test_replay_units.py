@@ -810,6 +810,10 @@ class FakeSplunk(object):
 			return {'entry': []}
 		if route == NS + 'configs/conf-tenx_config/config':
 			return {'entry': [{'content': {}}]}
+		if route == NS + 'storage/collections/data/tenx_dml':
+			# the template records stored in the hours the query names
+			hours = json.loads(query['query'])['stored_hour']['$in']
+			return [r for r in getattr(self, 'stored', []) if r['stored_hour'] in hours]
 		if route == NS + 'configs/conf-tenx_replay':
 			if data is not None:
 				name = data.pop('name')

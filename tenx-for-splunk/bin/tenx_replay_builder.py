@@ -321,7 +321,8 @@ def usable_sourcetype(name):
 	sender) may be written into the macro and become a tenx_replay.conf stanza. [default] and
 	[tenx:narrowing] are read back as something else, and brackets would end the stanza name.
 	"""
-	return safe_text(name) and name not in ('default', NARROWING_STANZA, RETIRED_STANZA, NOCARRIER_STANZA, PLAN_STANZA) \
+	return safe_text(name) and name not in ('default', NARROWING_STANZA, RETIRED_STANZA, NOCARRIER_STANZA, PLAN_STANZA,
+											SAMPLED_STANZA) \
 		and '[' not in name and ']' not in name
 
 
@@ -1595,6 +1596,9 @@ NOCARRIER_STANZA = 'tenx:nocarrier'
 # tenx_replay.conf stanza: the rule table of the `tenx-replay` macro (Selection), which tenxprefilter reads from
 # disk to choose the rules a `txf` search needs: generation = <the macro's>, rules = <JSON>.
 PLAN_STANZA = 'tenx:plan'
+# tenx_replay.conf stanza: pairs = the '<index> <original sourcetype>' pairs whose compact events tenxreplay sampled for
+# their field names, began = when the run that last sampled began (tenxreplay._sample_fields).
+SAMPLED_STANZA = 'tenx:sampled'
 MAX_NOCARRIER = 200
 
 

@@ -336,3 +336,42 @@ def test_the_rebuild_reads_the_names_of_each_sourcetype_and_index():
 		'search `tenx-events` index=wx tenx_sourcetype::XmlWinEventLog',
 		'search `tenx-events` index=au tenx_sourcetype::linux:audit',
 		'search `tenx-events` NOT ((index=wx tenx_sourcetype::XmlWinEventLog) OR (index=au tenx_sourcetype::linux:audit))']
+
+
+# Each rebuild samples only what it has not sampled: a new pair, and the templates stored since the last sample.
+REBUILDS = r'''
+import time
+fake = FakeSplunk([('XmlWinEventLog', 'XmlWinEventLog:Security', 'dc1', 5, 'wx', True),
+				   ('linux:audit', '/var/log/audit/audit.log', 'h1', 3, 'au', True)])
+out = []
+def rebuild():
+	run(fake)
+	out.append({'samples': [s.split(' | head')[0][len('search `tenx-events` '):] for s, _ in fake.searches if 'dedup tenx_th' in s],
+				'searches': len(fake.searches), 'recorded': [w for w in fake.writes if w[1] == 'tenx:sampled']})
+rebuild()
+rebuild()
+fake.stored = [{'pattern_hash': 'h new', 'stored_hour': str(int(time.time()) // 3600)}]
+rebuild()
+fake.stored = []
+fake.rows.append(('XmlWinEventLog', 'XmlWinEventLog:Microsoft-Windows-Sysmon/Operational', 'dc1', 9, 'sy', True))
+rebuild()
+fake.conf['tenx:sampled']['began'] = str(int(time.time()) - 8 * 86400)
+rebuild()
+print(json.dumps(out))
+'''
+
+
+def test_a_rebuild_samples_only_what_is_new():
+	from test_replay_coverage_record import child_run
+	first, quiet, template, pair, week = child_run(REBUILDS)
+	every = ['index=wx tenx_sourcetype::XmlWinEventLog', 'index=au tenx_sourcetype::linux:audit',
+			 'NOT ((index=wx tenx_sourcetype::XmlWinEventLog) OR (index=au tenx_sourcetype::linux:audit))']
+	assert sorted(first['samples']) == sorted(every) and first['recorded']
+	# nothing new: no sample, nothing recorded
+	assert quiet['samples'] == [] and quiet['recorded'] == []
+	# one new template: one read of its events
+	assert template['samples'] == ['("~h new")'] and template['recorded']
+	# a new pair: its sample alone
+	assert pair['samples'] == ['index=sy tenx_sourcetype::XmlWinEventLog']
+	# a sample older than the rebuild's window is taken again
+	assert len(week['samples']) == 4
