@@ -1520,10 +1520,113 @@ def hour_of(t):
 DML_PATH = "/servicesNS/nobody/tenx-for-splunk/storage/collections/data/tenx_dml"
 
 
-def written_in_path(hours):
-	"""The KV store read of at most one key of the records stored in `hours` (stored_hour values)."""
+# A read in part answers the records of its hours here (answer_records) when there are at most this many.
+RECORDS_MOST = 5000
+RECORD_FIELDS = ("_key", "pattern_hash", "pattern_search", "pattern")
+FORMAT_FIELDS = ("timestamp_format", "part_0", "pattern_parts", "pattern_terminator")
+
+
+def records_path(hours, formats, skip=0, limit=RECORDS_MOST + 1):
+	"""The KV store read of the records stored in `hours` (stored_hour values), with the fields dictionary_search() reads."""
 	query = json.dumps({STORED_HOUR: {"$in": [str(h) for h in hours]}})
-	return DML_PATH + "?output_mode=json&limit=1&fields=_key&query=" + urllib.parse.quote(query, safe="")
+	fields = ",".join(RECORD_FIELDS + (FORMAT_FIELDS if formats else ()))
+	return DML_PATH + "?output_mode=json&sort=_key&skip=%d&limit=%d&fields=%s&query=%s" % (
+		skip, limit, fields, urllib.parse.quote(query, safe=""))
+
+
+USABLE_PIECE = re.compile(r"^[a-z0-9*]+$")
+SELECTOR_STEPS = (re.compile(r"--|%[0-9A-Fa-f]{2}"), re.compile(r"(?<=\*)[^ !;<>{}|&?+\[\]*,()'\"]+(?=\*)"),
+				  re.compile(r"[ !;<>{}|&?+\[\]*,()'\"]"))
+TS_LEFT = re.compile(r"(^|[0-9])__TENX_TS__")
+TS_RIGHT = re.compile(r"__TENX_TS__([0-9]|$)")
+
+
+class _Unread(Exception):
+	pass
+
+
+def _text(record, name):
+	value = record.get(name)
+	if value is None or (isinstance(value, str) and value and value.isascii()):
+		return value
+	raise _Unread(name)
+
+
+def _values_of(record, names):
+	out = []
+	for name in names:
+		value = record.get(name)
+		for v in ([] if value is None else [value] if isinstance(value, str) else value if isinstance(value, list) else [None]):
+			if not isinstance(v, str):
+				raise _Unread(name)
+			out.append(v)
+	return out
+
+
+def _selector(dml_hash):
+	"""The clause dictionary_search() computes in SPL for a template hash (its eval of h)."""
+	if "*" not in dml_hash:
+		return '"~%s"' % dml_hash
+	text = "~" + dml_hash
+	for step in SELECTOR_STEPS:
+		text = step.sub(" ", text)
+	segs = text.split(" ")
+	cand = list(dict.fromkeys(s for s in segs if len(s) >= 2 and re.search(r"[A-Za-z0-9]", s)))
+	prefix = dml_hash.split("*", 1)[0]
+	sel = (['"~%s"' % prefix] if prefix else []) + ["TERM(%s)" % c for c in cand]
+	if not sel:
+		return "TERM(%s)" % segs[0]
+	return sel[0] if len(sel) == 1 else "(%s)" % " ".join(sel)
+
+
+def answer_records(records, pieces, formats):
+	"""
+	(dictionary, format keys) of dictionary_search(pieces, formats) over the KV records `records`, computed here.
+	None when a record's text or hash is not plain ASCII, is empty, or has another type, or a piece is not one the
+	search is built for: then the search answers.
+	"""
+	plist = sorted(pieces)
+	if not all(USABLE_PIECE.match(piece) for piece in plist):
+		return None
+	word = "[a-z0-9]"
+	marks = [re.compile("(^|[^a-z0-9])%s([^a-z0-9]|$)" % piece.replace("*", word + "*")) for piece in plist]
+	found = dict((piece, set()) for piece in plist)
+	counts = dict((piece, 0) for piece in plist)
+	keys = set()
+	try:
+		for record in records:
+			if not isinstance(record, dict):
+				raise _Unread("record")
+			text = _text(record, "pattern_search")
+			if text is None:
+				pattern = _text(record, "pattern")
+				text = None if pattern is None else pattern.replace("$", "")
+			if formats:
+				parts = [v for v in _values_of(record, ("part_0", "pattern_parts", "pattern_terminator")) if "__TENX_TS__" in v]
+				fmt = record.get("timestamp_format")
+				if fmt is not None and not isinstance(fmt, str):
+					raise _Unread("timestamp_format")
+				if parts:
+					keys.add(("1" if any(TS_LEFT.search(v) for v in parts) else "0") +
+							 ("1" if any(TS_RIGHT.search(v) for v in parts) else "0") + "|" + (fmt or ""))
+			if text is None:
+				continue
+			text = text.lower()
+			carried = [piece for piece, mark in zip(plist, marks) if mark.search(text)]
+			if not carried:
+				continue
+			dml_hash = _text(record, "pattern_hash")
+			if dml_hash is None:
+				dml_hash = _text(record, "_key")
+			if dml_hash is None:
+				raise _Unread("_key")
+			selector = _selector(dml_hash)
+			for piece in carried:
+				counts[piece] += 1
+				found[piece].add(selector)
+	except _Unread:
+		return None
+	return dict((piece, (counts[piece], sorted(found[piece]))) for piece in plist), (keys if formats else set())
 
 
 # The form of the kept answers' clauses: an answer kept by a version that wrote other clauses (one run of the
@@ -1616,6 +1719,32 @@ def cache_merge(entries, fresh, fresh_format_keys, pieces, formats):
 		return dictionary, None
 	keys = set(_values(entries[FORMATS_KEY].get("formats"))) | set(fresh_format_keys or ())
 	return dictionary, formats_from_rows([{"tenx_formats": sorted(keys)}])
+
+
+def cache_advanced(entries, fresh, fresh_format_keys, pieces, formats, started):
+	"""
+	The kept answers `entries` completed by a read in part that started at `started` (its answer `fresh`, as for
+	cache_merge), to keep in their place: the same full_at, and through_hour moved to the hour of started -
+	CACHE_LAG_SECONDS, which the reasoning of a full read gives a read of every hour since through_hour. A piece's
+	count becomes the number of templates it names, since the hours read again hold records counted before; a
+	count past MAX_TEMPLATES stays past it. Only the records whose through_hour moves.
+	"""
+	through, out = hour_of(started - CACHE_LAG_SECONDS), []
+	for piece in sorted(pieces) + ([None] if formats else []):
+		key = FORMATS_KEY if piece is None else cache_key(piece)
+		entry = entries[key]
+		if int(float(entry["through_hour"])) >= through:
+			continue
+		record = {"_key": key, "full_at": int(float(entry["full_at"])), "through_hour": through}
+		if piece is None:
+			record["formats"] = sorted(set(_values(entry.get("formats"))) | set(fresh_format_keys or ()))
+		else:
+			n, (fresh_n, fresh_terms) = int(float(entry.get("n") or 0)), fresh.get(piece, (0, []))
+			terms = sorted(set(_values(entry.get("hs"))) | set(fresh_terms))
+			n = n + fresh_n if n > MAX_TEMPLATES else len(terms)
+			record.update({"n": n, "hs": terms if n <= MAX_TEMPLATES else []})
+		out.append(record)
+	return out
 
 
 def cache_records(dictionary, format_keys, pieces, formats, started):

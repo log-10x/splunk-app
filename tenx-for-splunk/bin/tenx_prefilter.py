@@ -431,23 +431,41 @@ class TenxPrefilterCommand(tenx_chunked.GeneratingCommand):
 		with urllib.request.urlopen(request, context=tls_context(), timeout=60) as response:
 			return json.loads(response.read().decode() or "null")
 
-	def _written_in(self, hours):
-		"""Whether the template store holds a record stored in `hours`; True when that cannot be read."""
+	def _records_in(self, hours, pieces, formats):
+		"""
+		The answer of the records stored in `hours`, read from the KV store and answered here
+		(tenx_prefilter_parser.answer_records), or None when the search must answer them: more than
+		RECORDS_MOST, a second read past the first finds one, a record answer_records does not read, or a
+		read that fails.
+		"""
 		try:
-			return bool(self._kv(parser.written_in_path(hours)))
+			records = self._kv(parser.records_path(hours, formats))
+			if not isinstance(records, list) or len(records) > parser.RECORDS_MOST:
+				return None
+			if records and self._kv(parser.records_path(hours, formats, len(records), 1)):
+				return None
 		except Exception as e:
-			self.logger.info("tx: the recent template records could not be counted: %s", e)
-			return True
+			self.logger.info("tx: the recent template records could not be read: %s", e)
+			return None
+		return parser.answer_records(records, pieces, formats)
+
+	def _keep_advanced(self, entries, fresh, fresh_format_keys, pieces, formats, started):
+		"""Writes back the kept answers a read in part completed, when that moves their hour (cache_advanced)."""
+		try:
+			records = parser.cache_advanced(entries, fresh, fresh_format_keys, pieces, formats, started)
+			if records:
+				self._kv(parser.CACHE_PATH + "/batch_save?output_mode=json", records)
+		except Exception as e:
+			self.logger.info("tx: the completed template answer was not kept: %s", e)
 
 	def _dictionary(self, pieces, formats):
 		"""
 		(the template dictionary of `pieces`, the stored timestamp formats or None), as
 		tenx_prefilter_parser.dictionary_search() answers them over every record. With an earlier answer
 		for every piece in tenx_dict_cache (cache_hours), only the records written in the hours since are
-		read and added to it (cache_merge), and no search runs when the store holds none; otherwise every
-		record is read and the answer is kept. A
-		cache that cannot be read or written only means every record is read. Raises when the template
-		lookup fails or reports cut rows.
+		read and added to it (cache_merge), answered without a search when _records_in can; otherwise
+		every record is read and the answer is kept. A cache that cannot be read or written only means
+		every record is read. Raises when the template lookup fails or reports cut rows.
 		"""
 		started = time.time()
 		try:
@@ -459,21 +477,23 @@ class TenxPrefilterCommand(tenx_chunked.GeneratingCommand):
 			entries = {}
 		hours = parser.cache_hours(entries, pieces, formats, started,
 								   parser.cache_valid_from(getattr(self, "store_state", None)))
-		if hours is not None and not self._written_in(hours):
-			return parser.cache_merge(entries, {}, set(), pieces, formats)
-		result = self._rest(
-			"/servicesNS/%s/%s/search/jobs" % (urllib.parse.quote(self._metadata.searchinfo.username), APP_NAME),
-			{"search": parser.dictionary_search(pieces, formats=formats, hours=hours), "exec_mode": "oneshot", "output_mode": "json",
-			 "count": "0", "earliest_time": "0", "latest_time": "now"})
-		if dictionary_failed(result):
-			raise RuntimeError("the template lookup reported: %s" % dictionary_failed(result))
-		rows = result.get("results", [])
-		dictionary = parser.dictionary_from_rows(rows, pieces)
+		fresh = self._records_in(hours, pieces, formats) if hours is not None else None
+		if fresh is None:
+			result = self._rest(
+				"/servicesNS/%s/%s/search/jobs" % (urllib.parse.quote(self._metadata.searchinfo.username), APP_NAME),
+				{"search": parser.dictionary_search(pieces, formats=formats, hours=hours), "exec_mode": "oneshot", "output_mode": "json",
+				 "count": "0", "earliest_time": "0", "latest_time": "now"})
+			if dictionary_failed(result):
+				raise RuntimeError("the template lookup reported: %s" % dictionary_failed(result))
+			rows = result.get("results", [])
+			fresh = parser.dictionary_from_rows(rows, pieces), parser.format_keys_from_rows(rows)
+		dictionary, format_keys = fresh
 		if hours is not None:
-			return parser.cache_merge(entries, dictionary, parser.format_keys_from_rows(rows), pieces, formats)
+			self._keep_advanced(entries, dictionary, format_keys, pieces, formats, started)
+			return parser.cache_merge(entries, dictionary, format_keys, pieces, formats)
 		try:
 			self._kv(parser.CACHE_PATH + "/batch_save?output_mode=json",
-					 parser.cache_records(dictionary, parser.format_keys_from_rows(rows), pieces, formats, started))
+					 parser.cache_records(dictionary, format_keys, pieces, formats, started))
 		except Exception as e:
 			self.logger.info("tx: the template answer was not kept: %s", e)
 		return dictionary, (parser.formats_from_rows(rows) if formats else None)
