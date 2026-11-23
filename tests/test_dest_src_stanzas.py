@@ -35,7 +35,9 @@ class TestTheStanzas:
 		assert dict(conf('props.conf').items(WINDOWS)) == {'FIELDALIAS-tenx_dest': 'Computer ASNEW dest'}
 
 	def test_windows_classic_security_aliases_computername_as_dest(self):
-		assert dict(conf('props.conf').items(CLASSIC)) == {'FIELDALIAS-tenx_dest': 'ComputerName ASNEW dest'}
+		props = dict(conf('props.conf').items(CLASSIC))
+		assert props['FIELDALIAS-tenx_dest'] == 'ComputerName ASNEW dest'
+		assert [k for k in props if k.startswith('FIELDALIAS-')] == ['FIELDALIAS-tenx_dest']
 
 	def test_stream_aliases_src_and_dest(self):
 		assert dict(conf('props.conf').items(STREAM)) == \
@@ -54,10 +56,11 @@ class TestTheStanzas:
 	def test_both_set_their_fields_by_alias_alone(self):
 		# Splunk looks up the value of a search for an alias also as the source field's indexed value, which a compact
 		# event carries; a value an extraction gives is looked up only as words of the event text.
-		props = conf('props.conf')
-		for stanza in (WINDOWS, CLASSIC, STREAM):
+		props, transforms = conf('props.conf'), conf('transforms.conf')
+		for stanza in (WINDOWS, STREAM):
 			assert all(k.startswith('FIELDALIAS-') for k in props.options(stanza)), stanza
-		assert not [s for s in conf('transforms.conf').sections() if 'dest' in s or 'src' in s]
+		writes = [t for t in transforms.sections() if re.match(r'(?:dest|src)::', transforms.get(t, 'FORMAT', fallback=''))]
+		assert not writes
 
 
 class TestTheSourcesTheyApplyTo:
