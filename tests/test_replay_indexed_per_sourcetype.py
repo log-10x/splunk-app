@@ -169,21 +169,25 @@ searches = []
 def rest(path, data=None, method=None):
 	if 'conf-fields' in path:
 		return {'entry': [{'name': 'declared', 'content': {'INDEXED': 'true'}}, {'name': 'other', 'content': {}}]}
+	if path.endswith('/configs/conf-macros/tenx-extract'):
+		# a field an earlier run held, which no event of this sample carries
+		return {'entry': [{'content': {'definition': tenxreplay.builder.tx_extract(['before', 'srcip'])}}]}
 	s = data['search']
 	searches.append(s)
 	if 'dedup index host source sourcetype | fieldsummary' in s:
 		# the most recent event of each sender: one sender writes the indexed field rare
 		return {'results': [{'field': f} for f in ('host', 'rare', 'env')]}
 	if 'fieldsummary' in s:
-		return {'results': [{'field': f} for f in ('app', 'env', 'host', 'tenx_sourcetype', 'srcip', 'date_hour')]}
+		return {'results': [{'field': f} for f in ('app', 'env', 'host', 'tenx_sourcetype', 'srcip', 'date_hour',
+												   'eventtype', 'tag')]}
 	if s.startswith('| tstats max(_time)'):
 		return {'results': [{'index': 'ix', 'host': 'fw1', 'source': 'a.log', 'sourcetype': 'tenx_encoded', 't': '1590998439.250'},
 							{'index': 'ix', 'host': 'fw`2', 'source': 'b.log', 'sourcetype': 'tenx_encoded', 't': '1590998400'},
 							{'index': 'ix', 'host': 'fw"3', 'source': 'c.log', 'sourcetype': 'tenx_encoded', 't': '1590998401'}]}
 	if s.endswith('by tenx_sourcetype'):
-		return {'results': [{'tenx_sourcetype': 'fgt', 'f0': '0', 'f1': '1', 'f2': '1', 'f3': '1'},
-							{'tenx_sourcetype': 'win', 'f0': '0', 'f1': '1', 'f2': '0', 'f3': '0'}]}
-	return {'results': [{'f0': '3', 'f1': '2', 'f2': '1', 'f3': '1'}]}
+		return {'results': [{'tenx_sourcetype': 'fgt', 'f0': '0', 'f1': '1', 'f2': '1', 'f3': '1', 'f4': '1'},
+							{'tenx_sourcetype': 'win', 'f0': '0', 'f1': '0', 'f2': '1', 'f3': '0', 'f4': '0'}]}
+	return {'results': [{'f0': '3', 'f1': '1', 'f2': '2', 'f3': '1', 'f4': '1'}]}
 
 cmd._rest = rest
 cmd._metadata = types.SimpleNamespace(searchinfo=types.SimpleNamespace(
@@ -199,17 +203,21 @@ def test_the_command_counts_indexed_fields_per_original_sourcetype():
 	assert proc.returncode == 0, proc.stderr
 	out = json.loads(proc.stdout.strip().splitlines()[-1])
 	every, declared, by_st = out['got']
-	# app, env, rare and srcip are indexed somewhere (the prefilter's list); declared is fields.conf INDEXED = true
-	assert every == ['app', 'declared', 'env', 'rare', 'srcip'] and declared == ['declared']
+	# app, before, env, rare and srcip are indexed somewhere (the prefilter's list); declared is fields.conf
+	# INDEXED = true; Splunk's eventtype and tag are never counted
+	assert every == ['app', 'before', 'declared', 'env', 'rare', 'srcip'] and declared == ['declared']
 	# per sourcetype, over the events the replay works on
-	assert by_st == {'fgt': ['env', 'rare', 'srcip'], 'win': ['env']}
-	assert out['searches'][0] == 'search `tenx-events` | head 1000 | fieldsummary | fields field'
+	assert by_st == {'fgt': ['before', 'env', 'rare', 'srcip'], 'win': ['env']}
+	# one event of each template and sender among the most recent
+	assert out['searches'][0] == ('search `tenx-events` | head 100000 | eval tenx_th=if(match(_raw, "^~[^,]"), '
+		'replace(_raw, "^~([^,]+)[\\s\\S]*$", "\\1"), "-") | dedup tenx_th index host source sourcetype '
+		'| fieldsummary | fields field')
 	assert out['searches'][1] == '| tstats max(_time) as t where `tenx-events` by index host source sourcetype'
 	# the most recent event of each sender, one second of it; a value with a backtick is left out (a macro), a
 	# double quote is escaped
 	assert out['searches'][2] == ('search `tenx-events` ((index="ix" host="fw1" source="a.log" sourcetype="tenx_encoded" '
 		'earliest=1590998439 latest=1590998440) OR (index="ix" host="fw\\"3" source="c.log" sourcetype="tenx_encoded" '
 		'earliest=1590998401 latest=1590998402)) | dedup index host source sourcetype | fieldsummary | fields field')
-	funcs = 'dc("app") as f0, dc("env") as f1, dc("rare") as f2, dc("srcip") as f3'
+	funcs = 'dc("app") as f0, dc("before") as f1, dc("env") as f2, dc("rare") as f3, dc("srcip") as f4'
 	assert out['searches'][3] == '| tstats %s where `tenx-events`' % funcs
 	assert out['searches'][4] == '| tstats %s where `tenx-events` by tenx_sourcetype' % funcs
