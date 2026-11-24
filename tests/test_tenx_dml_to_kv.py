@@ -98,13 +98,17 @@ class PureCopies:
 
 
 def fill(monkeypatch, tmp_path, records, kv=None):
+	return fill_rows(monkeypatch, tmp_path, [{'_raw': '', 'templateHash': h, 'template': t} for h, t in records], kv)
+
+
+def fill_rows(monkeypatch, tmp_path, rows, kv=None):
 	import csv, gzip
 	path = tmp_path / 'results.csv.gz'
 	with gzip.open(path, 'wt', newline='') as f:
 		writer = csv.DictWriter(f, fieldnames=['_raw', 'templateHash', 'template'])
 		writer.writeheader()
-		for template_hash, template in records:
-			writer.writerow({'_raw': '', 'templateHash': template_hash, 'template': template})
+		for row in rows:
+			writer.writerow(row)
 
 	config = dict(tenx_consts.DEFAULT_CONFIG)
 	config[tenx_util.CONFIG_LOADED] = True
@@ -417,6 +421,30 @@ def test_a_source_that_is_not_an_event_search_is_refused(monkeypatch, tmp_path):
 
 	assert consume(monkeypatch, tmp_path, splunk, kv, state, configuration={'source': '| inputlookup x'}) == -1
 	assert splunk.searches == []
+
+
+def test_records_in_the_results_are_read_from_raw_when_their_fields_are_wrong(monkeypatch, tmp_path):
+	# The later rows of a large results file can carry an empty template, or another row's, beside a whole _raw.
+	records = [('-H%07d' % i, TEMPLATE_A + ' %d' % i) for i in range(3000)]
+	rows = []
+	for i, (template_hash, template) in enumerate(records):
+		row = {'_raw': json.dumps({'templateHash': template_hash, 'template': template}), 'templateHash': template_hash, 'template': template}
+		if i >= 2000:
+			row['template'] = ''
+		elif i >= 1000:
+			row['templateHash'] = records[i - 1000][0]
+		rows.append(row)
+
+	assert fill_rows(monkeypatch, tmp_path, rows) == 3000
+	stored = StoreKV.last.records
+	assert {k: r['pattern'] for k, r in stored.items()} == dict(records)
+	assert not any(r.get('expand_unsafe') for r in stored.values())
+
+
+def test_a_result_without_a_template_record_in_raw_is_read_from_its_fields(monkeypatch, tmp_path):
+	fill_rows(monkeypatch, tmp_path, [{'_raw': '{"event": "~-Abc123xyz,1"}', 'templateHash': '-Abc123xyz', 'template': TEMPLATE_A}])
+
+	assert StoreKV.last.records['-Abc123xyz']['pattern'] == TEMPLATE_A
 
 
 def test_records_in_the_results_are_stored_in_batches(monkeypatch, tmp_path):

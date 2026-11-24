@@ -197,6 +197,25 @@ def get_result_parts(result):
 	return record_key, pattern
 
 
+def record_of(result):
+	"""
+	The (template hash, template) of a search result: the members of the template record in its
+	_raw, or its templateHash and template fields when _raw holds no such record.
+
+	The record is read from _raw because the results file Splunk hands the action can carry wrong
+	or empty fields beside a whole _raw in the later rows of a large search.
+	"""
+	raw = result.get('_raw') or ''
+	if raw.lstrip().startswith('{'):
+		try:
+			record = json.loads(raw)
+		except ValueError:
+			record = None
+		if isinstance(record, dict) and isinstance(record.get('templateHash'), str) and isinstance(record.get('template'), str):
+			return record['templateHash'], record['template']
+	return result.get('templateHash'), result.get('template')
+
+
 LOOKUP_NAME = 'tenx-dml-lookup'
 
 RECONCILE_CREATED = "created"
@@ -730,7 +749,7 @@ def update_kv_store(settings):
 		if 'templateHash' in (reader.fieldnames or []):
 			records = []
 			for result in reader:
-				records.append((result.get('templateHash'), result.get('template')))
+				records.append(record_of(result))
 				if len(records) >= CHUNK_RECORDS:
 					store.store(records)
 					records = []
