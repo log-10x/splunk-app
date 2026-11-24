@@ -126,7 +126,7 @@ backfill search in Step 5. A Receiver's clock zone leaves no trace in the data, 
 
 An event whose template is found but whose expansion gives no text also stays compact, with
 `tenx_expand_refused` set to `empty-expansion`; an event whose template is not found, with
-`no-template`.
+`no-template`. An empty line has an empty template, and `tx` returns its event with empty text.
 
 ### Event time on compact events
 
