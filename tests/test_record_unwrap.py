@@ -151,12 +151,14 @@ class TestWhereTheRuleRuns:
 class TestTheRuleText:
 	def test_raw_is_replaced_last(self):
 		fields = [f for f, _, _ in assignments()]
-		assert fields == ['host', 'source', 'index', 'tenx_sourcetype', 'tenx_time', '_time', 'tenx_unwrap', '_meta', '_raw']
+		assert fields == ['host', 'source', 'index', 'tenx_sourcetype', 'tenx_time', '_time', 'tenx_unwrap', 'tenx_pattern',
+			'message_pattern', 'severity_level', '_meta', '_raw']
 
 	def test_metadata_is_set_and_the_rest_indexed(self):
 		ops = dict((f, op) for f, op, _ in assignments())
 		assert [f for f in ops if ops[f] == '='] == ['host', 'source', 'index', '_time', '_meta', '_raw']
-		assert [f for f in ops if ops[f] == ':='] == ['tenx_sourcetype', 'tenx_time', 'tenx_unwrap']
+		assert [f for f in ops if ops[f] == ':='] == ['tenx_sourcetype', 'tenx_time', 'tenx_unwrap', 'tenx_pattern',
+			'message_pattern', 'severity_level']
 
 	def test_the_time_keeps_its_fraction(self):
 		# tonumber() straight on json_extract() of a JSON number dropped the fraction on Splunk Enterprise 10.4.3.
@@ -213,3 +215,23 @@ class TestTheRuleOnLines:
 		assert e['_meta'] == ' ' + meta and e['_raw'] == LINE['event']
 		e = run(json.dumps(dict(LINE, meta=meta)), _meta='host::x', **MONITOR)
 		assert e['_meta'] == 'host::x ' + meta
+
+	def test_the_pattern_keys_become_indexed_fields(self):
+		line = dict(LINE, tenx_pattern='Xb3kQ_9aZ1c', message_pattern='cart_checkout_failed', severity_level='ERROR')
+		e = run(json.dumps(line), **MONITOR)
+		assert (e['tenx_pattern'], e['message_pattern'], e['severity_level']) == ('Xb3kQ_9aZ1c', 'cart_checkout_failed', 'ERROR')
+		assert e['_raw'] == LINE['event']
+
+	def test_a_line_without_them_writes_none(self):
+		e = run(json.dumps(LINE), **MONITOR)
+		assert not {'tenx_pattern', 'message_pattern', 'severity_level'} & set(e)
+
+	def test_a_value_the_event_has_is_kept_when_the_line_has_none(self):
+		e = run(json.dumps(LINE), tenx_pattern='Xb3kQ_9aZ1c', **MONITOR)
+		assert e['tenx_pattern'] == 'Xb3kQ_9aZ1c'
+
+	def test_a_tenx_hash_key_is_not_indexed(self):
+		# The expansion looks up an existing tenx_hash as the template id, so a pattern hash under that name would
+		# leave every event compact.
+		e = run(json.dumps(dict(LINE, tenx_hash='Xb3kQ_9aZ1c')), **MONITOR)
+		assert 'tenx_hash' not in e and 'tenx_hash' not in ingest_eval()
