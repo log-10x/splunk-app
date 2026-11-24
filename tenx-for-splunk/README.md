@@ -25,10 +25,10 @@ Compact events and their template records come from the Receiver, the Log10x eng
 
 ### What is 10x?
 
-10x is a log optimization system that reduces log storage costs by identifying repetitive patterns in log events and replacing them with compact representations. Instead of storing full log lines repeatedly, 10x stores:
+10x reduces the bytes a Splunk licence counts. The 10x Receiver sends each event as a compact event, the hash of its template and its variable values, and sends each template once as a template record:
 
-1. **Templates**: The static pattern structure with placeholders for variable data
-2. **Encoded Events**: Compact representations containing only a hash reference and variable values
+1. **Templates**: the static text of a pattern, with placeholders for its variable values
+2. **Compact events**: the template hash and the event's variable values
 
 ### What does the app do?
 
