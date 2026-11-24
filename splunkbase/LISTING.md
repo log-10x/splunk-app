@@ -191,7 +191,7 @@ Paste the block for the version being uploaded. Splunkbase keeps notes per relea
 > - A `tx` word search keeps its answer for each word, so a later search for the same word reads only the templates stored since.
 > - In a search that transforms its events, `txf` applies only the rules that produce the fields the search reads, at the top level and inside `union`.
 > - Compact events index the Receiver's pattern hash `tenx_pattern`, pattern name `message_pattern` and level `severity_level` when their record holds them, so `| tstats count where index=<index> by tenx_pattern` counts by pattern without expansion.
-> - The README shows how Fluent Bit sends the Receiver's events to the HTTP Event Collector with their attached fields as indexed fields, so an add-on's data models count them.
+> - The README shows how Fluent Bit sends the Receiver's events to the HTTP Event Collector with their attached fields as indexed fields, which the data models of the Windows and FortiGate add-ons read.
 > - `tx` and `txf` return an empty or whitespace-only line as its own text.
 > - Template records piped to `| sendalert tenx_dml_to_kv` are each read from their `_raw`, so every template is stored under its own hash.
 > - The field map tool and its saved searches are no longer part of the app. Where a field map is installed, move its source off the map before upgrading, as the README's Upgrading section describes.
