@@ -1102,6 +1102,14 @@ The rule also indexes three keys the Receiver can add to a line: the pattern has
 `| tstats count where index=<index> by tenx_pattern`. A `tenx_hash` key is not indexed, because the app
 reads that field as the template id.
 
+The pattern hash adds no indexing cost. To add the pattern name and level to compact events as well,
+start the Receiver with `receiverOptimize true` and `symbolMessageHashField tenx_pattern`, and
+set `outputEncodeField` as below. The name and level add indexing work per event.
+
+```
+outputEncodeField encoded=(true) ? encode("tenx_pattern","message_pattern","severity_level") : fullText("tenx_pattern")
+```
+
 Every compact event keeps the `_time` the heavy forwarder gave the raw event: the rule marks it
 with the indexed field `tenx_time=sender`, and the app keeps the time of an event so marked, even
 when its template has a timestamp slot. An HTTP Event Collector sender can set the same field. A
