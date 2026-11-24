@@ -622,21 +622,6 @@ class TestTxfOfASourcetypeLeavesOutTagsNoOneReads:
 				continue
 			assert 'ndnotags' not in open(f).read(), f
 
-	def test_the_plan_gives_typer_its_event_types(self):
-		assert 'typer ' + b.plan_switch('', 'eventtypes=tenx_no_event_type') in macros().get('tenx-replay-tags', 'definition')
-		switch = b.plan_switch('ON', 'OFF')
-		# the same read of the plan as tenx-replay-plan, and the flag only when the plan is field names
-		plan_step = macros().get('tenx-replay-plan', 'definition')
-		assert switch[:switch.index('| fields custom.tenx_replay_plan')] in plan_step
-		test = re.search(r'eval search=if\((.*), "OFF", "ON"\)', switch).group(1)
-		assert test == ('match(\'custom.tenx_replay_plan\', "^tenx_nd[A-Za-z0-9_ ]+$") AND '
-						'match(\'custom.tenx_replay_plan\', "(^| )tenx_ndnotags( |$)")')
-		for value, off_ in (('tenx_ndnotags', True), ('tenx_ndm0a1b2c3d tenx_nd0a1b2c3d_1_ tenx_ndnotags', True),
-							('tenx_ndm0a1b2c3d tenx_nd0a1b2c3d_1_', False), ('tenx_ndnotagsx', False),
-							('tenx_ndnotags | delete', False), ('', False)):
-			got = bool(re.match(r"^tenx_nd[A-Za-z0-9_ ]+$", value)) and bool(re.search(r"(^| )tenx_ndnotags( |$)", value))
-			assert got == off_, value
-
 	def test_the_tags_step_of_plain_txf_is_closed_the_same_way(self):
 		assert plan.NOTAGS == 'tenx_ndnotags'
 		spl = selected().spl()

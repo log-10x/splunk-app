@@ -3,12 +3,12 @@
 Enterprise 10.4.3, measured on the Windows 662 sample).
 
 1. Splunk's union checks the commands of each of its datasets before it runs the subsearches inside
-   them, and there eval, where and rex refuse a subsearch as their argument ("Error in 'EvalCommand':
-   The expression is malformed"); search and fillnull accept one. The step before the final search
-   of the tx macros (macros.conf [tenx-wild]) therefore takes its marks through fillnull, as one
-   percent-encoded value (tenx_prefilter_parser.wild_marks), and computes them in an eval that holds
-   no subsearch. 1.2.2 read them with `eval [subsearch]`, and every `tx` and `txf` inside
-   `| union [...]` failed.
+   them, and there eval, where, rex and typer refuse a subsearch as their argument ("Error in
+   'EvalCommand': The expression is malformed"); search and fillnull accept one. The step before
+   the final search of the tx macros (macros.conf [tenx-wild]) therefore takes its marks through
+   fillnull, as one percent-encoded value (tenx_prefilter_parser.wild_marks), and computes them in
+   an eval that holds no subsearch. 1.2.2 read them with `eval [subsearch]`, and every `tx` and
+   `txf` inside `| union [...]` failed.
 2. Every `tx` and `txf` of a search runs the prefilter, which reads the whole search and took the
    words after the first one: the second arm of a multisearch or union kept too few events (NTLM:
    0 of 50). With more than one in the search, the prefilter selects every compact event and stores
@@ -115,6 +115,20 @@ class TestTheMacroStep:
 	def test_the_step_follows_the_same_patterns_as_this_model(self):
 		step = self.definitions().get('tenx-wild', 'definition')
 		assert '"%s"' % NUMBER.pattern in step and '"%s"' % REST.pattern in step
+
+
+class TestWhatUnionChecks:
+	REFUSED = re.compile(r'\b(?:eval|where|rex|typer) \[')
+
+	def test_no_shipped_macro_gives_a_refused_command_a_subsearch(self):
+		conf = TestTheMacroStep().definitions()
+		for name in conf.sections():
+			if conf.has_option(name, 'definition'):
+				assert not self.REFUSED.search(conf.get(name, 'definition')), name
+
+	def test_nor_does_the_written_replay(self):
+		import tenx_replay_builder as b
+		assert not self.REFUSED.search(' | '.join(b.TAGS_STEPS))
 
 
 # The prefilter command, run in a child interpreter with the real vendored splunklib (the suite stubs it, see

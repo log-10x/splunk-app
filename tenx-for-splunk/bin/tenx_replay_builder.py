@@ -1537,24 +1537,6 @@ def generation(steps, rules):
 	return hashlib.md5((' | '.join(steps) + json.dumps(rules, sort_keys=True)).encode('utf-8')).hexdigest()[:8]
 
 
-def plan_switch(on, off):
-	"""
-	A subsearch that gives a command the argument `off` when the running search's plan holds
-	tenx_replay_plan.NOTAGS (it reads no event type and no tag), and `on` otherwise. Splunk fixes a
-	search's commands before any subsearch runs, so the plan can change their arguments only.
-	"""
-	return ('[| makeresults | addinfo | eval p=replace(info_sid, "^subsearch_(.+)_\\d+\\.\\d+$", "\\1") | where '
-			'p!=info_sid AND NOT match(p, "^nested_") | map maxsearches=1 search="| rest /services/search/jobs/$p$ '
-			'splunk_server=local | fields custom.tenx_replay_plan" | appendpipe [stats count | where count=0] | eval '
-			'search=if(match(\'custom.tenx_replay_plan\', "^tenx_nd[A-Za-z0-9_ ]+$") AND match(\'custom.tenx_replay_plan\', '
-			'"(^| )%s( |$)"), "%s", "%s") | fields search]' % (plan.NOTAGS, off, on))
-
-
-# The event type typer is given when the plan closes the tags step. No event type has this name, so typer loads
-# none; otherwise it loads every event type when the search starts, whether or not it runs on an event.
-NO_EVENT_TYPE = 'tenx_no_event_type'
-
-
 def tags_block():
 	"""
 	Event types and tags, recomputed on the replayed events (tenx_rst set); in a chunk that also
@@ -1567,7 +1549,8 @@ def tags_block():
 		'eval tenx_rk_et=if(isnull(%s), eventtype, null()), tenx_rk_tag=if(isnull(%s), tag, null()), '
 		'eventtype=if(isnull(%s), eventtype, null())' % (RST, RST, RST),
 		'foreach tag::* [eval "tenx_rk_<<FIELD>>"=if(isnull(%s), \'<<FIELD>>\', null())]' % RST,
-		'typer ' + plan_switch('', 'eventtypes=' + NO_EVENT_TYPE),
+		# No subsearch as typer's argument: union refuses one.
+		'typer',
 		'tags',
 		# Inside a foreach body, tags writes each tag::<field> but not the combined tag field
 		# (measured: 0 events had tag inside the block, 786 with the same steps outside it), so
