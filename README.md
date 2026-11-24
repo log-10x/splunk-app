@@ -45,7 +45,7 @@ which replaces the values the app's configuration sets. With the published image
 Bit container:
 
 ```
-docker run -d --name tenx-receiver --network container:<Fluent Bit container> log10x/edge-10x:1.1.181 \
+docker run -d --name tenx-receiver --network container:<Fluent Bit container> log10x/edge-10x:1.1.183 \
   @run/input/forwarder/fluentbit @apps/receiver receiverOptimize true varMaxRecurIndexes 0 \
   timestampZone UTC timestampMaxPerObject 1 groupJoinLines false
 ```

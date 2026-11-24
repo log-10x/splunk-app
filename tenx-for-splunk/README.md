@@ -730,7 +730,7 @@ second process share the first one's network:
 ```sh
 docker run -d --name tenx-fluentbit-in --network <network> \
   -v <fluent-bit-in.conf>:/fluent-bit/etc/fluent-bit.conf:ro -v <log folder>:/logs fluent/fluent-bit:5.1.5
-docker run -d --name tenx-receiver --network container:tenx-fluentbit-in log10x/edge-10x:1.1.181 \
+docker run -d --name tenx-receiver --network container:tenx-fluentbit-in log10x/edge-10x:1.1.183 \
   @run/input/forwarder/fluentbit @apps/receiver receiverOptimize true varMaxRecurIndexes 0 \
   timestampZone UTC timestampMaxPerObject 1 groupJoinLines false
 docker run -d --name tenx-fluentbit-back --network container:tenx-fluentbit-in --env-file <env file> \

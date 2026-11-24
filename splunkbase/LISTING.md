@@ -167,7 +167,7 @@ Repository name: `log-10x/splunk-app`. Repository URL: https://github.com/log-10
 | Splunk platform compatibility | Splunk Enterprise 9.4, 10.0, 10.2, 10.4, 10.6 |
 | CIM | None |
 
-Each line is tested: 9.4.15, 10.0.12, 10.2.9, 10.4.3 and 10.6.0.5 for 1.2.x, and 9.4.15, 10.0.10, 10.2.7 and 10.4.3, each a fresh install of 1.1.2. 1.1.3
+Each line is tested: 9.4.15, 10.0.12, 10.2.9, 10.4.3 and 10.6.0.5 for 1.3.0 and 1.2.x, and 9.4.15, 10.0.10, 10.2.7 and 10.4.3, each a fresh install of 1.1.2. 1.1.3
 changed one `props.conf` key, checked on 10.4.3 and measured on 9.4. 1.1.4 changes how
 templates are stored; it is checked on 9.4.15, 10.4.3 and 10.6.0.5, on a fresh install and an
 upgrade over 1.1.3. 1.1.5 changes the compact sourcetype's event time and the expansion macro; it is
@@ -189,7 +189,11 @@ Paste the block for the version being uploaded. Splunkbase keeps notes per relea
 > - Events the Receiver sends as their own text, in the same stream as compact events, come back as they are through `tx`, `txf`, the dashboards and compiled alerts.
 > - A Universal Forwarder can read compact events from files that carry the fields the Receiver attaches and each event's time.
 > - A `tx` word search keeps its answer for each word, so a later search for the same word reads only the templates stored since.
-> - In a search that transforms its events, `txf` applies only the rules that produce the fields the search reads.
+> - In a search that transforms its events, `txf` applies only the rules that produce the fields the search reads, at the top level and inside `union`.
+> - Compact events index the Receiver's pattern hash `tenx_pattern`, pattern name `message_pattern` and level `severity_level` when their record holds them, so `| tstats count where index=<index> by tenx_pattern` counts by pattern without expansion.
+> - The README shows how Fluent Bit sends the Receiver's events to the HTTP Event Collector with their attached fields as indexed fields, so an add-on's data models count them.
+> - `tx` and `txf` return an empty or whitespace-only line as its own text.
+> - Template records piped to `| sendalert tenx_dml_to_kv` are each read from their `_raw`, so every template is stored under its own hash.
 > - The field map tool and its saved searches are no longer part of the app. Where a field map is installed, move its source off the map before upgrading, as the README's Upgrading section describes.
 > - Requires the Log10x Receiver at release 1.1.181 or later and Splunk Enterprise 9.4 through 10.6. After upgrading the app, restart Splunk.
 
@@ -306,6 +310,10 @@ Paste the block for the version being uploaded. Splunkbase keeps notes per relea
 
 | Check | Result |
 |---|---|
+| 1.3.0 unit tests | 2,778 passed |
+| 1.3.0 AppInspect, offline: precert, cloud, private_victoria | 0 errors, 0 failures; warnings 6, 5 and 6 in that order |
+| 1.3.0 with engine 1.1.183 on Splunk 9.4.15, 10.0.12, 10.2.9, 10.4.3 and 10.6.0.5, each a fresh install: 8,311 Windows Security events in XML with the Receiver's Windows XML field profile and 5,000 OpenTelemetry demo lines | the same on each version: no error from the app's code in `splunkd.log`; 4,788 of 4,788 templates stored; `tx` and `txf` return every event with its original text; 8,311 of 8,311 compact Windows events indexed as `XmlWinEventLog` with 42 of 42 attached fields; Windows `_time` equal to the event's `SystemTime` on every event; the Analytics and Diagnostics panels run with no error; `live_endpoints` 3 of 3 and `live_tx_command_cr` 7 of 7. `live_tx_in_subsearch`, `txf` inside `union` included: 80 of 80 on 9.4.15, 10.4.3 and 10.6.0.5 |
+| 1.3.0 data models with engine 1.1.183 on Splunk 10.4.3, against the same events indexed raw | Windows Security in XML (Authentication, Change), Windows Security as classic text (Authentication, Change, Endpoint) and FortiGate (Network_Traffic): equal counts, and no table differs through `tstats`, accelerated and not, or `datamodel` search |
 | Search report on Splunk 10.4.3 with the Windows add-on 12.0.0, the AWS add-on 8.3.1, the FortiGate add-on 1.6.10 and CIM 8.8.0: 117 saved searches, 18 of them ESCU detection base searches, and two dashboards, one Simple XML and one Dashboard Studio, over 8,311 Windows Security, 5,000 CloudTrail and 10,923 FortiGate events (132 objects), each run on the events indexed raw and on the same events compact, without and with a field map (FortiGate without), as written or with the report's edit | Every object the report gives as unchanged, needing `tx` or needing `txf` returns the same number of events or rows as on raw (58 and 63 on Windows without and with a map, 16 and 21 on CloudTrail, 13 on FortiGate); all return the same rows except 4, which return the same events at the same times with their text compact: an alert that lists events, as its reason says, and two dashboard base searches whose panels return the same rows (Windows), and a CloudTrail alert that lists events. The objects that need a field map return nothing as written. Of the limits, punct, `tstats` on sourcetype, `NOT CASE()` (more events), event time on CloudTrail without a map and on FortiGate, and through a map `vendor_privilege`, the CloudTrail delete event type and `sessionToken` return other results than raw; a comma after the macro stops the search with its message; the rest return what raw returns on these events. Read over REST and from the files, the report gives the same verdicts and edits on all 238 object runs |
 | 1.2.1 unit tests | 1016 passed, among them the field replay behind `txf`, the field map and its fail-safe, field comparisons written with spaces, the index time of template records, the Consume KV window, and the term that selects a template whose hash contains `*` |
 | 1.2.1 AppInspect 4.4.0: default, cloud, future, private_victoria, private_classic | 0 errors, 0 failures, 0 future failures; warnings 6, 5, 0, 6, 6 in that order |
