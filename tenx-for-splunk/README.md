@@ -427,6 +427,82 @@ the Receiver attached and the expanded text also holds keeps the extracted value
 Universal Forwarder, the Receiver attaches the fields with `compactFieldsForm text`, `compactFieldsKey
 meta` and `compactFieldsSeparator ::`, and `[tenx-record-unwrap]` adds them to the event's indexed fields.
 
+On the route of [Fluent Bit Beside the Receiver](#fluent-bit-beside-the-receiver), give the Receiver the
+source's profile, such as `@run/fields/windows-security-xml.yaml`, and leave the three options above
+unset. Each compact record then comes back with its fields as one JSON object under `fields`.
+
+Fluent Bit's Splunk output with `event_key` sends that value as the event and leaves `fields` out. In
+the second process, replace the compact events' `modify` filter and output with these:
+
+```
+[FILTER]
+    Name              modify
+    Match             tenx.src.app
+    Add               tenx_sourcetype <original sourcetype>
+
+[FILTER]
+    Name              nest
+    Match             tenx.src.app
+    Operation         lift
+    Nested_under      fields
+    Add_prefix        fields.
+
+[FILTER]
+    Name              modify
+    Match             tenx.src.app
+    Rename            tenx_sourcetype fields.tenx_sourcetype
+    Rename            log event
+    Add               sourcetype tenx_encoded
+    Add               index <compact index>
+    Add               source <original source>
+
+[FILTER]
+    Name              nest
+    Match             tenx.src.app
+    Operation         nest
+    Wildcard          fields.*
+    Nest_under        fields
+    Remove_prefix     fields.
+
+[FILTER]
+    Name              record_modifier
+    Match             tenx.src.app
+    Allowlist_key     event
+    Allowlist_key     fields
+    Allowlist_key     sourcetype
+    Allowlist_key     index
+    Allowlist_key     source
+
+[OUTPUT]
+    Name              splunk
+    Match             tenx.src.app
+    Host              <HEC host>
+    Port              8088
+    Splunk_Token      ${HEC_TOKEN}
+    TLS               On
+    splunk_send_raw   On
+    Retry_Limit       False
+```
+
+The filters move `tenx_sourcetype` in with the attached fields and make each record an HTTP Event
+Collector event, which `splunk_send_raw On` sends as it stands. The HEC indexes every key of `fields`,
+and a list as several values. Set `source` to the source of the raw events, which the Windows add-on
+reads.
+
+The last filter drops every other key of the record. The HEC refuses a request whose record holds a key
+it does not read, such as those a `kubernetes` filter adds. Fluent Bit does not send that request again.
+
+Some add-ons set the sourcetype from the event text, as the FortiGate add-on does from `type`. For such
+a source, put one `modify` filter per value in place of the first one:
+
+```
+[FILTER]
+    Name              modify
+    Match             tenx.src.app
+    Condition         Key_value_equals $fields['type'] traffic
+    Add               tenx_sourcetype fortigate_traffic
+```
+
 ### Raw Events from Before the Receiver
 
 A source that sent raw events before the Receiver was installed keeps them in its index, next to
