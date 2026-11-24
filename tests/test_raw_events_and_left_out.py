@@ -325,7 +325,8 @@ class TestSubsecond:
 		conf = macros()
 		for name in ('tenx-inflate', 'tenx-inflate-debug'):
 			d = conf.get(name, 'definition')
-			assert ('_raw=if(len(tenx_text)>0, tenx_text, _raw), ' + self.STEP) in d, name
+			assert ('_raw=if(len(tenx_text)>0 OR (isnotnull(tenx_text) AND len(coalesce(mvjoin(tenx_expand_refused,""),""))==0), '
+				'tenx_text, _raw), ' + self.STEP) in d, name
 			# before the fields the step reads are removed
 			assert d.index(self.STEP) < (d.index('| fields  - ') if '| fields  - ' in d else len(d))
 

@@ -179,7 +179,8 @@ def get_result_parts(result):
 		logger.warning("Missing dml_hash on line - {}".format(raw_line))
 		return None, None
 
-	if not non_empty_string(pattern):
+	# An empty or whitespace-only line has a template of that same text.
+	if pattern is None:
 		logger.warning("Missing actual pattern on line - {}".format(raw_line))
 		return None, None
 
@@ -195,6 +196,25 @@ def get_result_parts(result):
 		return None, None
 
 	return record_key, pattern
+
+
+# Splunk reads a JSON null as the text "null". The template record of an empty line has a null
+# template, which is the empty template; a template that is the text "null" stays as it is.
+NULL_TEMPLATE_EVAL = 'eval template=if(template=="null" AND isnull(json_extract(_raw, "template")), "", template)'
+
+
+def record_template(result):
+	"""The template of a template record in search results, with a JSON null read as the empty template."""
+	template = result.get('template')
+
+	if template == 'null' and result.get('_raw'):
+		try:
+			if json.loads(result['_raw']).get('template', template) is None:
+				return ''
+		except (ValueError, AttributeError):
+			pass
+
+	return template
 
 
 LOOKUP_NAME = 'tenx-dml-lookup'
@@ -609,7 +629,7 @@ def load_since(server_connection, store, state_intf, dml_intf, source, start_fro
 		count = 0
 		slice_began = time.time()
 		if planned:
-			search = 'search {} _index_earliest={} _index_latest={} | fields templateHash, template, _indextime | fields - _raw'.format(source, int(a), int(b))
+			search = 'search {} _index_earliest={} _index_latest={} | {} | fields templateHash, template, _indextime | fields - _raw'.format(source, int(a), int(b), NULL_TEMPLATE_EVAL)
 			chunk = []
 			refresh = a < refresh_until
 			for result in export_results(server_connection, search):
@@ -730,7 +750,7 @@ def update_kv_store(settings):
 		if 'templateHash' in (reader.fieldnames or []):
 			records = []
 			for result in reader:
-				records.append((result.get('templateHash'), result.get('template')))
+				records.append((result.get('templateHash'), record_template(result)))
 				if len(records) >= CHUNK_RECORDS:
 					store.store(records)
 					records = []
