@@ -229,7 +229,7 @@ def record_of(result):
 	if raw.lstrip().startswith('{'):
 		try:
 			record = json.loads(raw)
-		except ValueError:
+		except (ValueError, RecursionError):
 			record = None
 		if isinstance(record, dict) and isinstance(record.get('templateHash'), str):
 			template = record.get('template')

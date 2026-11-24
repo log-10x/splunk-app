@@ -447,6 +447,12 @@ def test_a_result_without_a_template_record_in_raw_is_read_from_its_fields(monke
 	assert StoreKV.last.records['-Abc123xyz']['pattern'] == TEMPLATE_A
 
 
+def test_a_result_whose_raw_nests_too_deep_to_parse_is_read_from_its_fields(monkeypatch, tmp_path):
+	fill_rows(monkeypatch, tmp_path, [{'_raw': '{"a":' + '[' * 20000 + ']' * 20000 + '}', 'templateHash': '-Abc123xyz', 'template': TEMPLATE_A}])
+
+	assert StoreKV.last.records['-Abc123xyz']['pattern'] == TEMPLATE_A
+
+
 def test_records_in_the_results_are_stored_in_batches(monkeypatch, tmp_path):
 	kv = StoreKV()
 	fill(monkeypatch, tmp_path, [('-H%07d' % i, TEMPLATE_A + ' %d' % i) for i in range(4500)], kv=kv)
