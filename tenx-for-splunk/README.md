@@ -994,8 +994,8 @@ TRANSFORMS-00_tenx_unwrap = tenx-relay-line, tenx-record-unwrap
 The rule also indexes three keys the Receiver can add to a line: the pattern hash `tenx_pattern`
 (`symbolMessageHashField tenx_pattern`), the pattern name `message_pattern` and the level
 `severity_level`. A count per pattern then reads the index alone, as in
-`| tstats count where index=<index> by tenx_pattern`. Do not name the hash `tenx_hash`: the app reads
-that field as the template id, so the events would stay compact.
+`| tstats count where index=<index> by tenx_pattern`. A `tenx_hash` key is not indexed, because the app
+reads that field as the template id.
 
 Every compact event keeps the `_time` the heavy forwarder gave the raw event: the rule marks it
 with the indexed field `tenx_time=sender`, and the app keeps the time of an event so marked, even
