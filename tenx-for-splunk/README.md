@@ -58,8 +58,10 @@ $(yyyy-MM-dd'T'HH:mm:ss.SSS'Z') INFO [main] com.example.Service - Processing req
 
 At search time, the `tenx-inflate` macro reconstructs the original event by combining the template with the variable values.
 
-Each template is sent to Splunk once and counted like any other data. Where new templates keep
-arriving, as on a small or varied source, the template records can outweigh what compaction saves.
+The Receiver sends each template once per run, the first time it sees it, and Splunk counts it like
+any other data. After a restart, an upgrade included, it sends again each template it then sees.
+Where new templates keep arriving, as on a small or varied source, the template records can
+outweigh what compaction saves.
 On a steady source the count of templates levels off.
 
 ---
@@ -245,6 +247,31 @@ The `tenx_dml` collection stores parsed template data with fields:
 6. **Load templates already indexed:** run the backfill search once, see
    [Loading Templates Indexed Earlier](#loading-templates-indexed-earlier).
 
+### Upgrading
+
+Install the new package over the installed app with the command of step 1, then restart Splunk so
+Splunk Web serves the new dashboard script. The app keeps its local settings: the `tenx-events`
+macro, saved search schedules and the template collection. The app and the Receiver can be
+upgraded in either order.
+
+A `tenx-events` macro set on an earlier version keeps its value. Add `tenx_sourcetype::*` to its
+sourcetype clause, as the default now has it, so `tx` also reads compact events that carry
+`tenx_sourcetype` under another sourcetype.
+
+The field map tool and its saved searches, Field Map Events Without Fields and Field Map Dropped
+Events, are no longer part of the app. Where a field map is installed, move its source off the map
+before upgrading the app:
+
+1. Start its Receiver with `receiverOptimize true`, without `compactReceiverLookupFile` and the
+   edited compact configuration.
+2. Send its events with `event_sourcetype tenx_encoded`.
+3. Stop the scheduled `check`, and remove the field map app and its floor app from every instance.
+4. Remove any schedule given to Field Map Events Without Fields. Without its search, Splunk logs a
+   warning for it at each restart.
+
+Searches on the fields of that source then use `txf`, as for any compact source (see
+[Which Searches Change When a Source Moves](#which-searches-change-when-a-source-moves)).
+
 ### Directory Structure
 
 ```
@@ -370,6 +397,8 @@ Naming the index makes every panel faster. Raw events of the same sources, such 
 indexed before the Receiver, are named in a second macro; see the next section.
 
 ### Compact Events Under the Original Sourcetype
+
+Needs the Receiver at release 1.1.183 or later.
 
 An add-on keys its event types, tags and field rules on its sourcetype, so its data models do not read
 compact events indexed as `tenx_encoded`. Where the Receiver attaches the fields those models read

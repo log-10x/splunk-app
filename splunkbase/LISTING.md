@@ -182,6 +182,17 @@ Splunkbase requires a release to run on every version it names.
 
 Paste the block for the version being uploaded. Splunkbase keeps notes per release.
 
+1.3.0:
+
+> - An add-on's data models and `tstats` can read compact events: one `props.conf` line indexes each event under its original sourcetype, with the fields its Receiver attaches. This needs the Receiver at release 1.1.183 or later.
+> - `tx` and `txf` also return the raw events of the same sources, such as those indexed before the Receiver, that the new `tenx-raw-events` macro names.
+> - Events the Receiver sends as their own text, in the same stream as compact events, come back as they are through `tx`, `txf`, the dashboards and compiled alerts.
+> - A Universal Forwarder can read compact events from files that carry the fields the Receiver attaches and each event's time.
+> - A `tx` word search keeps its answer for each word, so a later search for the same word reads only the templates stored since.
+> - In a search that transforms its events, `txf` applies only the rules that produce the fields the search reads.
+> - The field map tool and its saved searches are no longer part of the app. Where a field map is installed, move its source off the map before upgrading, as the README's Upgrading section describes.
+> - Requires the Log10x Receiver at release 1.1.181 or later and Splunk Enterprise 9.4 through 10.6. After upgrading the app, restart Splunk.
+
 1.2.5, 1.2.4 and 1.2.3:
 
 > - The field map tool generates maps for Windows Security as classic text (`WinEventLog:Security`), FortiGate and Palo Alto Networks, beside Windows Security as rendered XML and CloudTrail. With a FortiGate map, the Network_Traffic data model, `tstats` and the Splunk Security Content (ESCU) detections give the same results as on raw events. With a Palo Alto map, the Network_Traffic and Change data models, `tstats` and ESCU detections give the same results on compact PAN-OS traffic and system events as on raw ones; threat events are passed whole.
