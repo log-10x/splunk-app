@@ -49,7 +49,7 @@ def spath(event, _):
 		event['Event.System.' + tag] = val
 
 
-from test_replay_units import mapped_guard_macros
+from test_replay_units import guard_macros
 
 
 def model(definition):
@@ -58,7 +58,7 @@ def model(definition):
 				  'inflatemodel': lambda e, _: e.__setitem__('_raw', e['__exp']),
 				  'typer': lambda e, _: e.__setitem__('eventtype', 'et_%s' % e.get('sourcetype')),
 				  'tags': lambda e, _: None},
-		macros=dict({'tenx-inflate': 'inflatemodel', 'tenx-replay': definition}, **mapped_guard_macros()))
+		macros=dict({'tenx-inflate': 'inflatemodel', 'tenx-replay': definition}, **guard_macros()))
 
 
 def compact(raw, exp, carrier=None, **read_time):
@@ -82,7 +82,7 @@ def changing_calls(event):
 	hidden form (no text, placeholder metadata) cannot set a field from the event. typer and tags
 	are left out: in a chunk that also holds replayed events they run on every event, and the
 	macro puts back the eventtype and tags of the others (the final fields are compared)."""
-	return [c for c in event.get('__log', []) if c[0] not in ('inflatemodel', 'typer', 'tags') and c[1][0] != '']
+	return [c for c in event.get('__log', []) if c[0].split(' ', 1)[0] not in ('inflatemodel', 'typer', 'tags') and c[1][0] != '']
 
 
 def rewrite_tail(search):

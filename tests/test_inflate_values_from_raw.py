@@ -2,12 +2,12 @@
 The values tenx-inflate expands a compact event with.
 
 A search-time extraction trims white space at both ends of each value it writes (Splunk Enterprise
-10.4.3: "~h,<epoch>,a,b<CR>" gave tenx_vars "a,b", and "~h,<epoch>,  a,b" gave "a,b"), and makemv
+10.4.3: "~h,<epoch>,a,b<CR>" gave tenx_vars "a,b", and "~h,<epoch>,  a,b" gave "a,b"), and the split
 drops empty values. The engine leaves the CR of a CR LF line end at the end of the value before the
 template's line feed, so the last value of a Windows event whose text ends with fixed lines ends in
 CR, or is a lone CR. Both inflate macros therefore read the values from _raw. These tests run that
 expression with Python's re, and model the rest of the chain as observed on Splunk Enterprise 10.4.3
-(makemv drops empty values, mvzip stops at the shorter list) on records tenx_dml_builder makes from
+(the split drops empty values, mvzip stops at the shorter list) on records tenx_dml_builder makes from
 the templates, as Consume KV stores them.
 
 The templates and compact lines below have the shapes the engine writes for such events (an empty
@@ -25,6 +25,8 @@ APP = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', 'tenx-for-sp
 MACROS = ('tenx-inflate', 'tenx-inflate-debug')
 STAMP = '11/15/2026 12:07:11 PM'
 CR = '\r'
+# The step that splits the values, dropping empty ones.
+SPLIT = 'eval tenx_vars=split(nullif(trim(replace(tenx_vars, ",,+", ","), ","), ""), ",")'
 
 
 def conf(name):
@@ -68,8 +70,16 @@ def values_from_raw(raw, name='tenx-inflate'):
 	return extracted(raw).get('tenx_vars')
 
 
-def makemv(value):
+def split(value):
 	return [v for v in value.split(',') if v != ''] if value else []
+
+
+def split_step(value):
+	"""SPLIT as eval runs it: runs of commas made one, the commas at both ends removed, then split."""
+	if value is None:
+		return []
+	text = re.sub(',,+', ',', value).strip(',')
+	return text.split(',') if text else []
 
 
 def expand(raw, template, values):
@@ -78,7 +88,7 @@ def expand(raw, template, values):
 	record = TenxDMLBuilder(timestamp_placeholder='__TENX_TS__', variable_separator='$').build_kv_record_data(
 		extracted(raw)['tenx_hash'], template)
 	assert record['timestamp_format']
-	zipped = [p + v for p, v in zip(record['pattern_parts'], makemv(values))]
+	zipped = [p + v for p, v in zip(record['pattern_parts'], split(values))]
 	return ''.join(zipped + [record['pattern_terminator']]).replace('__TENX_TS__', STAMP)
 
 
@@ -127,11 +137,21 @@ LF_CASES = {
 
 class TestValuesFromRaw:
 	@pytest.mark.parametrize('name', MACROS)
-	def test_the_macro_reads_the_values_before_makemv(self, name):
+	def test_the_macro_reads_the_values_before_the_split(self, name):
 		step, _, _ = values_step(name)
 		assert step.startswith('eval tenx_vars=if(match(_raw, ')
 		assert step.endswith(', tenx_vars)')
-		assert macro(name).index(step) < macro(name).index('makemv delim="," tenx_vars')
+		assert macro(name).index(step) < macro(name).index(SPLIT)
+
+	@pytest.mark.parametrize('value', ['a,b', ',a,,b,', ',,,', 'a', '  a,b ', 'a\r,\r,b\t', ',', 'a,,,,b', '\r'])
+	def test_the_split_drops_empty_values_and_keeps_every_other(self, value):
+		assert split_step(value) == split(value)
+
+	@pytest.mark.parametrize('name', MACROS)
+	def test_the_values_are_split_in_eval(self, name):
+		# makemv makes Splunk compute the event types of every event the base search reads
+		assert 'makemv' not in macro(name)
+		assert macro(name).split(' | ')[2] == SPLIT
 
 	@pytest.mark.parametrize('raw, values', [
 		('~h,1794744431000,a,b\r', 'a,b\r'),
@@ -194,11 +214,11 @@ class TestFirstValueFromRaw:
 	the branch for a template with no value at all."""
 
 	@pytest.mark.parametrize('name', MACROS)
-	def test_the_macro_reads_the_first_value_before_makemv(self, name):
+	def test_the_macro_reads_the_first_value_before_the_split(self, name):
 		step, _, _, _ = first_value_step(name)
 		assert step.startswith('eval tenx_var_0=if(match(_raw, ')
 		assert step.endswith(', tenx_var_0)')
-		assert macro(name).index(step) < macro(name).index('makemv delim="," tenx_vars')
+		assert macro(name).index(step) < macro(name).index(SPLIT)
 
 	@pytest.mark.parametrize('raw, value', [
 		('~h,1794744431000,a,b', '1794744431000'),

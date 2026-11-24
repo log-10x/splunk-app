@@ -3,12 +3,12 @@
 Enterprise 10.4.3, measured on the Windows 662 sample).
 
 1. Splunk's union checks the commands of each of its datasets before it runs the subsearches inside
-   them, and there eval, where and rex refuse a subsearch as their argument ("Error in 'EvalCommand':
-   The expression is malformed"); search and fillnull accept one. The step before the final search
-   of the tx macros (macros.conf [tenx-wild]) therefore takes its marks through fillnull, as one
-   percent-encoded value (tenx_prefilter_parser.wild_marks), and computes them in an eval that holds
-   no subsearch. 1.2.2 read them with `eval [subsearch]`, and every `tx` and `txf` inside
-   `| union [...]` failed.
+   them, and there eval, where, rex and typer refuse a subsearch as their argument ("Error in
+   'EvalCommand': The expression is malformed"); search and fillnull accept one. The step before
+   the final search of the tx macros (macros.conf [tenx-wild]) therefore takes its marks through
+   fillnull, as one percent-encoded value (tenx_prefilter_parser.wild_marks), and computes them in
+   an eval that holds no subsearch. 1.2.2 read them with `eval [subsearch]`, and every `tx` and
+   `txf` inside `| union [...]` failed.
 2. Every `tx` and `txf` of a search runs the prefilter, which reads the whole search and took the
    words after the first one: the second arm of a multisearch or union kept too few events (NTLM:
    0 of 50). With more than one in the search, the prefilter selects every compact event and stores
@@ -117,6 +117,20 @@ class TestTheMacroStep:
 		assert '"%s"' % NUMBER.pattern in step and '"%s"' % REST.pattern in step
 
 
+class TestWhatUnionChecks:
+	REFUSED = re.compile(r'\b(?:eval|where|rex|typer) \[')
+
+	def test_no_shipped_macro_gives_a_refused_command_a_subsearch(self):
+		conf = TestTheMacroStep().definitions()
+		for name in conf.sections():
+			if conf.has_option(name, 'definition'):
+				assert not self.REFUSED.search(conf.get(name, 'definition')), name
+
+	def test_nor_does_the_written_replay(self):
+		import tenx_replay_builder as b
+		assert not self.REFUSED.search(' | '.join(b.TAGS_STEPS))
+
+
 # The prefilter command, run in a child interpreter with the real vendored splunklib (the suite stubs it, see
 # conftest.py), its REST calls answered here: the job's search text, the template lookup, the store state.
 CHILD = r'''
@@ -141,18 +155,22 @@ def prefilter(search):
 	cmd._metadata = types.SimpleNamespace(searchinfo=types.SimpleNamespace(
 		sid='subsearch_1794937815.59_1794937816.89', username='admin', earliest_time=0, latest_time=0,
 		splunkd_uri='https://127.0.0.1:8089', session_key='key'))
-	calls, warnings = [], []
+	calls, warnings, searches = [], [], []
 	def rest(path, data=None, answer=True):
 		calls.append([path.split('?')[0], sorted((data or {}).keys())])
 		if path.startswith('/services/search/jobs/1794937815.59') and not data:
 			return {'entry': [{'content': {'search': search}}]}
+		if path.endswith('/search/jobs') and data and 'search' in data:
+			searches.append(data['search'])
+		# the dictionary read finds nothing; the word index check finds every compact event indexed with its words
 		return {'results': []}
 	cmd._rest = rest
 	cmd.write_warning = lambda m, *a: warnings.append(m)
 	rows = list(cmd.generate())
 	stored = [c for c in calls if c[0].startswith('/services/search/jobs/1794937815.59') and c[1]]
-	lookups = [c for c in calls if c[0].endswith('/search/jobs') and 'search' in c[1]]
-	return {'rows': rows, 'warnings': warnings, 'stored': stored, 'lookups': len(lookups)}
+	lookups = [s for s in searches if 'tenx-dml-lookup' in s]
+	word_checks = [s for s in searches if 'TERM(~*)' in s]
+	return {'rows': rows, 'warnings': warnings, 'stored': stored, 'lookups': len(lookups), 'word_checks': len(word_checks)}
 
 out = {
 	'one': prefilter('search index=c `tx` Se*Privilege | stats count'),
@@ -261,13 +279,15 @@ class TestSeveralInOneSearch:
 	def test_one_call_in_a_union_is_read_as_before(self):
 		one = child()['one_txf']
 		assert one['warnings'] == [] and one['lookups'] == 1 and one['stored'] == []
+		# a prefilter of terms is checked against compact events indexed without words, once
+		assert one['word_checks'] == 1
 
 	@pytest.mark.parametrize("name", ['two', 'three'])
 	def test_more_than_one_selects_every_compact_event_and_stores_no_plan(self, name):
 		got = child()[name]
 		assert got['rows'] == [{'search': '(*)'}]
 		assert got['warnings'] == ['tx: this search holds more than one tx or txf; every compact event in range is expanded.']
-		assert got['stored'] == [] and got['lookups'] == 0
+		assert got['stored'] == [] and got['lookups'] == 0 and got['word_checks'] == 0
 
 	def test_a_call_inside_quotes_is_not_counted(self):
 		got = child()['quoted']

@@ -13,8 +13,8 @@
 
   2. WHERE THE COMPACT EVENTS ARE: every panel reads the `tenx-events` macro (macros.conf)
      - Set it to the index and sourcetype your compact events use; naming the index is faster
-     - The default, index=* sourcetype=tenx_encoded, finds the app's sourcetype in every
-       index the searcher can read
+     - The default, index=* (sourcetype::tenx_encoded OR tenx_sourcetype::*), finds the app's
+       sourcetype, and every event that carries tenx_sourcetype, in every index the searcher can read
 
   5. NO SEARCH REWRITE ON THIS VIEW: dashboard.js leaves it out, because these panels read
      the compact form on purpose (compact bytes, template hashes) and expand explicitly
@@ -181,7 +181,8 @@
       <chart>
         <search>
           <query>`tenx-events`
-| rex field=_raw "^~?(?&lt;hash&gt;[^,]+)"
+| rex field=_raw "^~(?&lt;hash&gt;[^,]+)"
+| eval hash=coalesce(hash, "(sent as text)")
 | stats count by hash
 | sort -count
 | head 10
@@ -203,7 +204,8 @@
       <chart>
         <search>
           <query>`tenx-events`
-| rex field=_raw "^~?(?&lt;hash&gt;[^,]+)"
+| rex field=_raw "^~(?&lt;hash&gt;[^,]+)"
+| where isnotnull(hash)
 | stats count by hash
 | eval usage_bucket=case(
     count&lt;10, "1-9 events",
@@ -231,7 +233,6 @@
         <search>
           <query>`tenx-events`
 | head 1000
-| rex field=_raw "^~?(?&lt;hash&gt;[^,]+)"
 | `tenx-inflate`
 | eval success=if(match(_raw, "^~"), 0, 1)
 | stats sum(success) as successful, count as total
@@ -314,7 +315,8 @@
       <table>
         <search>
           <query>`tenx-events`
-| rex field=_raw "^~?(?&lt;hash&gt;[^,]+)"
+| rex field=_raw "^~(?&lt;hash&gt;[^,]+)"
+| eval hash=coalesce(hash, "(sent as text)")
 | stats count as "Event Count" by hash
 | sort -"Event Count"
 | head 20

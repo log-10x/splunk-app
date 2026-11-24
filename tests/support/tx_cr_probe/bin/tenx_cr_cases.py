@@ -15,10 +15,7 @@ CASES = (
 	("lf", "one\ntwo", "one\ntwo"),                         # a value without CR is unchanged
 )
 
-# The app README's sentence that states this (under "The `tx` and `tenxsearch` commands").
-README_SENTENCE = "`| tx` and `| tenxsearch` return a CR LF line end as LF; the `tx` and `txf` macros keep it."
-
 
 def as_read_back(value):
-	"""The README sentence as a rule: each CR LF becomes LF, in one pass from the left; any other CR is kept."""
+	"""What a search reads back: each CR LF becomes LF, in one pass from the left; any other CR is kept."""
 	return value.replace("\r\n", "\n")

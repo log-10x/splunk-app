@@ -2,10 +2,9 @@
 """
 Live check of what a search reads back from the `tx` and `tenxsearch` commands' way of writing
 events: a custom generating command, over the chunked protocol, through this app's vendored
-splunklib as shipped. Splunk Enterprise 10.4.3 drops a CR before LF and keeps every other CR; the
-app README states it as a limit of the two commands (README_SENTENCE in
-tests/support/tx_cr_probe/bin/tenx_cr_cases.py). This pins that behaviour, so a Splunk or SDK
-change shows up here first, in either direction.
+splunklib as shipped. Splunk Enterprise 10.4.3 drops a CR before LF and keeps every other CR, and
+the two commands write each CR LF so that it reads back as written (tenxsearch.as_written). This
+pins that behaviour, so a Splunk or SDK change shows up here first, in either direction.
 
 It installs the test-only probe app (tests/support/tx_cr_probe, never in the app package), runs
 its command, compares each value read back with the measured one, and removes the probe app. The

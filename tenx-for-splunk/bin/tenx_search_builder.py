@@ -638,6 +638,8 @@ class TenxSearchCommand(TenxSplCommand):
 		self.server_connection = server_connection
 		# True when the rewritten text is stored as a saved search (TenxAlertCompiler): hash_predicate.
 		self.saved_search = False
+		# True when the whole search reads no event type and no tag (TenxSearchBuilder.build): the replay leaves them out.
+		self.tags_unread = False
 		self.too_complex = False
 		self.needs_tenx = False
 		self.force_tenx = force_tenx
@@ -1195,7 +1197,7 @@ class TenxSearchCommand(TenxSplCommand):
 		"""
 		covered = self.tenx_config.get(tenx_util.REPLAY_COVERAGE) if self.tenx_config else None
 		indexes = self.parsed_command.get_passing_specifiers('index_specifier')
-		return tenx_replay_builder.rewrite_replay(covered, indexes)
+		return tenx_replay_builder.rewrite_replay(covered, indexes, tags=not self.tags_unread)
 
 	def replay_restore(self):
 		"""Gives a replayed event back its text, sourcetype, source and host (see inflate_suffix)."""
@@ -1359,6 +1361,18 @@ class TenxSplCommands:
 		return result
 
 
+def tags_unread(leading, rest):
+	"""
+	Whether a search reads no event type and no tag: its leading search's terms and the commands after it,
+	read by the rules of txf's replay plan (tenx_replay_plan.tags_skipped). False when that cannot be told.
+	"""
+	import tenx_replay_plan
+	text = "search `txf(tenx)` " + (leading.get('rawargs') or '')
+	if rest:
+		text += " | " + " | ".join(command.simple_resolved() for command in rest)
+	return tenx_replay_plan.tags_skipped(text, tenx_prefilter_parser)
+
+
 class TenxSearchBuilder:
 	"""
 	Class for building a search on 10x encoded data from a given user search.
@@ -1456,6 +1470,9 @@ class TenxSearchBuilder:
 
 			tenx_commands.append(tenx_command)
 
+		if leading_search is not None and tenx_commands[0] is leading_search:
+			leading_search.tags_unread = tags_unread(leading_search.raw_command, tenx_commands[1:])
+
 		spl_commands = TenxSplCommands(tenx_commands, self.debug)
 		spl_commands.resolve()
 
@@ -1517,7 +1534,6 @@ def original_sourcetype_probe(build_result, tenx_config):
 	compact event is indexed as the compact sourcetype and carries its original sourcetype in the
 	indexed field tenx_sourcetype, so `| tx index=x sourcetype=df:kv error` (not rewritten: df:kv is
 	not a compact sourcetype) matches none of them (Splunk Enterprise 10.4.3: 0 against 10,000 raw).
-	Field-mapped events (tenx_mapped) are left out: their sourcetype is renamed to the original.
 	A wildcard is probed too (sourcetype=df:*) unless it matches a compact sourcetype (tenx*, *).
 	"""
 	if build_result is None or build_result.engaged or not build_result.sourcetypes:
@@ -1535,7 +1551,7 @@ def original_sourcetype_probe(build_result, tenx_config):
 		where = '(%s) ' % ' OR '.join('index=%s' % _spl_value(i) for i in sorted(set(build_result.indexes)))
 	else:
 		where = ''
-	return ('| tstats count where %s(%s) NOT tenx_mapped=* (%s) by index, sourcetype, tenx_sourcetype' % (
+	return ('| tstats count where %s(%s) (%s) by index, sourcetype, tenx_sourcetype' % (
 		where, ' OR '.join('sourcetype=%s' % _spl_value(t) for t in compact),
 		' OR '.join('tenx_sourcetype=%s' % _spl_value(t) for t in named)))
 
@@ -1584,8 +1600,11 @@ def unnamed_compact_probe(build_result, tenx_config):
 	sources = [t for t in (config.get('tenx_sources') or []) if t]
 	if not sourcetypes and not sources:
 		return None
-	compact = ' OR '.join(['sourcetype=%s' % _spl_value(t) for t in sourcetypes] +
-						  ['source=%s' % _spl_value(t) for t in sources])
+	# Raw events share an original sourcetype with the compact events indexed under it; only the latter carry
+	# tenx_sourcetype.
+	renamed = set(config.get(tenx_util.RENAMED_SOURCE_TYPES) or [])
+	compact = ' OR '.join([('(sourcetype=%s tenx_sourcetype=*)' if t in renamed else 'sourcetype=%s') % _spl_value(t)
+						   for t in sourcetypes] + ['source=%s' % _spl_value(t) for t in sources])
 	if build_result.indexes is None:
 		where = 'index=* '
 	elif build_result.indexes:

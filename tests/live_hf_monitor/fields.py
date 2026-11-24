@@ -26,7 +26,7 @@ ALLOWED = set(x for x in (sys.argv[9] if len(sys.argv) > 9 else '').split(',') i
 SKIP = {'_raw', '_bkt', '_cd', '_si', '_serial', '_indextime', '_sourcetype', '_eventtype_color', '_kv', 'index',
 	'splunk_server', 'splunk_server_group', 'linecount', 'punct', 'timestartpos', 'timeendpos', 'date_hour', 'date_mday',
 	'date_minute', 'date_month', 'date_second', 'date_wday', 'date_year', 'date_zone', 'eventtype_color', 'sourcetype',
-	'tenx_sourcetype', 'tenx_compact_st', 'tenx_mapped', 'tenx_unmapped', 'tenx_hash', 'tenx_vars', 'tenx_var_0',
+	'tenx_sourcetype', 'tenx_hash', 'tenx_vars', 'tenx_var_0',
 	'tenx_compact_raw', 'tenx_log_parts', 'tenx_rst', 'tenx_gox', 'tenx_gow', 'tenx_expand_refused', '_time_raw',
 	'tenx_time'}
 CTX = ssl.create_default_context()

@@ -7,18 +7,19 @@ import io
 import json
 import os
 import re
+import ssl
 import urllib.error
+import urllib.request
 
 import pytest
 
 import tenx_search_report as r
 
 README_PATH = os.path.join(os.path.dirname(__file__), '..', 'tenx-for-splunk', 'README.md')
-NOMAP = r.Move(['XmlWinEventLog'], ['wineventlog'])
-MAP = r.Move(['XmlWinEventLog'], ['wineventlog'], ['XmlWinEventLog'])
+MOVE = r.Move(['XmlWinEventLog'], ['wineventlog'])
 
 
-def verdict(search, move=NOMAP, kind='report', expanded=None):
+def verdict(search, move=MOVE, kind='report', expanded=None):
 	return r.classify(search, move, kind, expanded)
 
 
@@ -109,9 +110,9 @@ class TestEdit:
 
 
 # -------------------------------------------------------------------------------------------
-# Without a field map
+# Verdicts
 
-class TestWithoutFieldMap:
+class TestVerdicts:
 	def test_field_search_needs_txf(self):
 		res = verdict('index=wineventlog EventCode=4625 | stats count by user')
 		assert res.verdict == r.NEEDS_TXF
@@ -177,13 +178,14 @@ class TestWithoutFieldMap:
 	def test_date_fields_not_classified(self):
 		assert verdict('index=wineventlog EventCode=1 | stats count by date_hour').verdict == r.NOT_CLASSIFIED
 
-	def test_data_model_needs_field_map(self):
+	def test_data_model_is_a_limit(self):
 		for s in ('| tstats count from datamodel=Authentication by Authentication.user',
 				'| tstats summariesonly=t count FROM datamodel=Change.All_Changes',
 				'| datamodel Authentication Failed_Authentication search | stats count',
 				'| from datamodel:Authentication.Failed_Authentication | stats count',
 				'| pivot Authentication Authentication count(Authentication) AS c'):
-			assert verdict(s).verdict == r.NEEDS_MAP, s
+			res = verdict(s)
+			assert res.verdict == r.LIMIT and r.README['data_models'] in res.reason, s
 
 	def test_tstats_by_host_unchanged(self):
 		assert verdict('| tstats count where index=wineventlog by host source').verdict == r.UNCHANGED
@@ -191,7 +193,6 @@ class TestWithoutFieldMap:
 
 	def test_tstats_on_sourcetype_is_a_limit_with_the_fix(self):
 		res = verdict('| tstats count where index=wineventlog sourcetype=XmlWinEventLog')
-		# the same README sentence with and without a map: tstats reads the indexed, compact sourcetype
 		assert res.verdict == r.LIMIT and r.README['tstats_sourcetype'] in res.reason
 		assert 'tenx_sourcetype=XmlWinEventLog' in res.reason
 		assert verdict('| tstats count where index=wineventlog by sourcetype').verdict == r.LIMIT
@@ -204,91 +205,10 @@ class TestWithoutFieldMap:
 
 
 # -------------------------------------------------------------------------------------------
-# With a field map
-
-class TestWithFieldMap:
-	def test_field_search_unchanged(self):
-		res = verdict('index=wineventlog sourcetype=XmlWinEventLog LogonProcessName=Kerberos | stats count by user', MAP)
-		assert res.verdict == r.UNCHANGED and res.edit == ''
-
-	def test_words_need_txf(self):
-		res = verdict('index=wineventlog Kerberos | stats count', MAP)
-		assert res.verdict == r.NEEDS_TXF and res.edit == 'index=wineventlog `txf` Kerberos | stats count'
-
-	def test_negated_word_needs_txf(self):
-		assert verdict('index=wineventlog EventCode=4624 NOT Kerberos | stats count', MAP).verdict == r.NEEDS_TXF
-
-	def test_commands_that_read_the_text_need_txf(self):
-		for s in ('index=wineventlog EventCode=1 | rex "Name\'>(?<n>[^<]+)" | stats count by n',
-				'index=wineventlog EventCode=1 | search Kerberos | stats count',
-				'index=wineventlog EventCode=1 | regex "x+" | stats count',
-				'index=wineventlog EventCode=1 | spath | stats count',
-				'index=wineventlog EventCode=1 | eval n=len(_raw) | stats sum(n)',
-				'index=wineventlog EventCode=1 | where searchmatch("x") | stats count',
-				'index=wineventlog EventCode=1 | transaction user startswith="a" | stats count'):
-			assert verdict(s, MAP).verdict == r.NEEDS_TXF, s
-
-	def test_commands_given_another_field_are_unchanged(self):
-		for s in ('index=wineventlog EventCode=1 | rex field=user "(?<d>\\w+)" | stats count by d',
-				'index=wineventlog EventCode=1 | spath input=Message | stats count',
-				'index=wineventlog EventCode=1 | regex user="^a" | stats count',
-				'index=wineventlog EventCode=1 | search user=bob | stats count'):
-			assert verdict(s, MAP).verdict == r.UNCHANGED, s
-
-	def test_events_for_a_report_need_txf_for_an_alert_not(self):
-		assert verdict('index=wineventlog EventCode=4625', MAP, 'report').verdict == r.NEEDS_TXF
-		res = verdict('index=wineventlog EventCode=4625', MAP, 'alert')
-		assert res.verdict == r.UNCHANGED and 'number of events' in res.reason
-
-	def test_table_without_raw_is_unchanged_with_raw_needs_txf(self):
-		assert verdict('index=wineventlog EventCode=1 | table _time user', MAP).verdict == r.UNCHANGED
-		assert verdict('index=wineventlog EventCode=1 | table _time _raw', MAP).verdict == r.NEEDS_TXF
-		assert verdict('index=wineventlog EventCode=1 | fields - _raw', MAP).verdict == r.UNCHANGED
-
-	def test_data_models_unchanged(self):
-		assert verdict('| tstats count from datamodel=Authentication by Authentication.user', MAP).verdict == r.UNCHANGED
-		assert verdict('| datamodel Authentication Authentication search | stats count', MAP).verdict == r.UNCHANGED
-
-	def test_datamodel_command_returning_events_needs_txf_in_a_report(self):
-		assert verdict('| datamodel Authentication Authentication search', MAP).verdict == r.NEEDS_TXF
-
-	def test_tstats_on_sourcetype_quotes_the_map_sentence(self):
-		res = verdict('| tstats count where sourcetype=XmlWinEventLog by host', MAP)
-		assert res.verdict == r.LIMIT and 'stays the compact one with or without a field map' in res.reason
-
-	@pytest.mark.parametrize('search,quote', [
-		('index=wineventlog EventCode=1 | stats count by date_wday', 'date_fields'),
-		('index=wineventlog eventtype=err0r | stats count', 'eventtype_words'),
-		('index=wineventlog eventtype IN (err0r, x) | stats count', 'eventtype_words'),
-		('index=wineventlog EventCode=4672 | stats count by vendor_privilege', 'privilege_dash'),
-		('index=wineventlog EventCode=4798 | stats count by dest', 'dest_4798'),
-		('index=wineventlog EventCode=1 | table EventData_Xml', 'xml_blocks'),
-		('index=wineventlog EventCode=1 | stats count by punct', 'punct'),
-		('index=wineventlog EventCode=4104 | stats count by ScriptBlockText', 'long_value'),
-	])
-	def test_limits_of_the_map(self, search, quote):
-		res = verdict(search, MAP)
-		assert res.verdict == r.LIMIT and r.README[quote] in res.reason
-
-	def test_dest_without_those_events_unchanged(self):
-		assert verdict('index=wineventlog EventCode=4624 | stats count by dest', MAP).verdict == r.UNCHANGED
-
-	def test_one_unmapped_sourcetype_means_no_map(self):
-		move = r.Move(['XmlWinEventLog', 'app:log'], ['wineventlog'], ['XmlWinEventLog'])
-		assert verdict('index=wineventlog EventCode=1 | stats count', move).verdict == r.NEEDS_TXF
-		assert verdict('index=wineventlog sourcetype=XmlWinEventLog EventCode=1 | stats count', move).verdict == r.UNCHANGED
-
-	def test_index_only_move_with_a_map(self):
-		move = r.Move([], ['wineventlog'], ['XmlWinEventLog'])
-		assert verdict('index=wineventlog EventCode=1 | stats count', move).verdict == r.UNCHANGED
-
-
-# -------------------------------------------------------------------------------------------
 # Sources whose compact events can carry another _time
 
 FGT = r.Move(['fortigate_*', 'fgt_*'], ['fw'])
 CT = r.Move(['aws:cloudtrail'], ['aws'])
-CT_MAP = r.Move(['aws:cloudtrail'], ['aws'], ['aws:cloudtrail'])
 
 
 class TestEventTime:
@@ -331,12 +251,6 @@ class TestEventTime:
 		move = r.Move(['aws:cloudtrail', 'XmlWinEventLog'], ['aws'])
 		assert verdict('index=aws sourcetype=XmlWinEventLog | timechart count', move).verdict == r.NEEDS_TXF
 		assert verdict('index=aws | timechart count', move).verdict == r.LIMIT
-
-	def test_cloudtrail_without_a_map_with_one_not(self):
-		res = verdict('index=aws sourcetype=aws:cloudtrail | timechart count by eventName', CT)
-		assert res.verdict == r.LIMIT and 'creationDate' in res.reason
-		assert verdict('index=aws sourcetype=aws:cloudtrail | timechart count by eventName', CT_MAP).verdict == r.UNCHANGED
-		assert verdict('index=aws sourcetype=aws:cloudtrail | stats count by eventName', CT).verdict == r.NEEDS_TXF
 
 	def test_windows_has_no_time_limit(self):
 		assert verdict('index=wineventlog EventCode=1 | timechart count').verdict == r.NEEDS_TXF
@@ -546,16 +460,16 @@ class TestDashboards:
 	def test_classic(self):
 		dash = r.dashboard_items('d', 'app', 'nobody', CLASSIC)
 		saved = [r.Item('s1', 'app', 'nobody', 'alert', 'index=wineventlog EventCode=4625')]
-		got = by_name(r.run(FakeSource(saved, dash), MAP))
+		got = by_name(r.run(FakeSource(saved, dash), MOVE))
 		assert got['d / search base'].kind == 'base search'
-		assert got['d / search base'].result.verdict == r.UNCHANGED
+		assert got['d / search base'].result.verdict == r.NEEDS_TXF
 		assert got['d / Code'].kind == 'input' or got['d / Code'].search.endswith('stats count')
-		assert got['d / By type'].result.verdict == r.UNCHANGED
-		assert got['d / Word'].result.verdict == r.NEEDS_TXF
+		assert got['d / By type'].result.verdict == r.NEEDS_TXF
+		assert got['d / Word'].result.verdict == r.NEEDS_TX
 		assert 'EventCode=4625 |' in r._shown(got['d / Code'])
 		assert r._shown(got['d / User']).startswith('index=wineventlog user=tenx_token_value')
 		assert got['d / Free'].result.verdict == r.NOT_CLASSIFIED and '$filter$' in got['d / Free'].result.reason
-		assert got['d / Saved'].result.verdict == r.UNCHANGED and 's1' in got['d / Saved'].result.reason
+		assert got['d / Saved'].result.verdict == r.NEEDS_TXF and 's1' in got['d / Saved'].result.reason
 		assert got['d / Lost'].result.verdict == r.NOT_CLASSIFIED
 
 	def test_input_is_named_by_its_label(self):
@@ -564,7 +478,7 @@ class TestDashboards:
 
 	def test_base_search_gets_the_edit_of_its_posts(self):
 		dash = r.dashboard_items('d', 'app', 'nobody', CLASSIC)
-		got = by_name(r.run(FakeSource([], dash), NOMAP))
+		got = by_name(r.run(FakeSource([], dash), MOVE))
 		base = got['d / search base']
 		assert base.result.verdict == r.NEEDS_TXF
 		assert base.result.edit == 'index=wineventlog `txf` EventCode=4624 | fields user Logon_Type'
@@ -577,16 +491,16 @@ class TestDashboards:
 		xml = '<dashboard version="2"><label>S</label><definition><![CDATA[%s]]></definition></dashboard>' % json.dumps(STUDIO)
 		dash = r.dashboard_items('s', 'app', 'nobody', xml)
 		saved = [r.Item('s1', 'app', 'nobody', 'report', '| tstats count from datamodel=Authentication')]
-		got = by_name(r.run(FakeSource(saved, dash), NOMAP))
+		got = by_name(r.run(FakeSource(saved, dash), MOVE))
 		assert got['s / b'].kind == 'base search' and got['s / b'].result.verdict == r.NEEDS_TXF
 		assert got['s / Types'].result.verdict == r.NEEDS_TXF
 		assert got['s / term'].result.verdict == r.NEEDS_TX
-		assert got['s / s'].result.verdict == r.NEEDS_MAP
+		assert got['s / s'].result.verdict == r.LIMIT
 		assert got['s / i'].kind == 'input' and got['s / i'].result.verdict == r.UNCHANGED
 
 	def test_bad_xml_and_other_views(self):
 		got = r.dashboard_items('d', 'a', 'o', '<dashboard><row>')
-		assert r.run(FakeSource([], got), NOMAP)[0].result.verdict == r.NOT_CLASSIFIED
+		assert r.run(FakeSource([], got), MOVE)[0].result.verdict == r.NOT_CLASSIFIED
 		assert r.dashboard_items('v', 'a', 'o', '<view><module/></view>') == []
 
 	def test_chained_post_process_and_a_loop(self):
@@ -596,7 +510,7 @@ class TestDashboards:
 		  <panel><table><search base="b"><query>| stats count by user</query></search></table></panel>
 		  <panel><table><search id="x" base="y"><query>| head 1</query></search></table></panel>
 		  <panel><table><search id="y" base="x"><query>| head 2</query></search></table></panel></row></dashboard>"""
-		got = r.run(FakeSource([], r.dashboard_items('c', 'a', 'o', xml)), NOMAP)
+		got = r.run(FakeSource([], r.dashboard_items('c', 'a', 'o', xml)), MOVE)
 		res = dict((i.sid or i.name, i.result) for i in got)
 		assert res['a'].verdict == r.NEEDS_TXF and res['a'].edit == 'index=wineventlog `txf` EventCode=4624'
 		assert res['b'].verdict == r.NEEDS_TXF and res['b'].edit == ''
@@ -608,22 +522,22 @@ class TestDashboards:
 		xml = """<dashboard><label>c</label><search id="a" ref="s1"></search>
 		  <row><panel><table><search base="a"><query>| stats count by user</query></search></table></panel></row></dashboard>"""
 		saved = [r.Item('s1', 'app', 'nobody', 'report', 'index=wineventlog EventCode=4624')]
-		got = r.run(FakeSource(saved, r.dashboard_items('c', 'app', 'o', xml)), MAP)
+		got = r.run(FakeSource(saved, r.dashboard_items('c', 'app', 'o', xml)), MOVE)
 		post = [i for i in got if i.base is not None][0]
-		assert post.result.verdict == r.UNCHANGED
+		assert post.result.verdict == r.NEEDS_TXF
 		assert r._shown(post) == 'index=wineventlog EventCode=4624 | stats count by user'
 
 	def test_post_process_of_a_base_with_a_missing_token_says_why(self):
 		xml = """<dashboard><label>c</label><search id="a"><query>index=wineventlog $f$</query></search>
 		  <row><panel><table><search base="a"><query>| stats count</query></search></table></panel></row></dashboard>"""
-		got = r.run(FakeSource([], r.dashboard_items('c', 'app', 'o', xml)), MAP)
+		got = r.run(FakeSource([], r.dashboard_items('c', 'app', 'o', xml)), MOVE)
 		post = [i for i in got if i.base is not None][0]
 		assert post.result.verdict == r.NOT_CLASSIFIED and '$f$' in post.result.reason
 
 	def test_objects_of_this_app_are_unchanged(self):
 		saved = [r.Item('Consume KV', 'tenx-for-splunk', 'nobody', 'alert', '| tstats count where index=* by sourcetype')]
-		assert r.run(FakeSource(saved, []), NOMAP)[0].result.verdict == r.UNCHANGED
-		assert verdict('`tenx-events` | stats count', NOMAP).verdict == r.UNCHANGED
+		assert r.run(FakeSource(saved, []), MOVE)[0].result.verdict == r.UNCHANGED
+		assert verdict('`tenx-events` | stats count', MOVE).verdict == r.UNCHANGED
 
 	def test_tokens(self):
 		assert r.substitute('index=w x=$a$ | stats count', {}) == 'index=w x=tenx_token_value | stats count'
@@ -680,7 +594,7 @@ class TestCommandLine:
 		text = out.getvalue()
 		assert text.splitlines()[0].split()[:6] == ['object', 'app', 'owner', 'kind', 'verdict', 'reason']
 		summary = [l for l in text.splitlines() if ' objects: ' in l][0]
-		assert re.match(r'^\d+ objects: \d+ unchanged, \d+ needs tx, \d+ needs txf, \d+ needs field map, \d+ limit, '
+		assert re.match(r'^\d+ objects: \d+ unchanged, \d+ needs tx, \d+ needs txf, \d+ limit, '
 			r'\d+ not classified, \d+ not affected$', summary)
 		rows = list(csv.DictReader(open(path, encoding='utf-8')))
 		assert list(rows[0]) == ['object', 'app', 'owner', 'kind', 'verdict', 'reason', 'search', 'edit']
@@ -688,19 +602,13 @@ class TestCommandLine:
 		assert got['failed']['verdict'] == r.NEEDS_TXF
 		assert got['failed']['edit'].startswith('`txf` `win` EventCode=4625')
 		assert got['words']['verdict'] == r.NOT_AFFECTED
-		assert got['dm']['verdict'] == r.NEEDS_MAP
+		assert got['dm']['verdict'] == r.LIMIT
 		assert got['broken']['verdict'] == r.NOT_CLASSIFIED and '`nope`' in got['broken']['reason']
 		assert got['mine']['verdict'] == r.UNCHANGED
 		assert sum(int(n) for n in re.findall(r'(\d+) (?:unchanged|needs|limit|not)', summary)) == len(rows)
 
-	def test_main_with_field_map(self, etc):
-		out = io.StringIO()
-		assert r.main(['--dir', etc, '--sourcetype', 'XmlWinEventLog', '--field-map', 'XmlWinEventLog'], out) == 0
-		assert ' 0 needs field map' in out.getvalue()
-
 	@pytest.mark.parametrize('argv', [
 		['--dir', '.'],
-		['--dir', '.', '--sourcetype', 'a', '--field-map', 'b'],
 		['--dir', '/nonexistent/folder', '--sourcetype', 'a'],
 	])
 	def test_main_refuses(self, argv, capsys):
@@ -744,7 +652,7 @@ class TestRest:
 
 	def test_items_and_expansion(self):
 		fake = FakeSplunkd(self.PARSED)
-		items = by_name(r.run(r.RestSource(fake), NOMAP))
+		items = by_name(r.run(r.RestSource(fake), MOVE))
 		assert items['a'].kind == 'alert' and items['a'].result.verdict == r.NEEDS_TXF
 		assert items['a'].result.edit == '`txf` `win` EventCode=1 | stats count'
 		assert items['b'].result.verdict == r.NOT_AFFECTED
@@ -761,14 +669,111 @@ class TestRest:
 
 	def test_parser_refusal_is_not_classified(self):
 		fake = FakeSplunkd(refuse='Error in macro: unknown')
-		items = by_name(r.run(r.RestSource(fake), NOMAP))
+		items = by_name(r.run(r.RestSource(fake), MOVE))
 		assert items['a'].result.verdict == r.NOT_CLASSIFIED and 'Error in macro: unknown' in items['a'].result.reason
 
 	def test_app_filter(self):
-		items = r.run(r.RestSource(FakeSplunkd(self.PARSED), ['other']), NOMAP)
+		items = r.run(r.RestSource(FakeSplunkd(self.PARSED), ['other']), MOVE)
 		assert [i.name for i in items] == ['b']
 
 	def test_no_macro_no_parser_call(self):
 		fake = FakeSplunkd()
 		assert r.RestSource(fake).expand(r.Item('x', 'a', 'o', 'report', ''), 'index=w x') is None
 		assert fake.calls == []
+
+
+class TestCertificateFailure:
+	def test_a_certificate_that_does_not_verify_is_one_line(self, monkeypatch, capsys):
+		def refuse(req, context=None, timeout=None):
+			raise urllib.error.URLError(ssl.SSLCertVerificationError(1, '[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify '
+				'failed: self-signed certificate in certificate chain (_ssl.c:1000)'))
+		monkeypatch.setattr(urllib.request, 'urlopen', refuse)
+		monkeypatch.setenv('TENX_SPLUNKD_TOKEN', 't')
+		assert r.main(['--splunkd', 'https://splunk.example:8089', '--sourcetype', 'a'], io.StringIO()) == 1
+		err = capsys.readouterr().err
+		assert err.count('\n') == 1 and 'Traceback' not in err
+		assert err.startswith('tenx_search_report: the certificate of https://splunk.example:8089 did not verify (')
+		assert '; add --tls-ca-file with the PEM file of the authority that signed it, or, for an instance' in err
+		assert err.rstrip().endswith('--tls-verify off')
+
+	def test_other_failures_are_not_changed(self, monkeypatch):
+		def down(req, context=None, timeout=None):
+			raise urllib.error.URLError(ConnectionRefusedError(111, 'Connection refused'))
+		monkeypatch.setattr(urllib.request, 'urlopen', down)
+		with pytest.raises(urllib.error.URLError):
+			r.Splunkd('https://splunk.example:8089').call('GET', '/services/server/info')
+
+
+def _openssl(*args, cwd=None):
+	import subprocess
+	subprocess.run(['openssl'] + list(args), cwd=cwd, check=True, capture_output=True)
+
+
+@pytest.fixture
+def tls_server(tmp_path):
+	"""An HTTPS server on 127.0.0.1 with a certificate for 127.0.0.1 signed by a CA made here: (url, CA file,
+	another CA file)."""
+	import shutil
+	import threading
+	from http.server import BaseHTTPRequestHandler, HTTPServer
+	if shutil.which('openssl') is None:
+		pytest.skip('no openssl')
+	d = str(tmp_path)
+	for name in ('ca', 'other'):
+		_openssl('req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', name + '.key', '-out', name + '.pem',
+			'-days', '2', '-subj', '/CN=test %s' % name, '-addext', 'basicConstraints=critical,CA:TRUE',
+			'-addext', 'keyUsage=critical,keyCertSign,cRLSign', cwd=d)
+	(tmp_path / 'ext.cnf').write_text('subjectAltName = IP:127.0.0.1\nbasicConstraints = CA:FALSE\n'
+		'keyUsage = critical,digitalSignature,keyEncipherment\nextendedKeyUsage = serverAuth\n'
+		'authorityKeyIdentifier = keyid,issuer\nsubjectKeyIdentifier = hash\n', encoding='utf-8')
+	_openssl('req', '-newkey', 'rsa:2048', '-nodes', '-keyout', 'srv.key', '-out', 'srv.csr', '-subj', '/CN=127.0.0.1',
+		cwd=d)
+	_openssl('x509', '-req', '-in', 'srv.csr', '-CA', 'ca.pem', '-CAkey', 'ca.key', '-CAcreateserial', '-out', 'srv.pem',
+		'-days', '2', '-extfile', 'ext.cnf', cwd=d)
+
+	class Handler(BaseHTTPRequestHandler):
+		def do_GET(self):
+			body = json.dumps({'entry': [{'name': 'server-info'}]}).encode('utf-8')
+			self.send_response(200)
+			self.send_header('Content-Type', 'application/json')
+			self.send_header('Content-Length', str(len(body)))
+			self.end_headers()
+			self.wfile.write(body)
+
+		def log_message(self, *a):
+			pass
+
+	server = HTTPServer(('127.0.0.1', 0), Handler)
+	ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+	ctx.load_cert_chain(os.path.join(d, 'srv.pem'), os.path.join(d, 'srv.key'))
+	server.socket = ctx.wrap_socket(server.socket, server_side=True)
+	t = threading.Thread(target=server.serve_forever, daemon=True)
+	t.start()
+	try:
+		yield 'https://127.0.0.1:%d' % server.server_address[1], os.path.join(d, 'ca.pem'), os.path.join(d, 'other.pem')
+	finally:
+		server.shutdown()
+		server.server_close()
+
+
+class TestCaFile:
+	def test_a_certificate_signed_by_the_given_authority_verifies(self, tls_server):
+		url, ca, _ = tls_server
+		got = r.Splunkd(url, ca_file=ca).call('GET', '/services/server/info')
+		assert got['entry'][0]['name'] == 'server-info'
+
+	def test_without_it_the_same_certificate_does_not_verify(self, tls_server):
+		url, _, _ = tls_server
+		with pytest.raises(r.TlsVerifyError):
+			r.Splunkd(url).call('GET', '/services/server/info')
+
+	def test_another_authority_does_not_verify_it(self, tls_server):
+		url, _, other = tls_server
+		with pytest.raises(r.TlsVerifyError):
+			r.Splunkd(url, ca_file=other).call('GET', '/services/server/info')
+
+	def test_the_option_reaches_the_connection(self, tmp_path, monkeypatch):
+		monkeypatch.setenv('TENX_SPLUNKD_TOKEN', 't')
+		with pytest.raises((FileNotFoundError, ssl.SSLError, OSError)):
+			r.main(['--splunkd', 'https://h:8089', '--sourcetype', 'a', '--tls-ca-file', str(tmp_path / 'missing.pem')],
+				io.StringIO())

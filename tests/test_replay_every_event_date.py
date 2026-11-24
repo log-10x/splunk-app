@@ -115,10 +115,11 @@ ROWS = [('app:kv', '/var/app/a.log', 'web-1', 5, 'app', True, True),
 out = {}
 before = IndexTimeSplunk(ROWS)
 go(before, False)
-out['event_time'] = sorted(before.conf)
+# the sourcetype stanzas (not tenx:narrowing, tenx:plan: written whenever a sourcetype is covered)
+out['event_time'] = sorted(n for n in before.conf if not n.startswith('tenx:'))
 fake = IndexTimeSplunk(ROWS)
 rows = go(fake, True)
-out['index_time'] = sorted(fake.conf)
+out['index_time'] = sorted(n for n in fake.conf if not n.startswith('tenx:'))
 out['jobs'] = fake.jobs
 out['units'] = sorted(n for n in fake.macros if n.startswith(b.UNIT_PREFIX))
 out['txf_one'] = fake.validations.get('txf(1)')
@@ -164,13 +165,15 @@ def test_the_rebuilds_find_every_event_date_and_keep_what_still_has_events():
 	assert out['units'] == sorted([old, future, kv])
 	assert all(reaches_unit(out['txf_one'], st) for st in ('fr:old', 'fr:future', 'app:kv'))
 	# every read is over every event date (from 0, no end), held to the index-time range, except
-	# the all-time read of a new sourcetype's sources, hosts and indexes
+	# the all-time read of a new sourcetype's sources, hosts and indexes, and the lexicon's field names,
+	# which tstats then counts over the range
 	for search, earliest, latest in out['jobs']:
 		assert (earliest, latest) == ('0', 'none'), search
-		assert '_index_earliest=-7d' in search or ('tenx_sourcetype="fr:future" OR ' in search), search
+		assert ('_index_earliest=-7d' in search or 'tenx_sourcetype="fr:future" OR ' in search
+				or search.startswith('| walklex type=field ')), search
 	# fr:old expired by last_seen but still has events: kept, last_seen today, its unit unchanged
 	assert ['conf-', 'fr:old'] not in out['kept_writes'] and ['macro~', old] not in out['kept_writes']
-	probe = [j for j in out['kept_jobs'] if '_index_earliest' not in j[0]]
+	probe = [j for j in out['kept_jobs'] if '_index_earliest' not in j[0] and not j[0].startswith('| walklex')]
 	assert len(probe) == 1 and 'tenx_sourcetype="fr:old")' in probe[0][0], probe
 	assert int(out['kept_last_seen']) > 1 and out['kept_unit'] != out['no_op']
 	# with no event left it expires: its stanza goes, its unit becomes the no-op unit

@@ -6,6 +6,8 @@ Tenx Replay Command
     | tenxreplay apply=false  report what it would write, and write nothing
     | tenxreplay by_index_time=true  the time range is when the compact events were indexed,
                                      whatever their event dates (the saved searches)
+    | tenxreplay skip_unchanged=true rebuild only when something it reads changed since the
+                                     last rebuild run this way (the hourly saved search)
 
 `txf` expands a compact event and then runs the `tenx-replay` macro, which applies the search-time
 rules of the event's original sourcetype: the indexed field tenx_sourcetype, set by the sender.
@@ -21,8 +23,9 @@ configuration (see tenx_replay_builder.py for the rules and their order):
 2. the props stanzas this app can see, as merged by Splunk, and the [default] stanza;
 3. the lookup definitions this app can see, with their fields;
 4. the indexed fields of the compact events, which the replay keeps when it clears the fields
-   Splunk set on the unexpanded event (fields.conf INDEXED = true on every event, and the fields
-   of a sample of compact events that tstats can count, per original sourcetype).
+   Splunk set on the unexpanded event (fields.conf INDEXED = true on every event, and, per original
+   sourcetype, the fields tstats counts among the indexed field names of the indexes that hold compact
+   events and those of a sample of the compact events of each original sourcetype in each index).
 
 What the written replay already covers stays covered (see tenx_replay_builder.keep_covered and
 coverage), so a sourcetype that stopped sending keeps its replay for searches over its older
@@ -36,11 +39,18 @@ the alias tenx-replay-st-<sourcetype>; the validation of txf(1), which lets txf(
 for a sourcetype that has a unit and stops it with a message for one that has none; one tenx_replay.conf stanza
 per original sourcetype listing the fields a calculated field or a lookup produces and the
 sources, hosts and indexes recorded (the search rewrite reads `indexes` to pick the units a search
-needs); and the stanza [tenx:narrowing]: every field whose value some props stanza takes from
+needs), with `renamed = 1` once compact events are indexed under that sourcetype (the search rewrite then
+expands a search that names it); the stanza [tenx:narrowing]: every field whose value some props stanza takes from
 somewhere other than the event's text, which the prefilter must not narrow on (see
-tenx_prefilter_parser.py). Every rule, the macro and the units are run against this Splunk before
+tenx_prefilter_parser.py), written whatever field_narrowing says so that the setting takes effect
+however it is changed; and the stanza [tenx:plan]: the macro's rule table, from which the prefilter
+chooses the rules a `txf` search reads (tenx_replay_plan.py). Every rule, the macro and the units are run against this Splunk before
 anything is written. Nothing is written when the result is unchanged. One row per original
-sourcetype is returned. The "Rebuild Field Replay" saved search runs it hourly. "Rebuild Field
+sourcetype is returned. The "Rebuild Field Replay" saved search runs it hourly with skip_unchanged:
+one tstats of the compact events, one walklex and one read of each sender's newest event, with REST
+reads of the template store and the configuration, give a digest of what a rebuild reads and
+leaves written; when it equals the one the last rebuild recorded, nothing is rebuilt. A new day
+always rebuilds, so names that stop being carried leave within a day. "Rebuild Field
 Replay When New" runs `| tenxreplay only_new=true` every five minutes over the last ten: one
 tstats and one read of tenx_replay.conf, and a full rebuild over the last 7 days only when an
 original sourcetype, or a sourcetype with a source, host or index, appears that the written
@@ -59,9 +69,11 @@ Logging
 Logs to: $SPLUNK_HOME/var/log/splunk/tenx_replay_command.log
 """
 
+import hashlib
 import json
 import logging
 import os
+import re
 import ssl
 import sys
 import time
@@ -80,18 +92,63 @@ from splunklib.searchcommands import dispatch, GeneratingCommand, Configuration,
 
 import tenx_util
 import tenx_replay_builder as builder
+import tenx_prefilter_parser as prefilter
 
 tenx_util.setup_logger('tenx_replay_command', logging.INFO)
 
 MACRO = 'tenx-replay'
+# The extraction `tx` runs (macros.conf [tenx-extract]).
+TX_EXTRACT = 'tenx-extract'
 CONF = 'tenx_replay'
 # default/savedsearches.conf: rewrites every managed compiled alert whose compiled text changed.
 RECOMPILE_SEARCH = 'Recompile Compiled Alerts'
-SAMPLE_EVENTS = 1000
+SAMPLE_EVENTS = 100000
+# An original sourcetype written as an indexed-field term (tenx_sourcetype::<name>), and an index name written in a search.
+SOURCETYPE_TERM = re.compile(r'^[A-Za-z0-9_.:/-]+$')
+INDEX_NAME = re.compile(r'^[A-Za-z0-9_-]+$')
+# A pair sampled before is sampled again only for the templates stored since that sample began, read with one
+# search when they are at most this many; with more, or when that sample is older than SAMPLE_VALID_SECONDS (the
+# hourly rebuild's window), every pair is sampled again.
+NEW_TEMPLATES_MOST = 500
+SAMPLE_VALID_SECONDS = 7 * 86400
+# The sample of the compact events of no listed pair, in [tenx:sampled] pairs.
+EVERY_OTHER = '*'
+# What a walklex row without a field name is given, so such rows are seen.
+NO_NAME = 'tenx_no_name'
 # Senders (index, host, source, sourcetype) per search that reads the most recent event of each.
 SENDERS_PER_SEARCH = 200
+# Field names per tstats that counts which of them the compact events carry.
+COUNTED_PER_SEARCH = 400
 # Every event date: from the epoch, with no end (an end of 'now' leaves out events dated ahead).
 ALL_TIME = ('0', None)
+# What the state read's tstats gives a compact event without tenx_sourcetype.
+NO_CARRIER = 'tenx_no_carrier'
+# [tenx:sampled] keys: the digest of what the last rebuild read and left written, and of the rules and units it left
+# out (see _record_state).
+STATE_KEY = 'state'
+OUTCOME_KEY = 'outcome'
+
+
+def json_path(path):
+	"""`path` with output_mode=json in its query once; splunkd refuses a request that names it twice."""
+	if re.search(r'[?&]output_mode=', path):
+		return path
+	return path + ('&' if '?' in path else '?') + 'output_mode=json'
+
+
+def digest(value):
+	"""A short stable digest of a JSON value."""
+	return hashlib.sha256(json.dumps(value, sort_keys=True, default=str).encode()).hexdigest()[:32]
+
+
+def listed_entries(reply, names=None):
+	"""The (name, content, sharing, readers) of each entry of a REST listing, sorted; only `names` when given."""
+	out = []
+	for e in (reply or {}).get('entry', []):
+		if names is None or names(e.get('name') or ''):
+			acl = e.get('acl') or {}
+			out.append([e.get('name'), e.get('content'), acl.get('sharing'), (acl.get('perms') or {}).get('read')])
+	return sorted(out, key=lambda x: json.dumps(x, sort_keys=True, default=str))
 
 
 def shared_with_everyone(acl):
@@ -116,6 +173,8 @@ class TenxReplayCommand(GeneratingCommand):
 	# over every event date: a sourcetype whose events are dated a year ago, or in the future, is
 	# found when they are indexed. The saved searches set it.
 	by_index_time = Option(require=False, validate=validators.Boolean(), default=False)
+	# Rebuild only when what a rebuild reads changed since the last rebuild run with it (_state, _record_state).
+	skip_unchanged = Option(require=False, validate=validators.Boolean(), default=False)
 	# (earliest, latest) of the index-time range while by_index_time is set (see generate).
 	index_range = None
 
@@ -124,9 +183,8 @@ class TenxReplayCommand(GeneratingCommand):
 		context = ssl.create_default_context()
 		context.check_hostname = False
 		context.verify_mode = ssl.CERT_NONE
-		sep = '&' if '?' in path else '?'
 		request = urllib.request.Request(
-			info.splunkd_uri + path + sep + 'output_mode=json',
+			info.splunkd_uri + json_path(path),
 			data=urllib.parse.urlencode(data).encode() if data is not None else None,
 			method=method or ('POST' if data is not None else 'GET'),
 			headers={'Authorization': 'Splunk ' + info.session_key})
@@ -189,19 +247,21 @@ class TenxReplayCommand(GeneratingCommand):
 		return dict((e['name'], e.get('content', {})) for e in
 			self._rest(self._ns('configs/conf-transforms?count=0')).get('entry', []))
 
-	def _indexed_fields(self, earliest, latest):
+	def _indexed_fields(self, earliest, latest, named=(), groups=(), indexes=(), sampled=frozenset(), began=None,
+						now=None):
 		"""
 		(every indexed field name of the compact events, the names declared indexed,
 		{original sourcetype: the indexed fields of its compact events}).
 
 		The first is what the prefilter must not narrow on (builder.fields_not_in_text): fields.conf
-		INDEXED = true, and the fields of a sample of compact events (_sample_fields) that tstats can
-		count over all compact events. The replay's clearing step keeps the second on every replayed event and the
+		INDEXED = true, and the names that tstats can count over all compact events among the indexed field
+		names of the `indexes` that hold them (_lexicon_fields), those of a sample of the compact events of
+		each (original sourcetype, index) in `groups` (_sample_fields), those tenx-extract holds already, and
+		`named`. The replay's clearing step keeps the second on every replayed event and the
 		third per original sourcetype (builder.build keep_by_sourcetype), counted over the events the
-		replay works on: those carrying tenx_sourcetype and not indexed with a field map (tenx_mapped,
-		which tenx-mapped-hide keeps out of the replay). An indexed field one sender writes for one
-		sourcetype (a field map's app on FortiGate events) is then no reason to keep the field of the
-		same name that Splunk set on another sourcetype's compact events when it read them.
+		replay works on, those carrying tenx_sourcetype. An indexed field one sender writes for one
+		sourcetype is then no reason to keep the field of the same name that Splunk set on another
+		sourcetype's compact events when it read them.
 		"""
 		declared = set()
 		for entry in self._rest(self._ns('configs/conf-fields?count=0')).get('entry', []):
@@ -209,39 +269,140 @@ class TenxReplayCommand(GeneratingCommand):
 				declared.add(entry['name'])
 		names = set(declared)
 		by_sourcetype = {}
-		candidates = sorted(self._sample_fields(earliest, latest) - set(builder.DEFAULT_KEEP))
-		candidates = [c for c in candidates if not c.startswith(('_', 'tenx_', 'date_')) and '"' not in c]
-		if candidates:
-			funcs = ', '.join('dc("%s") as f%d' % (c, n) for n, c in enumerate(candidates))
+		# A name tenx-extract holds already stays while tstats still counts it, so a field of a template a later
+		# sample misses is not dropped.
+		seen = (self._lexicon_fields(earliest, latest, indexes) | self._sample_fields(earliest, latest, groups, sampled, began, now)
+				| set(named) | set(builder.tx_extract_names(self._tx_extract_definition())))
+		candidates = sorted(seen - set(builder.DEFAULT_KEEP) - set(builder.SPLUNK_COMPUTED))
+		candidates = [c for c in candidates if not c.startswith(('_', 'tenx_', 'date_')) and '"' not in c
+					  and '\\' not in c and builder.safe_text(c)]
+		for at in range(0, len(candidates), COUNTED_PER_SEARCH):
+			chunk = candidates[at:at + COUNTED_PER_SEARCH]
+			funcs = ', '.join('dc("%s") as f%d' % (c, n) for n, c in enumerate(chunk))
 			counts = self._oneshot('| tstats %s where %s' % (funcs, self._events()), earliest, latest)
 			row = counts[0] if counts else {}
-			names.update(c for n, c in enumerate(candidates) if str(row.get('f%d' % n, '0')) not in ('0', ''))
-			for row in self._oneshot('| tstats %s where %s NOT %s=* by %s' % (
-					funcs, self._events(), builder.MAPPED_FIELD, builder.CARRIER_FIELD), earliest, latest):
+			names.update(c for n, c in enumerate(chunk) if str(row.get('f%d' % n, '0')) not in ('0', ''))
+			for row in self._oneshot('| tstats %s where %s by %s' % (
+					funcs, self._events(), builder.CARRIER_FIELD), earliest, latest):
 				st = row.get(builder.CARRIER_FIELD)
 				if st:
 					by_sourcetype.setdefault(st, set()).update(
-						c for n, c in enumerate(candidates) if str(row.get('f%d' % n, '0')) not in ('0', ''))
+						c for n, c in enumerate(chunk) if str(row.get('f%d' % n, '0')) not in ('0', ''))
 
 		def usable(found):
 			# Splunk's own fields.conf lists its default fields; those are kept anyway.
-			return sorted(n for n in found if n not in builder.DEFAULT_KEEP and '*' not in n and '::' not in n
-						  and not n.startswith(('_', 'tenx_', 'date_')))
+			return sorted(n for n in found if n not in builder.DEFAULT_KEEP and n not in builder.SPLUNK_COMPUTED
+						  and '*' not in n and '::' not in n and not n.startswith(('_', 'tenx_', 'date_')))
 		return usable(names), usable(declared), dict((st, usable(found)) for st, found in by_sourcetype.items())
 
-	def _sample_fields(self, earliest, latest):
+	def _lexicon_fields(self, earliest, latest, indexes):
 		"""
-		The field names of a sample of the compact events: the SAMPLE_EVENTS most recent, and the most
-		recent event of each index, host, source and sourcetype, so a sender whose events are not among
-		the most recent still brings the indexed fields it writes (an event_field of one Fluent Bit, a
-		_meta of one forwarder). A field that only older events of a sender carry is not in it; fields.conf
-		INDEXED = true names such a field.
+		The indexed field names in the lexicon of each bucket of `indexes` (walklex). Splunk reads the lexicon
+		only of a bucket with a merged lexicon or a single tsidx file, so most hot buckets are left out;
+		_sample_fields covers the newest events. Empty when walklex does not run here.
 		"""
-		found = set(r.get('field') for r in self._oneshot('search %s | head %d | fieldsummary | fields field' % (
-			self._events(), SAMPLE_EVENTS), earliest, latest))
+		named = [ix for ix in sorted(indexes) if INDEX_NAME.match(ix)]
+		if not named:
+			return set()
+		read = self.__dict__.setdefault('lexicon_read', {})
+		if (tuple(named), earliest, latest) in read:
+			return set(read[(tuple(named), earliest, latest)])
+		names = self._read_lexicon(named, earliest, latest)
+		read[(tuple(named), earliest, latest)] = names
+		return set(names)
+
+	def _read_lexicon(self, named, earliest, latest):
+		try:
+			rows = self._oneshot('| walklex type=field %s | fillnull value=%s field | stats count by field | fields field' % (
+				' '.join('index=%s' % ix for ix in named), NO_NAME), earliest, latest)
+		except Exception as e:
+			self.logger.warning("tenxreplay: walklex did not run (%s); the indexed field names come from the sample alone", e)
+			return set()
+		# walklex writes each name with a space before it.
+		names = set(str(r.get('field') or '').strip() for r in rows) - {'', NO_NAME}
+		if rows and not names:
+			self.logger.warning("tenxreplay: walklex returned rows without a field name; the indexed field names come "
+								"from the sample alone")
+		return names
+
+	def _sample_state(self):
+		"""([tenx:sampled] pairs, when the run that sampled them began); (set(), None) when none is recorded."""
+		try:
+			entries = self._rest(self._ns('configs/conf-%s?count=0' % CONF)).get('entry', [])
+			content = next(e.get('content', {}) for e in entries if e.get('name') == builder.SAMPLED_STANZA)
+			return set(p for p in str(content.get('pairs') or '').split(',') if p), float(content.get('began'))
+		except Exception:
+			return set(), None
+
+	def _new_templates(self, began, now):
+		"""
+		The hashes of the template records Consume KV stored since `began`, read by their stored_hour with the
+		prefilter's margin (tenx_prefilter_parser, CACHE_LAG_SECONDS); None when more than NEW_TEMPLATES_MOST,
+		when `began` is older than SAMPLE_VALID_SECONDS, or when the store cannot be read.
+		"""
+		if now is None or now - began > SAMPLE_VALID_SECONDS:
+			return None
+		hours = range(prefilter.hour_of(began - prefilter.CACHE_LAG_SECONDS), prefilter.hour_of(now) + 1)
+		try:
+			rows = self._rest(prefilter.records_path(hours, False, limit=NEW_TEMPLATES_MOST + 1))
+		except Exception as e:
+			self.logger.warning("tenxreplay: the template store could not be read (%s); every pair is sampled", e)
+			return None
+		if not isinstance(rows, list) or len(rows) > NEW_TEMPLATES_MOST:
+			return None
+		return sorted(set(str(r['pattern_hash']) for r in rows if r.get('pattern_hash')))
+
+	def _write_sampled(self, have, pairs, began):
+		"""Records in [tenx:sampled] the pairs sampled and when the run began."""
+		want = {'pairs': ','.join(sorted(pairs)), 'began': '%d' % int(began)}
+		if have is None:
+			self._rest(self._ns('configs/conf-%s' % CONF), dict(want, name=builder.SAMPLED_STANZA))
+		else:
+			self._rest(self._ns('configs/conf-%s/%s' % (CONF, urllib.parse.quote(builder.SAMPLED_STANZA, safe=''))), want)
+
+	def _sample_fields(self, earliest, latest, groups=(), sampled=frozenset(), began=None, now=None):
+		"""
+		The field names of a sample of the compact events: one event of each template and sender among the
+		SAMPLE_EVENTS most recent of each (original sourcetype, index) in `groups`, and among the SAMPLE_EVENTS
+		most recent of every other compact event, since the fields a reader attaches follow the event's
+		structure; and the most recent event of each index, host, source and sourcetype, so a sender whose
+		events are not among the most recent still brings the indexed fields it writes (an event_field of one
+		Fluent Bit, a _meta of one forwarder).
+
+		A pair in `sampled`, which a run that began at `began` sampled, is not sampled again: the names its
+		sample found are held in tenx-extract, and the events of the templates stored since then are read
+		instead (_new_templates). Sets self.sampled_pairs to the pairs to record, or None when this run sampled
+		nothing, so a quiet run writes nothing and the next one reads the templates stored since the last sample.
+		"""
+		listed = sorted(set((st, ix) for st, ix in groups if SOURCETYPE_TERM.match(st) and INDEX_NAME.match(ix)))
+		parts = dict(('%s %s' % (ix, st), 'index=%s %s::%s' % (ix, builder.CARRIER_FIELD, st)) for st, ix in listed)
+		parts[EVERY_OTHER] = 'NOT (%s)' % ' OR '.join('(%s)' % t for t in parts.values()) if parts else ''
+		new = None if began is None else self._new_templates(began, now)
+		chosen = [k for k in parts if new is None or k not in sampled]
+		reads = [parts[k] for k in chosen]
+		if new:
+			reads.append('(%s)' % ' OR '.join(prefilter.hash_selector(h) for h in new))
+		found = set()
+		for part in reads:
+			found.update(r.get('field') for r in self._oneshot(
+				'search %s | head %d | eval tenx_th=if(match(_raw, "^~[^,]"), replace(_raw, "^~([^,]+)[\\s\\S]*$", "\\1"), "-") '
+				'| dedup tenx_th index host source sourcetype | fieldsummary | fields field' % (
+					' '.join(t for t in (self._events(), part) if t), SAMPLE_EVENTS), earliest, latest))
+		self.sampled_pairs = set(parts) if reads or set(parts) - set(sampled) or began is None else None
+		senders = self.__dict__.get('senders_read', {}).get((earliest, latest))
+		if senders is None:
+			senders = self._sender_names(self._oneshot(
+				'| tstats max(_time) as t where %s by index host source sourcetype' % self._events(), earliest, latest),
+				earliest, latest)
+		found.update(senders)
+		found.discard(None)
+		return found
+
+	def _sender_names(self, rows, earliest, latest):
+		"""The field names of the newest event of each sender in `rows` (index, host, source, sourcetype, t)."""
+		found = set()
 		clauses = []
-		for r in self._oneshot('| tstats max(_time) as t where %s by index host source sourcetype' % self._events(),
-							   earliest, latest):
+		for r in rows:
 			values = [r.get(k) for k in ('index', 'host', 'source', 'sourcetype')]
 			try:
 				t = int(float(r.get('t')))
@@ -256,6 +417,86 @@ class TenxReplayCommand(GeneratingCommand):
 					self._events(), ' OR '.join(clauses[n:n + SENDERS_PER_SEARCH])), earliest, latest))
 		found.discard(None)
 		return found
+
+	def _sampled_record(self):
+		"""The content of [tenx:sampled]; {} when there is none."""
+		for e in self._rest(self._ns('configs/conf-%s?count=0' % CONF)).get('entry', []):
+			if e.get('name') == builder.SAMPLED_STANZA:
+				return dict(e.get('content') or {})
+		return {}
+
+	def _state(self, earliest, latest, now):
+		"""
+		What a rebuild over this time range reads, as a dict: the (index, host, source, sourcetype, original
+		sourcetype) groups of the compact events, with their original sourcetypes and indexes ranked by event count;
+		the indexed field names of their indexes' lexicons and of each sender's newest event; the templates stored
+		since the last sample; a digest of the configuration the replay is built from; and the day. None when the
+		templates stored since the last sample cannot be listed. The lexicon and sender names are kept for the
+		rebuild that may follow, which then does not read them again.
+		"""
+		try:
+			began = float(self._sampled_record().get('began'))
+		except (TypeError, ValueError):
+			return None
+		new = self._new_templates(began, now)
+		if new is None:
+			return None
+		rows = self._oneshot('| tstats fillnull_value=%s count max(_time) as t where %s by index host source sourcetype %s' % (
+			NO_CARRIER, self._events(), builder.CARRIER_FIELD), earliest, latest)
+		groups, senders, by_st, by_ix = set(), {}, {}, {}
+		for r in rows:
+			key = tuple(str(r.get(k) or '') for k in ('index', 'host', 'source', 'sourcetype'))
+			st, count = str(r.get(builder.CARRIER_FIELD) or ''), int(float(r.get('count') or 0))
+			groups.add(key + (st,))
+			try:
+				senders[key] = max(senders.get(key, 0.0), float(r.get('t')))
+			except (TypeError, ValueError):
+				pass
+			by_ix[key[0]] = by_ix.get(key[0], 0) + count
+			if st != NO_CARRIER:
+				by_st[st] = by_st.get(st, 0) + count
+		names = self._sender_names([dict(zip(('index', 'host', 'source', 'sourcetype'), k), t=t)
+									for k, t in sorted(senders.items())], earliest, latest)
+		self.__dict__.setdefault('senders_read', {})[(earliest, latest)] = names
+		ranked = lambda counts: [k for k, _ in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+		return {'day': builder.day_of(now), 'by_index_time': bool(self.by_index_time), 'all_time': (earliest, latest) == ALL_TIME,
+				'groups': sorted(groups), 'sourcetypes': ranked(by_st), 'indexes': ranked(by_ix),
+				'lexicon': sorted(self._lexicon_fields(earliest, latest, by_ix)), 'senders': sorted(names),
+				'templates': sorted(new), 'config': self._config_digest()}
+
+	def _config_digest(self):
+		"""A digest of the configuration the replay is built from, read over REST as the rebuild reads it."""
+		return digest([listed_entries(self._rest(p)) for p in (
+			self._ns('properties/props/default?count=0'), self._ns('configs/conf-props?count=0'),
+			self._ns('data/transforms/lookups?count=0'), self._ns('configs/conf-transforms?count=0'),
+			self._ns('configs/conf-fields?count=0'), self._ns('configs/conf-tenx_config/config'),
+			'/servicesNS/nobody/-/data/lookup-table-files?count=0', '/servicesNS/nobody/-/storage/collections/config?count=0')])
+
+	def _state_digest(self, state):
+		"""The digest of `state` and of what the rebuild writes as it stands now: tenx_replay.conf and its macros."""
+		conf = []
+		for e in self._rest(self._ns('configs/conf-%s?count=0' % CONF)).get('entry', []):
+			content = dict(e.get('content') or {})
+			if e.get('name') == builder.SAMPLED_STANZA:
+				content.pop(STATE_KEY, None)
+				content.pop(OUTCOME_KEY, None)
+			conf.append([e.get('name'), content])
+		macros = listed_entries(self._rest(self._ns('configs/conf-macros?count=0')),
+								lambda n: n.startswith(MACRO) or n in (TX_EXTRACT, builder.TXF_ONE))
+		return digest([state, sorted(conf, key=lambda x: x[0] or ''), macros])
+
+	def _record_state(self, state, outcome):
+		"""
+		Records in [tenx:sampled] the digest of `state` and of what this rebuild left written, which lets the next
+		run with skip_unchanged stop early, and `outcome`, the rules and units it left out. The state is recorded only
+		when `outcome` is the one recorded before, so a rule that failed once is checked again by the next run.
+		"""
+		try:
+			have = self._sampled_record()
+			want = {OUTCOME_KEY: outcome, STATE_KEY: self._state_digest(state) if have.get(OUTCOME_KEY) == outcome else ''}
+			self._rest(self._ns('configs/conf-%s/%s' % (CONF, urllib.parse.quote(builder.SAMPLED_STANZA, safe=''))), want)
+		except Exception as e:
+			self.logger.warning("tenxreplay: could not record what this rebuild read (%s); the next run rebuilds", e)
 
 	def _indexed_value_false(self):
 		"""
@@ -302,6 +543,13 @@ class TenxReplayCommand(GeneratingCommand):
 			self._events(all_time), where, builder.CARRIER_FIELD), earliest, latest)
 		return [(r[builder.CARRIER_FIELD], r.get('source', ''), r.get('host', ''), int(r.get('count', 0) or 0),
 				 r.get('index', '')) for r in rows if r.get(builder.CARRIER_FIELD)]
+
+	def _renamed(self, earliest, latest):
+		"""The original sourcetypes that compact events in the time range are indexed under."""
+		rows = self._oneshot('| tstats count where %s by %s, sourcetype' % (self._events(), builder.CARRIER_FIELD),
+							 earliest, latest)
+		return sorted(set(r[builder.CARRIER_FIELD] for r in rows
+						  if r.get(builder.CARRIER_FIELD) and r.get(builder.CARRIER_FIELD) == r.get('sourcetype')))
 
 	def _config(self):
 		"""tenx_config.conf [config]: the replay limits and field_narrowing. Unreadable: the defaults."""
@@ -487,8 +735,49 @@ class TenxReplayCommand(GeneratingCommand):
 		self._rest(self._macro_path(name) + '/acl', {'sharing': 'global', 'owner': 'nobody', 'perms.read': '*',
 													 'perms.write': 'admin,sc_admin,power'})
 
+	def _write_plan(self, have, selection):
+		"""
+		The [tenx:plan] stanza: the generation and rule table of the macro just written (builder.Selection),
+		which tenxprefilter reads to choose the rules a `txf` search needs; removed when the macro has none.
+		A table of another generation than the macro's is never used (the macro then runs whole).
+		"""
+		path = self._ns('configs/conf-%s/%s' % (CONF, urllib.parse.quote(builder.PLAN_STANZA, safe='')))
+		if selection is None:
+			if have is not None:
+				self._rest(path, method='DELETE')
+				return ['-' + builder.PLAN_STANZA]
+			return []
+		want = {'generation': selection[0], 'rules': json.dumps(selection[1], separators=(',', ':'))}
+		if have is None:
+			self._rest(self._ns('configs/conf-%s' % CONF), dict(want, name=builder.PLAN_STANZA))
+		elif any(str(have.get(k, '')) != v for k, v in want.items()):
+			self._rest(path, want)
+		else:
+			return []
+		return [builder.PLAN_STANZA]
+
+	def _tx_extract_definition(self):
+		"""The definition of tenx-extract as written now; None when it cannot be read."""
+		try:
+			current = self._rest(self._ns('configs/conf-macros/%s' % urllib.parse.quote(TX_EXTRACT, safe='')))
+		except (OSError, ValueError):
+			return None
+		return current.get('entry', [{}])[0].get('content', {}).get('definition')
+
+	def _write_tx_extract(self, definition):
+		"""Writes tenx-extract when its definition changed and it runs cleanly here; returns the names written."""
+		if self._tx_extract_definition() == definition:
+			return []
+		error = self._dry_run('| makeresults | eval _raw="x" | %s | stats count' % definition)
+		if error:
+			self.logger.warning("tenxreplay: the %s macro does not run (%s); the previous one is kept", TX_EXTRACT, error)
+			self.tx_extract_failed = True
+			return []
+		self._rest(self._ns('configs/conf-macros/%s' % urllib.parse.quote(TX_EXTRACT, safe='')), {'definition': definition})
+		return [TX_EXTRACT]
+
 	def _write(self, replay, not_in_text, last_seen, narrowing, units=None, cov=None, failed=(), now=None,
-			   settings=None, nocarrier=None):
+			   settings=None, nocarrier=None, tx_extract=None, renamed=()):
 		try:
 			existing = dict((e['name'], e.get('content', {})) for e in
 				self._rest(self._ns('configs/conf-%s?count=0' % CONF)).get('entry', []))
@@ -507,24 +796,42 @@ class TenxReplayCommand(GeneratingCommand):
 		if definition != replay.spl():
 			self._rest(self._ns('configs/conf-macros/%s' % urllib.parse.quote(MACRO, safe='')), {'definition': replay.spl()})
 			changed.append(MACRO)
-		for st, info in replay.per_sourcetype.items():
+		changed += self._write_plan(existing.get(builder.PLAN_STANZA), replay.selection)
+		if tx_extract is not None:
+			changed += self._write_tx_extract(tx_extract)
+		# The names a sample found are kept only in tenx-extract, so a sample counts once it is written there.
+		if getattr(self, 'sampled_pairs', None) is not None and not getattr(self, 'tx_extract_failed', False):
+			try:
+				self._write_sampled(existing.get(builder.SAMPLED_STANZA), self.sampled_pairs, now or time.time())
+			except Exception as e:
+				self.logger.warning("tenxreplay: could not record the sampled pairs (%s); the next run samples them again", e)
+		infos = self._recorded_infos(replay, units or {}, failed)
+		for st, info in infos.items():
 			seen = cov.get(st)
 			want = {'computed_fields': ','.join(info['computed']), 'aliased_fields': ','.join(info['aliased']),
 					'masked_at_index_time': ', '.join(info.get('masking', [])),
 					'sources': builder.listed_value(seen['sources']) if seen else builder.sources_value(info['sources']),
-					'last_seen': str(last_seen[st])}
+					'last_seen': str(last_seen[st]), builder.LEFT_OUT_KEY: self._left_out(st, replay, units or {})}
 			if seen:
 				want.update(hosts=builder.listed_value(seen['hosts']), indexes=builder.listed_value(seen['indexes']),
 							unit='' if st in failed else builder.unit_macro(st))
+				# The unit's size, which keeps the search rewrite's chain of units within Splunk's command limit.
+				want[builder.COMMANDS_KEY] = ('' if st in failed or st not in (units or {}) else
+											  str(builder.top_level_commands(units[st].spl())))
 			have = existing.get(st)
+			# Kept once set: the events indexed under the sourcetype stay searchable after this time range.
+			if st in renamed or (have or {}).get(builder.RENAMED_KEY) == '1':
+				want[builder.RENAMED_KEY] = '1'
 			if have is None:
 				self._rest(self._ns('configs/conf-%s' % CONF), dict(want, name=st))
 				changed.append(st)
 				self.rewrite_changed.append(st)
 			elif any(have.get(k, '') != v for k, v in want.items()):
+				moved = any(k in want and have.get(k, '') != want[k] for k in ('indexes', 'unit', builder.LEFT_OUT_KEY,
+																			   builder.COMMANDS_KEY, builder.RENAMED_KEY))
 				self._rest(self._ns('configs/conf-%s/%s' % (CONF, urllib.parse.quote(st, safe=''))), want)
 				changed.append(st)
-				if any(k in want and have.get(k, '') != want[k] for k in ('indexes', 'unit')):
+				if moved:
 					self.rewrite_changed.append(st)
 		if nocarrier is not None:
 			moved = self._write_nocarrier(existing.get(builder.NOCARRIER_STANZA), nocarrier)
@@ -533,7 +840,7 @@ class TenxReplayCommand(GeneratingCommand):
 		want = ','.join(not_in_text)
 		have = existing.get(builder.NARROWING_STANZA)
 		if not narrowing:
-			# Field narrowing off, or no compact event carries tenx_sourcetype: no list, so no
+			# No compact event carries tenx_sourcetype: no list, so with field_narrowing = true no
 			# field comparison restricts the prefilter.
 			if have is not None:
 				self._rest(self._ns('configs/conf-%s/%s' % (CONF, urllib.parse.quote(builder.NARROWING_STANZA, safe=''))),
@@ -547,12 +854,31 @@ class TenxReplayCommand(GeneratingCommand):
 				{'fields_not_in_text': want})
 			changed.append(builder.NARROWING_STANZA)
 		for st in existing:
-			if st not in replay.per_sourcetype and st not in ('default', builder.NARROWING_STANZA, builder.RETIRED_STANZA,
-															  builder.NOCARRIER_STANZA):
+			if st not in infos and st not in ('default', builder.NARROWING_STANZA, builder.RETIRED_STANZA,
+															  builder.NOCARRIER_STANZA, builder.PLAN_STANZA, builder.SAMPLED_STANZA):
 				self._rest(self._ns('configs/conf-%s/%s' % (CONF, urllib.parse.quote(st, safe=''))), method='DELETE')
 				changed.append('-' + st)
 				self.rewrite_changed.append('-' + st)
 		return changed
+
+	@staticmethod
+	def _recorded_infos(replay, units, failed=()):
+		"""
+		{original sourcetype: what its tenx_replay.conf stanza records} for every sourcetype the macro
+		replays or that has a unit (or a unit that did not run): the macro's own entry where it has one,
+		else the unit's.
+		"""
+		infos = dict((st, info) for st in units for s, info in units[st].per_sourcetype.items() if s == st)
+		for st in failed:
+			infos.setdefault(st, {'stanzas': [], 'aliases': 0, 'calculated': 0, 'lookups': 0, 'computed': [], 'aliased': [],
+								  'masking': [], 'sources': [], 'warnings': ['its unit does not run']})
+		infos.update(replay.per_sourcetype)
+		return infos
+
+	@staticmethod
+	def _left_out(st, replay, units):
+		"""The LEFT_OUT_KEY value of `st` (tenx_replay_builder.left_out_value)."""
+		return builder.left_out_value(st in replay.per_sourcetype, getattr(units.get(st), 'replays_nothing', False))
 
 	def _recompile_alerts(self):
 		"""
@@ -582,10 +908,11 @@ class TenxReplayCommand(GeneratingCommand):
 		return dict((e['name'], dict((k, str(e.get('content', {}).get(k, '') or ''))
 									 for k in ('sources', 'hosts', 'indexes', 'last_seen')))
 					for e in entries if e['name'] not in ('default', builder.NARROWING_STANZA, builder.RETIRED_STANZA,
-														  builder.NOCARRIER_STANZA))
+														  builder.NOCARRIER_STANZA, builder.PLAN_STANZA, builder.SAMPLED_STANZA))
 
 	def generate(self):
 		self.rewrite_changed, self.dispatched = [], []
+		self.sampled_pairs, self.tx_extract_failed = None, False
 		earliest, latest = self._time_range()
 		self.index_range = None
 		if self.by_index_time:
@@ -616,10 +943,21 @@ class TenxReplayCommand(GeneratingCommand):
 				self.index_range = (self.lookback, None)
 			else:
 				earliest, latest = self.lookback, None
+		now = time.time()
+		state = None
+		if self.skip_unchanged and self.apply and not self.only_new:
+			try:
+				state = self._state(earliest, latest, now)
+				if state is not None and self._sampled_record().get(STATE_KEY) == self._state_digest(state):
+					yield {'sourcetype': '', 'written': 'no change', 'recompile_dispatched': 'no',
+						   'warnings': ['nothing a rebuild reads has changed since the last rebuild']}
+					return
+			except Exception as e:
+				self.logger.warning("tenxreplay: could not read whether anything changed (%s); rebuilding", e)
+				state = None
 		try:
 			config = self._config()
 			settings = builder.replay_settings(config)
-			now = time.time()
 			recorded = self._covered()
 			covered, expired = builder.expire_covered(recorded, now, settings['replay_expire_days'])
 			if expired:
@@ -645,35 +983,46 @@ class TenxReplayCommand(GeneratingCommand):
 			for value in cov.values():
 				if value['indexes'] is not builder.ALL:
 					carrier_ix |= set(value['indexes'])
-			nocarrier = builder.nocarrier_value(self._compact_indexes(earliest, latest), carrier_ix)
+			compact_ix = self._compact_indexes(earliest, latest)
+			sampled, began = self._sample_state()
+			nocarrier = builder.nocarrier_value(compact_ix, carrier_ix)
 			stanzas = self._stanzas()
 			lookups = self._lookup_fields()
-			keep_all, keep, keep_by_st = self._indexed_fields(earliest, latest)
-			not_raw = self._indexed_value_false()
 			transforms = self._transforms()
+			named = builder.rule_field_names(stanzas, [p[0] for p in present if builder.usable_sourcetype(p[0])],
+											 transforms, lookups)
+			keep_all, keep, keep_by_st = self._indexed_fields(
+				earliest, latest, named, groups=[(r[0], r[4]) for r in rows if r[3]], indexes=compact_ix,
+				sampled=sampled, began=began, now=now)
+			not_raw = self._indexed_value_false()
+			renamed = self._renamed(earliest, latest)
 		except Exception as e:
 			self.logger.exception("tenxreplay: reading the configuration failed")
 			self.error_exit(e, "tenxreplay: could not read the instance's configuration (%s); nothing was written." % e)
 			return
 		last_seen = builder.last_seen_of(present, covered, now)
 		replay = builder.build_capped(stanzas, present, lookups, keep, settings, last_seen, transforms=transforms,
-									  keep_by_sourcetype=keep_by_st)
-		units, failed = {}, set()
-		if replay.per_sourcetype:
+									  keep_by_sourcetype=keep_by_st, select=True)
+		# Every covered sourcetype gets a unit, including those the macro's size limits leave out of it:
+		# their units are what txf(<sourcetype>) and the search rewrite replay them with.
+		unit_sts = builder.unit_sourcetypes(present, last_seen, settings)
+		units, failed, rejected = {}, set(), {}
+		if unit_sts:
 			# Check every rule against this Splunk before writing, so one rule it cannot run
 			# is left out (and named in the log) instead of failing every `tx` search.
 			try:
 				bad_lookups = self._lookup_problems()
 				replay = builder.build_capped(stanzas, present, lookups, keep, settings, last_seen,
-											  bad_lookups=bad_lookups, transforms=transforms, keep_by_sourcetype=keep_by_st)
-				units = builder.build_units(stanzas, cov, replay.per_sourcetype, lookups, keep, settings,
+											  bad_lookups=bad_lookups, transforms=transforms, keep_by_sourcetype=keep_by_st,
+											  select=True)
+				units = builder.build_units(stanzas, cov, unit_sts, lookups, keep, settings,
 											bad_lookups=bad_lookups, transforms=transforms, keep_by_sourcetype=keep_by_st)
 				rejected = builder.failing_rules(builder.all_rules(replay, units), self._dry_run)
 				if rejected:
 					replay = builder.build_capped(stanzas, present, lookups, keep, settings, last_seen,
 												  rejected=rejected, bad_lookups=bad_lookups, transforms=transforms,
-												  keep_by_sourcetype=keep_by_st)
-					units = builder.build_units(stanzas, cov, replay.per_sourcetype, lookups, keep, settings,
+												  keep_by_sourcetype=keep_by_st, select=True)
+					units = builder.build_units(stanzas, cov, unit_sts, lookups, keep, settings,
 												rejected=rejected, bad_lookups=bad_lookups, transforms=transforms,
 												keep_by_sourcetype=keep_by_st)
 				error = self._dry_run(builder.macro_dry_run(replay))
@@ -709,23 +1058,28 @@ class TenxReplayCommand(GeneratingCommand):
 				self.logger.warning("tenxreplay: original sourcetype %s is masked at index time (%s); its compact events "
 									"hold those values unmasked", st, ', '.join(info['masking']))
 		not_in_text = builder.fields_not_in_text(stanzas, transforms, lookups, keep_all, not_raw)
+		computed = set()
+		for info in self._recorded_infos(replay, units, failed).values():
+			computed.update(info.get('computed', ()), info.get('aliased', ()))
 		written = []
 		if self.apply:
 			try:
 				written = self._write(replay, not_in_text, last_seen, builder.narrowing_wanted(config, replay), units, cov,
-									  failed, now, settings, nocarrier)
+									  failed, now, settings, nocarrier, builder.tx_extract(keep_all, computed), renamed)
 			except Exception as e:
 				self.logger.exception("tenxreplay: writing the macro failed")
 				self._recompile_alerts()
 				self.error_exit(e, "tenxreplay: could not write the %s macro (%s)." % (MACRO, e))
 				return
 			self._recompile_alerts()
+			if state is not None:
+				self._record_state(state, digest([sorted(map(list, rejected)), sorted(failed), bool(self.tx_extract_failed)]))
 		self.logger.info("tenxreplay: %d sourcetypes, %d steps, written %s, warnings %s",
 			len(replay.per_sourcetype), len(replay.steps), written, replay.warnings)
 		events = {}
 		for st, _, _, count in present:
 			events[st] = events.get(st, 0) + count
-		for st, info in sorted(replay.per_sourcetype.items()):
+		for st, info in sorted(self._recorded_infos(replay, units, failed).items()):
 			row = {
 				'sourcetype': st,
 				'compact_events': events.get(st, 0),
@@ -745,12 +1099,13 @@ class TenxReplayCommand(GeneratingCommand):
 				'indexes': builder.listed_value(cov.get(st, {}).get('indexes', set())),
 				'written': 'yes' if written else ('no change' if self.apply else 'dry run'),
 				'recompile_dispatched': 'yes' if self.dispatched else 'no',
+				'left_out': self._left_out(st, replay, units),
 			}
 			if not self.apply:
 				row['definition'] = replay.spl()
 				row['unit_definition'] = units[st].spl() if st in units else ''
 			yield row
-		if not replay.per_sourcetype:
+		if not self._recorded_infos(replay, units, failed):
 			yield {'sourcetype': '', 'compact_events': 0,
 				   'warnings': ['no compact event in this time range carries %s' % builder.CARRIER_FIELD],
 				   'written': 'yes' if written else 'no change', 'recompile_dispatched': 'yes' if self.dispatched else 'no'}

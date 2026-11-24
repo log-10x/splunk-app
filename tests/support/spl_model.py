@@ -4,7 +4,7 @@ an event rather than what its text looks like.
 
 It runs a list of events (dicts) through a pipeline string. It knows only what the replay macro,
 the `tx` macro and the search rewrite use: eval (if, case, coalesce, isnull, isnotnull, null,
-true, mvindex, match, len, lower, substr, mvappend, mvjoin, mvdedup, mvsort; ==, !=, AND, OR, NOT), fields -, foreach,
+true, mvindex, mvcount, match, len, lower, substr, split, urldecode, mvappend, mvjoin, mvdedup, mvsort; ==, !=, AND, OR, NOT), fields -, foreach,
 rename (one literal name to another, on every event that has it), and stand-ins for extract, spath,
 lookup, typer and tags supplied by the test.
 
@@ -15,6 +15,8 @@ Modelled behaviour, as observed on Splunk Enterprise 10.4.3:
   false, so NOT (a==1) is TRUE when a is null (not three-valued logic); if() and case() take a
   null condition as false; case() returns the value of the first true branch even when that
   value is null. An eval that yields null removes the field (fieldsummary count 0).
+- fillnull value=<v> <names>: each named field set to <v> where it has no value (the model's only form); a
+  name given twice is refused, as Splunk refuses the search.
 - foreach <pattern>: the body runs once per field name that matches the pattern on any event of
   the result set (the whole list is one chunk), over every event, and not at all when none
   matches; fieldstr and matchstr rename the placeholders, and a nested foreach keeps its own.
@@ -25,6 +27,7 @@ Modelled behaviour, as observed on Splunk Enterprise 10.4.3:
 """
 import fnmatch
 import re
+import urllib.parse
 
 
 class Unsupported(Exception):
@@ -209,6 +212,16 @@ def evaluate(node, event):
 		if name == 'mvindex':
 			v = vals[0]
 			return v[vals[1]] if isinstance(v, list) else v
+		if name == 'mvcount':
+			v = vals[0]
+			return None if v is None else len(v) if isinstance(v, list) else 1
+		if name == 'split':
+			if vals[0] is None:
+				return None
+			parts = str(vals[0]).split(str(vals[1]))
+			return parts if len(parts) > 1 else parts[0]
+		if name == 'urldecode':
+			return None if vals[0] is None else urllib.parse.unquote(str(vals[0]))
 		if name == 'len':
 			return None if vals[0] is None else len(str(vals[0]))
 		if name == 'lower':
@@ -251,10 +264,13 @@ class Model(object):
 	_raw, sourcetype, source and host it saw).
 	"""
 
-	def __init__(self, commands=None, lookups=None, macros=None):
+	def __init__(self, commands=None, lookups=None, macros=None, plan=None):
 		self.commands = commands or {}
 		self.lookups = lookups or {}
 		self.macros = macros or {}
+		# What the step before the replay of `txf` reads back from the job (macros.conf [tenx-replay-plan]):
+		# the fields of a stored replay plan, or tenx_ndnoplan when none was stored, and no word marks.
+		self.plan = plan or 'tenx_ndnoplan'
 
 	def run(self, pipeline, events):
 		for step in split_top(self.expand(pipeline), '|'):
@@ -264,7 +280,10 @@ class Model(object):
 
 	def expand(self, text):
 		for _ in range(5):
-			new = re.sub(r'`([^`]+)`', lambda m: WILD_STEP if m.group(1) == 'tenx-wild' else self.macros[m.group(1)], text)
+			new = re.sub(r'`([^`]+)`', lambda m: WILD_STEP if m.group(1) == 'tenx-wild' else (
+				'fields - tenx_wild' if m.group(1) == 'tenx-wild-planned' else (
+				'fillnull value=- ' + self.plan + ' tenx_ndnone tenx_wild' if m.group(1) == 'tenx-replay-plan'
+				else self.macros[m.group(1)])), text)
 			if new == text:
 				return text
 			text = new
@@ -305,6 +324,19 @@ class Model(object):
 				for f in list(event):
 					if not f.startswith('__') and any(fnmatch.fnmatchcase(f, p) for p in pats):
 						del event[f]
+			return
+		if word == 'fillnull':
+			m = re.match(r'^value=(\S+)\s+(.+)$', rest)
+			if not m:
+				raise Unsupported(step)
+			if len(set(m.group(2).split())) != len(m.group(2).split()):
+				# Splunk Enterprise 10.4.3: "Error in 'fillnull' command: Field '<name>' cannot be specified
+				# multiple times." (the search does not run)
+				raise Unsupported('fillnull names a field twice: %r' % step)
+			for event in events:
+				for name in m.group(2).split():
+					if event.get(name) is None:
+						event[name] = m.group(1)
 			return
 		if word == 'foreach':
 			# One pattern or several (`foreach a b c [...]`, the units' clearing step): the body

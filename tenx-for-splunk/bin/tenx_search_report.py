@@ -9,8 +9,6 @@ says for each one what moving the named sourcetypes or indexes to compact events
 * unchanged        it runs as it is and returns what it returned on the raw events;
 * needs tx         `tx` written in front of its search terms; it reads only the events' text;
 * needs txf        `txf` written in front of its search terms;
-* needs field map  it reads fields Splunk stored with the event (data models, `tstats`), which a
-                   compact event has only through a field map;
 * limit            a shape the app's README lists as behaving differently on compact events; the
                    reason quotes the README;
 * not classified   the tool cannot tell: a macro it cannot expand, `map`, a subsearch whose
@@ -19,21 +17,9 @@ says for each one what moving the named sourcetypes or indexes to compact events
 * not affected     it reads none of the moved data.
 
 Every verdict rests on a measured result or on a sentence of the README, and the reason says
-which. What was measured (Splunk Enterprise 10.4.3, the Windows add-on 12.0.0, CIM 8.8.0, 8,311
-Windows Security events indexed raw, compact with tenx_sourcetype, and compact through a field
-map):
-
-* without a field map, a search over compact events finds an event only where its words are
-  values ("Kerberos": 0 of 21; "NULL SID": 0 of 107) and its original sourcetype not at all
-  (`sourcetype=XmlWinEventLog`: 0 of 8,311); with `txf` in front, 21, 107 and 8,311; `stats` and
-  `tstats` by index, host and source count compact events as raw ones;
-* through a field map, a field comparison returns what it returns on raw events, also where the
-  value is template text (LogonProcessName=Kerberos 21, SubjectUserSid="NULL SID" 71; EventCode,
-  ObjectType, wildcard values, action, user, tag, eventtype and Logon_Type equal too), and so does
-  `sourcetype=XmlWinEventLog` (the map renames the event); a word of the text does not (Kerberos
-  0 of 21), nor a command that reads `_raw` (`rex`, `search <word>`), nor punct and linecount,
-  nor `tstats` on sourcetype (0 of 8,311); `tstats` by index, host and source does;
-* `txf` on mapped events finds the words and the text again (21 of 21, 107 of 107).
+which. A search over compact events finds an event only where its words are values, and not by its
+original sourcetype; with `txf` in front it finds both. `stats` and `tstats` by index, host and
+source count compact events as raw ones.
 
 The edit printed for `tx` and `txf` puts the index, host, source and time terms written at the
 top level of the search before the macro and every other term after it, as the README's Usage
@@ -42,9 +28,9 @@ section asks (time modifiers before the macro, the original sourcetype after `tx
 Usage
 -----
     tenx_search_report.py --splunkd https://<search head>:8089 --sourcetype XmlWinEventLog \\
-        [--index wineventlog] [--field-map XmlWinEventLog] [--app <app>] [--csv report.csv]
+        [--index wineventlog] [--app <app>] [--csv report.csv]
     tenx_search_report.py --dir <folder of savedsearches.conf, macros.conf and dashboard files> \\
-        --sourcetype XmlWinEventLog [--field-map XmlWinEventLog] [--csv report.csv]
+        --sourcetype XmlWinEventLog [--csv report.csv]
 
 Over REST the tool reads saved searches and views, and expands each search's macros with Splunk's
 search parser (search/parser with parse_only, which runs nothing); it starts no search job.
@@ -55,14 +41,17 @@ Standard library only.
 """
 
 import argparse
+import base64
 import csv
 import fnmatch
 import json
 import os
 import re
+import ssl
 import sys
 import urllib.error
 import urllib.parse
+import urllib.request
 import xml.etree.ElementTree as ET
 
 # The app's own modules sit beside this file; found also when Python runs isolated (-I) or from another folder.
@@ -72,14 +61,13 @@ import tenx_prefilter_parser as pp  # noqa: E402
 UNCHANGED = 'unchanged'
 NEEDS_TX = 'needs tx'
 NEEDS_TXF = 'needs txf'
-NEEDS_MAP = 'needs field map'
 LIMIT = 'limit'
 NOT_CLASSIFIED = 'not classified'
 NOT_AFFECTED = 'not affected'
 # Worst first: the verdict of a search is the first of these that one of its findings gives.
-VERDICTS = (NOT_CLASSIFIED, LIMIT, NEEDS_MAP, NEEDS_TXF, NEEDS_TX, UNCHANGED, NOT_AFFECTED)
+VERDICTS = (NOT_CLASSIFIED, LIMIT, NEEDS_TXF, NEEDS_TX, UNCHANGED, NOT_AFFECTED)
 # The order of the summary line.
-SUMMARY_ORDER = (UNCHANGED, NEEDS_TX, NEEDS_TXF, NEEDS_MAP, LIMIT, NOT_CLASSIFIED, NOT_AFFECTED)
+SUMMARY_ORDER = (UNCHANGED, NEEDS_TX, NEEDS_TXF, LIMIT, NOT_CLASSIFIED, NOT_AFFECTED)
 
 # Sentences of tenx-for-splunk/README.md as written there (line breaks aside; " [...] " stands for words left out);
 # tests/test_tenx_search_report.py checks that each one is in the README.
@@ -105,28 +93,14 @@ README = {
 		'events they differ from the raw event\'s.',
 	'xml_profile': '`txf` gives the add-on\'s search-time fields, so three fields that depend on that indexing '
 		'(`xmlns`, `vendor_privilege`, `privilege_id`) are not on expanded events.',
-	'data_models': 'Data models, their accelerations, `tstats` and saved searches that do not use `tx` read the '
-		'fields Splunk stored with an event. The field map writes a compact event\'s original fields while it is '
-		'indexed, so these searches read them.',
-	'tstats_sourcetype': '`tstats` reads the indexed sourcetype, which stays the compact one with or without a field '
-		'map, so `tstats` by or on the original sourcetype counts no compact event; `tenx_sourcetype` holds the '
-		'original. Use `where (sourcetype=XmlWinEventLog OR tenx_sourcetype=XmlWinEventLog)`, or a data model, which '
-		'applies the rename.',
-	'eventtype_words': 'Event types that match words of the original text, such as `err0r` in the CIM add-on '
-		'and `aws_cloudtrail_delete_events` in the AWS add-on, match a mapped event only where its compact text holds '
-		'the word.',
-	'dest_4798': 'On Windows EventID 4798, 5156 and 5157, `dest` is the event\'s Computer and `src_ip` and '
-		'`dest_ip` are not written.',
-	'xml_blocks': 'The add-on\'s XML block fields `EventData_Xml` and `System_Props_Xml` are not written.',
-	'privilege_dash': '`vendor_privilege` and `privilege_id` carry `-` on events where the raw event has neither.',
-	'long_value': 'A plain search shows a mapped field longer than 1,000 characters, such as a PowerShell '
-		'`ScriptBlockText`, cut to its first 1,000',
+	'data_models': 'Data models and their accelerations read the original sourcetype\'s fields. A compact event '
+		'does not carry them, so data models do not count it.',
+	'tstats_sourcetype': '`tstats` reads the indexed sourcetype, which on a compact event stays the compact one. A '
+		'`tstats` search by or on the original sourcetype therefore counts no compact events. The original '
+		'sourcetype is in `tenx_sourcetype`, for example '
+		'`where (sourcetype=XmlWinEventLog OR tenx_sourcetype=XmlWinEventLog)`.',
 	'ct_time': 'A compact event\'s `_time` is the first timestamp the Receiver found in the line. In a CloudTrail record '
-		'that can be `userIdentity.sessionContext.attributes.creationDate`, which comes before `eventTime`. A CloudTrail '
-		'field map built with `--time-props` (below) gives every compact CloudTrail event the raw event\'s `_time`.',
-	'date_fields': 'Mapped events carry no `date_*` fields (`date_hour`, `date_wday` and the others), which Splunk '
-		'gives raw events it reads from a file, so a detection that reads them, such as a business-hours one, '
-		'matches no mapped event.',
+		'that can be `userIdentity.sessionContext.attributes.creationDate`, which comes before `eventTime`.',
 }
 
 TIME_FIELDS = pp.TIME_FIELDS | frozenset(('_index_earliest', '_index_latest'))
@@ -170,23 +144,18 @@ TSTATS_OPTIONS = re.compile(r'(?<![A-Za-z0-9_])(?:prestats|local|append|summarie
 LIMIT_FIELDS = (
 	(re.compile(r'^date_\w+$'), 'date'),
 	(re.compile(r'^(?:punct|linecount)$'), 'punct'),
-	(re.compile(r'^(?:EventData_Xml|System_Props_Xml)$'), 'xml_blocks'),
 	(re.compile(r'^(?:vendor_privilege|privilege_id)$'), 'privilege'),
 	(re.compile(r'^xmlns$'), 'xmlns'),
-	(re.compile(r'^ScriptBlockText$'), 'long_value'),
 )
 # Sources whose compact events can carry another `_time` than their raw events (README): patterns of the original
-# sourcetype, the README sentence, and whether a field map (built with --time-props, as the README says) removes it.
-# FortiGate is not one: on Receiver 1.1.181 a compact FortiGate event's `_time` is the line's own date= and time=.
-TIME_SOURCES = ((('aws:cloudtrail',), 'ct_time', True),)
+# sourcetype and the README sentence. FortiGate is not one: on Receiver 1.1.181 a compact FortiGate event's `_time`
+# is the line's own date= and time=.
+TIME_SOURCES = ((('aws:cloudtrail',), 'ct_time'),)
 # Commands and functions whose results depend on the events' times or their order.
 TIME_COMMANDS = frozenset(('timechart', 'bin', 'bucket', 'transaction', 'streamstats', 'head', 'tail', 'dedup', 'reverse',
 	'delta', 'autoregress', 'trendline', 'predict', 'timewrap', 'concurrency', 'localize', 'sitimechart', 'accum'))
 TIME_FUNCTIONS = re.compile(r'(?<![A-Za-z0-9_])(?:earliest|latest|earliest_time|latest_time|first|last|rate|per_second|'
 	r'per_minute|per_hour|per_day)\s*\(', re.I)
-EVENTTYPE_WORDS = frozenset(('err0r', 'aws_cloudtrail_delete_events'))
-DEST_FIELDS = frozenset(('dest', 'src_ip', 'dest_ip'))
-DEST_EVENTS = re.compile(r'(?<![0-9])(?:4798|5156|5157)(?![0-9])')
 IDENT = re.compile(r'(?<![A-Za-z0-9_.:{}@$-])[A-Za-z_][A-Za-z0-9_.:{}@-]*')
 OPERATOR_END = re.compile(r'(?:!=|<=|>=|=|<|>)$')
 OPERATOR_START = re.compile(r'^(?:!=|<=|>=|=|<|>)')
@@ -195,12 +164,11 @@ TOKEN_VALUE = 'tenx_token_value'
 
 
 class Move(object):
-	"""What moves to compact events: sourcetypes and indexes (fnmatch patterns), and the sourcetypes a field map covers."""
+	"""What moves to compact events: sourcetypes and indexes (fnmatch patterns)."""
 
-	def __init__(self, sourcetypes=(), indexes=(), mapped=()):
+	def __init__(self, sourcetypes=(), indexes=()):
 		self.sourcetypes = [s for s in sourcetypes if s]
 		self.indexes = [i for i in indexes if i]
-		self.mapped = [m for m in mapped if m]
 		if not self.sourcetypes and not self.indexes:
 			raise ValueError('name at least one --sourcetype or --index that moves')
 
@@ -216,15 +184,6 @@ class Move(object):
 		if indexes and self.indexes and not any(self.match(i, self.indexes) for i in indexes):
 			return False, 'It names index %s, which does not move.' % ', '.join(indexes)
 		return True, None
-
-	def is_mapped(self, sourcetypes):
-		"""Whether every moved sourcetype the search can read is covered by a field map."""
-		if not self.mapped:
-			return False
-		if not self.sourcetypes:
-			return True
-		named = [s for s in sourcetypes if self.match(s, self.sourcetypes)]
-		return all(self.match(s, self.mapped) for s in (named or self.sourcetypes))
 
 
 class Result(object):
@@ -555,10 +514,8 @@ def _time_source(text, move):
 		named_st = []
 	read = [s for s in named_st if Move.match(s, move.sourcetypes)] if move.sourcetypes else []
 	read = read or move.sourcetypes
-	for patterns, quote, map_removes in TIME_SOURCES:
-		hit = [s for s in read if any(fnmatch.fnmatchcase(s.lower(), p) or fnmatch.fnmatchcase(p, s.lower())
-			for p in patterns)]
-		if hit and not (map_removes and move.is_mapped(hit)):
+	for patterns, quote in TIME_SOURCES:
+		if any(fnmatch.fnmatchcase(s.lower(), p) or fnmatch.fnmatchcase(p, s.lower()) for s in read for p in patterns):
 			return quote
 	return None
 
@@ -605,9 +562,9 @@ def _classify(search, move, kind='report', expanded=None):
 			return Result(NOT_CLASSIFIED, ['A subsearch reads data that moves: [%s]' % sub[:120]])
 	first = parts[0]
 	if generating and names[0] != 'search':
-		return _generating(names[0], command_args(first), parts[1:], move, kind)
+		return _generating(names[0], command_args(first), move)
 	base = command_args(first) if names[0] == 'search' and re.match(r'^search\b', first) else first
-	return _search(base, parts[1:], move, kind, search, expanded is not None)
+	return _search(base, parts[1:], move, search, expanded is not None)
 
 
 def _already_compact(search, first):
@@ -625,7 +582,7 @@ def _already_compact(search, first):
 	return worst(found)
 
 
-def _generating(name, args, rest, move, kind):
+def _generating(name, args, move):
 	if name in NO_EVENTS:
 		return Result(NOT_AFFECTED, ['`%s` reads no indexed events.' % name])
 	if name in OTHER_SEARCH:
@@ -639,16 +596,7 @@ def _generating(name, args, rest, move, kind):
 		return Result(NOT_CLASSIFIED, ['`%s` reads what the moved indexes hold: not measured.' % name])
 	if (name in DATA_MODEL_COMMANDS or (name == 'from' and re.match(r'datamodel\b', args, re.I))
 			or (name == 'tstats' and re.search(r'(?<![A-Za-z0-9_])datamodel\s*=', args, re.I))):
-		if not move.is_mapped([]):
-			return Result(NEEDS_MAP, [readme('data_models')])
-		pipeline = _pipeline(rest)
-		found = [Result(UNCHANGED, ['It reads a data model: the field map writes the fields data models read (data '
-			'models measured equal to raw).'])]
-		found += _map_limits(args + ' | ' + ' | '.join(rest), [])
-		if pipeline['reads_text'] or (name == 'datamodel' and pipeline['returns_events'] and kind != 'alert'):
-			found.append(Result(NEEDS_TXF, ['A later command reads the events\' text, which on mapped events is the '
-				'compact text.']))
-		return worst(found)
+		return Result(LIMIT, [readme('data_models')])
 	if name == 'tstats':
 		return _tstats(args, move)
 	return Result(NOT_CLASSIFIED, ['Its first command, `%s`, is not one this tool reads.' % name])
@@ -747,22 +695,7 @@ def _limit_keys(names):
 	return found
 
 
-def _map_limits(text, leaves):
-	"""The README's limits of the field map that a search's text touches."""
-	names = set(identifiers(text)) | set(n[1] for _, n in leaves if n[0] in ('field', 'in'))
-	keys, results = _limit_keys(names), []
-	for key, quote in (('date', 'date_fields'), ('punct', 'punct'), ('xml_blocks', 'xml_blocks'),
-			('privilege', 'privilege_dash'), ('long_value', 'long_value')):
-		if key in keys:
-			results.append(Result(LIMIT, [readme(quote)]))
-	if set(named(leaves, 'eventtype')) & EVENTTYPE_WORDS:
-		results.append(Result(LIMIT, [readme('eventtype_words')]))
-	if names & DEST_FIELDS and DEST_EVENTS.search(text):
-		results.append(Result(LIMIT, [readme('dest_4798')]))
-	return results
-
-
-def _search(base, rest, move, kind, written, expanded):
+def _search(base, rest, move, written, expanded):
 	try:
 		leaves, parser = parse_terms(base)
 	except pp.Unparsed as e:
@@ -788,47 +721,27 @@ def _search(base, rest, move, kind, written, expanded):
 			found.append(Result(LIMIT, [readme('punct')]))
 		return found
 
-	if move.is_mapped(sts):
-		if words:
-			findings.append(Result(NEEDS_TXF, [readme('words'), 'The field map writes fields, not the words of the text; '
-				'`txf` expands mapped events too (measured equal to raw).']))
-			findings += macro_limits()
-		elif pipeline['reads_text']:
-			findings.append(Result(NEEDS_TXF, ['A later command reads the events\' text (`_raw`), which on mapped events '
-				'is the compact text; `txf` expands it (measured equal to raw).']))
-		elif pipeline['returns_events'] and kind != 'alert':
-			findings.append(Result(NEEDS_TXF, ['It returns the events: on mapped events their text is the compact text '
-				'and their fields the raw event\'s; `txf` shows the original text.']))
-		else:
-			why = ['Through the field map, field comparisons and metadata return what they return on raw events, '
-				'template-text values included (measured).']
-			if pipeline['returns_events']:
-				why.append('It fires on the number of events, which is equal; the events in its results show the '
-					'compact text.')
-			findings.append(Result(UNCHANGED, why))
-		findings += _map_limits(all_text, leaves)
+	other = [f for f in field_names if f not in SAME_ON_COMPACT]
+	pipe_fields = [n for n in pipeline['names'] if n.lower() not in SPL_WORDS and n not in pipeline['produced']]
+	reads_meta_only = (pipeline['tx_safe'] and not pipeline['reads_text']
+		and all(n in SAME_ON_COMPACT or n == '_raw' for n in pipe_fields))
+	if not words and not other and reads_meta_only and not pipeline['returns_events']:
+		findings.append(Result(UNCHANGED, ['It reads only index, host, source and time, which compact events carry '
+			'as raw ones do (measured: counts by host and source equal).']))
+	elif not other and reads_meta_only:
+		findings.append(Result(NEEDS_TX, [readme('words') if words else readme('no_keywords'),
+			'It reads only the events\' text and metadata, so `tx` serves it (`txf` too).']))
 	else:
-		other = [f for f in field_names if f not in SAME_ON_COMPACT]
-		pipe_fields = [n for n in pipeline['names'] if n.lower() not in SPL_WORDS and n not in pipeline['produced']]
-		reads_meta_only = (pipeline['tx_safe'] and not pipeline['reads_text']
-			and all(n in SAME_ON_COMPACT or n == '_raw' for n in pipe_fields))
-		if not words and not other and reads_meta_only and not pipeline['returns_events']:
-			findings.append(Result(UNCHANGED, ['It reads only index, host, source and time, which compact events carry '
-				'as raw ones do (measured: counts by host and source equal).']))
-		elif not other and reads_meta_only:
-			findings.append(Result(NEEDS_TX, [readme('words') if words else readme('no_keywords'),
-				'It reads only the events\' text and metadata, so `tx` serves it (`txf` too).']))
-		else:
-			reasons = [readme('words')] if words else ([] if field_names else [readme('no_keywords')])
-			reasons.append(readme('txf') + '.')
-			if 'sourcetype' in field_names:
-				reasons.append(readme('sourcetype'))
-			findings.append(Result(NEEDS_TXF, reasons))
-		findings += macro_limits()
-		if 'xmlns' in keys or 'privilege' in keys:
-			findings.append(Result(LIMIT, [readme('xml_profile')]))
-		if 'date' in keys:
-			findings.append(Result(NOT_CLASSIFIED, ['It reads `date_*` fields: through `txf`, not measured.']))
+		reasons = [readme('words')] if words else ([] if field_names else [readme('no_keywords')])
+		reasons.append(readme('txf') + '.')
+		if 'sourcetype' in field_names:
+			reasons.append(readme('sourcetype'))
+		findings.append(Result(NEEDS_TXF, reasons))
+	findings += macro_limits()
+	if 'xmlns' in keys or 'privilege' in keys:
+		findings.append(Result(LIMIT, [readme('xml_profile')]))
+	if 'date' in keys:
+		findings.append(Result(NOT_CLASSIFIED, ['It reads `date_*` fields: through `txf`, not measured.']))
 	result = worst(findings)
 	if any(f.verdict in (NEEDS_TX, NEEDS_TXF) for f in findings):
 		macro = 'txf' if any(f.verdict == NEEDS_TXF for f in findings) else 'tx'
@@ -1171,6 +1084,65 @@ class DirSource(object):
 		return expanded if expanded is not None else '!' + why
 
 
+class TlsVerifyError(Exception):
+	"""The certificate of the management port did not verify; str() is one line for the person running the tool."""
+
+	def __init__(self, url, detail):
+		Exception.__init__(self, 'the certificate of %s did not verify (%s); add --tls-ca-file with the PEM file of the '
+			'authority that signed it, or, for an instance with Splunk\'s default self-signed certificate, --tls-verify off'
+			% (url, detail))
+
+
+def _certificate_failure(e):
+	"""The verification message of an exception urlopen raised for a certificate that did not verify, or None."""
+	reason = getattr(e, 'reason', e)
+	if isinstance(reason, ssl.SSLCertVerificationError):
+		return getattr(reason, 'verify_message', None) or str(reason)
+	if isinstance(reason, ssl.SSLError) and 'CERTIFICATE_VERIFY_FAILED' in str(reason):
+		return 'CERTIFICATE_VERIFY_FAILED'
+	return None
+
+
+class Splunkd(object):
+	"""The search head's management port (REST, JSON)."""
+
+	def __init__(self, url, auth=None, token=None, tls_verify=True, ca_file=None):
+		self.url = url.rstrip('/')
+		self.headers = {}
+		if token:
+			self.headers['Authorization'] = 'Splunk %s' % token
+		elif auth:
+			self.headers['Authorization'] = 'Basic ' + base64.b64encode(auth.encode('utf-8')).decode('ascii')
+		self.ctx = None
+		if not tls_verify:
+			self.ctx = ssl.create_default_context()
+			self.ctx.check_hostname = False
+			self.ctx.verify_mode = ssl.CERT_NONE
+		elif ca_file:
+			# Certificates are checked against these authorities only, host name included.
+			self.ctx = ssl.create_default_context(cafile=ca_file)
+
+	def call(self, method, path, params=None):
+		params = dict(params or {}, output_mode='json')
+		url, data = self.url + path, None
+		if method == 'GET':
+			url += '?' + urllib.parse.urlencode(params)
+		else:
+			data = urllib.parse.urlencode(params).encode('ascii')
+		req = urllib.request.Request(url, data=data, method=method, headers=self.headers)
+		try:
+			res = urllib.request.urlopen(req, context=self.ctx, timeout=120)
+		except (urllib.error.URLError, ssl.SSLError) as e:
+			detail = _certificate_failure(e)
+			if detail is None:
+				raise
+			parts = urllib.parse.urlsplit(req.full_url)
+			raise TlsVerifyError('%s://%s' % (parts.scheme, parts.netloc), detail)
+		with res:
+			body = res.read()
+		return json.loads(body) if body.strip() else {}
+
+
 class RestSource(object):
 	"""Saved searches and views over the management port; macros expanded by Splunk's search parser."""
 
@@ -1378,8 +1350,6 @@ def build_parser():
 		help='an original sourcetype that moves to compact events (repeatable; wildcards allowed)')
 	ap.add_argument('--index', action='append', default=[],
 		help='an index whose events move to compact events (repeatable; wildcards allowed)')
-	ap.add_argument('--field-map', action='append', default=[], metavar='SOURCETYPE',
-		help='a moved sourcetype that a field map covers (repeatable)')
 	ap.add_argument('--app', action='append', default=[], help='report only the objects of this app (repeatable)')
 	ap.add_argument('--csv', help='also write the report to this CSV file, with each search and its edit')
 	ap.add_argument('--splunkd-auth-env', default='TENX_SPLUNKD_AUTH',
@@ -1397,13 +1367,9 @@ def main(argv=None, out=None):
 	out = out or sys.stdout
 	args = build_parser().parse_args(argv)
 	try:
-		move = Move(args.sourcetype, args.index, args.field_map)
+		move = Move(args.sourcetype, args.index)
 	except ValueError as e:
 		sys.stderr.write('tenx_search_report: %s\n' % e)
-		return 2
-	unknown = [m for m in args.field_map if args.sourcetype and not Move.match(m, args.sourcetype)]
-	if unknown:
-		sys.stderr.write('tenx_search_report: --field-map %s is not a --sourcetype that moves\n' % ', '.join(unknown))
 		return 2
 	if args.dir:
 		if not os.path.isdir(args.dir):
@@ -1411,16 +1377,15 @@ def main(argv=None, out=None):
 			return 2
 		items = run(DirSource(args.dir, args.app), move)
 	else:
-		import tenx_field_map
 		auth, token = os.environ.get(args.splunkd_auth_env), os.environ.get(args.splunkd_token_env)
 		if not auth and not token:
 			sys.stderr.write('tenx_search_report: set %s or %s\n' % (args.splunkd_token_env, args.splunkd_auth_env))
 			return 2
-		splunkd = tenx_field_map.Splunkd(args.splunkd, auth=auth, token=token, tls_verify=args.tls_verify == 'on',
+		splunkd = Splunkd(args.splunkd, auth=auth, token=token, tls_verify=args.tls_verify == 'on',
 			ca_file=args.tls_ca_file)
 		try:
 			items = run(RestSource(splunkd, args.app), move)
-		except tenx_field_map.TlsVerifyError as e:
+		except TlsVerifyError as e:
 			sys.stderr.write('tenx_search_report: %s\n' % e)
 			return 1
 		except urllib.error.URLError as e:

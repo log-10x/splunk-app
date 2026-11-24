@@ -179,7 +179,8 @@ def get_result_parts(result):
 		logger.warning("Missing dml_hash on line - {}".format(raw_line))
 		return None, None
 
-	if not non_empty_string(pattern):
+	# An empty or whitespace-only line has a template of that same text.
+	if pattern is None:
 		logger.warning("Missing actual pattern on line - {}".format(raw_line))
 		return None, None
 
@@ -195,6 +196,48 @@ def get_result_parts(result):
 		return None, None
 
 	return record_key, pattern
+
+
+# Splunk reads a JSON null as the text "null". The template record of an empty line has a null
+# template, which is the empty template; a template that is the text "null" stays as it is.
+NULL_TEMPLATE_EVAL = 'eval template=if(template=="null" AND isnull(json_extract(_raw, "template")), "", template)'
+
+
+def record_template(result):
+	"""The template of a template record in search results, with a JSON null read as the empty template."""
+	template = result.get('template')
+
+	if template == 'null' and result.get('_raw'):
+		try:
+			if json.loads(result['_raw']).get('template', template) is None:
+				return ''
+		except (ValueError, AttributeError):
+			pass
+
+	return template
+
+
+def record_of(result):
+	"""
+	The (template hash, template) of a search result: the members of the template record in its
+	_raw, or its templateHash and template fields when _raw holds no such record.
+
+	The record is read from _raw because the results file Splunk hands the action can carry wrong
+	or empty fields beside a whole _raw in the later rows of a large search.
+	"""
+	raw = result.get('_raw') or ''
+	if raw.lstrip().startswith('{'):
+		try:
+			record = json.loads(raw)
+		except (ValueError, RecursionError):
+			record = None
+		if isinstance(record, dict) and isinstance(record.get('templateHash'), str):
+			template = record.get('template')
+			if template is None and 'template' in record:
+				return record['templateHash'], ''
+			if isinstance(template, str):
+				return record['templateHash'], template
+	return result.get('templateHash'), record_template(result)
 
 
 LOOKUP_NAME = 'tenx-dml-lookup'
@@ -228,6 +271,13 @@ STATE_RUN_STARTED = 'run_started'
 STATE_RUN_ENDED = 'run_ended'
 # The last run stopped from outside, as the next run found it; kept for Diagnostics.
 STATE_LAST_CUT = 'last_cut'
+# When the first run of this version started (an install or an upgrade): for some minutes after it the
+# `tx` prefilter checks that the template lookup runs on the indexers (tenx_prefilter.py).
+STATE_VERSION_SINCE = 'version_since'
+# When the last load from a given index time (the `from` parameter: the step after the store was emptied or
+# restored) started: the `tx` prefilter uses no template answer it kept from before then
+# (tenx_prefilter_parser.cache_valid_from).
+STATE_DICT_RESET = 'dict_reset'
 STATUS_CURRENT = 'current'
 STATUS_LOADING = 'loading'
 STATUS_FAILED = 'failed'
@@ -384,6 +434,9 @@ class TemplateStore:
 		self.seconds['find'] += time.time() - began
 		began = time.time()
 		writes = {}
+		# Taken before the records are built and saved, so every record of the chunk becomes readable
+		# after the start of its hour, which the prefilter's partial reads rely on.
+		hour = str(int(began) // 3600)
 
 		for record_key, pattern in valid:
 			key = self.kv_intf.kv_key(record_key)
@@ -393,6 +446,7 @@ class TemplateStore:
 			if record is not None:
 				record = dict(record)
 				record[self.kv_intf.KV_KEY] = key
+				record[tenx_dml_intf.STORED_HOUR] = hour
 				current[key] = record
 				writes[key] = record
 
@@ -562,10 +616,13 @@ def load_since(server_connection, store, state_intf, dml_intf, source, start_fro
 		start = 0
 		refresh_until = end
 		write_state(state_intf, state, **{STATE_VERSION: app_version(), STATE_REFRESH_UNTIL: end, STATE_LOADED_THROUGH: 0,
-			STATE_STATUS: STATUS_LOADING, STATE_DETAIL: 'reading every template record for version {}'.format(app_version())}, reset=True)
+			STATE_STATUS: STATUS_LOADING, STATE_DETAIL: 'reading every template record for version {}'.format(app_version()),
+			STATE_VERSION_SINCE: now}, reset=True)
 
 	started, ended = float(state.get(STATE_RUN_STARTED) or 0), float(state.get(STATE_RUN_ENDED) or 0)
 	marker = {STATE_RUN_STARTED: now}
+	if start_from is not None:
+		marker[STATE_DICT_RESET] = now
 	if started > ended:
 		cut = ("the run that started at {} did not finish (stopped by the alert action's maxtime or a restart); "
 			"this run continues from the checkpoint").format(time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(started)))
@@ -595,7 +652,7 @@ def load_since(server_connection, store, state_intf, dml_intf, source, start_fro
 		count = 0
 		slice_began = time.time()
 		if planned:
-			search = 'search {} _index_earliest={} _index_latest={} | fields templateHash, template, _indextime | fields - _raw'.format(source, int(a), int(b))
+			search = 'search {} _index_earliest={} _index_latest={} | {} | fields templateHash, template, _indextime | fields - _raw'.format(source, int(a), int(b), NULL_TEMPLATE_EVAL)
 			chunk = []
 			refresh = a < refresh_until
 			for result in export_results(server_connection, search):
@@ -716,7 +773,7 @@ def update_kv_store(settings):
 		if 'templateHash' in (reader.fieldnames or []):
 			records = []
 			for result in reader:
-				records.append((result.get('templateHash'), result.get('template')))
+				records.append(record_of(result))
 				if len(records) >= CHUNK_RECORDS:
 					store.store(records)
 					records = []

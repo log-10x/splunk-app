@@ -1,12 +1,9 @@
 """
 Which indexed fields the clearing step of the field replay keeps, run through the SPL model
 (tests/support/spl_model.py). Indexed fields are set per event by whoever sent it, so the list is
-kept per original sourcetype (build() keep_by_sourcetype): a field map that writes `app` as an
+kept per original sourcetype (build() keep_by_sourcetype): a sender that writes `app` as an
 indexed field on FortiGate events is no reason to keep the `app` that Splunk set on a Windows
-compact event when it read the compact text (Splunk Enterprise 10.4.3, 662 Windows Security
-events with FortiGate field map sourcetypes named in tenx-events: 142 events kept
-app=win:unknown where raw has win:remote, 177 of 183 fields equal to raw; 180 with the list per
-sourcetype).
+compact event when it read the compact text.
 
 The stand-in for Splunk's extract adds each value it finds to a field that already exists, as
 measured on Splunk Enterprise 10.4.3 for an extraction with MV_ADD.
@@ -77,8 +74,7 @@ PRESENT = [('win', 'XmlWinEventLog:Security', 'dc01'), ('fgt', 'fgt.log', 'fw1')
 
 def model(full, units=None):
 	conf = macros_conf()
-	macros = dict((n, conf.get(n, 'definition')) for n in ('tenx-mapped-hide', 'tenx-mapped-restore', 'tenx-whole-hide',
-														  'tenx-whole-restore'))
+	macros = dict((n, conf.get(n, 'definition')) for n in ('tenx-whole-hide', 'tenx-whole-restore'))
 	macros.update({'tenx-inflate': 'inflatemodel', 'tenx-replay': full, 'tenx-replay-tags': ' | '.join(b.TAGS_STEPS)})
 	macros.update(units or {})
 	return Model(commands={'extract': extract, 'typer': typer, 'tags': lambda e, _: None,
@@ -173,21 +169,25 @@ searches = []
 def rest(path, data=None, method=None):
 	if 'conf-fields' in path:
 		return {'entry': [{'name': 'declared', 'content': {'INDEXED': 'true'}}, {'name': 'other', 'content': {}}]}
+	if path.endswith('/configs/conf-macros/tenx-extract'):
+		# a field an earlier run held, which no event of this sample carries
+		return {'entry': [{'content': {'definition': tenxreplay.builder.tx_extract(['before', 'srcip'])}}]}
 	s = data['search']
 	searches.append(s)
 	if 'dedup index host source sourcetype | fieldsummary' in s:
 		# the most recent event of each sender: one sender writes the indexed field rare
 		return {'results': [{'field': f} for f in ('host', 'rare', 'env')]}
 	if 'fieldsummary' in s:
-		return {'results': [{'field': f} for f in ('app', 'env', 'host', 'tenx_sourcetype', 'srcip', 'date_hour')]}
+		return {'results': [{'field': f} for f in ('app', 'env', 'host', 'tenx_sourcetype', 'srcip', 'date_hour',
+												   'eventtype', 'tag')]}
 	if s.startswith('| tstats max(_time)'):
 		return {'results': [{'index': 'ix', 'host': 'fw1', 'source': 'a.log', 'sourcetype': 'tenx_encoded', 't': '1590998439.250'},
 							{'index': 'ix', 'host': 'fw`2', 'source': 'b.log', 'sourcetype': 'tenx_encoded', 't': '1590998400'},
 							{'index': 'ix', 'host': 'fw"3', 'source': 'c.log', 'sourcetype': 'tenx_encoded', 't': '1590998401'}]}
 	if s.endswith('by tenx_sourcetype'):
-		return {'results': [{'tenx_sourcetype': 'fgt', 'f0': '0', 'f1': '1', 'f2': '1', 'f3': '1'},
-							{'tenx_sourcetype': 'win', 'f0': '0', 'f1': '1', 'f2': '0', 'f3': '0'}]}
-	return {'results': [{'f0': '3', 'f1': '2', 'f2': '1', 'f3': '1'}]}
+		return {'results': [{'tenx_sourcetype': 'fgt', 'f0': '0', 'f1': '1', 'f2': '1', 'f3': '1', 'f4': '1'},
+							{'tenx_sourcetype': 'win', 'f0': '0', 'f1': '0', 'f2': '1', 'f3': '0', 'f4': '0'}]}
+	return {'results': [{'f0': '3', 'f1': '1', 'f2': '2', 'f3': '1', 'f4': '1'}]}
 
 cmd._rest = rest
 cmd._metadata = types.SimpleNamespace(searchinfo=types.SimpleNamespace(
@@ -203,17 +203,242 @@ def test_the_command_counts_indexed_fields_per_original_sourcetype():
 	assert proc.returncode == 0, proc.stderr
 	out = json.loads(proc.stdout.strip().splitlines()[-1])
 	every, declared, by_st = out['got']
-	# app, env, rare and srcip are indexed somewhere (the prefilter's list); declared is fields.conf INDEXED = true
-	assert every == ['app', 'declared', 'env', 'rare', 'srcip'] and declared == ['declared']
-	# per sourcetype, over the events the replay works on: no field-map event (tenx_mapped)
-	assert by_st == {'fgt': ['env', 'rare', 'srcip'], 'win': ['env']}
-	assert out['searches'][0] == 'search `tenx-events` | head 1000 | fieldsummary | fields field'
+	# app, before, env, rare and srcip are indexed somewhere (the prefilter's list); declared is fields.conf
+	# INDEXED = true; Splunk's eventtype and tag are never counted
+	assert every == ['app', 'before', 'declared', 'env', 'rare', 'srcip'] and declared == ['declared']
+	# per sourcetype, over the events the replay works on
+	assert by_st == {'fgt': ['before', 'env', 'rare', 'srcip'], 'win': ['env']}
+	# one event of each template and sender among the most recent
+	assert out['searches'][0] == ('search `tenx-events` | head 100000 | eval tenx_th=if(match(_raw, "^~[^,]"), '
+		'replace(_raw, "^~([^,]+)[\\s\\S]*$", "\\1"), "-") | dedup tenx_th index host source sourcetype '
+		'| fieldsummary | fields field')
 	assert out['searches'][1] == '| tstats max(_time) as t where `tenx-events` by index host source sourcetype'
 	# the most recent event of each sender, one second of it; a value with a backtick is left out (a macro), a
 	# double quote is escaped
 	assert out['searches'][2] == ('search `tenx-events` ((index="ix" host="fw1" source="a.log" sourcetype="tenx_encoded" '
 		'earliest=1590998439 latest=1590998440) OR (index="ix" host="fw\\"3" source="c.log" sourcetype="tenx_encoded" '
 		'earliest=1590998401 latest=1590998402)) | dedup index host source sourcetype | fieldsummary | fields field')
-	funcs = 'dc("app") as f0, dc("env") as f1, dc("rare") as f2, dc("srcip") as f3'
+	funcs = 'dc("app") as f0, dc("before") as f1, dc("env") as f2, dc("rare") as f3, dc("srcip") as f4'
 	assert out['searches'][3] == '| tstats %s where `tenx-events`' % funcs
-	assert out['searches'][4] == '| tstats %s where `tenx-events` NOT tenx_mapped=* by tenx_sourcetype' % funcs
+	assert out['searches'][4] == '| tstats %s where `tenx-events` by tenx_sourcetype' % funcs
+
+
+# The names of every original sourcetype in every index, whichever sends most: the newest compact events are all
+# of one source, the others' templates are older, and some of their names are only in the index's lexicon.
+EVERY_SOURCE = CHILD.split('cmd = tenxreplay.TenxReplayCommand()')[0] + r'''
+import urllib.error
+
+EVERY_OTHER = ('NOT ((index=sy tenx_sourcetype::XmlWinEventLog) OR (index=wx tenx_sourcetype::XmlWinEventLog) '
+			   'OR (index=au tenx_sourcetype::linux:audit))')
+SAMPLED = {'index=sy tenx_sourcetype::XmlWinEventLog': ['Image'], 'index=wx tenx_sourcetype::XmlWinEventLog': ['TargetLogonId'],
+		   'index=au tenx_sourcetype::linux:audit': ['exit'], EVERY_OTHER: ['k8s_ns']}
+CARRIED = {'XmlWinEventLog': {'SidHistory', 'NewSd', 'TargetLogonId', 'Image'}, 'linux:audit': {'exit'}, '': {'k8s_ns'}}
+
+def answer(walklex):
+	searches = []
+	def rest(path, data=None, method=None):
+		if 'conf-fields' in path:
+			return {'entry': []}
+		if path.endswith('/configs/conf-macros/tenx-extract'):
+			return {'entry': [{'content': {'definition': 'extract'}}]}
+		s = data['search']
+		searches.append(s)
+		if s.startswith('| walklex'):
+			if not walklex:
+				raise urllib.error.HTTPError(path, 400, 'Unknown search command', {}, None)
+			if walklex == 'unnamed':
+				return {'results': [{'field': 'tenx_no_name', 'count': '3'}]}
+			# each name with a space before it, as Splunk 10.4.3 writes them
+			return {'results': [{'field': ' ' + t} for t in ('SidHistory', 'NewSd', 'host', 'raw_only')]}
+		if 'dedup tenx_th' in s:
+			part = s.split('`tenx-events` ', 1)[1].split(' | head', 1)[0]
+			return {'results': [{'field': f} for f in SAMPLED[part]]}
+		if 'fieldsummary' in s or s.startswith('| tstats max(_time)'):
+			return {'results': []}
+		names = dict(re.findall(r'dc\("([^"]+)"\) as (f\d+)', s))
+		inverse = dict((f, n) for n, f in names.items())
+		def row(sts):
+			return dict((f, '1' if any(inverse[f] in CARRIED[st] for st in sts) else '0') for f in inverse)
+		if s.endswith('by tenx_sourcetype'):
+			return {'results': [dict(row([st]), tenx_sourcetype=st) for st in CARRIED if st]}
+		return {'results': [row(list(CARRIED))]}
+	return rest, searches
+
+import re
+out = {}
+for walklex in (True, False, 'unnamed'):
+	cmd = tenxreplay.TenxReplayCommand()
+	cmd._rest, searches = answer(walklex)
+	warnings = []
+	cmd.logger.warning = lambda *a: warnings.append(a[0] % a[1:] if len(a) > 1 else a[0])
+	cmd._metadata = types.SimpleNamespace(searchinfo=types.SimpleNamespace(
+		username='splunk-system-user', splunkd_uri='https://127.0.0.1:8089', session_key='key'))
+	got = cmd._indexed_fields('0', None, (), groups=[('XmlWinEventLog', 'wx'), ('XmlWinEventLog', 'sy'),
+													 ('linux:audit', 'au'), ('odd name', 'wx')],
+							  indexes={'wx': 10, 'sy': 20, 'au': 5, 'bad index': 1})
+	out[str(walklex)] = {'got': got, 'searches': searches, 'warnings': warnings}
+print(json.dumps(out))
+'''
+
+
+def every_source():
+	with tempfile.TemporaryDirectory() as home:
+		proc = subprocess.run([sys.executable, '-c', EVERY_SOURCE, ROOT, home], capture_output=True, text=True,
+							  timeout=60)
+	assert proc.returncode == 0, proc.stderr[-3000:]
+	return json.loads(proc.stdout.strip().splitlines()[-1])
+
+
+class TestTheNamesOfEveryOriginalSourcetype:
+	def test_each_sourcetype_is_sampled_and_the_lexicon_read(self):
+		out = every_source()['True']
+		every, _, by_st = out['got']
+		# SidHistory and NewSd are only in the lexicon; raw_only is there and no compact event carries it
+		assert every == ['Image', 'NewSd', 'SidHistory', 'TargetLogonId', 'exit', 'k8s_ns']
+		assert by_st == {'XmlWinEventLog': ['Image', 'NewSd', 'SidHistory', 'TargetLogonId'], 'linux:audit': ['exit']}
+		assert out['searches'][0] == ('| walklex type=field index=au index=sy index=wx | fillnull value=tenx_no_name field '
+									  '| stats count by field | fields field')
+		assert out['warnings'] == []
+		# one sample per original sourcetype and index, and one for every other compact event
+		sample = ('search `tenx-events` %s | head 100000 | eval tenx_th=if(match(_raw, "^~[^,]"), '
+				  'replace(_raw, "^~([^,]+)[\\s\\S]*$", "\\1"), "-") | dedup tenx_th index host source sourcetype '
+				  '| fieldsummary | fields field')
+		assert out['searches'][1:5] == [sample % p for p in (
+			'index=sy tenx_sourcetype::XmlWinEventLog', 'index=wx tenx_sourcetype::XmlWinEventLog',
+			'index=au tenx_sourcetype::linux:audit', 'NOT ((index=sy tenx_sourcetype::XmlWinEventLog) OR '
+			'(index=wx tenx_sourcetype::XmlWinEventLog) OR (index=au tenx_sourcetype::linux:audit))')]
+
+	def test_rows_without_a_name_are_reported(self):
+		out = every_source()['unnamed']
+		assert out['got'][0] == ['Image', 'TargetLogonId', 'exit', 'k8s_ns']
+		assert [w for w in out['warnings'] if 'walklex returned rows without a field name' in w]
+
+	def test_without_walklex_the_samples_still_count(self):
+		every, _, by_st = every_source()['False']['got']
+		assert every == ['Image', 'TargetLogonId', 'exit', 'k8s_ns']
+		assert by_st == {'XmlWinEventLog': ['Image', 'TargetLogonId'], 'linux:audit': ['exit']}
+
+
+FROM_THE_REBUILD = r'''
+fake = FakeSplunk([('XmlWinEventLog', 'XmlWinEventLog:Security', 'dc1', 5, 'wx', True),
+				   ('linux:audit', '/var/log/audit/audit.log', 'h1', 3, 'au', True)])
+run(fake)
+print(json.dumps([s for s, _ in fake.searches if s.startswith('| walklex') or 'dedup tenx_th' in s]))
+'''
+
+
+def test_the_rebuild_reads_the_names_of_each_sourcetype_and_index():
+	from test_replay_coverage_record import child_run
+	searches = child_run(FROM_THE_REBUILD)
+	assert searches[0] == ('| walklex type=field index=au index=wx | fillnull value=tenx_no_name field | stats count by field '
+						   '| fields field')
+	assert [s.split(' | head')[0] for s in searches[1:]] == [
+		'search `tenx-events` index=wx tenx_sourcetype::XmlWinEventLog',
+		'search `tenx-events` index=au tenx_sourcetype::linux:audit',
+		'search `tenx-events` NOT ((index=wx tenx_sourcetype::XmlWinEventLog) OR (index=au tenx_sourcetype::linux:audit))']
+
+
+# Each rebuild samples only what it has not sampled: a new pair, and the templates stored since the last sample.
+REBUILDS = r'''
+import time
+fake = FakeSplunk([('XmlWinEventLog', 'XmlWinEventLog:Security', 'dc1', 5, 'wx', True),
+				   ('linux:audit', '/var/log/audit/audit.log', 'h1', 3, 'au', True)])
+out = []
+def rebuild():
+	run(fake)
+	out.append({'samples': [s.split(' | head')[0][len('search `tenx-events` '):] for s, _ in fake.searches if 'dedup tenx_th' in s],
+				'searches': len(fake.searches), 'recorded': [w for w in fake.writes if w[1] == 'tenx:sampled']})
+rebuild()
+rebuild()
+fake.stored = [{'pattern_hash': 'h new', 'stored_hour': str(int(time.time()) // 3600)}]
+rebuild()
+fake.stored = []
+fake.rows.append(('XmlWinEventLog', 'XmlWinEventLog:Microsoft-Windows-Sysmon/Operational', 'dc1', 9, 'sy', True))
+rebuild()
+fake.conf['tenx:sampled']['began'] = str(int(time.time()) - 8 * 86400)
+rebuild()
+print(json.dumps(out))
+'''
+
+
+def test_a_rebuild_samples_only_what_is_new():
+	from test_replay_coverage_record import child_run
+	first, quiet, template, pair, week = child_run(REBUILDS)
+	every = ['index=wx tenx_sourcetype::XmlWinEventLog', 'index=au tenx_sourcetype::linux:audit',
+			 'NOT ((index=wx tenx_sourcetype::XmlWinEventLog) OR (index=au tenx_sourcetype::linux:audit))']
+	assert sorted(first['samples']) == sorted(every) and first['recorded']
+	# nothing new: no sample, nothing recorded
+	assert quiet['samples'] == [] and quiet['recorded'] == []
+	# one new template: one read of its events
+	assert template['samples'] == ['("~h new")'] and template['recorded']
+	# a new pair: its sample alone
+	assert pair['samples'] == ['index=sy tenx_sourcetype::XmlWinEventLog']
+	# a sample older than the rebuild's window is taken again
+	assert len(week['samples']) == 4
+
+
+# The rebuild through its own requests: every URL it builds is answered as splunkd answers it, refused when it
+# names a query key twice (splunkd 10.4.3: "Must provide one value for output mode (got 2).").
+THROUGH_REQUESTS = r'''
+import io, time, urllib.error, urllib.request
+
+repeated = []
+
+class Response(io.BytesIO):
+	def __enter__(self):
+		return self
+
+	def __exit__(self, *a):
+		return False
+
+def urlopen(request, context=None, timeout=None):
+	url = urllib.parse.urlsplit(request.full_url)
+	keys = [k for k, _ in urllib.parse.parse_qsl(url.query, keep_blank_values=True)]
+	if len(keys) != len(set(keys)):
+		repeated.append(url.path)
+		raise urllib.error.HTTPError(request.full_url, 400, 'Must provide one value for output mode (got 2).', {}, None)
+	data = dict(urllib.parse.parse_qsl(request.data.decode())) if request.data else None
+	method = 'DELETE' if request.get_method() == 'DELETE' else None
+	return Response(json.dumps(fake.rest(url.path + ('?' + url.query if url.query else ''), data, method)).encode())
+
+urllib.request.urlopen = urlopen
+
+def rebuild():
+	cmd = tenxreplay.TenxReplayCommand()
+	cmd._metadata = types.SimpleNamespace(searchinfo=types.SimpleNamespace(
+		username='splunk-system-user', splunkd_uri='https://127.0.0.1:8089', session_key='key',
+		earliest_time='-7d', latest_time='now'))
+	cmd._apply, cmd._only_new, cmd._lookback = True, False, '-7d'
+	warnings = []
+	cmd.logger.warning = lambda *a: warnings.append(a[0] % a[1:] if len(a) > 1 else a[0])
+	fake.searches, fake.writes = [], []
+	list(cmd.generate())
+	return {'samples': len([s for s, _ in fake.searches if 'dedup tenx_th' in s]), 'warnings': warnings}
+
+fake = FakeSplunk([('XmlWinEventLog', 'XmlWinEventLog:Security', 'dc1', 5, 'wx', True),
+				   ('linux:audit', '/var/log/audit/audit.log', 'h1', 3, 'au', True)])
+out = {'first': rebuild(), 'quiet': rebuild()}
+fake.stored = [{'pattern_hash': 'h new', 'stored_hour': str(int(time.time()) // 3600)}]
+out['template'] = rebuild()
+out['repeated'] = sorted(set(repeated))
+print(json.dumps(out))
+'''
+
+
+class TestTheRebuildsOwnRequests:
+	ran = {}
+
+	def out(self):
+		from test_replay_coverage_record import child_run
+		if not self.ran:
+			self.ran.update(child_run(THROUGH_REQUESTS))
+		return self.ran
+
+	def test_no_request_names_a_query_key_twice(self):
+		assert self.out()['repeated'] == []
+
+	def test_a_run_with_nothing_new_reads_the_store_and_samples_nothing(self):
+		out = self.out()
+		assert out['first']['samples'] == 3
+		assert out['quiet'] == {'samples': 0, 'warnings': []}
+		assert out['template']['samples'] == 1

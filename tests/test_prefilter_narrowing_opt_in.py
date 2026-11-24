@@ -98,14 +98,16 @@ class TestOffMatchesTheBaseline:
 		assert new.narrowing_on({'field_narrowing': 'true'}) and new.narrowing_on({'field_narrowing': '1'})
 
 
-class TestTheListIsWrittenOnlyWhenWanted:
-	def test_off_or_without_a_carrier_no_list(self):
+class TestTheListIsWrittenWhateverTheSetting:
+	# The prefilter reads field_narrowing from the files on disk; tenxreplay read it through splunkd, which
+	# does not see a file edited in local/ until a reload, so `true` set that way had no list (Splunk
+	# Enterprise 10.4.3, FortiGate: no field comparison narrowed). The list now follows the carrier alone.
+	def test_written_whenever_a_compact_event_carries_its_sourcetype(self):
 		with_carrier = b.build([b.Stanza('st', {'EVAL-x': '1'}, {})], [('st', 's', 'h')])
 		without = b.build([], [])
-		assert not b.narrowing_wanted({}, with_carrier)
-		assert not b.narrowing_wanted({'field_narrowing': 'false'}, with_carrier)
-		assert not b.narrowing_wanted({'field_narrowing': 'true'}, without)
-		assert b.narrowing_wanted({'field_narrowing': 'true'}, with_carrier)
+		for config in ({}, {'field_narrowing': 'false'}, {'field_narrowing': 'true'}, {'field_narrowing': 'splunk'}, None):
+			assert b.narrowing_wanted(config, with_carrier)
+			assert not b.narrowing_wanted(config, without)
 
 
 def narrowed(text):

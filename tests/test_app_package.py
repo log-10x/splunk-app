@@ -57,7 +57,9 @@ class TestDashboardsFindCompactEvents:
 		# A compact event is marked extracted (_kv) before expansion; without dropping the
 		# mark, extract does nothing and every field=value term on key=value text returns 0.
 		tx = conf('macros.conf').get('tx', 'definition')
-		assert '| `tenx-inflate` | `tenx-mapped-hide` | `tenx-whole-hide` | fields - _kv | extract |' in tx
+		assert '| `tenx-inflate` | `tenx-whole-hide` | fields - _kv | `tenx-extract` |' in tx
+		# shipped, the extraction is plain `extract`; tenxreplay writes the indexed fields around it
+		assert conf('macros.conf').get('tenx-extract', 'definition') == 'extract'
 		# spath on non-JSON text invents fields, and on JSON doubles what extract finds.
 		assert 'spath' not in tx
 
@@ -65,7 +67,7 @@ class TestDashboardsFindCompactEvents:
 		macros = conf('macros.conf')
 		for name in ('txf', 'txf(1)'):
 			txf = macros.get(name, 'definition')
-			assert '| `tenx-inflate` | fields - _kv | `tenx-mapped-hide` | `tenx-whole-hide` | `tenx-replay' in txf, name
+			assert '| `tenx-inflate` | fields - _kv | `tenx-whole-hide` | `tenx-replay' in txf, name
 			assert 'spath' not in txf, name
 		# The shipped replay is exactly the extraction `tx` runs; tenxreplay writes the rest.
 		assert macros.get('tenx-replay', 'definition').count('| extract |') == 1
@@ -245,23 +247,13 @@ class TestScheduledRecompile:
 
 	def test_the_field_replay_is_rebuilt_on_a_schedule(self):
 		saved = conf('savedsearches.conf')
-		# by index time, over every event date: events dated a year ago or ahead are found when indexed
-		assert saved.get('Rebuild Field Replay', 'search').strip() == '| tenxreplay by_index_time=true'
+		# by index time, over every event date: events dated a year ago or ahead are found when indexed; the hourly
+		# run rebuilds only when something it reads changed
+		assert saved.get('Rebuild Field Replay', 'search').strip() == '| tenxreplay by_index_time=true skip_unchanged=true'
 		assert saved.get('Rebuild Field Replay When New', 'search').strip() == '| tenxreplay only_new=true by_index_time=true'
 		assert saved.get('Rebuild Field Replay', 'enableSched') == '1'
 		assert conf('commands.conf').get('tenxreplay', 'filename') == 'tenxreplay.py'
 		assert os.path.exists(os.path.join(APP, 'bin', 'tenxreplay.py'))
-
-	def test_events_a_field_map_lookup_drops_are_reported_on_a_schedule(self):
-		saved = conf('savedsearches.conf')
-		ss = dict(saved.items('Field Map Dropped Events'))
-		assert ss['enableSched'] == '1' and ss['cron_schedule'] == '*/5 * * * *' and ss['alert.track'] == '1'
-		assert (ss['dispatch.earliest_time'], ss['dispatch.latest_time']) == ('-5m@m', '@m')
-		# the splunkd.log line of a dropped event, held to the compact sourcetypes of field maps, by node
-		assert ss['search'].startswith('index=_internal sourcetype=splunkd "Runtime exception" "processor=regexreplacement"')
-		assert '_fields_eval' in ss['search'] and 'BY host, compact_sourcetype' in ss['search']
-		import tenx_field_map as fm
-		assert '"processor=regexreplacement"' in fm.DROP_SEARCH and 'by host' in fm.DROP_SEARCH
 
 	def test_the_conf_the_replay_writes_is_declared(self):
 		spec = open(os.path.join(APP, 'README', 'tenx_replay.conf.spec')).read()

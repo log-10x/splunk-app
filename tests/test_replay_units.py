@@ -43,13 +43,15 @@ TX_SHIPPED = ('`tenx-events` [| tenxprefilter] | `tenx-inflate` | fields - _kv |
 REFUSED_STEP = ' | eval tenx_expand_refused=if(len(tenx_expand_refused)>0, tenx_expand_refused, null())'
 # Then the wildcard filter (b.WILD_STEP): a word with a wildcard inside it matched as a base search on the
 # index matches it, not as its prefix alone (test_wildcard_inside_a_word.py).
-# [tx] now: the same, with the field-map guard around `extract` and REFUSED_STEP before the final
+# [tx] now: the same, with the whole-event guard around `extract` and REFUSED_STEP before the final
 # search (see TestTxIsTheShippedMacro)
-TX_DEFINITION = ('`tenx-events` [| tenxprefilter] | eval tenx_passed=if(match(_raw, "^~"), null(), 1) | `tenx-inflate` | '
-				 '`tenx-mapped-hide` | `tenx-whole-hide` | fields - _kv | extract | `tenx-whole-restore` | '
-				 '`tenx-mapped-restore` | fields - tenx_hash, tenx_var_0, tenx_vars' + REFUSED_STEP + b.WILD_STEP + ' | search *')
-# the field-map guard, and the whole-event guard with the marks that select its events
-GUARD_CALLS = (' | `tenx-mapped-hide`', ' | `tenx-mapped-restore`', ' | `tenx-whole-hide`', ' | `tenx-whole-restore`',
+TX_DEFINITION = ('((`tenx-events`) OR (`tenx-raw-events`)) [| tenxprefilter] | eval tenx_passed=if(match(_raw, "^~"), null(), 1) | `tenx-inflate` | '
+				 '`tenx-whole-hide` | fields - _kv | `tenx-extract` | `tenx-whole-restore` | '
+				 'fields - tenx_hash, tenx_var_0, tenx_vars' + REFUSED_STEP + b.WILD_STEP + ' | search *')
+# The macro `tx` calls in place of `extract`, shipped as `extract` (test_original_sourcetype.py).
+EXTRACT_CALL = '`tenx-extract`'
+# the whole-event guard with the marks that select its events
+GUARD_CALLS = (' | `tenx-whole-hide`', ' | `tenx-whole-restore`',
 			   ' | eval tenx_passed=if(match(_raw, "^~"), null(), 1)',
 			   ', tenx_passed=if(match(_raw, "^~") OR isnotnull(tenx_sourcetype), null(), 1)')
 
@@ -57,15 +59,16 @@ GUARD_CALLS = (' | `tenx-mapped-hide`', ' | `tenx-mapped-restore`', ' | `tenx-wh
 def without_guard(definition):
 	for call in GUARD_CALLS:
 		definition = definition.replace(call, '')
-	return definition
+	return definition.replace(EXTRACT_CALL, 'extract')
 
 
 # The empty-expansion guard of tenx-inflate and tenx-inflate-debug (test_inflate_one_row_no_silent_empty.py),
 # as the expansion was written before it: the text went straight to _raw.
 EMPTY_GUARD = (' | eval tenx_expand_refused=case(isnull(tenx_log_term) AND match(_raw, "^~"), "no-template",'
-	' isnotnull(tenx_log_term) AND coalesce(len(tenx_text),0)==0,'
+	' isnotnull(tenx_log_term) AND coalesce(len(tenx_text),0)==0 AND NOT (isnotnull(tenx_text) AND tenx_log_term==""'
+	' AND isnull(tenx_log_parts) AND tenx_part_0==""),'
 	' if(len(mvjoin(tenx_expand_refused,""))>0, tenx_expand_refused, "empty-expansion"), true(), tenx_expand_refused),'
-	' _raw=if(len(tenx_text)>0, tenx_text, _raw)')
+	' _raw=if(len(tenx_text)>0 OR (isnotnull(tenx_text) AND len(coalesce(mvjoin(tenx_expand_refused,""),""))==0), tenx_text, _raw)')
 
 # The rows the template lookup matched, and each row's values once (test_inflate_one_row_no_silent_empty.py).
 ROWS_OUTPUT = 'OUTPUT _key AS tenx_rows, part_0 AS tenx_part_0, '
@@ -75,6 +78,21 @@ ONE_COPY = (' | eval tenx_n=mvcount(tenx_rows)'
 	' tenx_log_term=if(tenx_n>1, coalesce(mvindex(tenx_log_term, 0), ""), tenx_log_term),'
 	' tenx_ts_f=if(tenx_n>1, coalesce(mvindex(tenx_ts_f, 0), ""), tenx_ts_f),'
 	' tenx_expand_refused=if(tenx_n>1, coalesce(mvindex(tenx_expand_refused, 0), ""), tenx_expand_refused)')
+
+
+# The sub-second step of tenx-inflate and tenx-inflate-debug (test_raw_events_and_left_out.py), and the comment
+# above the macros that says why.
+SUBSECOND_STEP = (', _subsecond=if(len(tenx_text)>0 AND len(tenx_ts_f)>0 AND tenx_ts_f!="__TENX_EPOCH__" AND '
+				  'NOT match(tenx_ts_f, "%\\d+Q"), null(), _subsecond)')
+
+
+def without_subsecond(text):
+	lines = text.split('\n')
+	if '# Sub-seconds. tenx-event-time (transforms.conf) gives every compact event with a timestamp a time with a' in lines:
+		start = lines.index('# Sub-seconds. tenx-event-time (transforms.conf) gives every compact event with a timestamp a time with a')
+		end = lines.index('#', start)
+		lines = lines[:start] + lines[end + 1:]
+	return '\n'.join(lines).replace(SUBSECOND_STEP, '')
 
 
 def without_empty_guard(text):
@@ -88,6 +106,36 @@ def without_empty_guard(text):
 # from _raw, and the comment above the macros that says why.
 VALUES_STEP = 'eval tenx_vars=if(match(_raw, "^~?[^,]+,[^,]+,[\\s\\S]"), replace(_raw, "^~?[^,]+,[^,]+,", ""), tenx_vars) | ' \
 	'eval tenx_var_0=if(match(_raw, "^~?[^,]+,[^,]"), replace(_raw, "^~?[^,]+,([^,]*)[\\s\\S]*$", "\\1"), tenx_var_0) | '
+# The step of both inflate macros that splits the values (test_inflate_values_from_raw.py).
+SPLIT_STEP = 'eval tenx_vars=split(nullif(trim(replace(tenx_vars, ",,+", ","), ","), ""), ",")'
+
+
+# The comment over the inflate macros on events sent as their own text, and the leading "~" those macros require
+# where e12ec4e had it optional (test_text_events.py).
+TEXT_EVENTS_NOTE = '# Events sent as text. A line that does not start with ~ is an event the Receiver sent as its own'
+
+
+def without_text_events(text):
+	lines = text.split('\n')
+	if TEXT_EVENTS_NOTE in lines:
+		start = lines.index(TEXT_EVENTS_NOTE)
+		end = lines.index('#', start)
+		lines = lines[:start] + lines[end + 1:]
+	return '\n'.join(lines).replace('match(_raw, "^~[^,]', 'match(_raw, "^~?[^,]').replace('replace(_raw, "^~[^,]', 'replace(_raw, "^~?[^,]')
+
+
+TRAILING_CR_NOTE = '# The last CR. An engine that reads a CR LF line end as one line break keeps the CR in the template, so the'
+TRAILING_CR_STEP = ' | eval tenx_text=replace(tenx_text, "\\r(?![\\s\\S])", "")'
+
+
+def without_trailing_cr(text):
+	"""The inflate macros without the step that drops the CR at the end of the text (test_inflate_trailing_cr.py)."""
+	lines = text.split('\n')
+	if TRAILING_CR_NOTE in lines:
+		start = lines.index(TRAILING_CR_NOTE)
+		end = lines.index('#', start)
+		lines = lines[:start] + lines[end + 1:]
+	return '\n'.join(lines).replace(TRAILING_CR_STEP, '')
 
 
 def without_values_from_raw(text):
@@ -97,6 +145,45 @@ def without_values_from_raw(text):
 		end = lines.index('#', start)
 		lines = lines[:start] + lines[end + 1:]
 	return '\n'.join(lines).replace('definition = ' + VALUES_STEP, 'definition = ')
+
+
+def without_split(text):
+	"""The stanza with the values split by makemv, as shipped: the split step and its comment block back out."""
+	lines = text.split('\n')
+	head = '# The values are split in eval, empty values dropped (runs of commas made one, and the commas at both'
+	if head in lines:
+		start = lines.index(head)
+		end = lines.index('#', start)
+		lines = lines[:start] + lines[end + 1:]
+	return '\n'.join(lines).replace(SPLIT_STEP, 'makemv delim="," tenx_vars')
+
+
+# The step of both inflate macros that reads the template hash from _raw, and the comment above them that says
+# why (test_original_sourcetype.py).
+HASH_NOTE = "# The template hash. Splunk's extraction gives tenx_hash only to an event of a sourcetype whose props carry"
+HASH_STEP = (' | eval tenx_hash=if(isnull(tenx_hash) AND match(_raw, "^~[^,]"), '
+			 'nullif(trim(replace(_raw, "^~([^,]+)[\\s\\S]*$", "\\1")), ""), tenx_hash)')
+
+
+def without_hash_step(text):
+	lines = text.split('\n')
+	if HASH_NOTE in lines:
+		start = lines.index(HASH_NOTE)
+		end = lines.index('#', start)
+		lines = lines[:start] + lines[end + 1:]
+	return '\n'.join(lines).replace(HASH_STEP, '')
+
+
+# tenx-events with the marker term, and the lines of its comment on it (test_original_sourcetype.py).
+MARKER_LINES = """# It also finds every event that carries the indexed field tenx_sourcetype, which is how an
+# event indexed under its original sourcetype (transforms.conf [tenx-original-sourcetype])
+# is found: tenx_sourcetype::* is looked up in the index terms, as sourcetype:: is.
+"""
+
+
+def without_marker(text):
+	return text.replace(MARKER_LINES, '').replace(' OR tenx_sourcetype::*)', ')').replace(
+		'definition = index=* (sourcetype::tenx_encoded)', 'definition = index=* sourcetype::tenx_encoded')
 
 
 def macros():
@@ -118,14 +205,13 @@ def stanza_text(text, name):
 	return '\n'.join(lines[start:end])
 
 
-def mapped_guard_macros():
-	"""tenx-mapped-hide and tenx-mapped-restore as macros.conf defines them, for the SPL model."""
+def guard_macros():
+	"""tenx-whole-hide and tenx-whole-restore as macros.conf defines them, for the SPL model."""
 	import configparser
 	import os
 	conf = configparser.RawConfigParser(strict=False)
 	conf.read(os.path.join(os.path.dirname(__file__), '..', 'tenx-for-splunk', 'default', 'macros.conf'))
-	return dict((n, conf.get(n, 'definition')) for n in ('tenx-mapped-hide', 'tenx-mapped-restore', 'tenx-whole-hide',
-														 'tenx-whole-restore'))
+	return dict((n, conf.get(n, 'definition')) for n in ('tenx-whole-hide', 'tenx-whole-restore'))
 
 
 class TestTheRefusedStep:
@@ -150,17 +236,16 @@ class TestTheRefusedStep:
 
 class TestTxIsTheShippedMacro:
 	"""
-	`tx` is the shipped macro with two additions: tenx-mapped-hide before its `extract` and
-	tenx-mapped-restore after it, for events indexed with a field map (tenx_mapped); and the same
-	for events the sender passed whole (tenx_passed, marked before the expansion). Each is a
-	foreach over tenx_mapped*, which runs only on a chunk of results holding such an event, and
-	each eval is guarded per event; TestTheMappedGuard runs both on events with and without it.
-	And REFUSED_STEP before its final search, which removes the empty tenx_expand_refused the
-	template lookup leaves on every expanded event (TestTheRefusedStep).
+	`tx` is the shipped macro with these additions: tenx-whole-hide before its `extract` and
+	tenx-whole-restore after it, for events the sender passed whole (tenx_passed, marked before the
+	expansion). And REFUSED_STEP before its final search, which removes the empty tenx_expand_refused the
+	template lookup leaves on every expanded event (TestTheRefusedStep). And it reads
+	(`tenx-events`) OR (`tenx-raw-events`), whose shipped definition selects no event.
 	"""
 	def test_the_definition(self):
 		assert macros().get('tx', 'definition') == TX_DEFINITION
-		assert without_guard(TX_DEFINITION).replace(REFUSED_STEP, '').replace(b.WILD_STEP, '') == TX_SHIPPED
+		assert without_guard(TX_DEFINITION).replace(REFUSED_STEP, '').replace(b.WILD_STEP, '').replace(
+			b.EVENTS, '`tenx-events`') == TX_SHIPPED
 
 	def test_every_other_shipped_stanza_is_unchanged_character_for_character(self):
 		try:
@@ -174,14 +259,17 @@ class TestTxIsTheShippedMacro:
 		shipped = configparser.RawConfigParser(strict=False)
 		shipped.read_string(base.stdout)
 		assert macros().get('tx', 'definition') != shipped.get('tx', 'definition')
-		assert without_guard(macros().get('tx', 'definition')).replace(REFUSED_STEP, '').replace(b.WILD_STEP, '') == (
-			shipped.get('tx', 'definition'))
+		assert without_guard(macros().get('tx', 'definition')).replace(REFUSED_STEP, '').replace(b.WILD_STEP, '').replace(
+			b.EVENTS, '`tenx-events`') == shipped.get('tx', 'definition')
 		# every other stanza shipped at e12ec4e is unchanged, its comments included; the two inflate
-		# macros differ by the empty-expansion guard (test_inflate_one_row_no_silent_empty.py) and by the
-		# values read from _raw (test_inflate_values_from_raw.py) alone
+		# macros differ by the empty-expansion guard (test_inflate_one_row_no_silent_empty.py), by the
+		# values read from _raw (test_inflate_values_from_raw.py), by the step that drops the last CR
+		# (test_inflate_trailing_cr.py), by the split of the values (test_inflate_values_from_raw.py), by the hash
+		# read from _raw (test_original_sourcetype.py) and by the sub-second step; tenx-events by its marker term
 		for name in shipped.sections():
 			if name != 'tx':
-				assert without_values_from_raw(without_empty_guard(stanza_text(ours, name))) == (
+				assert without_marker(without_split(without_values_from_raw(without_empty_guard(without_subsecond(
+					without_text_events(without_trailing_cr(without_hash_step(stanza_text(ours, name))))))))) == (
 					stanza_text(base.stdout, name)), name
 
 	def test_tx_runs_no_replay(self):
@@ -190,21 +278,23 @@ class TestTxIsTheShippedMacro:
 	def test_txf_is_tx_with_the_replay(self):
 		conf = macros()
 		mark = 'tenx_passed=if(match(_raw, "^~") OR isnotnull(tenx_sourcetype), null(), 1)'
-		head = ('`tenx-events` [| tenxprefilter] | eval tenx_compact_raw=_raw, %s | `tenx-inflate` | fields - _kv | '
-				'`tenx-mapped-hide` | `tenx-whole-hide` | ')
-		tail = (' | `tenx-whole-restore` | `tenx-mapped-restore` | fields - tenx_compact_raw, tenx_rst, tenx_hash, '
-				'tenx_var_0, tenx_vars' + REFUSED_STEP + b.WILD_STEP + ' | search *')
-		assert conf.get('txf', 'definition') == head % mark + '`tenx-replay`' + tail
+		head = ('((`tenx-events`) OR (`tenx-raw-events`)) [| tenxprefilter] | eval tenx_compact_raw=_raw, %s | `tenx-inflate` | fields - _kv | '
+				'`tenx-whole-hide` | ')
+		tail = (' | `tenx-whole-restore` | fields - tenx_compact_raw, tenx_rst, tenx_hash, '
+				'tenx_var_0, tenx_vars' + REFUSED_STEP + b.WILD_AFTER_PLAN + ' | search *')
+		tail = tail.replace('tenx_var_0, tenx_vars', 'tenx_var_0, tenx_vars, tenx_nd*')
+		# plain txf reads its replay plan right before the replay, and removes the plan's fields after it
+		assert conf.get('txf', 'definition') == head % mark + '`tenx-replay-plan` | `tenx-replay`' + tail
 		# Splunk Enterprise 10.4.3 refuses a colon in a macro name, so txf(1) computes the unit's
 		# name with md5() in eval; on 10.4.3, md5 in eval equals hashlib's for the five names tried
 		assert conf.get('txf(1)', 'iseval') == '1'
 		assert conf.get('txf(1)', 'definition') == b.TXF_ONE_UNIT == (
-			'"' + head % mark.replace('"', '\\"') + '`tenx-replay-u" . substr(md5("$st$"), 1, 12) . "` | `tenx-replay-tags`'
+			'"' + head % mark.replace('"', '\\"') + '`tenx-replay-u" . substr(md5("$st$"), 1, 12) . "` | `tenx-replay-plan` | `tenx-replay-tags`'
 			+ tail + '"')
 		assert without_guard(conf.get('txf', 'definition')) == (
-			'`tenx-events` [| tenxprefilter] | eval tenx_compact_raw=_raw | `tenx-inflate` | fields - _kv | '
-			'`tenx-replay` | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars' + REFUSED_STEP + b.WILD_STEP +
-			' | search *')
+			'((`tenx-events`) OR (`tenx-raw-events`)) [| tenxprefilter] | eval tenx_compact_raw=_raw | `tenx-inflate` | fields - _kv | '
+			'`tenx-replay-plan` | `tenx-replay` | fields - tenx_compact_raw, tenx_rst, tenx_hash, tenx_var_0, tenx_vars, tenx_nd*'
+			+ REFUSED_STEP + b.WILD_AFTER_PLAN + ' | search *')
 		assert conf.get('txf(1)', 'args') == 'st'
 		# shipped, the validation names no unit; tenxreplay writes the units it has written into it
 		assert conf.get('txf(1)', 'validation') == b.txf_one_validation([]) == (
@@ -274,7 +364,7 @@ class TestRewriteWithoutCarrierMatchesTheBaseline:
 	def test_an_index_the_record_does_not_know_gets_the_full_replay(self, search):
 		# Where any compact event carries tenx_sourcetype, an index no stanza records may hold
 		# such events not recorded yet, so it gets `tenx-replay`, never the text without replay.
-		covered = {'XmlWinEventLog': {'indexes': 'wineventlog'}}
+		covered = {'XmlWinEventLog': {'indexes': 'wineventlog', 'commands': '10'}}
 		state, text = compiled(search, covered)
 		base_state, base_text = compiled(search, False, baseline_builder)
 		if 'tenx-inflate' in base_text:
@@ -289,8 +379,8 @@ class TestRewriteWithoutCarrierMatchesTheBaseline:
 		assert 'tenx-replay' not in text and 'tenx_compact_raw' not in text
 
 
-COVERED = {'XmlWinEventLog': {'indexes': 'wineventlog'}, 'app:kv': {'indexes': 'app,shared'},
-		   'app:json': {'indexes': 'shared'}}
+COVERED = {'XmlWinEventLog': {'indexes': 'wineventlog', 'commands': '10'}, 'app:kv': {'indexes': 'app,shared', 'commands': '10'},
+		   'app:json': {'indexes': 'shared', 'commands': '10'}}
 
 
 def with_replay(replay):
@@ -347,7 +437,7 @@ class TestRewriteReplay:
 
 	def test_a_sourcetype_listed_with_every_index_or_none_matches_any(self):
 		# * past 200 indexes; empty in a stanza that records no index
-		covered = {'a': {'indexes': '*'}, 'b': {'indexes': ''}, 'c': {'indexes': 'only_c'}, 'd': {'indexes': 'only_d'}}
+		covered = {'a': {'indexes': '*', 'commands': '10'}, 'b': {'indexes': '', 'commands': '10'}, 'c': {'indexes': 'only_c', 'commands': '10'}, 'd': {'indexes': 'only_d', 'commands': '10'}}
 		assert b.rewrite_replay(covered, ['only_c']) == b.compose_units(['a', 'b', 'c'])
 
 	def test_reserved_and_unusable_names_are_not_sourcetypes(self):
@@ -409,7 +499,7 @@ def model(**macros_):
 	return Model(commands={'extract': extract, 'typer': typer, 'tags': lambda e, _: None,
 						   'spath': lambda e, _: None, 'extract kvdelim="=" pairdelim=" "': lambda e, _: None,
 						   'inflatemodel': lambda e, _: e.__setitem__('_raw', e['__exp'])},
-				 lookups=TABLES, macros=dict(dict({'tenx-inflate': 'inflatemodel'}, **mapped_guard_macros()), **macros_))
+				 lookups=TABLES, macros=dict(dict({'tenx-inflate': 'inflatemodel'}, **guard_macros()), **macros_))
 
 
 def compact(st=None, source='/var/app/a.log', host='web-1', **text_fields):
@@ -454,63 +544,6 @@ def run_txf(replay, evs):
 
 def run_tx(evs):
 	return [visible(e) for e in model().run(PLAIN_TX, evs)]
-
-
-def mapped(**indexed):
-	"""An event indexed with a field map: renamed to its original sourcetype, its fields indexed,
-	tenx_mapped set. Splunk's extract on its expanded text would add each field again."""
-	e = {'_raw': '~h,4625', '__exp': '<Event>4625</Event>', 'sourcetype': 'XmlWinEventLog', 'source': 'XmlWinEventLog:Security',
-		 'host': 'dc01', '_kv': 1, 'tenx_hash': 'h', 'tenx_var_0': '4625', 'tenx_mapped': '1',
-		 '__text_fields': dict((k, v + ' (again)') for k, v in indexed.items())}
-	e.update(indexed)
-	return e
-
-
-TX_STEPS = '`tenx-inflate` | `tenx-mapped-hide` | fields - _kv | extract | `tenx-mapped-restore` | fields - tenx_hash, tenx_var_0, tenx_vars'
-
-
-class TestTheMappedGuard:
-	"""tenx-mapped-hide and tenx-mapped-restore, as `tx` runs them around its extract."""
-
-	def test_a_mapped_event_keeps_exactly_its_indexed_fields_and_gets_its_text(self):
-		out = model().run(TX_STEPS, [mapped(EventID='4625', Computer='dc01')])[0]
-		want = dict(mapped(EventID='4625', Computer='dc01'), _raw='<Event>4625</Event>')
-		for gone in ('_kv', 'tenx_hash', 'tenx_var_0'):
-			del want[gone]
-		assert visible(out) == visible(want)
-		assert out['EventID'] == '4625' and out['Computer'] == 'dc01'
-		assert (out['_raw'], out['sourcetype'], out['source'], out['host']) == (
-			'<Event>4625</Event>', 'XmlWinEventLog', 'XmlWinEventLog:Security', 'dc01')
-		assert not [k for k in out if k.startswith('tenx_fm_')]
-
-	def test_events_without_the_mark_get_the_shipped_steps_in_a_mixed_chunk(self):
-		plain = events()
-		together = model().run(TX_STEPS, [mapped(EventID='4625')] + events())[1:]
-		alone = model().run(PLAIN_TX, plain)
-		assert [visible(e) for e in together] == [visible(e) for e in alone]
-
-	def test_without_a_mapped_event_the_guard_runs_nothing(self):
-		assert run_tx(events()) == [visible(e) for e in model().run(TX_STEPS, events())]
-
-	def test_txf_leaves_a_mapped_event_that_carries_its_sourcetype_as_tx_does(self):
-		# A forwarder that sets tenx_sourcetype sets it on mapped events too. The replay must not
-		# run on them: their fields are indexed, and the replay would clear and recompute its
-		# fields from the hidden event (Splunk Enterprise 10.4.3, 662 mapped Windows events carrying
-		# tenx_sourcetype: 86 of 186 fields differed from raw through txf, among them action, dest,
-		# user and eventtype; 0 differ through tx).
-		def ev():
-			e = mapped(dept='eng', x='X', user='u9')
-			e.update(sourcetype='app:kv', tenx_sourcetype='app:kv')
-			return e
-		guarded = TXF % '`tenx-mapped-hide` | %s | `tenx-mapped-restore`'
-		for replay in ('`tenx-replay`', '`%s` | `tenx-replay-tags`' % b.unit_macro('app:kv')):
-			m = model(**dict({'tenx-replay': full_macro(), 'tenx-replay-tags': ' | '.join(b.TAGS_STEPS)},
-							 **dict((b.unit_macro(st), u) for st, u in units().items())))
-			out = [visible(e) for e in m.run(guarded % replay, [ev()] + events())]
-			want = [visible(e) for e in model().run(TX_STEPS, [ev()])]
-			assert out[0] == want[0], replay
-			# and the other events of the chunk get what txf gives them without a mapped event
-			assert out[1:] == run_txf(replay, events())
 
 
 class TestTxfOfOneSourcetype:
@@ -778,6 +811,10 @@ class FakeSplunk(object):
 			return {'entry': []}
 		if route == NS + 'configs/conf-tenx_config/config':
 			return {'entry': [{'content': {}}]}
+		if route == NS + 'storage/collections/data/tenx_dml':
+			# the template records stored in the hours the query names
+			hours = json.loads(query['query'])['stored_hour']['$in']
+			return [r for r in getattr(self, 'stored', []) if r['stored_hour'] in hours]
 		if route == NS + 'configs/conf-tenx_replay':
 			if data is not None:
 				name = data.pop('name')
@@ -820,8 +857,8 @@ class FakeSplunk(object):
 					self.macros[name] = data['definition']
 				self.writes.append(('macro~', name))
 				return {}
-			# txf(1) is shipped (default/macros.conf): its definition is the unit's
-			default = tenxreplay.builder.TXF_ONE_UNIT if name == 'txf(1)' else None
+			# txf(1) is shipped (default/macros.conf): its definition is the unit's; tenx-extract is shipped as extract
+			default = {'txf(1)': tenxreplay.builder.TXF_ONE_UNIT, 'tenx-extract': 'extract'}.get(name)
 			return {'entry': [{'name': name, 'content': {'definition': self.macros.get(name, default),
 														 'validation': self.validations.get(name)}}]}
 		raise AssertionError('unexpected REST call %s %s' % (path, data))
@@ -860,6 +897,8 @@ out['macros'] = sorted(fake.macros)
 out['acl'] = sorted((k, v['sharing']) for k, v in fake.acl.items())
 out['conf'] = fake.conf
 out['kv_unit'] = fake.macros[tenxreplay.builder.unit_macro('app:kv')]
+out['replay'] = fake.macros['tenx-replay']
+out['plan'] = dict(fake.conf.get(tenxreplay.builder.PLAN_STANZA, {}))
 out['alias'] = fake.macros.get('tenx-replay-st-app:kv')
 out['txf_one'] = fake.validations.get('txf(1)')
 run(fake)
@@ -898,6 +937,16 @@ def test_the_command_writes_units_aliases_and_what_they_cover():
 	assert out['conf']['app:kv']['sources'] == '/var/app/a.log,/var/app/old.log' and out['conf']['app:kv']['unit'] == kv
 	# the old source's events get the source stanza; the host stanza applies (web-0, web-1)
 	assert '"src"' in out['kv_unit'] and '"host"' in out['kv_unit'] and 'mvindex(tenx_sourcetype,0)=="app:kv"' in out['kv_unit']
+	# the macro's rule table, with the generation its guards carry; the list of fields not in text whatever
+	# field_narrowing says (here unset)
+	table = out['plan']
+	generation, rules = table['generation'], json.loads(table['rules'])
+	assert re.fullmatch(r'[0-9a-f]{8}', generation) and ('tenx_nd%s*_' % generation) in out['replay']
+	assert ('tenx_ndm%s' % generation) in out['replay'] and b.GEN not in out['replay']
+	assert sorted(tuple(r[1]) for r in rules) == [('h',), ('j',), ('k',), ('s',), ('y',)]
+	assert b.NARROWING_STANZA in out['conf']
+	# units carry no guard
+	assert 'tenx_nd' not in out['kv_unit']
 	# the next rebuild over the same events writes nothing
 	assert out['writes_second'] == []
 	# an expired sourcetype loses its stanza; its unit becomes the no-op unit, its alias stays
@@ -970,7 +1019,8 @@ class TestTheRewriteReadsTheCoverage:
 		import tenx_util
 		got = tenx_util.get_replay_coverage(self.service({'XmlWinEventLog': {'indexes': 'wineventlog', 'sources': 'x'},
 														 'demo:kv': {}}))
-		assert got == {'XmlWinEventLog': {'indexes': 'wineventlog', 'unit': ''}, 'demo:kv': {'indexes': '', 'unit': ''}}
+		empty = {'left_out': '', 'commands': '', 'renamed': ''}
+		assert got == {'XmlWinEventLog': dict(empty, indexes='wineventlog', unit=''), 'demo:kv': dict(empty, indexes='', unit='')}
 		# JSON-safe: the search handler logs the config with json.dumps
 		json.dumps(got)
 
@@ -1031,7 +1081,8 @@ class TestTheWholeGuard:
 				e[k] = [e[k], v] if k in e else v
 		m = Model(commands={'extract': doubling_extract,
 							'inflatemodel': lambda e, _: e.__setitem__('_raw', e.get('__exp', e['_raw']))},
-				  macros=dict({'tenx-inflate': 'inflatemodel'}, **mapped_guard_macros()))
+				  macros=dict({'tenx-inflate': 'inflatemodel', 'tenx-extract': macros().get('tenx-extract', 'definition')},
+							  **guard_macros()))
 		return [visible(e) for e in m.run(steps, evs)]
 
 	@staticmethod
@@ -1049,7 +1100,7 @@ class TestTheWholeGuard:
 	@staticmethod
 	def tx():
 		d = macros().get('tx', 'definition')
-		head, tail = '`tenx-events` [| tenxprefilter] | ', ' | search *'
+		head, tail = '((`tenx-events`) OR (`tenx-raw-events`)) [| tenxprefilter] | ', ' | search *'
 		assert d.startswith(head) and d.endswith(tail)
 		return d[len(head):-len(tail)]
 
@@ -1065,6 +1116,6 @@ class TestTheWholeGuard:
 
 	def test_txf_marks_only_whole_events_without_their_original_sourcetype(self):
 		d = macros().get('txf', 'definition')
-		mark = d.split(' | ')[1]
+		mark = [step for step in d.split(' | ') if 'tenx_passed=' in step][0]
 		got = self.run(mark, [self.whole(), self.whole(tenx_sourcetype='aws:cloudtrail'), self.compact()])
 		assert [e.get('tenx_passed') for e in got] == [1, None, None]

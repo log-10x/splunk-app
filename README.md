@@ -45,7 +45,7 @@ which replaces the values the app's configuration sets. With the published image
 Bit container:
 
 ```
-docker run -d --name tenx-receiver --network container:<Fluent Bit container> log10x/edge-10x:1.1.181 \
+docker run -d --name tenx-receiver --network container:<Fluent Bit container> log10x/edge-10x:1.1.183 \
   @run/input/forwarder/fluentbit @apps/receiver receiverOptimize true varMaxRecurIndexes 0 \
   timestampZone UTC timestampMaxPerObject 1 groupJoinLines false
 ```
@@ -126,7 +126,7 @@ backfill search in Step 5. A Receiver's clock zone leaves no trace in the data, 
 
 An event whose template is found but whose expansion gives no text also stays compact, with
 `tenx_expand_refused` set to `empty-expansion`; an event whose template is not found, with
-`no-template`.
+`no-template`. An empty line has an empty template, and `tx` returns its event with empty text.
 
 ### Event time on compact events
 
@@ -213,15 +213,17 @@ Start the Receiver with `receiverOptimize true`, `varMaxRecurIndexes 0`, `timest
 
 Set the `tenx-events` macro to your compact index under **Settings > Advanced search > Search macros**, for example `index=my_compact_index sourcetype::tenx_encoded`. Every `tx` search starts with this macro too, so it uses the indexed form `sourcetype::`.
 
+Where an index also holds raw events of the same sources, such as those indexed before the Receiver, name them in the `tenx-raw-events` macro so that `tx` and `txf` return them too: see [Raw Events from Before the Receiver](tenx-for-splunk/README.md#raw-events-from-before-the-receiver).
+
 ### Step 5: Load Existing Templates
 
-The **Consume KV** saved search stores new templates every five minutes. To load templates indexed before the app was installed, or during an outage of that search, run this search once as an admin or power user:
+The **Consume KV** saved search stores new templates every five minutes, and its first run after an install or an upgrade reads every template record in the index. To load them again after the KV collection was emptied or restored, run this once as an admin or power user:
 
 ```spl
-index=tenx_dml sourcetype=tenx_dml_raw_json earliest=-30d | sendalert tenx_dml_to_kv
+| makeresults | sendalert tenx_dml_to_kv param.from=0
 ```
 
-Widen `earliest` to reach older templates. Running it again is safe: templates already stored are kept, and their records are brought up to date when this version of the app derives them differently. The app's **Backfill KV** saved search holds the same search; its alert action fires only when the search runs on a schedule or with `sendalert`, not from the **Run** button. To load every template record ever indexed, use `earliest=0`.
+The app's **Backfill KV** saved search holds the same search; the **Run** button does not fire its alert action, so run the search above. See [Loading Templates Indexed Earlier](tenx-for-splunk/README.md#loading-templates-indexed-earlier).
 
 ### Step 6: Verify End-to-End
 
@@ -244,7 +246,7 @@ index=your_logs_index `tx` | head 10
 
 ## Security Sources
 
-The `txf` macro gives expanded events the fields, event types and tags of their original sourcetype, and the field map tool makes compact events readable by data models and detections. Setup: [Fields of the Original Sourcetype](tenx-for-splunk/README.md#fields-of-the-original-sourcetype-txf), [the Field Map](tenx-for-splunk/README.md#data-models-and-detections-the-field-map), [What to Install on Each Tier](tenx-for-splunk/README.md#what-to-install-on-each-tier). Before a source moves, [the search report](tenx-for-splunk/README.md#which-searches-change-when-a-source-moves) lists which of a search head's saved searches, alerts and dashboard panels need an edit.
+The `txf` macro gives expanded events the fields, event types and tags of their original sourcetype. Setup: [Fields of the Original Sourcetype](tenx-for-splunk/README.md#fields-of-the-original-sourcetype-txf), [What to Install on Each Tier](tenx-for-splunk/README.md#what-to-install-on-each-tier). Before a source moves, [the search report](tenx-for-splunk/README.md#which-searches-change-when-a-source-moves) lists which of a search head's saved searches, alerts and dashboard panels need an edit.
 
 ## Analytics Dashboard
 
@@ -269,8 +271,7 @@ The Analytics dashboard finds compact events through the `tenx-events` macro.
 | **tx Macro** | Written in front of a search to search compact events by what the lines say, from the search bar, Dashboard Studio, saved searches and alerts |
 | **txf Macro** | `tx` with the search-time fields of the original sourcetype; see [Fields of the Original Sourcetype](tenx-for-splunk/README.md#fields-of-the-original-sourcetype-txf) |
 | **tenxreplay Command** | Writes the replay macros `txf` runs, from the search head's props; run by the Rebuild Field Replay saved searches |
-| **Field Map Tool** | `bin/tenx_field_map.py`: generates the app that writes compact events' original fields at index time; see [the Field Map](tenx-for-splunk/README.md#data-models-and-detections-the-field-map) |
-| **Search Report** | `bin/tenx_search_report.py`: says which saved searches, alerts and dashboard panels run unchanged, need `tx` or `txf`, or need a field map when a source moves to compact events; see [Which Searches Change](tenx-for-splunk/README.md#which-searches-change-when-a-source-moves) |
+| **Search Report** | `bin/tenx_search_report.py`: says which saved searches, alerts and dashboard panels run unchanged or need `tx` or `txf` when a source moves to compact events; see [Which Searches Change](tenx-for-splunk/README.md#which-searches-change-when-a-source-moves) |
 | **tenxprefilter Command** | Run once per search by the `tx` macro; reads the search, looks up the templates that carry its words, and selects the compact events to expand |
 | **tx and tenxsearch Commands** | `\| tx <search>` and `\| tenxsearch searchstring="..."`: generating commands that write every event out through Python, kept so saved searches written with them keep working |
 | **tenxrecompile Command** | Recompiles every compiled alert so it picks up new templates |
@@ -279,10 +280,9 @@ The Analytics dashboard finds compact events through the `tenx-events` macro.
 | **KV Store** | Template patterns for event reconstruction |
 | **Inflate Macro** | SPL macro joining events with templates |
 | **Consume KV Search** | Scheduled search storing new templates in the KV Store |
-| **Backfill KV Search** | The same template load over 30 days, for templates indexed before the app was installed |
+| **Backfill KV Search** | The same template load from the start of the index, after the KV store was emptied or restored |
 | **Recompile Compiled Alerts Search** | Runs `tenxrecompile` every 15 minutes |
 | **Rebuild Field Replay Searches** | Run `tenxreplay` every hour, and every five minutes for sourcetypes not yet covered |
-| **Field Map Events Without Fields Search** | Not scheduled; where a field map is installed, counts compact events indexed without their fields by index, sourcetype and reason |
 | **Analytics Dashboard** | Compression and template metrics |
 | **Diagnostics Dashboard** | Troubleshooting and verification tools |
 
