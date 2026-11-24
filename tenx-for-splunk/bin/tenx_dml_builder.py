@@ -442,7 +442,7 @@ class TenxDMLBuilder:
 		* pattern_parts			- The parts of the pattern after splitting it with variable_separator, excluding
 								  the first and last parts. If the pattern has 2 parts or less, this is an empty list.
 		* part_0				- The first part of the pattern. If the pattern is only 1 part long, this is empty
-		* pattern_terminator	- The last part of the pattern, always contains something (a pattern is never empty)
+		* pattern_terminator	- The last part of the pattern, empty when the pattern ends with a variable or is empty
 		* timestamp_format		- The format for the timestamp of this pattern, used with Splunk's strftime to render
 								  the actual timestamp for each individual event.
 		"""

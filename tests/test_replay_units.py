@@ -65,9 +65,10 @@ def without_guard(definition):
 # The empty-expansion guard of tenx-inflate and tenx-inflate-debug (test_inflate_one_row_no_silent_empty.py),
 # as the expansion was written before it: the text went straight to _raw.
 EMPTY_GUARD = (' | eval tenx_expand_refused=case(isnull(tenx_log_term) AND match(_raw, "^~"), "no-template",'
-	' isnotnull(tenx_log_term) AND coalesce(len(tenx_text),0)==0,'
+	' isnotnull(tenx_log_term) AND coalesce(len(tenx_text),0)==0 AND NOT (isnotnull(tenx_text) AND tenx_log_term==""'
+	' AND isnull(tenx_log_parts) AND tenx_part_0==""),'
 	' if(len(mvjoin(tenx_expand_refused,""))>0, tenx_expand_refused, "empty-expansion"), true(), tenx_expand_refused),'
-	' _raw=if(len(tenx_text)>0, tenx_text, _raw)')
+	' _raw=if(len(tenx_text)>0 OR (isnotnull(tenx_text) AND len(coalesce(mvjoin(tenx_expand_refused,""),""))==0), tenx_text, _raw)')
 
 # The rows the template lookup matched, and each row's values once (test_inflate_one_row_no_silent_empty.py).
 ROWS_OUTPUT = 'OUTPUT _key AS tenx_rows, part_0 AS tenx_part_0, '
