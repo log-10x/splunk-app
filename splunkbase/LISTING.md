@@ -163,7 +163,7 @@ Repository name: `log-10x/splunk-app`. Repository URL: https://github.com/log-10
 
 | Field | Value |
 |---|---|
-| Version | 1.3.0, read from the package |
+| Version | 1.3.1, read from the package |
 | Splunk platform compatibility | Splunk Enterprise 9.4, 10.0, 10.2, 10.4, 10.6 |
 | CIM | None |
 
@@ -181,6 +181,13 @@ Splunkbase requires a release to run on every version it names.
 **Release notes**
 
 Paste the block for the version being uploaded. Splunkbase keeps notes per release.
+
+1.3.1:
+
+> - The app opens on Overview: compact events for the chosen time range, the event text volume they save and the reduction, per index and source type. A row opens a `tx` search of that source.
+> - Health replaces Diagnostics: six checks, from compact events arriving to every event expanding, including that a search returns the same event as was indexed.
+> - The app's navigation holds four pages: Overview, Health, Search and Alerts.
+> - Through `txf`, an alias of a field that only a lookup sets equals raw, empty where the raw event has none, such as the Windows add-on's `category` and the FortiGate add-on's `vendor_transport`.
 
 1.3.0:
 

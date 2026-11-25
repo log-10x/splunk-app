@@ -1,0 +1,190 @@
+<form version="1.1" theme="light">
+  <label>Health</label>
+  <description>Six checks that compact events arrive, their templates are stored and events expand to their original text.</description>
+  <fieldset submitButton="false">
+    <input type="time" token="t" searchWhenChanged="true">
+      <label>Time range</label>
+      <default>
+        <earliest>-7d@h</earliest>
+        <latest>now</latest>
+      </default>
+    </input>
+  </fieldset>
+  <row>
+    <panel>
+      <title>1. Compact events received</title>
+      <single>
+        <search>
+          <query>| tstats count where `tenx-events`</query>
+          <earliest>$t.earliest$</earliest>
+          <latest>$t.latest$</latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="useThousandSeparators">1</option>
+        <option name="colorMode">block</option>
+        <option name="useColors">1</option>
+        <option name="rangeColors">["0xdc4e41","0x53a051"]</option>
+        <option name="rangeValues">[0.5]</option>
+        <option name="underLabel">0 means the Receiver is not sending here</option>
+      </single>
+    </panel>
+    <panel>
+      <title>2. Template records received</title>
+      <single>
+        <search>
+          <query>| tstats count where index=tenx_dml sourcetype=tenx_dml_raw_json</query>
+          <earliest>0</earliest>
+          <latest></latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="useThousandSeparators">1</option>
+        <option name="colorMode">block</option>
+        <option name="useColors">1</option>
+        <option name="rangeColors">["0xdc4e41","0x53a051"]</option>
+        <option name="rangeValues">[0.5]</option>
+        <option name="underLabel">in the template index, all time</option>
+      </single>
+    </panel>
+    <panel>
+      <title>3. Templates stored</title>
+      <single>
+        <search>
+          <query>| inputlookup tenx-dml-lookup | stats count</query>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="useThousandSeparators">1</option>
+        <option name="colorMode">block</option>
+        <option name="useColors">1</option>
+        <option name="rangeColors">["0xdc4e41","0x53a051"]</option>
+        <option name="rangeValues">[0.5]</option>
+        <option name="underLabel">ready for searches to expand events</option>
+      </single>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>4. Templates received and not yet stored</title>
+      <single>
+        <search>
+          <query>index=tenx_dml sourcetype=tenx_dml_raw_json _index_latest=-10m | eval tenx_key=trim(templateHash) | stats count by tenx_key | lookup tenx-dml-lookup _key AS tenx_key OUTPUT pattern_hash AS tenx_stored | stats count as indexed, count(tenx_stored) as stored | eval missing=indexed-stored | table missing</query>
+          <earliest>0</earliest>
+          <latest></latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="colorMode">block</option>
+        <option name="useColors">1</option>
+        <option name="rangeColors">["0x53a051","0xdc4e41"]</option>
+        <option name="rangeValues">[0.5]</option>
+        <option name="underLabel">should be 0; the store loads every 5 minutes</option>
+      </single>
+    </panel>
+    <panel>
+      <title>5. Templates the app refuses to expand</title>
+      <single>
+        <search>
+          <query>| inputlookup tenx-dml-lookup | where isnotnull(expand_unsafe) AND expand_unsafe!="" | stats count</query>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="colorMode">block</option>
+        <option name="useColors">1</option>
+        <option name="rangeColors">["0x53a051","0xdc4e41"]</option>
+        <option name="rangeValues">[0.5]</option>
+        <option name="underLabel">should be 0; a Receiver setting causes these</option>
+      </single>
+    </panel>
+    <panel>
+      <title>6. Events that did not expand</title>
+      <single>
+        <search>
+          <query>`tenx-events` | head 2000 | `tenx-inflate` | stats count(eval(match(_raw, "^~"))) as n | table n</query>
+          <earliest>$t.earliest$</earliest>
+          <latest>$t.latest$</latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="colorMode">block</option>
+        <option name="useColors">1</option>
+        <option name="rangeColors">["0x53a051","0xdc4e41"]</option>
+        <option name="rangeValues">[0.5]</option>
+        <option name="underLabel">of the latest 2,000 compact events</option>
+      </single>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>The same event, as indexed and as a search returns it</title>
+      <table>
+        <search>
+          <query>`tenx-events` | head 200 | dedup sourcetype | head 5 | eval "As indexed (compact)"=_raw | `tenx-inflate` | rename sourcetype as Sourcetype, _raw as "As a search returns it" | table Sourcetype "As indexed (compact)" "As a search returns it"</query>
+          <earliest>$t.earliest$</earliest>
+          <latest>$t.latest$</latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="wrap">true</option>
+        <option name="count">5</option>
+      </table>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Compact events by index and source type</title>
+      <table>
+        <search>
+          <query>| tstats count as events max(_indextime) as last where `tenx-events` by index sourcetype | sort - events | eval Events=tostring(events, "commas"), "Last received"=strftime(last, "%Y-%m-%d %H:%M:%S") | rename index as Index, sourcetype as Sourcetype | table Index Sourcetype Events "Last received"</query>
+          <earliest>$t.earliest$</earliest>
+          <latest>$t.latest$</latest>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="count">20</option>
+      </table>
+    </panel>
+    <panel>
+      <title>Template store</title>
+      <table>
+        <search>
+          <query>| inputlookup tenx-kv-state-lookup | eval "Last load"=strftime(updated, "%Y-%m-%d %H:%M:%S"), "Loaded through"=strftime(loaded_through, "%Y-%m-%d %H:%M:%S") | rename status as Status, records as "Records in last load", detail as Detail | table "Last load" Status "Loaded through" "Records in last load" Detail</query>
+        </search>
+        <option name="drilldown">none</option>
+      </table>
+    </panel>
+  </row>
+  <row>
+    <panel depends="$show_refused$">
+      <title>Templates the app refuses to expand</title>
+      <table>
+        <search>
+          <query>| inputlookup tenx-dml-lookup | where isnotnull(expand_unsafe) AND expand_unsafe!="" | rename _key as Template, expand_unsafe as Reason, pattern as "Template text" | table Template Reason "Template text"</query>
+          <done>
+            <condition match="'job.resultCount' == 0">
+              <unset token="show_refused"></unset>
+            </condition>
+            <condition>
+              <set token="show_refused">1</set>
+            </condition>
+          </done>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="wrap">true</option>
+        <option name="count">20</option>
+      </table>
+    </panel>
+    <panel depends="$show_masked$">
+      <title>Source types whose index-time masking does not apply to compact events</title>
+      <table>
+        <search>
+          <query>| rest splunk_server=local /servicesNS/nobody/tenx-for-splunk/configs/conf-tenx_replay count=0 | where isnotnull(masked_at_index_time) AND masked_at_index_time!="" | rename title as Sourcetype, masked_at_index_time as "Index-time rules" | table Sourcetype "Index-time rules"</query>
+          <done>
+            <condition match="'job.resultCount' == 0">
+              <unset token="show_masked"></unset>
+            </condition>
+            <condition>
+              <set token="show_masked">1</set>
+            </condition>
+          </done>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="wrap">true</option>
+        <option name="count">20</option>
+      </table>
+    </panel>
+  </row>
+</form>

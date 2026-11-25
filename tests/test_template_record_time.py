@@ -59,10 +59,10 @@ class TestTemplateRecordTime:
 		assert saved.get('Backfill KV', 'action.tenx_dml_to_kv.param.from') == '0'
 		assert saved.get('Backfill KV', 'enableSched') == '0'
 
-	def test_diagnostics_shows_the_template_store_gap_search(self):
+	def test_health_shows_the_template_store_gap_search(self):
 		gap = conf('savedsearches.conf').get('Template Store Gap', 'search')
-		view = open(os.path.join(APP, 'default', 'data', 'ui', 'views', 'tenx_diagnostics.xml')).read()
-		assert '<query>%s</query>' % gap in view
+		view = open(os.path.join(APP, 'default', 'data', 'ui', 'views', 'tenx_health.xml')).read()
+		assert '<query>%s | table missing</query>' % gap in view
 		assert 'missing=indexed-stored' in gap
 
 	def test_the_checkpoint_collection_is_not_replicated(self):

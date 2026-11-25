@@ -269,7 +269,7 @@ STATE_RECHECKED = 'rechecked'
 # and never ended was stopped from outside (the alert action's maxtime, a restart).
 STATE_RUN_STARTED = 'run_started'
 STATE_RUN_ENDED = 'run_ended'
-# The last run stopped from outside, as the next run found it; kept for Diagnostics.
+# The last run stopped from outside, as the next run found it; kept for Health.
 STATE_LAST_CUT = 'last_cut'
 # When the first run of this version started (an install or an upgrade): for some minutes after it the
 # `tx` prefilter checks that the template lookup runs on the indexers (tenx_prefilter.py).

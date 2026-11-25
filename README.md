@@ -10,14 +10,14 @@ To find optimization opportunities in your existing Splunk data, point the [Log1
 
 ## How It Works
 
-A [compact event](https://doc.log10x.com/run/transform/#compact) carries a template hash and its variable values; the constant words live in the KV Store, and the app puts them back at search time. A word that exists only in a template is not in the index, so a plain keyword search over compact data finds the events where the word is a value and misses the others. To search by what the lines say, write the `tx` macro in front of the search terms, after the index and any metadata or time terms: ``index=app_logs `tx` error "payment failed"``. The words after it are ordinary SPL, applied to the expanded lines. Classic dashboards keep their panel SPL unchanged: `dashboard.js` routes each panel's search through the app's REST endpoint. An alert created in the app's **Compile Alert** view compiles once into a native saved search.
+A [compact event](https://doc.log10x.com/run/transform/#compact) carries a template hash and its variable values. The Receiver sends each template once, the app keeps it in its template store, and searches put the constant words back. A word that exists only in a template is not in the index, so a plain keyword search over compact data finds the events where the word is a value and misses the others. To search by what the lines say, write the `tx` macro in front of the search terms, after the index and any metadata or time terms: ``index=app_logs `tx` error "payment failed"``. The words after it are ordinary SPL, applied to the expanded lines. Classic dashboards keep their panel SPL unchanged: `dashboard.js` routes each panel's search through the app's REST endpoint. An alert created on the app's **Alerts** page compiles once into a native saved search.
 
 ### Ingestion Flow
 
 The [Receiver](https://doc.log10x.com/apps/receiver/) running in [Compact mode](https://doc.log10x.com/apps/receiver/compact/) [compacts](https://doc.log10x.com/run/transform/#compact) events at the edge, and Splunk ingests them at reduced size:
 
 ```
-Receiver  -->  Ingest (HEC)  -->  KV Store (Templates)
+Receiver  -->  Ingest (HEC)  -->  Template store
                              -->  Index (compact events, metadata as indexed fields)
 ```
 
@@ -33,7 +33,7 @@ Classic dashboard panel:  dashboard.js hook  -->  /tenx-search rewrite  --------
 
 On one laptop running Splunk 10.4.3, a `tx` search over 157,228 compact events returned in about 1.5 to 4 seconds, where the same search over the raw lines took under a second; the `| tx` command, which writes every event out itself, took two to five times as long as the macro.
 
-Scheduled alerts run server-side, where the browser hook never fires. An alert created in the **Compile Alert** view, or through the `/tenx-alert` endpoint, is **compiled once at save time** into native SPL, a template hash prefilter plus the inflate macro, so the scheduler runs an ordinary saved search. This is handled by the `/tenx-alert` REST endpoint and the **Compile Alert** view (with a recompile pass that converts `| tx` and `| tenxsearch` alerts and refreshes prefilters as templates appear). See [SAVE_TIME_ALERTS.md](SAVE_TIME_ALERTS.md).
+Scheduled alerts run server-side, where the browser hook never fires. An alert created on the **Alerts** page, or through the `/tenx-alert` endpoint, is **compiled once at save time** into native SPL, a template hash prefilter plus the `tenx-inflate` macro, so the scheduler runs an ordinary saved search. This is handled by the `/tenx-alert` REST endpoint and the **Alerts** page (with a recompile pass that converts `| tx` and `| tenxsearch` alerts and refreshes prefilters as templates appear). See [SAVE_TIME_ALERTS.md](SAVE_TIME_ALERTS.md).
 
 ## Receiver-side configuration
 
@@ -81,7 +81,7 @@ Setting them in these files instead works as well.
 **Set `varMaxRecurIndexes: 0`.** The app expands templates whose values all travel in the event.
 The Receiver's [`varMaxRecurIndexes`](https://doc.log10x.com/run/template/#varmaxrecurindexes)
 setting lets a template refer back to an earlier value (`$N`) instead. The setting applies to the
-whole Receiver process. At 0, modeled compression is about half a percentage point lower on a
+whole Receiver process. At 0, modeled reduction is about half a percentage point lower on a
 Kubernetes/OTel dataset, and every event expands exactly.
 
 A Receiver that also feeds Elasticsearch applies the setting there too. The
@@ -100,7 +100,7 @@ compacted on a host in New York and on a host in UTC produces two different
 events, and nothing downstream can tell them apart.
 
 Pinning the Receiver to UTC makes that choice fixed and knowable, and this app's
-inflate macro renders in UTC to match. Without it, expansion returns a time
+`tenx-inflate` macro renders in UTC to match. Without it, expansion returns a time
 shifted by the difference between the Receiver's host clock and UTC.
 
 A timestamp written in UTC, ending in `Z`, `+0000` or `+00:00`, is unaffected.
@@ -119,7 +119,7 @@ unchanged.
 Back-references, multi-timestamp templates and two different templates under one template hash
 are detected when stored. Their events stay compact and carry `tenx_expand_refused` naming the
 reason, `back-reference`, `multiple-timestamps` or `hash-conflict`, so every expanded line is the
-original line. The Diagnostics dashboard lists every refused template. To clear a `hash-conflict`
+original line. The Health page lists every refused template. To clear a `hash-conflict`
 after deciding which template is right, delete that key from the `tenx_dml` collection and run the
 backfill search in Step 5. A Receiver's clock zone leaves no trace in the data, so
 `timestampZone: UTC` is required rather than checked.
@@ -197,7 +197,7 @@ Create an index named `tenx_dml` for templates, then two HTTP Event Collector to
 | Source type | `tenx_dml_raw_json` |
 | Index | `tenx_dml` |
 
-**Encoded Events Token:**
+**Compact Events Token:**
 
 | Setting | Value |
 |---------|-------|
@@ -234,7 +234,7 @@ Run these SPL queries to confirm everything is working:
 index=tenx_dml sourcetype=tenx_dml_raw_json | head 10
 ```
 
-**Check KV store is populated:**
+**Check that templates are stored:**
 ```spl
 | inputlookup tenx-dml-lookup | stats count
 ```
@@ -248,19 +248,14 @@ index=your_logs_index `tx` | head 10
 
 The `txf` macro gives expanded events the fields, event types and tags of their original sourcetype. Setup: [Fields of the Original Sourcetype](tenx-for-splunk/README.md#fields-of-the-original-sourcetype-txf), [What to Install on Each Tier](tenx-for-splunk/README.md#what-to-install-on-each-tier). Before a source moves, [the search report](tenx-for-splunk/README.md#which-searches-change-when-a-source-moves) lists which of a search head's saved searches, alerts and dashboard panels need an edit.
 
-## Analytics Dashboard
+## Pages
 
-The Analytics dashboard finds compact events through the `tenx-events` macro.
-
-| Panel | Description |
-|--------|-------------|
-| **Total Encoded Events** | Compact events indexed |
-| **Active Templates** | Templates in the KV Store |
-| **Compression Ratio** | Original size over compact size, on the latest 5,000 events |
-| **Estimated Storage Savings** | Bytes saved and percentage reduction, on the latest 10,000 events |
-| **Event Volume, Last 7 Days** | Compact events per hour |
-| **Top 10 Templates by Usage** | Template hashes with the most events |
-| **Inflation Success Rate** | Share of the latest 1,000 events that expand |
+| Page | What it shows |
+|------|---------------|
+| **Overview** | Compact events for the chosen time range, the event text volume they save and the reduction, per index and source type; a row opens a `tx` search of that source. Sizes are estimated from a sample of the events; event counts are exact. |
+| **Health** | Six checks, from compact events arriving to every event expanding, including that a search returns the same event as was indexed, and the template store's last load. When there are any, the page lists templates the app refuses to expand and source types whose index-time masking does not apply to compact events. |
+| **Search** | Splunk's search page; write `tx` or `txf` in front of the search terms. |
+| **Alerts** | Compile a search into a scheduled alert that runs as native SPL. |
 
 ## Components
 
@@ -276,15 +271,15 @@ The Analytics dashboard finds compact events through the `tenx-events` macro.
 | **tx and tenxsearch Commands** | `\| tx <search>` and `\| tenxsearch searchstring="..."`: generating commands that write every event out through Python, kept so saved searches written with them keep working |
 | **tenxrecompile Command** | Recompiles every compiled alert so it picks up new templates |
 | **Alert Compiler** | `/tenx-alert` REST endpoint compiling a search into a native scheduled alert at save time (with a recompile/migrate pass) |
-| **Compile Alert View** | UI to compile, review, and recompile save-time alerts |
-| **KV Store** | Template patterns for event reconstruction |
-| **Inflate Macro** | SPL macro joining events with templates |
-| **Consume KV Search** | Scheduled search storing new templates in the KV Store |
-| **Backfill KV Search** | The same template load from the start of the index, after the KV store was emptied or restored |
+| **Alerts Page** | Compiles, reviews and recompiles save-time alerts |
+| **Template Store** | The templates searches use to expand events, in the `tenx_dml` KV store collection |
+| **tenx-inflate Macro** | Expands each compact event with its template |
+| **Consume KV Search** | Scheduled search storing new templates in the template store |
+| **Backfill KV Search** | The same template load from the start of the index, after the template store was emptied or restored |
 | **Recompile Compiled Alerts Search** | Runs `tenxrecompile` every 15 minutes |
 | **Rebuild Field Replay Searches** | Run `tenxreplay` every hour, and every five minutes for sourcetypes not yet covered |
-| **Analytics Dashboard** | Compression and template metrics |
-| **Diagnostics Dashboard** | Troubleshooting and verification tools |
+| **Overview Page** | Compact events, volume saved and reduction per source |
+| **Health Page** | Checks that events arrive, templates are stored and events expand |
 
 ## Documentation
 

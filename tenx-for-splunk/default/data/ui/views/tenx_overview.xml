@@ -1,0 +1,131 @@
+<form version="1.1" theme="light">
+  <label>Overview</label>
+  <description>Compact events in this Splunk, by source, and the event text volume they save.</description>
+  <!-- Sizes come from a sample of the compact events: the ratio keeps about 100,000 events
+       sampled whatever the range holds. Event counts are exact (tstats). The sample ratio
+       applies to the main search only, so the exact counts ride in the appended subsearch. -->
+  <search id="size">
+    <query>| tstats count where `tenx-events` | eval ratio=max(1, ceiling(count/100000))</query>
+    <earliest>$t.earliest$</earliest>
+    <latest>$t.latest$</latest>
+    <done>
+      <set token="ratio">$result.ratio$</set>
+    </done>
+  </search>
+  <search id="vol">
+    <query>`tenx-events`
+| eval c=len(_raw)
+| `tenx-inflate`
+| eval o=len(_raw), bad=if(match(_raw, "^~"), 1, 0)
+| stats count as sampled sum(c) as c sum(o) as o sum(bad) as not_expanded by index sourcetype
+| append [| tstats count as events where `tenx-events` by index sourcetype]
+| stats sum(*) as * by index sourcetype
+| eval ratio=$ratio$, original_b=events*o/sampled, compact_b=events*c/sampled</query>
+    <earliest>$t.earliest$</earliest>
+    <latest>$t.latest$</latest>
+    <sampleRatio>$ratio$</sampleRatio>
+  </search>
+  <fieldset submitButton="false">
+    <input type="time" token="t" searchWhenChanged="true">
+      <label>Time range</label>
+      <default>
+        <earliest>-7d@h</earliest>
+        <latest>now</latest>
+      </default>
+    </input>
+  </fieldset>
+  <row>
+    <panel>
+      <title>Compact events</title>
+      <single>
+        <search base="vol">
+          <query>| stats sum(events) as events</query>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="useThousandSeparators">1</option>
+        <option name="underLabel">events indexed in compact form</option>
+      </single>
+    </panel>
+    <panel>
+      <title>Volume saved</title>
+      <single>
+        <search base="vol">
+          <query>| stats sum(original_b) as o sum(compact_b) as c
+| eval div=if(o&gt;=1073741824, 1073741824, 1048576), unit=if(o&gt;=1073741824, "GB", "MB")
+| eval v=round((o-c)/div, 1)." of ".round(o/div, 1)." ".unit
+| table v</query>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="underLabel">of the original event text</option>
+      </single>
+    </panel>
+    <panel>
+      <title>Reduction</title>
+      <single>
+        <search base="vol">
+          <query>| stats sum(original_b) as o sum(compact_b) as c | eval pct=round(100*(1-c/o)) | table pct</query>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="unit">%</option>
+        <option name="colorMode">block</option>
+        <option name="useColors">1</option>
+        <option name="rangeColors">["0x53a051","0x53a051"]</option>
+        <option name="rangeValues">[0]</option>
+      </single>
+    </panel>
+    <panel>
+      <title>Events that did not expand</title>
+      <single>
+        <search base="vol">
+          <query>| stats sum(not_expanded) as n | table n</query>
+        </search>
+        <option name="drilldown">none</option>
+        <option name="colorMode">block</option>
+        <option name="useColors">1</option>
+        <option name="rangeColors">["0x53a051","0xdc4e41"]</option>
+        <option name="rangeValues">[0.5]</option>
+        <option name="underLabel">of the events checked; see Health</option>
+      </single>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>Original against compact, by source type (MB of event text, from 1 in $ratio$ events)</title>
+      <chart>
+        <search base="vol">
+          <query>| where sampled&gt;0
+| sort - original_b
+| eval Original=round(original_b/1048576, 1), Compact=round(compact_b/1048576, 1)
+| eval source=if(sourcetype=="tenx_encoded", index, sourcetype)
+| table source Original Compact</query>
+        </search>
+        <option name="charting.chart">bar</option>
+        <option name="charting.chart.showDataLabels">all</option>
+        <option name="charting.drilldown">none</option>
+        <option name="charting.legend.placement">bottom</option>
+        <option name="charting.axisTitleX.visibility">collapsed</option>
+        <option name="charting.axisTitleY.text">MB</option>
+        <option name="charting.seriesColors">[0x9aa0a6,0x53a051]</option>
+        <option name="height">260</option>
+      </chart>
+    </panel>
+  </row>
+  <row>
+    <panel>
+      <title>By source: click a row to search its events as original text</title>
+      <table>
+        <search base="vol">
+          <query>| sort - events
+| eval Events=tostring(events, "commas"), "Original MB"=round(original_b/1048576, 1), "Compact MB"=round(compact_b/1048576, 1), "Saved %"=round(100*(1-c/o), 1)
+| rename index as Index, sourcetype as Sourcetype
+| table Index Sourcetype Events "Original MB" "Compact MB" "Saved %"</query>
+        </search>
+        <option name="count">20</option>
+        <option name="drilldown">row</option>
+        <drilldown>
+          <link target="_blank">search?q=index%3D$row.Index|u$%20sourcetype%3A%3A$row.Sourcetype|u$%20%60tx%60&amp;earliest=$t.earliest$&amp;latest=$t.latest$</link>
+        </drilldown>
+      </table>
+    </panel>
+  </row>
+</form>

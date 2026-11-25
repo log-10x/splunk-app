@@ -2011,7 +2011,7 @@ def store_warning(state, now):
 	status = state.get("status")
 	if status == "failed":
 		return ("tx: Consume KV stopped with an error (%s), so templates%s may not be stored; events that use them stay "
-				"compact. See the Diagnostics dashboard." % (str(state.get("detail") or "see tenx_dml_to_kv.log")[:200], after))
+				"compact. See the Health page." % (str(state.get("detail") or "see tenx_dml_to_kv.log")[:200], after))
 	if now - updated > STORE_STALE_SECONDS:
 		return ("tx: Consume KV has not run since %s, so templates indexed since then are not stored; events that use "
 				"them stay compact." % time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime(updated)))
