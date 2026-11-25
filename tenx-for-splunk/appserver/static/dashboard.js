@@ -14,9 +14,9 @@ How it works:
 
 Alternatively, the code can be added independently to any dashboard it's required in.
 
-The app's own Analytics and Diagnostics dashboards are left out on purpose: their
-panels read the compact form, counting events and templates and measuring compact bytes, and
-expand explicitly where they need the original line. Routed through the rewrite, every event
+The app's own Overview and Health pages are left out on purpose: their panels read the
+compact form, counting events and templates and measuring compact bytes, and expand
+explicitly where they need the original line. Routed through the rewrite, every event
 would be expanded first, the compact sizes would be measured on expanded lines, and the
 template fields those panels group by would be dropped.
 */
@@ -32,7 +32,7 @@ require([
 	//
 	// See tenx_search_hook.js for more info.
 	//
-	var compactFormViews = ["tenx_dashboard", "tenx_diagnostics"];
+	var compactFormViews = ["tenx_overview", "tenx_health"];
 	var view = window.location.pathname.replace(/\/+$/, "").split("/").pop();
 
 	if (compactFormViews.indexOf(view) !== -1) {

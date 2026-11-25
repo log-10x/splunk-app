@@ -427,8 +427,8 @@ def test_the_record_holds_the_masking_rules_of_each_sourcetype():
 	assert kv == 'SEDCMD-pw in [app:kv]' and js == '' and row == [['SEDCMD-pw in [app:kv]']]
 
 
-def test_the_diagnostics_dashboard_lists_them():
-	text = open(os.path.join(APP, 'default', 'data', 'ui', 'views', 'tenx_diagnostics.xml'), encoding='utf-8').read()
-	assert 'Original Sourcetypes Masked at Index Time' in text and 'masked_at_index_time' in text
+def test_the_health_page_lists_them():
+	text = open(os.path.join(APP, 'default', 'data', 'ui', 'views', 'tenx_health.xml'), encoding='utf-8').read()
+	assert 'index-time masking does not apply to compact events' in text and 'masked_at_index_time' in text
 	spec = open(os.path.join(APP, 'README', 'tenx_replay.conf.spec'), encoding='utf-8').read()
 	assert 'masked_at_index_time = ' in spec

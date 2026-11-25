@@ -36,7 +36,7 @@ The app provides the infrastructure to:
 
 1. **Receive** template definitions from the Receiver
 2. **Store** parsed template data in a KV store for efficient lookup
-3. **Inflate** compact events back to their original form at search time
+3. **Expand** compact events back to their original form at search time
 4. **Search** compact data by what the lines say: the `tx` macro in front of an ordinary search, and classic dashboards unchanged
 
 ### Reduction Example
@@ -79,7 +79,7 @@ On a steady source the count of templates levels off.
                      |                                                |
                      v                                                v
         +------------------------+                      +------------------------+
-        | Templates (JSON)       |                      | Encoded Events         |
+        | Templates (JSON)       |                      | Compact Events         |
         | sourcetype:            |                      | sourcetype:            |
         | tenx_dml_raw_json       |                      | tenx_encoded            |
         +------------------------+                      +------------------------+
@@ -144,7 +144,7 @@ The `tenx_dml` collection stores parsed template data with fields:
 | `part_0` | string | First template segment (before first variable) |
 | `pattern_terminator` | string | Last template segment (after last variable) |
 | `timestamp_format` | string | Splunk strftime format for timestamp reconstruction |
-| `expand_unsafe` | string | Empty when the template can be expanded; otherwise the reason it cannot (`back-reference`, `multiple-timestamps`, `hash-conflict`), and the inflate macro leaves its events compact |
+| `expand_unsafe` | string | Empty when the template can be expanded; otherwise the reason it cannot (`back-reference`, `multiple-timestamps`, `hash-conflict`), and the `tenx-inflate` macro leaves its events compact |
 | `pattern_search` | string | Searchable text of the template: separators removed, line breaks as spaces |
 | `search_copy` | string | `pending` until the searchable copy is written, then `written` |
 
@@ -152,7 +152,7 @@ The `tenx_dml` collection stores parsed template data with fields:
 
 | Macro | Purpose |
 |-------|---------|
-| `tenx-inflate` | Main inflation macro: reconstructs original events |
+| `tenx-inflate` | Expands compact events to their original text |
 | `tenx-inflate-debug` | Same as above but keeps intermediate fields for debugging |
 | `tenx-message(1)` | Utility macro to display messages in search results |
 | `tx` | Written in front of a search: searches compact events by what the original lines say (see Usage) |
@@ -242,7 +242,7 @@ The `tenx_dml` collection stores parsed template data with fields:
      `stash`, source `tenx_dml_pure`), does not. Compact events (`tenx_encoded`) go to any index.
 
 5. **Point the dashboards at your compact index:** set the `tenx-events` macro, see
-   [Pointing the Dashboards at Your Compact Events](#pointing-the-dashboards-at-your-compact-events).
+   [Pointing the Pages at Your Compact Events](#pointing-the-pages-at-your-compact-events).
 
 6. **Load templates already indexed:** run the backfill search once, see
    [Loading Templates Indexed Earlier](#loading-templates-indexed-earlier).
@@ -277,7 +277,7 @@ Searches on the fields of that source then use `txf`, as for any compact source 
 ```
 tenx-for-splunk/
 ├── app.manifest                 # Workloads, for slim partition
-├── appserver/static/            # dashboard.js, the search hook, the Compile Alert script
+├── appserver/static/            # dashboard.js, the search hook, the Alerts page script
 ├── bin/                         # Python scripts, see Python Scripts above
 ├── default/
 │   ├── alert_actions.conf       # Alert action definition
@@ -363,12 +363,12 @@ or restored, run this as an admin or power user:
 
 The **Backfill KV** saved search holds the same search; the **Run** button does not fire its alert
 action, so run the search above. A run that stops before it ends leaves stored and copied what it
-finished, and the next run continues; Diagnostics shows the last run that did not finish.
+finished, and the next run continues; the Health page shows the last run that did not finish.
 
-Diagnostics counts the template hashes indexed against those the KV store holds; `tx` and `txf` warn
+The Health page counts the template hashes indexed against those stored; `tx` and `txf` warn
 when Consume KV failed, is still loading, or has not run for fifteen minutes.
 
-### Adding Custom Sourcetypes for Encoded Events
+### Adding Custom Sourcetypes for Compact Events
 
 To use 10x with custom sourcetypes, add to `props.conf`:
 
@@ -379,9 +379,9 @@ REPORT-tenx = tenx-hash-vars-extraction
 
 This applies the field extraction that parses compact events into `tenx_hash`, `tenx_var_0`, and `tenx_vars` fields.
 
-### Pointing the Dashboards at Your Compact Events
+### Pointing the Pages at Your Compact Events
 
-The app's Analytics and Diagnostics dashboards read the `tenx-events` macro, and every `tx`
+The app's Overview and Health pages read the `tenx-events` macro, and every `tx`
 and `txf` search starts with it, so it limits what they read as well. Its default,
 `index=* (sourcetype::tenx_encoded OR tenx_sourcetype::*)`, finds the app's sourcetype, and every
 event that carries `tenx_sourcetype`, in every index that can be searched. Set it to the compact
@@ -653,7 +653,7 @@ searches written with them keep working. The search they run must name the compa
   minutes. Until then its events stay compact, with `tenx_expand_refused` set to `no-template`, and a
   search for a word of that template does not select them.
 - While the KV store is loaded again after it was emptied or restored, `tx` expands events but a
-  search for a word of a template not yet stored does not select them; Diagnostics shows the load.
+  search for a word of a template not yet stored does not select them; the Health page shows the load.
 
 **Speed.** On one laptop running Splunk 10.4.3, a `tx` search over 157,228 compact events
 returned in about 1.5 to 4 seconds, where the same search over the raw lines took under a
@@ -708,7 +708,7 @@ Check what templates are in the KV store:
 | table _key, pattern, timestamp_format
 ```
 
-### Verify Encoded Event Extraction
+### Verify Compact Event Extraction
 
 Check that field extraction is working:
 
@@ -1168,7 +1168,7 @@ of the Log10x documentation describes, so that they send:
    - Sourcetype: `tenx_dml_raw_json`
    - Format: `{"templateHash":"<hash>", "template":"<pattern>"}`
 
-2. **Encoded events** with:
+2. **Compact events** with:
    - Sourcetype: `tenx_encoded`
    - Format: `~<hash>,<var0>,<var1>,...`
 
@@ -1209,7 +1209,7 @@ index=* sourcetype=tenx_encoded earliest=-15m
 
 ### Step 5: Validate Results
 
-Compare inflated events to your original logs to ensure accuracy:
+Compare expanded events to your original logs to ensure accuracy:
 
 ```spl
 index=* sourcetype=tenx_encoded earliest=-15m
@@ -1222,7 +1222,7 @@ index=* sourcetype=tenx_encoded earliest=-15m
 
 ## Technical Reference
 
-### Encoded Event Format
+### Compact Event Format
 
 ```
 ~<hash>,<var0>,<var1>,<var2>,...
@@ -1325,8 +1325,8 @@ reads `<earliest>0</earliest>` as no time constraint, not as epoch 0.
 **Problem**: the 10x dashboards report no events although compact events are indexed.
 
 **Solution**: the dashboards find events through the `tenx-events` macro. Set it to the index
-and sourcetype your compact events use; see [Pointing the Dashboards at Your Compact
-Events](#pointing-the-dashboards-at-your-compact-events).
+and sourcetype your compact events use; see [Pointing the Pages at Your Compact
+Events](#pointing-the-pages-at-your-compact-events).
 
 #### Subsearch Limitations
 

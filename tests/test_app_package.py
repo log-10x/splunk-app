@@ -4,10 +4,10 @@ meets before any search runs, and that no other test reads.
 
 Each guards a defect that shipped:
 
-- Both dashboards named `index=tenx_encoded`, an index the setup guide never creates, so
-  every panel read zero on a deployment that followed the guide. They now read the
+- The dashboards once named `index=tenx_encoded`, an index the setup guide never creates,
+  so every panel read zero on a deployment that followed the guide. They read the
   `tenx-events` macro.
-- Those two dashboards measure the compact form (compact bytes, template hashes). Routed
+- Overview and Health measure the compact form (compact bytes, template hashes). Routed
   through the search rewrite they would be expanded first, so dashboard.js must leave them
   out.
 - Splunkbase requires the listing name to match `[ui] label`, to lead with the brand, and
@@ -40,6 +40,12 @@ def view_files():
 def queries(view_file):
 	root = ET.parse(os.path.join(VIEWS, view_file)).getroot()
 	return [q.text or '' for q in root.iter('query')]
+
+
+def event_queries(view_file):
+	# post-process searches (base=) read their base search's results, not the index
+	root = ET.parse(os.path.join(VIEWS, view_file)).getroot()
+	return [(s.findtext('query') or '') for s in root.iter('search') if 'base' not in s.attrib]
 
 
 class TestDashboardsFindCompactEvents:
@@ -116,8 +122,8 @@ class TestDashboardsFindCompactEvents:
 		assert bnf.get('tx-command', 'usage') == 'private' and bnf.get('tenxsearch-command', 'usage') == 'private'
 
 	def test_every_compact_panel_reads_the_macro(self):
-		for f in ('tenx_dashboard.xml', 'tenx_diagnostics.xml'):
-			compact = [q for q in queries(f) if 'inputlookup' not in q and 'index=_internal' not in q
+		for f in ('tenx_overview.xml', 'tenx_health.xml'):
+			compact = [q for q in event_queries(f) if 'inputlookup' not in q and 'index=_internal' not in q
 					   and 'sourcetype=tenx_dml' not in q and not q.lstrip().startswith('| rest ')]
 			assert compact, f
 			assert all('`tenx-events`' in q for q in compact), f
@@ -129,10 +135,10 @@ class TestHookLeavesCompactFormViewsAlone:
 		listed = re.search(r'compactFormViews\s*=\s*\[([^\]]*)\]', js)
 		assert listed, "dashboard.js no longer names the views it must leave alone"
 		names = re.findall(r'"([^"]+)"', listed.group(1))
-		assert set(names) >= {'tenx_dashboard', 'tenx_diagnostics'}
+		assert set(names) >= {'tenx_overview', 'tenx_health'}
 
 	def test_the_excluded_views_exist(self):
-		for name in ('tenx_dashboard', 'tenx_diagnostics'):
+		for name in ('tenx_overview', 'tenx_health'):
 			assert os.path.exists(os.path.join(VIEWS, name + '.xml'))
 
 

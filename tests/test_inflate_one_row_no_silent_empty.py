@@ -63,7 +63,7 @@ class TestOneRowPerKey:
 				for m in re.finditer(r'(?<!input)lookup\s+(?:local=\S+\s+)?tenx-dml-lookup\s+(\S+)', text):
 					found += 1
 					assert m.group(1) == '_key', (f, m.group(0))
-		assert found >= 5
+		assert found >= 4
 
 
 class TestNoSilentEmptyExpansion:

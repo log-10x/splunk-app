@@ -18,7 +18,7 @@ masked_at_index_time = <comma-separated list>
   TRANSFORMS- classes whose transform sets DEST_KEY = _raw, in its own props stanza and the
   source:: and host:: stanzas recorded for it. Splunk does not run them on compact events, which
   are parsed as the compact sourcetype, so the values they mask are stored as sent and `tx`
-  shows them unmasked. Empty when there are none. The Diagnostics dashboard lists them.
+  shows them unmasked. Empty when there are none. The Health page lists them.
 
 sources = <comma-separated list>|*
 * The sources of this sourcetype's compact events: every source a rebuild has seen with it, or *

@@ -77,16 +77,3 @@ class TestTheInflateMacros:
 		assert out == {'_raw': 'h1,1759386934498,a,b'}
 		out = visible(Model().run(guard, [{'_raw': '~h1,1759386934498,a,b'}])[0])
 		assert out['tenx_expand_refused'] == 'no-template'
-
-
-class TestTheDashboard:
-	def text(self):
-		return open(os.path.join(APP, 'default', 'data', 'ui', 'views', 'tenx_dashboard.xml'), encoding='utf-8').read()
-
-	def test_no_optional_tilde_is_left(self):
-		assert '^~?' not in self.text()
-
-	def test_text_events_are_one_row_of_the_template_counts(self):
-		text = self.text()
-		assert text.count('| eval hash=coalesce(hash, "(sent as text)")') == 2
-		assert text.count('| where isnotnull(hash)') == 1

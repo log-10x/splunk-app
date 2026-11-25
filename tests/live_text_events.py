@@ -19,7 +19,6 @@ holding every line of those sources indexed raw, with the same host and source. 
   the raw events have);
 - for each word (--words), the `| tx` command, a compiled alert (the tenx-alert endpoint's compile, run) and the
   dashboard hook (the tenx-search endpoint) count as many events as the raw index;
-- the dashboard's template table counts every event, the events sent as text as one row "(sent as text)";
 - with --hist-index (raw lines of an application that itself starts some lines with "~", indexed raw under
   --hist-sourcetype), what `tx` returns for them when tenx-raw-events names them (printed, not checked), and the
   macro is put back.
@@ -31,7 +30,6 @@ import argparse
 import collections
 import json
 import os
-import re
 import sys
 import time
 import urllib.parse
@@ -42,16 +40,7 @@ from live_endpoints import CheckFailed, Splunk, json_or_fail, results_of, wait_f
 from live_raw_history import search  # noqa: E402
 from live_txf_left_out import SKIP, export  # noqa: E402
 
-TEXT_ROW = '(sent as text)'
 KEYS = 'eval m=md5(_raw), t=printf("%.3f", _time), st=coalesce(tenx_sourcetype, sourcetype), refused=tenx_expand_refused'
-
-
-def dashboard_query(name):
-	"""The query of a panel of the app's dashboard, by its title."""
-	path = os.path.join(HERE, '..', 'tenx-for-splunk', 'default', 'data', 'ui', 'views', 'tenx_dashboard.xml')
-	text = open(path, encoding='utf-8').read()
-	m = re.search(r'<title>%s</title>.*?<query>(.*?)</query>' % re.escape(name), text, re.S)
-	return m.group(1).replace('&lt;', '<').replace('&gt;', '>').replace('&amp;', '&')
 
 
 def count_of(rows):
@@ -224,13 +213,6 @@ def main():
 				hook = count_of(results_of(splunk, sid))
 			check('"%s": | tx, a compiled alert and the dashboard hook count as raw' % word, want > 0 and cmd == alert == hook == want,
 				  'raw %d, | tx %d, compiled alert %d, dashboard hook %d' % (want, cmd, alert, hook))
-
-		q = dashboard_query('Top 10 Templates by Usage').replace('| head 10', '')
-		q = q.replace('`tenx-events`', 'index=%s sourcetype::tenx_encoded' % args.index, 1)
-		rows, _ = search(splunk, 'search ' + q + ' | stats sum(count) AS total, sum(eval(if(template=="%s", count, 0))) AS text' % TEXT_ROW, '0')
-		total, text = int(float(rows[0].get('total') or 0)), int(float(rows[0].get('text') or 0))
-		check('the dashboard\'s template table counts both kinds', total == len(stream) and text == n_text,
-			  'total %d of %d events, "%s" %d of %d' % (total, len(stream), TEXT_ROW, text, n_text))
 
 		if args.hist_index:
 			macro = 'admin/macros/tenx-raw-events'

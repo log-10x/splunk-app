@@ -1,10 +1,8 @@
 <nav>
-  <view name="tenx_dashboard" default='true' label="Analytics" />
-  <view name="tenx_diagnostics" label="Diagnostics" />
-  <view name="tenx_alert_compile" label="Compile Alert" />
+  <view name="tenx_overview" default="true" />
+  <view name="tenx_health" />
   <!-- Splunk's own search view. Its search bar loads no app JavaScript, so compact data is
        searched there with the tx command; see the README. -->
   <view name="search" />
-  <view name="alerts" />
-  <view name="dashboards" />
+  <view name="tenx_alert_compile" label="Alerts" />
 </nav>

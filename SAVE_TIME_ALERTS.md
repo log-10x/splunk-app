@@ -4,14 +4,14 @@ A scheduled alert runs on the server, where the dashboard hook never fires. The 
 compiles the alert's search once, when it is saved, into native SPL, and stores that. The
 scheduler then runs an ordinary saved search with no Python between it and the data.
 
-Only alerts created through the **Compile Alert** view or the `/tenx-alert` endpoint are
+Only alerts created on the **Alerts** page or the `/tenx-alert` endpoint are
 compiled. An alert saved the usual way from the search page is not: on compact data its
 search starts with `| tx`, and every run then proxies a nested job and writes each event out
 through Python. Compiling avoids that cost.
 
 ## Compiling an alert
 
-Open **Compile Alert** in the app's navigation, enter the search and the alert settings,
+Open **Alerts** in the app's navigation, enter the search and the alert settings,
 and select **Compile**. The view shows the compiled search, its strategy, and any reason
 to review it. A clean result is saved at once. A result flagged for review is saved only
 after **Confirm and schedule**.
