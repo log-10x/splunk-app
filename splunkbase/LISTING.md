@@ -187,7 +187,7 @@ Paste the block for the version being uploaded. Splunkbase keeps notes per relea
 > - The app opens on Overview: compact events for the chosen time range, the event text volume they save and the reduction, per index and source type. A row opens a `tx` search of that source.
 > - Health replaces Diagnostics: six checks, from compact events arriving to every event expanding, including that a search returns the same event as was indexed.
 > - The app's navigation holds four pages: Overview, Health, Search and Alerts.
-> - Through `txf`, a field alias of a field that only a lookup sets stays empty, as on the raw event.
+> - Through `txf`, an alias of a field that only a lookup sets equals raw, empty where the raw event has none, such as the Windows add-on's `category` and the FortiGate add-on's `vendor_transport`.
 
 1.3.0:
 
