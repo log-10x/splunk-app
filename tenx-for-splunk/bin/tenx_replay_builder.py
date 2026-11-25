@@ -22,7 +22,9 @@ per-sourcetype units instead, see the notes above unit_macro()):
 2. The search-time fields Splunk set on the unexpanded event are cleared (they came from rules
    keyed on the compact text: on Windows Security data, app=win:unknown on 142 of 662 events).
    Splunk's default fields, tenx_* fields and the indexed fields that the compact events of the
-   event's original sourcetype carry are kept.
+   event's original sourcetype carry are kept. On an event indexed under its original sourcetype,
+   what that sourcetype's aliases, calculated fields and lookups set when Splunk read it is cleared
+   too, indexed fields included, so that step 4 runs them on what the raw event gives them.
    eval cannot write a field whose name holds a brace (it reads the braces as a field naming the
    target), so the macro must run before anything that makes such fields: spath, or JSON and XML
    extraction. Both callers run it right after tenx-inflate.
@@ -1103,26 +1105,54 @@ def read_time_names(stanzas, transforms=None, lookup_fields=None):
 							transform.get('DELIMS') and not transform.get('FIELDS')) or not transform:
 						dynamic = True
 					names.update(n for n in out if n != '*' and not n.startswith(('_KEY_', '_VAL_')))
-		for key, value in stanza.rules.items():
-			if ALIAS_KEY.match(key):
-				try:
-					names.update(p[2] for p in parse_aliases(value))
-				except ReplayError:
-					pass
-			elif EVAL_KEY.match(key):
-				names.add(EVAL_KEY.match(key).group(1))
-			elif LOOKUP_KEY.match(key):
-				try:
-					table, inputs, mode, outputs = parse_lookup(value)
-				except ReplayError:
-					continue
-				if mode:
-					names.update(evt for _, evt in outputs)
-				elif (lookup_fields or {}).get(table) is None:
-					dynamic = True
-				else:
-					names.update(c for c in lookup_fields[table] if c not in set(col for col, _ in inputs))
+		written, unknown = rule_outputs(stanza, lookup_fields)
+		names.update(written)
+		dynamic = dynamic or unknown
 	return names, dynamic
+
+
+def rule_outputs(stanza, lookup_fields=None):
+	"""(the fields the aliases, calculated fields and lookups of `stanza` write, True when a lookup's columns are unknown)."""
+	names, dynamic = set(), False
+	for key, value in stanza.rules.items():
+		if ALIAS_KEY.match(key):
+			try:
+				names.update(p[2] for p in parse_aliases(value))
+			except ReplayError:
+				pass
+		elif EVAL_KEY.match(key):
+			names.add(EVAL_KEY.match(key).group(1))
+		elif LOOKUP_KEY.match(key):
+			try:
+				table, inputs, mode, outputs = parse_lookup(value)
+			except ReplayError:
+				continue
+			if mode:
+				names.update(evt for _, evt in outputs)
+			elif (lookup_fields or {}).get(table) is None:
+				dynamic = True
+			else:
+				names.update(c for c in lookup_fields[table] if c not in set(col for col, _ in inputs))
+	return names, dynamic
+
+
+def read_rule_steps(stanzas, read_as, lookup_fields=None):
+	"""
+	The steps that remove, from a replayed event Splunk read under one of the sourcetypes `read_as`, what that
+	sourcetype's aliases, calculated fields and lookups set then, attached fields included. The replay runs those
+	rules again in Splunk's order, and on the raw event an alias or a calculated field never reads a lookup's output.
+	"""
+	keep = re.compile('^(%s)$' % '|'.join(KEEP_PATTERNS))
+	steps = []
+	for st in sorted(set(read_as)):
+		stanza = next((s for s in stanzas if s.kind == 'sourcetype' and s.name == st), None)
+		if stanza is None:
+			continue
+		cond = 'isnotnull(%s) AND sourcetype==%s' % (RST, spl_string(st))
+		names = sorted(n for n in rule_outputs(stanza, lookup_fields)[0]
+					   if n not in DEFAULT_KEEP and n not in SPLUNK_COMPUTED and not keep.match(n))
+		steps += _holds(names, [], '"<<FIELD>>"=if(%s, null(), \'<<FIELD>>\')' % cond)
+	return steps
 
 
 def rule_field_names(stanzas, sourcetypes, transforms=None, lookup_fields=None):
@@ -1464,7 +1494,8 @@ def build(stanzas, present, lookup_fields=None, keep_fields=(), all_shared=True,
 							   'and are not cleared on replayed events')
 	steps.extend(whole_clearing_steps(keep_rx, cleared_on, originals))
 	steps.append(block(ANY, clearing_steps(names, keep_rx, replay.warnings, compact=seen is not None,
-											cleared_on=cleared_on) + [
+											cleared_on=cleared_on)
+					   + read_rule_steps(stanzas, originals + sourcetypes, lookup_fields) + [
 		'eval sourcetype=coalesce(%s, sourcetype)' % RST,
 		'eval _kv=if(isnotnull(%s), null(), _kv)' % RST]))
 	steps.extend(extract_steps(as_read=True, indexed=indexed))

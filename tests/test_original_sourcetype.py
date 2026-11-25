@@ -439,6 +439,74 @@ class TestAValueExtractJoinsIsAPlainValue:
 			assert run_tx([e], b.tx_extract(ATTACHED + ['EventCode']))[0]['EventCode'] == found, (held, found)
 
 
+# ---------------------------------------------------------------------------
+# Splunk ran the original sourcetype's aliases, calculated fields and lookups when it read the compact event,
+# from its attached fields. Through `txf` each rule sees what it sees on the raw event: an alias or a calculated
+# field never reads what a lookup wrote.
+# ---------------------------------------------------------------------------
+
+READ_TABLES = {'tasks': [{'Task': '12544', 'TaskCategory': 'Logon'}],
+			   'protos': [{'proto': '6', 'transport': 'tcp', 'protocol': 'ip'}]}
+READ_LOOKUP_FIELDS = {'tasks': ['Task', 'TaskCategory'], 'protos': ['proto', 'transport', 'protocol']}
+
+
+def read_stanzas(mode):
+	return [b.Stanza('default', {}, {}),
+			b.Stanza('tenx_encoded', {'REPORT-tenx': 'tenx-hash-vars-extraction'}, {}),
+			b.Stanza('XmlWinEventLog', {'FIELDALIAS-category': 'TaskCategory AS category',
+										'EVAL-task_name': 'lower(TaskCategory)',
+										'LOOKUP-task': 'tasks Task %s TaskCategory' % mode}, {}),
+			b.Stanza('fortigate_traffic', {'FIELDALIAS-transport': 'transport AS vendor_transport',
+										   'LOOKUP-proto': 'protos proto OUTPUT transport, protocol'}, {})]
+
+
+def run_read(events, mode='OUTPUTNEW'):
+	present = [('XmlWinEventLog', 'XmlWinEventLog:Security', 'dc01'), ('fortigate_traffic', 'fgt', 'fw1')]
+	by_st = {'XmlWinEventLog': ['Task'], 'fortigate_traffic': ['proto', 'transport']}
+	full = b.build(read_stanzas(mode), present, READ_LOOKUP_FIELDS, (), keep_by_sourcetype=by_st).spl()
+	m = replay_model(full)
+	m.lookups = READ_TABLES
+	return [visible(e) for e in m.run(txf_steps('`tenx-replay`'), events)]
+
+
+def read_event(st, exp, attached, read, text):
+	"""A compact event indexed under `st`: its attached fields, and what that sourcetype's rules set from them when it was read."""
+	e = {'_raw': '~h,1', '__exp': exp, 'sourcetype': st, 'tenx_sourcetype': st, 'source': 'src', 'host': 'h',
+		 '_kv': 1, '__by_st': {st: text}}
+	e.update(attached)
+	e.update(read)
+	return e
+
+
+def win_read():
+	return read_event('XmlWinEventLog', '<Event><Task>12544</Task></Event>', {'Task': '12544'},
+					  {'TaskCategory': 'Logon'}, {'Task': '12544'})
+
+
+class TestTxfRulesSeeWhatTheRawEventGives:
+	def test_an_alias_of_a_field_only_a_lookup_sets_is_empty(self):
+		for mode in ('OUTPUTNEW', 'OUTPUT'):
+			out = run_read([win_read()], mode)
+			assert out[0]['TaskCategory'] == 'Logon', mode
+			assert 'category' not in out[0] and 'task_name' not in out[0], mode
+
+	def test_an_alias_reads_the_text_value_a_lookup_overwrites(self):
+		nat = read_event('fortigate_traffic', 'proto=6 transport=5555', {'proto': '6', 'transport': '5555'},
+						 {'vendor_transport': '5555', 'transport': 'tcp', 'protocol': 'ip'}, {'proto': '6', 'transport': '5555'})
+		plain = read_event('fortigate_traffic', 'proto=6', {'proto': '6'},
+						   {'transport': 'tcp', 'protocol': 'ip'}, {'proto': '6'})
+		out = run_read([nat, plain])
+		assert (out[0]['vendor_transport'], out[0]['transport'], out[0]['protocol']) == ('5555', 'tcp', 'ip')
+		assert 'vendor_transport' not in out[1] and (out[1]['transport'], out[1]['protocol']) == ('tcp', 'ip')
+
+	def test_an_event_read_as_the_compact_sourcetype_is_replayed_alike(self):
+		e = win_read()
+		e['sourcetype'] = 'tenx_encoded'
+		del e['TaskCategory']
+		out = run_read([e])
+		assert out[0]['TaskCategory'] == 'Logon' and 'category' not in out[0]
+
+
 def appending_typer(event, _):
 	"""A typer that adds the event types it finds to an eventtype the event has already."""
 	found, have = 'et_%s' % event.get('sourcetype'), event.get('eventtype')
