@@ -56,7 +56,7 @@
 | table v</query>
         </search>
         <option name="drilldown">none</option>
-        <option name="underLabel">event text not indexed, of the original event text</option>
+        <option name="underLabel">of the original event text</option>
       </single>
     </panel>
     <panel>
@@ -71,7 +71,6 @@
         <option name="useColors">1</option>
         <option name="rangeColors">["0x53a051","0x53a051"]</option>
         <option name="rangeValues">[0]</option>
-        <option name="underLabel">smaller than the original events</option>
       </single>
     </panel>
     <panel>

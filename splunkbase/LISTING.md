@@ -185,7 +185,7 @@ Paste the block for the version being uploaded. Splunkbase keeps notes per relea
 1.3.1:
 
 > - The app opens on Overview: compact events for the chosen time range, the event text volume they save and the reduction, per index and source type. A row opens a `tx` search of that source.
-> - Health replaces Diagnostics: six checks, from compact events arriving to every event expanding, and the same event as indexed and as a search returns it.
+> - Health replaces Diagnostics: six checks, from compact events arriving to every event expanding, including that a search returns the same event as was indexed.
 > - The app's navigation holds four pages: Overview, Health, Search and Alerts.
 
 1.3.0:

@@ -10,7 +10,7 @@ To find optimization opportunities in your existing Splunk data, point the [Log1
 
 ## How It Works
 
-A [compact event](https://doc.log10x.com/run/transform/#compact) carries a template hash and its variable values; the app stores the constant words as templates and puts them back at search time. A word that exists only in a template is not in the index, so a plain keyword search over compact data finds the events where the word is a value and misses the others. To search by what the lines say, write the `tx` macro in front of the search terms, after the index and any metadata or time terms: ``index=app_logs `tx` error "payment failed"``. The words after it are ordinary SPL, applied to the expanded lines. Classic dashboards keep their panel SPL unchanged: `dashboard.js` routes each panel's search through the app's REST endpoint. An alert created on the app's **Alerts** page compiles once into a native saved search.
+A [compact event](https://doc.log10x.com/run/transform/#compact) carries a template hash and its variable values. The Receiver sends each template once, the app keeps it in its template store, and searches put the constant words back. A word that exists only in a template is not in the index, so a plain keyword search over compact data finds the events where the word is a value and misses the others. To search by what the lines say, write the `tx` macro in front of the search terms, after the index and any metadata or time terms: ``index=app_logs `tx` error "payment failed"``. The words after it are ordinary SPL, applied to the expanded lines. Classic dashboards keep their panel SPL unchanged: `dashboard.js` routes each panel's search through the app's REST endpoint. An alert created on the app's **Alerts** page compiles once into a native saved search.
 
 ### Ingestion Flow
 
@@ -253,7 +253,7 @@ The `txf` macro gives expanded events the fields, event types and tags of their 
 | Page | What it shows |
 |------|---------------|
 | **Overview** | Compact events for the chosen time range, the event text volume they save and the reduction, per index and source type; a row opens a `tx` search of that source. Sizes are estimated from a sample of the events; event counts are exact. |
-| **Health** | Six checks, from compact events arriving to every event expanding, the same event as indexed and as a search returns it, and the template store's last load. Templates the app refuses to expand, and source types whose index-time masking does not apply to compact events, are listed when there are any. |
+| **Health** | Six checks, from compact events arriving to every event expanding, including that a search returns the same event as was indexed, and the template store's last load. When there are any, the page lists templates the app refuses to expand and source types whose index-time masking does not apply to compact events. |
 | **Search** | Splunk's search page; write `tx` or `txf` in front of the search terms. |
 | **Alerts** | Compile a search into a scheduled alert that runs as native SPL. |
 
@@ -272,7 +272,7 @@ The `txf` macro gives expanded events the fields, event types and tags of their 
 | **tenxrecompile Command** | Recompiles every compiled alert so it picks up new templates |
 | **Alert Compiler** | `/tenx-alert` REST endpoint compiling a search into a native scheduled alert at save time (with a recompile/migrate pass) |
 | **Alerts Page** | Compiles, reviews and recompiles save-time alerts |
-| **Template Store** | The templates searches expand events with, in the `tenx_dml` collection |
+| **Template Store** | The templates searches use to expand events, in the `tenx_dml` KV store collection |
 | **tenx-inflate Macro** | Expands each compact event with its template |
 | **Consume KV Search** | Scheduled search storing new templates in the template store |
 | **Backfill KV Search** | The same template load from the start of the index, after the template store was emptied or restored |
